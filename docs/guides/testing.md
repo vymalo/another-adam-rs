@@ -108,6 +108,8 @@ job of `.github/workflows/coder.yml` runs it in the built coder image**, whose w
 (vymalo/another-agentic-images#15), with `ADAM_TEST_REQUIRE_LANGUAGE_SERVERS=1`. Run on 2026-11-17 on a machine with `rust-analyzer`
 1.97.0 and `pyright-langserver`, both passed; the other two were not installed.
 
+::: in-depth What the store suite covers, and adding a backend
+
 ## What the store suite covers
 
 49 cases: exact JSON round trip (unicode, `i64` bounds, floats, special keys), CAS conflicts, 16-way concurrent
@@ -139,6 +141,8 @@ Implement `Store` and add one line: `adam_store_testkit::store_conformance!(make
 `release_worker_leases`, which defaults to a no-op). A new `Notifier` runs
 `adam_notify_testkit::notifier_conformance!(make_pair);` (the Postgres one needs `ADAM_TEST_POSTGRES_URL`, a
 superuser, for its reconnect test). See [Store adapters](../reference/store-adapters.md#adding-a-backend).
+
+:::
 
 ## End-to-end scenarios
 

@@ -1,5 +1,5 @@
--- The schema version 7 that adam-store-postgres emits.
--- Regenerate with ADAM_WRITE_FIXTURE=1 cargo test -p adam-store-postgres --lib the_statements_equal_the_version_7_fixture
+-- The schema version 9 that adam-store-postgres emits.
+-- Regenerate with ADAM_WRITE_FIXTURE=1 cargo test -p adam-store-postgres --lib the_statements_equal_the_version_9_fixture
 CREATE TABLE IF NOT EXISTS adam_meta (
                     key   TEXT PRIMARY KEY,
                     value TEXT NOT NULL
@@ -110,6 +110,42 @@ CREATE TABLE IF NOT EXISTS adam_body (
 
 CREATE INDEX IF NOT EXISTS adam_body_written ON adam_body (written_at);
 
-INSERT INTO adam_meta (key, value) VALUES ('schema_version', '7')
+ALTER TABLE adam_runs ADD COLUMN IF NOT EXISTS served JSONB
+                 GENERATED ALWAYS AS (CASE WHEN jsonb_typeof(head) = 'object' AND (head_version = version OR state = 'null'::jsonb) THEN head ELSE state END) VIRTUAL;
+
+CREATE OR REPLACE FUNCTION adam_claim_due(
+             in_agents text[], in_worker text, in_pinned boolean, in_busy uuid[],
+             in_now timestamptz, in_until timestamptz, in_limit bigint)
+         RETURNS TABLE (id uuid, agent text, conversation_id text, parent_id uuid, status text,
+                        served jsonb, wake_at timestamptz, version bigint,
+                        created_at timestamptz, updated_at timestamptz)
+         LANGUAGE sql
+         BEGIN ATOMIC
+             WITH due AS (
+                 SELECT d.id FROM adam_runs d
+                  WHERE d.agent = ANY(in_agents)
+                    AND d.id <> ALL(in_busy)
+                    AND d.sched_at <= in_now
+                    AND (d.lease_until IS NULL OR d.lease_until <= in_now)
+                    AND (NOT in_pinned OR d.owner IS NULL OR d.owner = in_worker)
+                  ORDER BY d.sched_at, d.id
+                  LIMIT in_limit
+                  FOR UPDATE SKIP LOCKED
+             ), claimed AS (
+                 UPDATE adam_runs r
+                    SET lease_owner = in_worker, lease_until = in_until,
+                        owner = CASE WHEN in_pinned THEN COALESCE(r.owner, in_worker) ELSE r.owner END
+                   FROM due
+                  WHERE r.id = due.id
+                 RETURNING r.id, r.agent, r.conversation_id, r.parent_id, r.status, r.served,
+                           r.wake_at, r.version, r.created_at, r.updated_at, r.sched_at
+             )
+             SELECT c.id, c.agent, c.conversation_id, c.parent_id, c.status, c.served,
+                    c.wake_at, c.version, c.created_at, c.updated_at
+               FROM claimed c
+              ORDER BY c.sched_at, c.id;
+         END;
+
+INSERT INTO adam_meta (key, value) VALUES ('schema_version', '9')
              ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
               WHERE adam_meta.value::INT < EXCLUDED.value::INT;

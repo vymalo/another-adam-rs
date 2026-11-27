@@ -9,10 +9,10 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-adam-code-tools = { path = "../adam-code-tools", version = "0.1.0", features = ["test-util"] } # x-release-please-version
+adam-code-tools = { path = "../adam-code-tools", version = "0.6.0", features = ["test-util"] } # x-release-please-version
 adam-llm-agent.workspace = true
 adam-runtime.workspace = true
-adam-workspace = { path = "../adam-workspace", version = "0.1.0", default-features = false } # x-release-please-version
+adam-workspace = { path = "../adam-workspace", version = "0.6.0", default-features = false } # x-release-please-version
 async-trait.workspace = true
 
 [dev-dependencies]

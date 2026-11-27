@@ -54,6 +54,10 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
       - name: Install the pinned site dependencies
         run: npm --prefix docs ci --no-fund --no-audit
+      # The `::: in-depth` container's own tests (STRUCTURE.md v3). They use VitePress's renderer, so they run
+      # against the same dependency tree the site builds with — the file's header says CI runs them, and this is it.
+      - name: Test the in-depth container
+        run: npm --prefix docs run test:in-depth
       - name: Build the site
         run: npm --prefix docs run build
       # Crawls the built pages: every internal link must reach a page of dist/ and every #fragment an id on it. Before the

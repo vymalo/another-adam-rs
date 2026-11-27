@@ -2,7 +2,7 @@
 
 For people: [Releases](../../../docs/guides/releases.md). That page decides; this one gives the files, the invariants
 to check, the commands and the evidence. The decision is [ADR 0084](../../../docs/decisions/0084-releases-are-cut-by-release-please-and-production-pins-a-version.md).
-Written at `ce99d98` plus this change on 2026-11-27. The model is vaam-apps/vpay at `master` on 2026-11-27
+Written at `ce99d98` plus this change on 2026-11-27, amended the same day for ANR-1195. The model is vaam-apps/vpay at `master` on 2026-11-27
 (`release-please-config.json`, `.release-please-manifest.json`, `.github/workflows/release-please.yml`,
 `.github/workflows/release.yml`; *verified* by reading them).
 
@@ -42,6 +42,14 @@ Written at `ce99d98` plus this change on 2026-11-27. The model is vaam-apps/vpay
 6. **The release image is built from the tag's commit with coder.yml's build arguments** (`ADAM_BUILD_REVISION`, the
    revision label) and only after `coder.yml`'s job `build, smoke-test and push the image` concluded `success` on that
    commit, any event (`gate`, `:87-122`). Renaming that job breaks the gate.
+   **The run must survive later pushes.** `coder.yml`'s `concurrency.group` is `coder-<ref>` for a pull request,
+   `coder-<sha>` for a `workflow_dispatch` and for a commit whose message starts `chore: release` (release-please's
+   squash), and `coder-<ref>` for every other push to main: a group holds one pending run and a newer pending run
+   cancels the older even with `cancel-in-progress: false` (v0.6.0, run 46041005870, ANR-1195). The `bump` job has no
+   group (a group ordered by finish time can lose the newest bump) and skips when `main` has a newer non-bump commit.
+   The gate takes any `coder.yml` run on the commit (`head_sha`, any event, any run conclusion) in which the job named
+   above concluded `success`, and waits while a run has not finished that job. A hand `workflow_dispatch` on the tag
+   passes it; re-run `release.yml` after it.
 7. **No `latest`, no tag on main.** `release.yml` runs on `push: tags: ["v*"]` only.
 
 ## Read a release's digests

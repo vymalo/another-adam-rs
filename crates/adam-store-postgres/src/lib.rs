@@ -93,7 +93,15 @@ use uuid::Uuid;
 ///   ([`MIN_SERVER_VERSION_NUM`]). A start on a current schema runs no DDL, so a slice that adds,
 ///   changes or drops a function bumps this version again (8, 9, …); a function whose contract
 ///   changes gets a new name.
-pub const SCHEMA_VERSION: i32 = 7;
+/// * 8: the served document is a column of the runs table, `served`, a **virtual** generated
+///   column (ADR 0082, decision 12, slice P1): the head when it is a JSON object and either
+///   current (`head_version = version`) or the state is the `null` tombstone, else the state. It
+///   is computed when it is read, so adding it rewrites and stores nothing, and every read selects
+///   it instead of repeating the expression. No function yet.
+/// * 9: the claim is a function, `<prefix>claim_due` (ADR 0082, decision 1, slice P2): due, not
+///   busy, lease free and the pinned owner, locked with `SKIP LOCKED`, leased and returned in claim
+///   order, in one `BEGIN ATOMIC` body. Renewal and release stay inline.
+pub const SCHEMA_VERSION: i32 = 9;
 
 /// The oldest server [`Store::migrate`] accepts, as PostgreSQL's `server_version_num`: 18.0, the
 /// floor of [ADR 0082](../../docs/decisions/0082-the-sql-adapters-keep-their-rules-in-the-database.md)
@@ -136,29 +144,50 @@ pub const MAX_POOL_SIZE: u32 = 65_535;
 
 const PUSH_COLUMNS: &str = "run_id, id, agent, owner, config, cursor, state, attempts, last_error, next_attempt_at, version, created_at, updated_at";
 
-/// The record a **reader** sees in the contract release (ADR 0055): the current head when the store
-/// has one (`head_version = version`), the whole state otherwise (a v4 run, or a head a later commit
-/// did not rebuild). No read here touches a body row; `Runtime::state` joins the head with the
-/// generation it names.
+/// The record a **reader** sees in the contract release (ADR 0055): the `served` column, the
+/// current head when the store has one (`head_version = version`), the whole state otherwise (a v4
+/// run, or a head a later commit did not rebuild). No read here touches a body row;
+/// `Runtime::state` joins the head with the generation it names.
 ///
-/// A **tombstoned** run whose head is behind the version (a pre-S3 process failed a converted run
-/// with `state = null`, no head and the version bumped) serves the head: it is the only readable
-/// document, and serving it is the one-line repair. `jsonb_typeof(head) = 'object'` is the test for
-/// "a head": a JSONB `null` is not one.
+/// The rule is the column's expression ([`SERVED_EXPRESSION`]), written once beside the data
+/// (ADR 0082, decision 12), so every read, inline or in a later function, serves the same
+/// document. [`run_from_row`] decodes it into the record's `state`; no read selects the stored
+/// `state` column itself.
 ///
 /// `prefix` is the table alias a statement needs (`""` for a plain `SELECT`, `"r."` for the
 /// `UPDATE ... FROM` of a claim).
 fn served_columns(prefix: &str) -> String {
     let p = prefix;
     format!(
-        "{p}id, {p}agent, {p}conversation_id, {p}parent_id, {p}status, \
-         CASE WHEN jsonb_typeof({p}head) = 'object' \
-                   AND ({p}head_version = {p}version OR {p}state = 'null'::jsonb) \
-              THEN {p}head ELSE {p}state \
-         END AS state, \
+        "{p}id, {p}agent, {p}conversation_id, {p}parent_id, {p}status, {p}served, \
          {p}wake_at, {p}version, {p}created_at, {p}updated_at"
     )
 }
+
+/// The expression of the `served` column (schema version 8).
+///
+/// A **tombstoned** run whose head is behind the version (a pre-S3 process failed a converted run
+/// with `state = null`, no head and the version bumped) serves the head: it is the only readable
+/// document, and serving it is the one-line repair. `jsonb_typeof(head) = 'object'` is the test for
+/// "a head": a JSONB `null` is not one. A `NULL` `head_version` leaves the condition unknown, so a
+/// run with no head serves its state.
+///
+/// A virtual generated column may use only built-in, immutable functions and operators: the
+/// server refuses the `ALTER TABLE` otherwise, so a migration that succeeds is the proof that
+/// `jsonb_typeof` and these `=` operators qualify. The column depends on `head`, `head_version`,
+/// `version` and `state`: a migration that alters one of them drops and recreates the column in
+/// the same transaction.
+///
+/// **A change to this expression is not applied by editing it.** The column is added with
+/// `ADD COLUMN IF NOT EXISTS`, which leaves an existing column as it is, so a database at
+/// version 8 would keep the old expression. A change bumps [`SCHEMA_VERSION`] and adds
+/// `ALTER TABLE <prefix>runs ALTER COLUMN served SET EXPRESSION AS (..)` to the migration; on a
+/// virtual column that rewrites no row (*verified 2026-11-27* on 18.7: the table's file node is
+/// unchanged and the new expression is served). `tests/migrate.rs` holds the stored expression
+/// (`pg_get_expr`) equal to this one after an upgrade.
+const SERVED_EXPRESSION: &str = "CASE WHEN jsonb_typeof(head) = 'object' \
+                                       AND (head_version = version OR state = 'null'::jsonb) \
+                                  THEN head ELSE state END";
 
 /// What `create_run` and `commit_run` return: the record's metadata without `state`. The caller
 /// wrote the state, and a `RETURNING` that echoed it would parse the largest column back on every
@@ -655,8 +684,7 @@ struct Sql {
     journal_get: Arc<str>,
     journal_insert: Arc<str>,
     journal_list: Arc<str>,
-    claim_due_any: Arc<str>,
-    claim_due_pinned: Arc<str>,
+    claim_due: Arc<str>,
     renew_lease: Arc<str>,
     release_lease: Arc<str>,
     lease_until: Arc<str>,
@@ -851,6 +879,18 @@ impl Sql {
         .collect();
         migrate.extend(migrate_blobs.iter().cloned());
         migrate.extend(migrate_body.iter().cloned());
+        // Schema version 8 (ADR 0082, decision 12, slice P1): the served document as a virtual
+        // generated column, after the head columns it reads. A catalog change only: a virtual
+        // column is computed when it is read, so `ADD COLUMN` rewrites no row; it holds
+        // `ACCESS EXCLUSIVE` on `runs` until the migration commits, as the other `ADD COLUMN`s of
+        // this list do. A fresh database gets it here too, so a fresh and an upgraded table end
+        // with the same columns in the same order. `IF NOT EXISTS` keeps a re-run a no-op, and so
+        // never changes the expression of an existing column: a change to `SERVED_EXPRESSION` is
+        // a version bump with `ALTER COLUMN served SET EXPRESSION AS (..)` (see its doc).
+        migrate.push(Arc::from(format!(
+            "ALTER TABLE {runs} ADD COLUMN IF NOT EXISTS served JSONB
+                 GENERATED ALWAYS AS ({SERVED_EXPRESSION}) VIRTUAL"
+        )));
         // Schema version 7 and later (ADR 0082, decision 10): the store's functions, after every
         // table they name and before the version row, in the migration transaction. Rules:
         // * each is one statement, sent whole by `batch_execute` (one simple-protocol message), so
@@ -864,8 +904,8 @@ impl Sql {
         //   release later; a column a SQL-standard body reads is altered only by dropping and
         //   recreating the function in the same transaction;
         // * `tests/functions.rs` lists every function and calls it on a fresh database.
-        // Slice P0 creates none.
-        let migrate_functions: Vec<Arc<str>> = Vec::new();
+        // Slices P0 and P1 create none (P1 adds the `served` column, above); P2 adds the claim.
+        let migrate_functions: Vec<Arc<str>> = vec![Arc::from(claim_due_function(p, &runs))];
         migrate.extend(migrate_functions);
         // Record the version, and raise it from an older one. Never lower it: a process
         // running an older release must not undo a newer one's migration.
@@ -984,8 +1024,10 @@ impl Sql {
             journal_list: Arc::from(format!(
                 "SELECT seq, name, ok, payload, recorded_at FROM {journal} WHERE run_id = $1 ORDER BY seq"
             )),
-            claim_due_any: Arc::from(claim_due_sql(&runs, ClaimScope::Any)),
-            claim_due_pinned: Arc::from(claim_due_sql(&runs, ClaimScope::Pinned)),
+            claim_due: Arc::from(format!(
+                "SELECT {} FROM {p}claim_due($1, $2, $3, $4, $5, $6, $7)",
+                served_columns("")
+            )),
             renew_lease: Arc::from(format!(
                 "UPDATE {runs} SET lease_until = $4
                   WHERE id = $1 AND lease_owner = $2 AND lease_until > $3"
@@ -1092,35 +1134,54 @@ impl Sql {
     }
 }
 
-/// The claiming statement. `$1` agents, `$2` now, `$3` limit, `$4` worker, `$5` lease end, `$6` the
-/// runs the caller is stepping, which are never claimed. The pinned form filters on `owner` and
-/// sets it (`COALESCE` keeps an existing owner).
-fn claim_due_sql(runs: &str, scope: ClaimScope) -> String {
-    let (filter, set_owner) = match scope {
-        ClaimScope::Any => ("", ""),
-        ClaimScope::Pinned => (
-            "AND (owner IS NULL OR owner = $4)",
-            ", owner = COALESCE(r.owner, $4)",
-        ),
-    };
+/// The claim function (schema version 9, ADR 0082 slice P2): `<prefix>claim_due(agents, worker,
+/// pinned, busy, now, until, max)`. It picks the runs of `agents` that are due (`sched_at <= now`),
+/// not in `busy` (the runs the caller is stepping) and whose lease is free or ended, in claim order
+/// (`sched_at`, `id`), at most `max`, locks them with `FOR UPDATE SKIP LOCKED` so a claim never
+/// waits for a row another worker holds, sets the lease (`lease_owner = worker`,
+/// `lease_until = until`) and returns the claimed runs in that order, each as the record a reader
+/// is served (the `served` column). With `pinned`, only a run no worker owns or the worker owns is
+/// a candidate, and the claim ties it to the worker (`COALESCE` keeps an existing owner); without
+/// it the owner is neither read nor written.
+///
+/// Both times are arguments (decision 2): the database's clock is never read. A SQL-standard body
+/// (`BEGIN ATOMIC`) is parsed and bound when the function is created, so a renamed column fails
+/// the migration, not a claim. The one statement is a data-modifying `WITH` whose rows are then
+/// ordered: the order of an `UPDATE .. RETURNING` is unspecified.
+fn claim_due_function(p: &str, runs: &str) -> String {
     format!(
-        "WITH due AS (
-            SELECT id FROM {runs}
-             WHERE agent = ANY($1)
-               AND id <> ALL($6)
-               AND sched_at <= $2
-               AND (lease_until IS NULL OR lease_until <= $2)
-               {filter}
-             ORDER BY sched_at, id
-             LIMIT $3
-             FOR UPDATE SKIP LOCKED
-         )
-         UPDATE {runs} r
-            SET lease_owner = $4, lease_until = $5{set_owner}
-           FROM due
-          WHERE r.id = due.id
-         RETURNING {}, r.sched_at",
-        served_columns("r.")
+        "CREATE OR REPLACE FUNCTION {p}claim_due(
+             in_agents text[], in_worker text, in_pinned boolean, in_busy uuid[],
+             in_now timestamptz, in_until timestamptz, in_limit bigint)
+         RETURNS TABLE (id uuid, agent text, conversation_id text, parent_id uuid, status text,
+                        served jsonb, wake_at timestamptz, version bigint,
+                        created_at timestamptz, updated_at timestamptz)
+         LANGUAGE sql
+         BEGIN ATOMIC
+             WITH due AS (
+                 SELECT d.id FROM {runs} d
+                  WHERE d.agent = ANY(in_agents)
+                    AND d.id <> ALL(in_busy)
+                    AND d.sched_at <= in_now
+                    AND (d.lease_until IS NULL OR d.lease_until <= in_now)
+                    AND (NOT in_pinned OR d.owner IS NULL OR d.owner = in_worker)
+                  ORDER BY d.sched_at, d.id
+                  LIMIT in_limit
+                  FOR UPDATE SKIP LOCKED
+             ), claimed AS (
+                 UPDATE {runs} r
+                    SET lease_owner = in_worker, lease_until = in_until,
+                        owner = CASE WHEN in_pinned THEN COALESCE(r.owner, in_worker) ELSE r.owner END
+                   FROM due
+                  WHERE r.id = due.id
+                 RETURNING r.id, r.agent, r.conversation_id, r.parent_id, r.status, r.served,
+                           r.wake_at, r.version, r.created_at, r.updated_at, r.sched_at
+             )
+             SELECT c.id, c.agent, c.conversation_id, c.parent_id, c.status, c.served,
+                    c.wake_at, c.version, c.created_at, c.updated_at
+               FROM claimed c
+              ORDER BY c.sched_at, c.id;
+         END"
     )
 }
 
@@ -1312,9 +1373,10 @@ fn corrupt_source(err: tokio_postgres::Error) -> StoreError {
     }
 }
 
+/// A row of [`served_columns`]: the record with the document a reader is served as its `state`.
 fn run_from_row(row: &Row) -> StoreResult<RunRecord> {
     let mut run = run_metadata_from_row(row)?;
-    run.state = decode(row, "state")?;
+    run.state = decode(row, "served")?;
     Ok(run)
 }
 
@@ -1708,35 +1770,32 @@ impl Store for PgStore {
         }
         let now = truncate_ms(now);
         let until = add_ttl(now, ttl);
-        let statement = match scope {
-            ClaimScope::Any => &self.sql.claim_due_any,
-            ClaimScope::Pinned => &self.sql.claim_due_pinned,
+        let pinned = match scope {
+            ClaimScope::Any => false,
+            ClaimScope::Pinned => true,
         };
         let busy: Vec<Uuid> = busy.iter().map(|id| id.0).collect();
         let limit = i64::try_from(limit).unwrap_or(i64::MAX);
         let (now_sql, until_sql) = (sql_time(now), sql_time(until));
-        let params: &[&(dyn ToSql + Sync)] =
-            &[&agents, &now_sql, &limit, &worker, &until_sql, &busy];
+        let params: &[&(dyn ToSql + Sync)] = &[
+            &agents, &worker, &pinned, &busy, &now_sql, &until_sql, &limit,
+        ];
         let client = self.pool.get().await.map_err(classify_pool)?;
-        let stmt = client.prepare_cached(statement).await.map_err(classify)?;
+        let stmt = client
+            .prepare_cached(&self.sql.claim_due)
+            .await
+            .map_err(classify)?;
         let rows = client.query(&stmt, params).await.map_err(classify)?;
-        // RETURNING order is unspecified; restore the claim order.
-        let mut claimed = rows
-            .iter()
+        // The function returns the runs in claim order (`sched_at`, `id`).
+        rows.iter()
             .map(|row| {
-                let sched = time(row, "sched_at")?;
-                Ok((sched, run_from_row(row)?))
+                Ok(Lease {
+                    run: run_from_row(row)?,
+                    worker: worker.to_owned(),
+                    until,
+                })
             })
-            .collect::<StoreResult<Vec<_>>>()?;
-        claimed.sort_by(|(a, x), (b, y)| a.cmp(b).then(x.id.cmp(&y.id)));
-        Ok(claimed
-            .into_iter()
-            .map(|(_, run)| Lease {
-                run,
-                worker: worker.to_owned(),
-                until,
-            })
-            .collect())
+            .collect()
     }
 
     async fn renew_lease(
@@ -2517,24 +2576,24 @@ mod tests {
     /// fixture: a start on a current schema runs no DDL, so such a change would never reach a
     /// database (ADR 0082, decision 10).
     #[test]
-    fn the_statements_equal_the_version_7_fixture() {
-        assert_eq!(SCHEMA_VERSION, 7, "a new version gets a fixture of its own");
+    fn the_statements_equal_the_version_9_fixture() {
+        assert_eq!(SCHEMA_VERSION, 9, "a new version gets a fixture of its own");
         let sql = Sql::new("adam_");
         assert!(
             sql.migrate.len() > 4,
             "the fixture must hold the whole migration"
         );
         let mut generated = String::from(
-            "-- The schema version 7 that adam-store-postgres emits.\n\
-             -- Regenerate with ADAM_WRITE_FIXTURE=1 cargo test -p adam-store-postgres --lib the_statements_equal_the_version_7_fixture\n",
+            "-- The schema version 9 that adam-store-postgres emits.\n\
+             -- Regenerate with ADAM_WRITE_FIXTURE=1 cargo test -p adam-store-postgres --lib the_statements_equal_the_version_9_fixture\n",
         );
         generated.push_str(&sql.migrate.join(";\n\n"));
         generated.push_str(";\n");
-        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/schema-v7.sql");
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/schema-v9.sql");
         if std::env::var_os("ADAM_WRITE_FIXTURE").is_some() {
             std::fs::write(path, &generated).expect("write the fixture");
         }
-        let fixture = include_str!("../tests/fixtures/schema-v7.sql");
+        let fixture = include_str!("../tests/fixtures/schema-v9.sql");
         assert_eq!(
             normalise(&(sql.migrate.join("; ") + ";")),
             normalise(fixture)

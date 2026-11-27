@@ -69,8 +69,15 @@ env:
   # Kubernetes version the rendered manifests are validated against: the chart's floor (ADR 0080).
   KUBERNETES_VERSION: 1.37.0
 
+# A pull request run is replaced by the next push to its branch. A manual dispatch and the release commit
+# (release-please's squash, "chore: release main (#N)") each have a group of their own, their sha. Every
+# other push to main shares one group and skips to the newest. A group holds one running and one pending run,
+# and a newer pending run cancels the older pending one even with cancel-in-progress false: that is how a
+# burst of merges replaced the v0.6.0 commit's run, and release.yml's gate reads that run (ANR-1195, ADR 0084
+# amended 2026-11-27). Every merge getting a group of its own would run a 90-minute build for each one in parallel.
+# coder.yml has no tag trigger: a tag's commit is reached by this main push, or by a dispatch on the tag.
 concurrency:
-  group: coder-${{ github.ref }}
+  group: "coder-${{ github.event_name == 'pull_request' && github.ref || (github.event_name == 'workflow_dispatch' || startsWith(github.event.head_commit.message, 'chore: release')) && github.sha || github.ref }}"
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
@@ -505,9 +512,8 @@ jobs:
     needs: image
     if: needs.image.outputs.pushed == 'true'
     runs-on: ubuntu-latest
-    concurrency:
-      group: coder-bump
-      cancel-in-progress: false
+    # No concurrency group: a queue ordered by finish time lets an older commit's pending bump cancel the newest
+    # one's and then skip. The check below (only the newest non-bump commit writes) and the retry keep it safe.
     permissions:
       contents: write
     steps:

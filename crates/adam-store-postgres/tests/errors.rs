@@ -36,6 +36,7 @@ async fn an_undecodable_row_is_corrupt_and_not_retryable() {
     // Hand-alter the row's shape: `created_at` is read as a timestamp. (`state` is no longer the
     // column a read always decodes — the contract's `load_run` reads the head when it is current —
     // so a type change there would fail to plan, not to decode.)
+    support::drop_claim_function(&pool, &prefix).await;
     support::exec(
         &pool,
         &format!(

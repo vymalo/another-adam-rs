@@ -64,6 +64,11 @@ spec:
             - name: UPLOADS_INLINE_MAX_BYTES
               value: {{ . | quote }}
             {{- end }}
+            {{- with include "coder.maxParallelToolCalls" . }}
+            {{- /* config.maxParallelToolCalls: read by every role, so the control plane holds a person's start.config to the same bound the workers apply (ADR 0054). Unset: the binary's 10. */}}
+            - name: MAX_PARALLEL_TOOL_CALLS
+              value: {{ . | quote }}
+            {{- end }}
             {{- with (include "coder.sessionEnv" . | trim) }}
             {{- . | nindent 12 }}
             {{- end }}

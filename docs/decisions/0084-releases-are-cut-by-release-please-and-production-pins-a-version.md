@@ -79,3 +79,26 @@ pushed to GHCR as OCI and signed.
 - **Unverified until the first tag:** the App token minting and the release pull request, the release image's build
   and smoke tests on a tag, the carbon copy (`imagetools create --prefer-index=false`) keeping the signed digest,
   creating the chart's package with `GITHUB_TOKEN`, and `cosign verify` of either. `release.yml` checks each in the run.
+
+## Amended 2026-11-27: the tag's commit keeps its `coder.yml` run (ANR-1195)
+
+The first release, v0.6.0, failed its gate: no `coder.yml` run on the tag's commit had passed its image job. The cause
+was not `cancel-in-progress` (already off for `main`) but the concurrency group. A group runs one workflow and holds
+one pending; a newer pending run **cancels the older pending run even with `cancel-in-progress: false`**. Seven docs
+pull requests merged within minutes of the release commit, so its run was replaced while it waited. The fix:
+
+1. **The release commit has a group of its own, its sha** (`coder-<sha>`), and so has a manual dispatch; a pull request
+   keeps `coder-<ref>` and keeps cancelling; every other push to main shares `coder-refs/heads/main` and skips to the
+   newest. The release commit is special because release.yml's gate needs exactly its run, and it is recognised by
+   its subject, `chore: release main (#N)`. Giving every merge a group would run a 90-minute build and e2e for each
+   merge of a burst in parallel (about 11 for v0.6.0's). A release cut from another commit, or a gate that finds its
+   run replaced, is recovered by a `workflow_dispatch` of `coder.yml` on the tag.
+2. **The gate accepts any `coder.yml` run on the commit whose image job concluded `success`**, whatever the run's
+   status or conclusion (a later job, such as the bump, may be cancelled), a manual dispatch on the tag included, and
+   keeps waiting while a run of the commit has not finished its image job.
+3. **`bump the tag in the chart` has no concurrency group.** A queue ordered by finish time lets an older commit's
+   pending bump cancel the newest commit's pending bump and then skip. It cannot write a stale tag without the group:
+   it skips when `main` has a non-bump commit newer than its own, and its fetch, reset and retry loop keeps the newest
+   writing. If the newer commit's image job fails, the chart keeps the older tag until the next good build.
+4. `ci.yml` is not read by the gate; its group is unchanged. `coder.yml` has no tag trigger: a tag's commit is reached
+   by the main push or by a dispatch.

@@ -17,8 +17,13 @@ use deadpool_postgres::Pool;
 
 /// Every function of the store's schema: its name without the table prefix, its identity
 /// arguments as `pg_get_function_identity_arguments` prints them, and a statement that calls it,
-/// `{p}` standing for the prefix. Empty at slice P0; P1 to P7 add theirs.
-const FUNCTIONS: &[(&str, &str, &str)] = &[];
+/// `{p}` standing for the prefix. Empty at slices P0 and P1 (P1 adds a column, not a function);
+/// P2 adds the claim, P3 to P7 add theirs.
+const FUNCTIONS: &[(&str, &str, &str)] = &[(
+    "claim_due",
+    "in_agents text[], in_worker text, in_pinned boolean, in_busy uuid[], in_now timestamp with time zone, in_until timestamp with time zone, in_limit bigint",
+    "SELECT * FROM {p}claim_due(ARRAY['nobody'], 'w', false, ARRAY[]::uuid[], now(), now(), 1)",
+)];
 
 /// A fresh prefix of the test's own, so no other store's functions match it.
 fn prefix(label: &str) -> String {
@@ -186,6 +191,55 @@ async fn a_version_6_database_gets_the_functions() {
         listed(FUNCTIONS),
         "the upgrade made exactly the listed functions"
     );
+    drop_store(&pool, &p).await;
+}
+
+/// A database of schema version 8 (the release before the claim function) has the tables and no
+/// function: its next start creates the function, stamps 9, and a claim through the store works.
+#[tokio::test]
+async fn a_version_8_database_gets_the_claim_function_and_claims() {
+    use adam_core::{ClaimScope, NewRun};
+    let Some(url) = support::test_url() else {
+        return;
+    };
+    let pool = support::pool(&url, 2);
+    let p = prefix("fn8");
+    let store = PgStore::from_pool(pool.clone())
+        .with_table_prefix(&p)
+        .unwrap();
+    store.migrate().await.unwrap();
+    for (name, args, _) in FUNCTIONS {
+        support::exec(&pool, &format!("DROP FUNCTION {p}{name}({args})")).await;
+    }
+    support::exec(
+        &pool,
+        &format!("UPDATE {p}meta SET value = '8' WHERE key = 'schema_version'"),
+    )
+    .await;
+    assert!(functions_in_schema(&pool, &p).await.is_empty());
+
+    store.migrate().await.unwrap();
+    assert_eq!(functions_in_schema(&pool, &p).await, listed(FUNCTIONS));
+    let run = store
+        .create_run(NewRun::new("claimer", serde_json::json!({"n": 1})))
+        .await
+        .unwrap();
+    let at = adam_core::store::now() + jiff::SignedDuration::from_secs(1);
+    let claimed = store
+        .claim_due(
+            &["claimer".to_owned()],
+            "w",
+            ClaimScope::Any,
+            &[],
+            at,
+            std::time::Duration::from_secs(30),
+            5,
+        )
+        .await
+        .unwrap();
+    assert_eq!(claimed.len(), 1);
+    assert_eq!(claimed[0].run.id, run.id);
+    assert_eq!(claimed[0].run.state, serde_json::json!({"n": 1}));
     drop_store(&pool, &p).await;
 }
 

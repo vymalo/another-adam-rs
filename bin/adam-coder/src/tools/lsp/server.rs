@@ -285,6 +285,31 @@ impl Shared {
             }
         }
     }
+    /// Wait, while the server is still indexing, for a publication of `uri` newer than `seen`: the
+    /// newer one when it comes, the last one it made when indexing ends first (that word is then
+    /// final), and that same last word at `deadline`. A publication that arrived while the server
+    /// was indexing is not final — rust-analyzer publishes an empty set before it has looked at the
+    /// file, and taking it then reports a broken file as clean.
+    async fn wait_past_indexing(
+        &self,
+        uri: &str,
+        seen: u64,
+        deadline: Instant,
+    ) -> Option<Vec<Value>> {
+        let mut rx = self.changed.subscribe();
+        loop {
+            if self.published_seq(uri) > seen || !self.indexing() {
+                return self.published(uri).1;
+            }
+            if Instant::now() >= deadline {
+                return self.published(uri).1;
+            }
+            tokio::select! {
+                _ = rx.changed() => {}
+                () = tokio::time::sleep_until(deadline.into()) => {}
+            }
+        }
+    }
 }
 
 impl Peer for Shared {
@@ -1116,10 +1141,27 @@ impl Gate<'_> {
         }
         let indexing = server.indexing();
         // A file that changed (or was never published) is waited for; one that is as it was has
-        // what the server said last.
+        // what the server said last. **Unless the server is still indexing**: a publication that
+        // arrived while it was (an empty one above all) is not final — rust-analyzer publishes an
+        // empty set before it has looked at the file, and taking it then reports a broken file as
+        // clean. Wait for a newer one, up to the deadline.
         let (seq, stored) = server.shared.published(target_uri);
         if !sent.target_changed && seq > 0 {
-            return Ok(Diagnostics::Items(stored.unwrap_or_default()));
+            if !indexing {
+                return Ok(Diagnostics::Items(stored.unwrap_or_default()));
+            }
+            // Still indexing: what it published so far (an empty set, above all) is not final.
+            let waited = deadline.saturating_duration_since(Instant::now());
+            return Ok(
+                match server
+                    .shared
+                    .wait_past_indexing(target_uri, seq, deadline)
+                    .await
+                {
+                    Some(items) => Diagnostics::Items(items),
+                    None => Diagnostics::Nothing(waited),
+                },
+            );
         }
         let first = if indexing {
             deadline.saturating_duration_since(Instant::now())

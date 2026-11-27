@@ -72,6 +72,8 @@ A plain line is `send` to the conversation; `/steer <text>`, `/answer <text>`, `
 before every call of it, so "remember to buy milk" prints an approval to answer. A send while the run waits is its answer, and one while it works steers it (`Turn::delivered` says which).
 When the input ends (`printf 'hi\n' | ...`), the example follows the run to its end or its question, then shuts down.
 
+::: in-depth How events work, in full
+
 ## How events work
 
 `events(run)` is a stream of `EngineEvent`: `Live(RunEvent)` (a step, a piece of text, a status), `Behind { skipped }`
@@ -110,6 +112,8 @@ sequenceDiagram
   W->>S: claim_due, then commit_run Done
   R-->>A: EngineEvent Ended, read from the store
 ```
+
+:::
 
 ## Approvals
 

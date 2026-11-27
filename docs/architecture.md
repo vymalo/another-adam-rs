@@ -1202,6 +1202,8 @@ checked with one `blob_stored`; one whose bytes are gone is left out of the head
 (logged), because the head cannot store it again. A delivery writes the head it read unchanged, so a
 later refused split still sees the missing file and refuses rather than demoting without its bytes.
 
+::: in-depth The head and the body, in full
+
 ### The head and the body (schema version 5, part 2; the contract release)
 
 Every commit writes a **head**, the **body rows** it appends and — for a store that keeps bodies —
@@ -1278,6 +1280,8 @@ Not stored, by design: `RunEvent`s (`Status`, `Progress`, `Step`, `TextDelta`, `
 `Custom`, `Artifact`) are live and may be lost (a short in-memory replay per run covers a late subscriber, see
 [the A2A server](reference/a2a-server.md#steps)); the durable truth is the record. Signals
 (`Runnable`, `Finished`) are hints.
+
+:::
 
 ## Across processes: signals and events
 

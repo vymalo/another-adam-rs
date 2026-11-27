@@ -6,11 +6,12 @@
     "dev": "vitepress dev",
     "build": "vitepress build",
     "preview": "vitepress preview",
-    "check-links": "node .vitepress/check-links.mjs"
+    "check-links": "node .vitepress/check-links.mjs",
+    "test:in-depth": "node --test .vitepress/theme/in-depth.test.mjs"
   },
   "devDependencies": {
     "@vaam-apps/vitepress-md3": "1.0.2",
-    "mermaid": "12.3.0",
+    "mermaid": "11.17.2",
     "vitepress": "1.6.4",
     "vitepress-openapi": "0.2.21",
     "vitepress-plugin-mermaid": "2.0.17",

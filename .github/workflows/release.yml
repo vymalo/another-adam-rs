@@ -98,12 +98,13 @@ jobs:
             passed=
             pending=
             while read -r id status conclusion; do
-              if [ "$status" != completed ]; then
+              # The image job decides, not the run: a later job (the bump) may be cancelled or fail.
+              job=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$id/jobs?per_page=100" \
+                --jq ".jobs[] | select(.name == \"$JOB\") | .conclusion // \"none\"")
+              if [ "$job" = success ]; then
+                passed=$id
+              elif [ "$status" != completed ]; then
                 pending=1
-              elif [ "$conclusion" = success ]; then
-                job=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$id/jobs?per_page=100" \
-                  --jq ".jobs[] | select(.name == \"$JOB\") | .conclusion")
-                if [ "$job" = success ]; then passed=$id; fi
               fi
             done < "$runs"
             if [ -n "$passed" ]; then

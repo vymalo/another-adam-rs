@@ -3,6 +3,8 @@ import { dirname, join, posix } from "node:path";
 import { fileURLToPath } from "node:url";
 import { defineMd3Config } from "@vaam-apps/vitepress-md3/config";
 import { withMermaid } from "vitepress-plugin-mermaid";
+// The `::: in-depth` container of STRUCTURE.md v3: a closed <details> for the part of a page a reader may skip.
+import { inDepth } from "./theme/in-depth";
 // The one slug function of the sources' checker (tools/docs-check) and of this site, so the two cannot drift.
 import { githubSlug } from "../../tools/docs-check/slug.mjs";
 
@@ -174,6 +176,7 @@ export default withMermaid(
       config: (md: any) => {
         escapeUnknownTags(md);
         md.core.ruler.push("links-leaving-docs", leavingDocsLinks);
+        md.use(inDepth);
       },
     },
   }),

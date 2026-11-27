@@ -55,7 +55,7 @@ future for a `lease_owner` that is not a live pod is waiting out the lease. Comp
 | the client's state from the row | `crates/adam-a2a-runtime/src/convert.rs:132` (`task_state`); table in `docs/architecture.md` "The run lifecycle" |
 | a front claims nothing, so its tasks stay `submitted` | `docs/architecture.md` "The run lifecycle" (after the state table) |
 | lease 30 s, poll 250 ms, four runs per worker loop, renewal every third of the lease | `crates/adam-runtime/src/runtime.rs:1270-1274`; `docs/architecture.md` "The worker" |
-| claiming is exclusive and skips locked rows | `crates/adam-store-postgres/src/lib.rs:992-1010` (`claim_due_sql`, `FOR UPDATE SKIP LOCKED`) |
+| claiming is exclusive and skips locked rows | `crates/adam-store-postgres/src/lib.rs` (`claim_due_function`, `FOR UPDATE SKIP LOCKED`, since schema version 9) |
 | a pinned run's owner is set by the first pinned claim and never cleared; a claim cannot tell busy from gone | `docs/reference/workspace-and-environments.md` "Placement" (lines 24-26, 55) |
 | a cut step is run again from the journal; effects are at-least-once | `docs/architecture.md` "The worker" (Replay is safe) |
 | a step's tool limit is 300 s unless it says otherwise | `docs/architecture.md` "The worker" (first bullet) |
