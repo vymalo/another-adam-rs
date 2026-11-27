@@ -201,6 +201,32 @@ limit of its own; `EndpointError::Timeout` names the time of that call) and send
 listed tool's own `_meta["thread-tools/v1"].timeoutSecs` says (`RemoteTool::meta` is the tool's `_meta` as listed), capped
 by `McpPolicy::thread_tools_max_call` (`THREAD_TOOLS_MAX_CALL_SECS`, 3600 s). A plain `call_tool` is a call with neither.
 
+## Uploads (`uploads/v1`, the agent's side, part 1)
+
+`Uploader` asks the thread-tools endpoint for a slot (`tools/call request_upload {filename, mediaType, size,
+sha256}`, over an [`Endpoint`](#an-endpoint-a-message-announces)), `PUT`s the bytes to the returned `url` with
+exactly the returned signed `headers`, and returns `Uploaded {upload_id, expires_at}`. The contract is
+`docs/api/uploads-v1.md` of another-agentic-system, sections 1 to 6.
+
+| Item | What |
+|---|---|
+| `UploadRequest::for_bytes(name, type, &bytes)` | computes the size and the lower-case SHA-256 the slot is keyed by |
+| `Uploader::new(&McpPolicy)` | the slot's URL follows the policy (https, or `http` to this machine unless `allow_insecure`); `put_timeout` (default 15 min) |
+| `request` / `put` / `upload` | the slot alone, the `PUT` alone, or both; `put` refuses bytes that are not the request's size and hash before anything leaves |
+| `UploadError` | `Refused {code, message}` (`too_large`, `over_limit`, `not_activated`, ... or `unknown`), `Endpoint`, `BadSlot`, `BytesMismatch`, `PutRejected(status)`, `PutFailed` |
+
+* **A refusal is an error, never an inline fallback.** Nothing here retries, asks twice, or sends the bytes anywhere
+  but the one signed `PUT` (no redirect is followed; no credential of ours goes to the bucket).
+* **The URL and the signed headers are the bucket's only credential.** `UploadSlot`'s `Debug` shows neither, no
+  error this module returns carries them (the HTTP client's error is stripped of its URL and scrubbed), and this
+  crate logs neither. A test captures every log line at `TRACE` and looks for the signature, the query, the checksum
+  and the path. **One exception, outside this crate: `rmcp` logs each tool result it receives at `debug`, and the
+  slot is one. Filter the `rmcp` log target out of any log that leaves the process**, as for `allow_url_secrets`.
+* **Not here (parts 2 and 3):** the artifact that names the `uploadId`, the inline threshold that decides when to ask
+  (`UPLOADS_INLINE_MAX_BYTES`), and the end-to-end and parity cells. No tool calls `Uploader` yet.
+* Tests: `tests/upload.rs` (a fake thread-tools endpoint and a WireMock bucket). The testkit's
+  `ThreadToolsServer::set_structured_answer` answers a tool with a fixed JSON body.
+
 ## What `mcp.json` means here
 
 * **`type: http` and `type: streamable-http`** are the streamable HTTP transport. **`type: sse` is refused**

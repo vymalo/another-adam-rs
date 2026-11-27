@@ -115,6 +115,8 @@ struct Shared {
     lists: AtomicUsize,
     /// Every `tools/call`.
     calls: Mutex<Vec<Call>>,
+    /// Tools that answer a fixed JSON body as `structuredContent` and as text: `(body, is_error)`.
+    structured: Mutex<HashMap<String, (Value, bool)>>,
     /// How long each extra tool takes to answer (none: at once).
     delays: Mutex<HashMap<String, Duration>>,
     /// The calls that have not answered (or were dropped).
@@ -238,6 +240,20 @@ impl ServerHandler for Endpoint {
         }
         if name == TURN_OUTPUT && lock(&self.shared.turn_output).enabled {
             return self.turn_output_answer(&arguments);
+        }
+        if let Some((body, is_error)) = lock(&self.shared.structured).get(&name).cloned() {
+            let mut result = if is_error {
+                CallToolResult::error(vec![ContentBlock::text(
+                    body.as_str()
+                        .map_or_else(|| body.to_string(), str::to_owned),
+                )])
+            } else {
+                CallToolResult::success(vec![ContentBlock::text(body.to_string())])
+            };
+            if !is_error {
+                result.structured_content = Some(body);
+            }
+            return Ok(CallToolResponse::Complete(result));
         }
         let extra = lock(&self.shared.extra);
         match extra.iter().find(|(tool, _)| tool.name == name) {
@@ -425,6 +441,13 @@ impl ThreadToolsServer {
         let mut extra = lock(&self.shared.extra);
         extra.retain(|(t, _)| t.name != name);
         extra.push((tool, text.to_owned()));
+    }
+
+    /// Answer calls of the tool `name` (listed or not) with `body`: as `structuredContent` and as
+    /// its JSON text, or, with `is_error`, as a tool error whose text is the JSON. What the real
+    /// `request_upload` does. A later call replaces the answer.
+    pub fn set_structured_answer(&self, name: &str, body: Value, is_error: bool) {
+        lock(&self.shared.structured).insert(name.to_owned(), (body, is_error));
     }
 
     /// Make the tool `name` take `delay` to answer (it answers after that, whatever it is asked).

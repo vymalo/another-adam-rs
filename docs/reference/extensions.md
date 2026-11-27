@@ -43,7 +43,8 @@ orchestration layer writes what a client sends and reads. The system's pages wer
   slot: a client that sends a file too large for a message to an adam agent gets no help from it. The orchestration
   layer's side is built; this is the gap tracked as
   [vymalo/another-adam-rs#282](https://github.com/vymalo/another-adam-rs/issues/282) and row 10 of
-  [Parity](parity.md). The inline threshold that decides what is "too large" (`UPLOADS_INLINE_MAX_BYTES`) is read and not
+  [Parity](parity.md). The first half of the client exists in `adam-mcp` (`Uploader`: it asks the thread tools for a
+  slot and `PUT`s the bytes); nothing calls it yet, so the row stays "no". The inline threshold that decides what is "too large" (`UPLOADS_INLINE_MAX_BYTES`) is read and not
   used yet.
 * **A conditional row is listed exactly when it is served.** The process adds the entry when its own configuration makes
   it true (a locale, a profiled model, a subagent, a signed model call), and a card that already lists the URI keeps its
