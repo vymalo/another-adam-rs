@@ -55,6 +55,9 @@ const BACKOFF_MAX: Duration = Duration::from_secs(30);
 /// How long a killed program is given to exit on its own before its group is killed.
 const EXIT_GRACE: Duration = Duration::from_secs(1);
 
+/// A stderr line longer than this is dropped whole (the bound `adam-mcp` uses for its children).
+const STDERR_LINE_MAX: usize = 4 * 1024;
+
 /// What one program is: fixed for the life of the adapter.
 pub(crate) struct Spec {
     pub(crate) name: String,
@@ -240,18 +243,46 @@ fn write_lines(mut stdin: ChildStdin, lines: Receiver<Vec<u8>>, shared: Arc<Shar
     }
 }
 
-/// Log the program's stderr, one scrubbed line at a time.
+/// Log the program's stderr, one scrubbed line at a time. A line longer than [`STDERR_LINE_MAX`] is
+/// dropped whole — the rest of it is consumed and thrown away — as `adam-mcp` drops one: a cut line
+/// could end in the first half of a secret.
 fn read_stderr(stderr: ChildStderr, program: String, scrub: Arc<Scrub>) {
     let mut reader = BufReader::new(stderr);
     let mut line = Vec::new();
     loop {
         line.clear();
-        match reader.read_until(b'\n', &mut line) {
-            Ok(0) | Err(_) => return,
-            Ok(_) => {}
+        match read_bounded(&mut reader, &mut line) {
+            None => return,
+            Some(true) => {
+                // The line was longer than the bound: consume the rest of it, then say so.
+                loop {
+                    line.clear();
+                    match read_bounded(&mut reader, &mut line) {
+                        None => return,
+                        Some(_) if line.last() == Some(&b'\n') => break,
+                        Some(_) => {}
+                    }
+                }
+                debug!(program = %program, "a stderr line over {STDERR_LINE_MAX} bytes was dropped");
+                continue;
+            }
+            Some(false) => {}
         }
         let text = String::from_utf8_lossy(&line);
         debug!(program = %program, "{}", scrub.as_ref()(text.trim_end()));
+    }
+}
+
+/// Read at most [`STDERR_LINE_MAX`] bytes of one line into `line`: `None` at the end of the stream,
+/// `Some(true)` when the line goes past the bound (and is not finished), `Some(false)` otherwise.
+fn read_bounded(reader: &mut BufReader<ChildStderr>, line: &mut Vec<u8>) -> Option<bool> {
+    match reader
+        .by_ref()
+        .take(STDERR_LINE_MAX as u64 + 1)
+        .read_until(b'\n', line)
+    {
+        Ok(0) | Err(_) => None,
+        Ok(_) => Some(line.last() != Some(&b'\n') && line.len() > STDERR_LINE_MAX),
     }
 }
 
