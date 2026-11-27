@@ -34,6 +34,27 @@ MongoDB) and `crates/adam-llm-agent/tests/child_runs.rs`. The cases: [failure in
 | 16 | `a_child_created_after_the_cancel_never_steps` |
 | 17 | `a_claimed_run_that_is_cancelled_already_is_not_stepped` (`src/worker.rs`), `a_parent_cascade_and_a_deadline_run_the_hook` |
 
+## A session's limits (ADR 0054, slice 1c)
+
+For people: [a session's own limits](../../../docs/reference/child-runs.md#sessions-adr-0045-slices-1-to-4). The header's
+`config` is read where each limit is enforced, never raised: `LlmAgent::limits_of` (`max_turns`, `max_tool_calls`),
+`live_model` (`max_output_tokens`, `0` of the folder = the session's, never `0`), `parallel_of` (`max_parallel_tool_calls`),
+`history_budget` with `compaction::effective_window` (`context_window`: `min` with the model's window, held to
+`20,000 + cap + 8,000`), and `Send::call` / `round_within` in `sessions.rs` (`max_rounds`, `time_limit`, read from the header
+clamped by `SessionBounds::clamp` **before** the round-limit check).
+
+| Limit | Test |
+|---|---|
+| `max_output_tokens` | `session_limits.rs`: `max_output_tokens_of_the_header_is_the_cap_of_the_request`, `..._never_raises_the_agents_and_is_never_zero` |
+| `max_turns` | `session_limits.rs`: `max_turns_of_the_header_ends_the_round_at_its_closing_turn`, `max_turns_of_the_header_never_raises_the_agents` |
+| `max_tool_calls` | `session_limits.rs`: `max_tool_calls_of_the_header_refuses_a_turn_that_would_go_over_it` |
+| `max_parallel_tool_calls` | `session_limits.rs`: `max_parallel_tool_calls_of_the_header_narrows_how_many_run_at_once`, `..._never_raises_the_agents` |
+| `context_window` | `compaction.rs`: `a_sessions_context_window_starts_compaction_sooner`, `..._is_the_minimum_with_the_models_never_instead_of_it`, `a_sessions_window_that_leaves_no_budget_...`, `a_sessions_floor_follows_its_narrower_output_cap`; unit tests in `compaction.rs` |
+| `time_limit` | `sessions.rs`: `a_sessions_time_limit_is_the_deadline_of_its_round` |
+| `max_rounds` | `sessions.rs`: `a_sessions_own_max_rounds_is_enforced_by_a_send` |
+| a config beyond the bounds is refused; one within is recorded | `sessions.rs`: `a_start_config_beyond_the_bounds_is_refused_and_one_within_is_recorded` |
+| round 2 carries the config, clamped to the bounds of now | `sessions.rs`: `round_two_carries_the_config_clamped_to_the_bounds_of_now`; `SessionBounds::clamp` in `crates/adam-runtime/src/session.rs` |
+
 ## Session interleavings
 
 Each has a test in `crates/adam-llm-agent/tests/sessions.rs` (memory, PostgreSQL and MongoDB, with no fixed sleeps; the report

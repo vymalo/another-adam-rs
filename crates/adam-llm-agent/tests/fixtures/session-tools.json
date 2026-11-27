@@ -27,6 +27,42 @@
           "type": "boolean",
           "default": false,
           "description": "Keep the session open after its first report, to send it more. By default it closes when its round has ended."
+        },
+        "config": {
+          "type": "object",
+          "description": "Optional limits for this session, each at most what the subagent's folder allows (a value above it is refused, naming the option). An option you leave out is the folder's own.",
+          "properties": {
+            "max_turns": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "max_tool_calls": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "max_output_tokens": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "context_window": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "max_parallel_tool_calls": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "time_limit": {
+              "type": "integer",
+              "minimum": 1,
+              "description": "Minutes one round may take."
+            },
+            "max_rounds": {
+              "type": "integer",
+              "minimum": 1
+            }
+          },
+          "additionalProperties": false
         }
       },
       "required": [

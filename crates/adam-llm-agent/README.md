@@ -506,7 +506,7 @@ parks the run and returns.
 
 | Tool | Arguments | Result |
 |---|---|---|
-| `subagent_start` | `agent` (enum), `description` (at most 80 characters), `prompt`, `keep_open` (default `false`) | `{"session", "agent", "state": "working", "keep_open"}` at once; the parent keeps working |
+| `subagent_start` | `agent` (enum), `description` (at most 80 characters), `prompt`, `keep_open` (default `false`), `config` (optional: `max_turns`, `max_tool_calls`, `max_output_tokens`, `context_window`, `max_parallel_tool_calls`, `time_limit`, `max_rounds`; [ADR 0054](../../docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md)) | `{"session", "agent", "state": "working", "keep_open"}` at once; the parent keeps working; a `config` above the subagent's bounds, or with an option that is not one of the seven, is an error result and starts nothing |
 | `subagent_send` | `session`, `message` | `{"session", "round", "state", "delivered": "new_round" \| "steered" \| "queued"}` (`queued`: the round's agent says in its state, `queues_messages: true`, that it keeps the message until its remote can take it); an error result when the session is closed |
 | `subagent_read` | `session`, `wait` (default `false`), `offset`, `limit` | a header line, `report: done` or `failed` and the report as a numbered page (the paging convention), or `report: none yet` while the round works, or `report: blocked` and the question while the round waits for the person (`SessionView::waiting`) |
 | `subagent_close` | `session`, `cancel` (default `false`) | `{"session", "state": "closed"}` |
@@ -515,6 +515,17 @@ parks the run and returns.
 * **A session** is a conversation of child runs ("rounds") of one subagent, in **the parent's own conversation** (so a later
   task of it finds the session, and no other conversation does). Its id is round 1's run id. A round carries the session's
   header (`Conversation::session`, a `SessionHeader`) in its first message and every later round carries it on.
+* **The session's limits** (ADR 0054 slice 1). `subagent_start`'s `config` is held to the subagent's `SessionBounds` by
+  `SessionBounds::admit` (a request above a bound is refused, naming the option) and recorded in the session's header
+  (`SessionHeader::config`). A round reads its limits **from its header, narrowing what the agent has and never raising it**:
+  `max_turns` and `max_tool_calls` against `Limits` at each step, `max_output_tokens` in the request (never `0`: with the
+  folder's cap left to the model the session's is the cap), `max_parallel_tool_calls` for the run's segments, and
+  `context_window` as `min(model window, context_window)` for the compaction budget (never instead of the model's window; held
+  to at least 20,000 + the cap + 8,000, so a budget is left). These apply at the next model call. `time_limit` (the deadline of
+  the round, under the folder's) and `max_rounds` (read by `subagent_send`) apply from the next round. `subagent_send` copies
+  the header's config into round 2 **clamped to the bounds of that moment** (`SessionBounds::clamp`), before it checks the round
+  limit, so a lowered deployment limit is obeyed and the session's own `max_rounds` is enforced. Tests:
+  `tests/session_limits.rs`, `tests/compaction.rs` and `tests/sessions.rs`.
 * **Auto-close.** With `keep_open: false` the session is closed as soon as its round has ended (the report can still be read;
   a send is refused, in words that tell the model to start a new one). With `keep_open: true` it stays idle for the next
   `subagent_send`, whose round **continues the session's conversation** (round 2 sees round 1). Closing an idle session starts a

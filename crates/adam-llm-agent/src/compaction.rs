@@ -203,6 +203,36 @@ fn is_true(b: &bool) -> bool {
     *b
 }
 
+/// The window the budget is taken from ([ADR 0054]): the model's, narrowed by a session's own
+/// `context_window`. **The minimum with the model's window, never instead of it**: with no known
+/// window the session's alone applies, and a model's smaller window wins over a larger ask.
+///
+/// This is the **only** place the model-window ceiling is enforced: the bounds the assembly gives
+/// `SessionBounds::admit` carry `context_window: None` (the window is a fact of the model alias, not
+/// known there), so `admit` checks the floor alone and a larger ask is clamped here, at run time.
+///
+/// A session's window is held to at least [`CONTEXT_WINDOW_PROMPT_TOKENS`](adam_runtime::CONTEXT_WINDOW_PROMPT_TOKENS) + the cap of the request +
+/// [`CONTEXT_WINDOW_HEADROOM_TOKENS`](adam_runtime::CONTEXT_WINDOW_HEADROOM_TOKENS), so a budget is always left: a smaller window would leave the
+/// history none (a budget of one token compacts at every turn) and never reach what
+/// [`SessionBounds::admit`](adam_runtime::SessionBounds::admit) refuses. A model whose own window is
+/// smaller than that floor keeps its own.
+///
+/// [ADR 0054]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md
+pub(crate) fn effective_window(
+    model: Option<u64>,
+    session: Option<u32>,
+    max_output_tokens: u32,
+) -> Option<u64> {
+    let Some(asked) = session else {
+        return model;
+    };
+    let floor = u64::from(adam_runtime::CONTEXT_WINDOW_PROMPT_TOKENS)
+        + u64::from(max_output_tokens)
+        + u64::from(adam_runtime::CONTEXT_WINDOW_HEADROOM_TOKENS);
+    let asked = u64::from(asked).max(floor);
+    Some(model.map_or(asked, |m| m.min(asked)))
+}
+
 /// The budget of the history in tokens: what a request may hold before the run is compacted. From
 /// the model's context window: the window less [`WINDOW_MARGIN_TOKENS`] and the output the request
 /// asks for; from [`Limits::max_history_tokens`](crate::Limits): that. The smaller when both are
@@ -1125,6 +1155,38 @@ mod tests {
         assert_eq!(summary_output_tokens(1000), 1000);
         assert_eq!(summary_output_tokens(4096), 4096);
         assert_eq!(summary_output_tokens(128_000), 4096);
+    }
+
+    #[test]
+    fn a_sessions_window_is_the_minimum_with_the_models_never_instead_of_it() {
+        // No session: the model's, known or not.
+        assert_eq!(effective_window(Some(200_000), None, 4_096), Some(200_000));
+        assert_eq!(effective_window(None, None, 4_096), None);
+        // A smaller session window wins; a larger one does not widen the model's.
+        assert_eq!(
+            effective_window(Some(200_000), Some(50_000), 4_096),
+            Some(50_000)
+        );
+        assert_eq!(
+            effective_window(Some(50_000), Some(200_000), 4_096),
+            Some(50_000)
+        );
+        // With none known, the session's alone is the window.
+        assert_eq!(effective_window(None, Some(50_000), 4_096), Some(50_000));
+    }
+
+    #[test]
+    fn a_sessions_window_never_leaves_less_than_a_budget() {
+        // 20,000 for the prompt, the cap, 8,000 of room: a smaller ask is held to it, so the budget
+        // is 8,000 and not the one token that would compact every turn.
+        let floor: u32 = 20_000 + 4_096 + 8_000;
+        let window = effective_window(None, Some(1_000), 4_096);
+        assert_eq!(window, Some(u64::from(floor)));
+        assert_eq!(budget(window, 4_096, 0), Some(8_000));
+        // The floor follows the cap of the request.
+        assert_eq!(effective_window(None, Some(1), 512), Some(28_512));
+        // A model whose own window is below the floor keeps its own.
+        assert_eq!(effective_window(Some(10_000), Some(1), 4_096), Some(10_000));
     }
 
     #[test]

@@ -251,6 +251,16 @@ where a store is involved (`crates/adam-llm-agent/tests/sessions.rs` holds the s
   and a `context_window` that leaves no budget are refused; an unknown option is refused; a session with a smaller
   `context_window` compacts at the turn the budget says; round 2 carries the config; a lowered deployment limit clamps round 2;
   a replay of a committed journal gives the same requests; list and read show the config.
+* *2026-11-27 (ANR-651, slice 1 part 3):* the run reads the seven options from the header. `max_turns`, `max_tool_calls`,
+  `max_output_tokens`, `max_parallel_tool_calls` and `context_window` at the next model call (`agent.rs`, `compaction::effective_window`),
+  `time_limit` and `max_rounds` in `Send::call`. Round 2 copies the config and clamps it (`SessionBounds::clamp`) before the round
+  limit is checked. `subagent_start` takes `config` in snake_case and admits it with `SessionBounds::admit`. **Not in this part:**
+  `config` on the A2A `start` (the front), and *list and read showing the config* (the head line of `subagent_read`, the
+  `subagent_list` row), which stay open in slice 1; a re-configuration of a running session is `subagent_edit` (slice 4).
+  The `subagent_start` schema grew (the `config` object), which **changes the stable prompt prefix, and so the prompt cache,
+  of every agent that has subagents**: the first requests after the deploy miss the cache once. A `config` on a remote subagent
+  is refused by option name unless it is `time_limit` or `max_rounds`, and a value that is not a whole number of 32 bits is
+  refused naming its option.
 
 **2. The system prompt section** (decision 9). Depends on 1.
 * Files: `sessions.rs` (the table, `SessionTools::guide`), `crates/adam-assembly/src/def.rs` or `assembly.rs` (append at bind),
