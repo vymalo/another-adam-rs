@@ -22,6 +22,8 @@
 //! | `MAX_PARALLEL_TOOL_CALLS` | the most tool calls of one model turn that run at the same time, 1 to 32 (`1` is one at a time); an agent file's `limits.max_parallel` may lower it for that agent; read by the roles that run workers ([`WorkerSettings::max_parallel_tool_calls`]), which refuse a bad value; **every role also reads it, leniently** (a bad value is the default and no problem), because a control plane holds a person's `start.config` to the same bound ([`SessionSettings::max_parallel_tool_calls`]) | `10` |
 //! | `MAX_TOOL_CALLS_IN_FLIGHT` | the most tool calls of the whole process that run at the same time, 1 to 256: the process's pool, inside which `MAX_PARALLEL_TOOL_CALLS` still bounds one turn (ADR 0065) | `4` |
 //! | `MAX_RUN_CONTINUATIONS` | the most times `run.ending` hooks may keep one run going, 0 to 20 (ADR 0050); anything else is exit 78 | `3` |
+//! | `ADAM_HOOKS_FILE` | the deployment's hook programs (ADR 0050, slice P2a): a JSON file with `programs`, each `{name, command, args?, env?, agents?, points?, deadlineMs?}`; refused unless `HOOKS_ALLOW_PROGRAMS=true`, and a file under a directory the agent works on is refused ([`HooksSettings`](crate::HooksSettings)) | unset (no program) |
+//! | `HOOKS_ALLOW_PROGRAMS` | `true` lets this process run hook programs at all; a file that names one without it is exit 78 | `false` |
 //! | `MAX_MODEL_CALLS` | the most model calls in flight in the process, 1 to 64 (ADR 0065) | `2` |
 //! | `MAX_PROCESSES` | the most commands (`run`, `run_command`, checks, background commands, language servers) of the whole process at once, 1 to 256; a command waits for a seat, then the tool says so and the run retries (ADR 0065) | `4` |
 //! | `MAX_GIT_PROCESSES` | the most git processes at once, 1 to 64 (ADR 0065) | `2` |
@@ -261,6 +263,10 @@ pub struct ServiceConfig {
     /// [`DEFAULT_UPLOADS_INLINE_MAX_BYTES`](adam_a2a::DEFAULT_UPLOADS_INLINE_MAX_BYTES). The agent folder's
     /// `limits.max_inline_upload_bytes` wins over it ([`Agents::uploads_inline_max_bytes`](crate::Agents)).
     pub uploads_inline_max_bytes: Option<u64>,
+    /// `ADAM_HOOKS_FILE` and `HOOKS_ALLOW_PROGRAMS`: the deployment's hook programs (ADR 0050, slice
+    /// P2a). Empty unless the file is named and the switch is on. Read by every role; a program is
+    /// started per worker, not here.
+    pub hooks: crate::hooks::HooksSettings,
     /// `MODEL_AUTH=injector` or `TURN_SIGNING_KEY_FILE` set, read by every role (the word only): the
     /// process's model calls carry a message's prompt statement and the person's envelope, so the
     /// card lists `prompt-statement/v1` (ADR 0077; with a turn key the calls are signed and the
@@ -289,6 +295,7 @@ impl std::fmt::Debug for ServiceConfig {
             .field("a2a", &self.a2a)
             .field("sessions", &self.sessions)
             .field("prompt_statement", &self.prompt_statement)
+            .field("hooks", &self.hooks.programs().len())
             .finish()
     }
 }
@@ -411,6 +418,7 @@ impl ServiceConfig {
             retention: crate::retention::RetentionSettings::parse(lookup, problems),
             default_locale,
             uploads_inline_max_bytes,
+            hooks: crate::hooks::HooksSettings::parse(&get, problems),
             prompt_statement: is_injector(lookup)
                 || not_blank(lookup, "TURN_SIGNING_KEY_FILE").is_some(),
         }
