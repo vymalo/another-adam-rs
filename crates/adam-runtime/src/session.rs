@@ -710,7 +710,18 @@ pub struct SessionConfig {
     /// [ADR 0054]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub report_schema: Option<Value>,
+    /// Text the parent agent (or the person) adds to this session, **after** the folder's own
+    /// instructions and never replacing them: at most [`MAX_SESSION_INSTRUCTIONS_CHARS`] characters,
+    /// rendered under a fixed heading that says where it comes from and that the text above wins
+    /// ([ADR 0054], decision 4).
+    ///
+    /// [ADR 0054]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instructions: Option<String>,
 }
+
+/// The most characters a session's `instructions` may hold ([ADR 0054], decision 4).
+pub const MAX_SESSION_INSTRUCTIONS_CHARS: usize = 4_000;
 
 impl SessionConfig {
     /// Whether no option is asked for: the folder's own settings, exactly as no `config` at all.
@@ -723,6 +734,7 @@ impl SessionConfig {
             && self.time_limit.is_none()
             && self.max_rounds.is_none()
             && self.report_schema.is_none()
+            && self.instructions.is_none()
     }
 
     /// Read a `config` object ([ADR 0054], decision 1). **An unknown member is refused**, unlike the
@@ -920,6 +932,18 @@ impl SessionBounds {
         if let Some(v) = requested.max_rounds {
             within("max_rounds", v, 1, self.max_rounds)?;
         }
+        if let Some(text) = &requested.instructions {
+            let chars = text.chars().count();
+            if chars > MAX_SESSION_INSTRUCTIONS_CHARS {
+                return Err(Refusal::new(
+                    Some("instructions"),
+                    format!(
+                        "config.instructions is {chars} characters; at most \
+                         {MAX_SESSION_INSTRUCTIONS_CHARS}"
+                    ),
+                ));
+            }
+        }
         if let Some(schema) = &requested.report_schema {
             report_schema_admissible(schema)?;
         }
@@ -976,6 +1000,9 @@ impl SessionBounds {
                 .max_rounds
                 .map(|v| v.clamp(1, self.max_rounds.max(1))),
             report_schema: config.report_schema.clone(),
+            // Text has no bound to clamp to: `admit` already refused one that is too long, and a
+            // later round keeps what the session was started with.
+            instructions: config.instructions.clone(),
         }
     }
 }
