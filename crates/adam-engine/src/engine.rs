@@ -19,7 +19,7 @@ use adam_core::{
     ConversationScope, DynSecretSource, DynStore, DynTurnKeys, RunId, RunQuery, RunStatus, TurnKeys,
 };
 use adam_device_state::{DeviceReadings, DeviceState, DynDeviceState};
-use adam_llm_agent::{DEFAULT_MAX_PARALLEL, ToolSet};
+use adam_llm_agent::{DEFAULT_MAX_PARALLEL, HookSet, Plugin, StepIo, ToolSet};
 use adam_model::{DynModel, ModelProfiles, ReasoningEffort};
 use adam_runtime::{
     BroadcastSink, FileRef, RetryPolicy, RunView, Runtime, RuntimeBuilder, RuntimeError,
@@ -31,9 +31,9 @@ use tokio::task::AbortHandle;
 
 use crate::events::EngineSink;
 use crate::{
-    ConversationId, Delivered, EngineError, Firing, FiringQuery, ListQuery, Page, RunEvents,
-    RunFile, RunInfo, RunState, Say, SessionHelper, SessionInfo, StartSession, Turn,
-    default_secrets,
+    ApprovalRequest, ConversationId, Decision, Delivered, EngineError, Firing, FiringQuery,
+    ListQuery, Page, RunEvents, RunFile, RunInfo, RunState, Say, SessionHelper, SessionInfo,
+    StartSession, Turn, default_secrets,
 };
 
 /// Why a firing a host cancelled ended (#289).
@@ -161,6 +161,8 @@ pub struct EngineBuilder {
     device: Option<DynDeviceState>,
     device_rules: DeviceRules,
     turn_keys: Option<DynTurnKeys>,
+    hooks: HookSet,
+    step_io: Option<StepIo>,
 }
 
 impl std::fmt::Debug for EngineBuilder {
@@ -171,6 +173,8 @@ impl std::fmt::Debug for EngineBuilder {
             .field("secrets", &self.secrets)
             .field("limits", &self.limits)
             .field("reasoning_effort", &self.reasoning_effort)
+            .field("hooks", &self.hooks)
+            .field("step_io", &self.step_io)
             .finish_non_exhaustive()
     }
 }
@@ -233,6 +237,38 @@ impl EngineBuilder {
     /// name and nobody gives, is refused at [`start`](Self::start).
     pub fn tools(mut self, tools: ToolSet) -> Self {
         self.tools = tools;
+        self
+    }
+
+    /// The host's hooks around the agent loop ([ADR 0050]), as
+    /// [`LlmAgentBuilder::hooks`](adam_llm_agent::LlmAgentBuilder::hooks) takes them: every agent
+    /// the engine runs, the root and each subagent, runs them first, in their order and under the
+    /// set's limits, then the plugins its file names in `plugins:`. A `before_tool` hook that
+    /// answers `Verdict::Ask` parks the run for the person's approval
+    /// ([`RunState::AwaitingApproval`], [`Engine::approve`]). Default none; a later call replaces
+    /// the set, and [`plugin`](Self::plugin) appends to it.
+    ///
+    /// [ADR 0050]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0050-hooks-around-the-agent-loop-compiled-first-and-programs-second.md
+    pub fn hooks(mut self, hooks: HookSet) -> Self {
+        self.hooks = hooks;
+        self
+    }
+
+    /// Append `plugin` to the host's hooks ([`hooks`](Self::hooks)): the order plugins are added in
+    /// is the order their hooks run in, as
+    /// [`LlmAgentBuilder::plugin`](adam_llm_agent::LlmAgentBuilder::plugin).
+    pub fn plugin(mut self, plugin: impl Plugin + 'static) -> Self {
+        self.hooks = std::mem::take(&mut self.hooks).with(Arc::new(plugin));
+        self
+    }
+
+    /// How a tool call's step reports its input and output, and what is scrubbed from them first
+    /// ([`StepIo`]): the steps of every agent, and what an approval shows of its call
+    /// ([`ApprovalRequest::arguments`], [`ApprovalRequest::question`]), which is never more than the
+    /// call's step shows. Default [`StepIo::default`]: both sent, cut to the contract's bounds, with
+    /// no redactor; a host whose agent's tools see secrets gives the redactor that knows them.
+    pub fn step_io(mut self, step_io: StepIo) -> Self {
+        self.step_io = Some(step_io);
         self
     }
 
@@ -313,6 +349,8 @@ impl EngineBuilder {
             device,
             device_rules,
             turn_keys,
+            hooks,
+            step_io,
         } = self;
         if limits.lease_ttl.is_zero() {
             return Err(EngineError::Invalid(
@@ -359,6 +397,17 @@ impl EngineBuilder {
             .max_parallel(limits.max_parallel_tools)
             .model_profiles(profiles)
             .allow_model_choice();
+        // The host's hooks reach every agent, before the plugins its file names (ADR 0047 slice 5:
+        // the hook that asks the person is the host's).
+        let bound = if hooks.is_empty() {
+            bound
+        } else {
+            bound.hooks(hooks)
+        };
+        let bound = match &step_io {
+            Some(step_io) => bound.step_io(step_io.clone()),
+            None => bound,
+        };
         // The same admission is kept for the resource report (`Engine::resources`): the agent
         // asks it for its seats, the report asks it what is held.
         let device = Arc::new(DeviceSlot::new(device));
@@ -486,6 +535,7 @@ impl EngineBuilder {
         Ok(Engine {
             shared: Arc::new(Shared {
                 models,
+                step_io: step_io.unwrap_or_default(),
                 steering,
                 helpers,
                 helper_agents,
@@ -626,6 +676,9 @@ pub(crate) struct Shared {
     /// The aliases a [`Say::model`] may name: the root agent's own and the models it can be bound
     /// to (they have a profile).
     models: Vec<String>,
+    /// What the agents' steps show of a call ([`EngineBuilder::step_io`]): an approval shows its
+    /// call through it too.
+    step_io: StepIo,
     /// What [`Engine::file`] reads a file's bytes from, once the backend has said the run is this
     /// engine's caller's.
     runtime: Runtime,
@@ -684,6 +737,47 @@ impl Shared {
                 switch.from, switch.to
             ))),
             None => Ok(()),
+        }
+    }
+
+    /// The approval `view` waits for, and the question a person reads for it, both through the
+    /// steps' redactor: `Some` when the run is parked on a question that is a hook's approval of a
+    /// call (ADR 0050 slice H8: `Conversation::approval`, not yet approved, for the call the
+    /// question is about).
+    pub(crate) fn approval_of(&self, view: &RunView) -> Option<(ApprovalRequest, Option<String>)> {
+        if view.status != RunStatus::Parked || !view.waiting {
+            return None;
+        }
+        let approval: adam_llm_agent::Approval =
+            serde_json::from_value(view.state.get("approval")?.clone()).ok()?;
+        let asked = view
+            .state
+            .pointer("/pending_wait/call_id")
+            .and_then(serde_json::Value::as_str);
+        if approval.approved || asked != Some(approval.call_id.as_str()) {
+            return None;
+        }
+        let question = view
+            .state
+            .pointer("/pending_wait/question")
+            .and_then(serde_json::Value::as_str)
+            .map(|question| self.step_io.redacted(question));
+        let request = ApprovalRequest {
+            arguments: self.step_io.shown_input(&approval.arguments),
+            question: self.step_io.redacted(&approval.question),
+            call_id: approval.call_id,
+            tool: approval.tool,
+        };
+        Some((request, question))
+    }
+
+    /// `info` read from `view`'s task, with the approval `view` waits for.
+    fn with_approval(&self, info: RunInfo, view: &RunView) -> RunInfo {
+        match self.approval_of(view) {
+            Some((approval, question)) if info.state == RunState::Waiting => {
+                info.awaiting(approval, question)
+            }
+            _ => info,
         }
     }
 
@@ -758,6 +852,8 @@ impl Engine {
             device: None,
             device_rules: DeviceRules::default(),
             turn_keys: None,
+            hooks: HookSet::new(),
+            step_io: None,
         }
     }
 
@@ -818,7 +914,10 @@ impl Engine {
                 let latest = self.latest_run(conversation).await?;
                 // Continued once it has ended; while it is open, the backend delivers to it.
                 message.reference_task_ids = Some(vec![latest.run.to_string()]);
-                if matches!(latest.state, RunState::Working | RunState::Waiting) {
+                if matches!(
+                    latest.state,
+                    RunState::Working | RunState::Waiting | RunState::AwaitingApproval
+                ) {
                     shared.refuse_pick_after_switch(latest.run, &say).await?;
                 }
                 Some(latest)
@@ -836,10 +935,10 @@ impl Engine {
                 }
                 e => EngineError::of_backend(e, latest.as_ref().map(|l| l.run)),
             })?;
-        let info = RunInfo::of(&task)?;
+        let info = self.info(&task).await?;
         let delivered = match &latest {
             _ if !owns.contains(&info.run) => match latest {
-                Some(latest) if latest.run == info.run && latest.state == RunState::Waiting => {
+                Some(latest) if latest.run == info.run && latest.state.waits_for_the_person() => {
                     Delivered::Answered
                 }
                 _ => Delivered::Steered,
@@ -878,13 +977,16 @@ impl Engine {
             )
             .await;
         match steered {
-            Ok(task) => RunInfo::of(&task),
+            Ok(task) => self.info(&task).await,
             Err(BackendError::InvalidParams(_)) => Err(self.refused(run, Expected::Open).await),
             Err(e) => Err(EngineError::of_backend(e, Some(run))),
         }
     }
 
-    /// Answer the question `run` waits on ([`RunState::Waiting`]); it goes on working.
+    /// Answer the question `run` waits on ([`RunState::Waiting`]); it goes on working. A run that
+    /// awaits an approval ([`RunState::AwaitingApproval`]) takes the text as its answer too, and
+    /// only a clear yes (`yes`, `ok`, ...) runs the call: a host with a yes and a no calls
+    /// [`approve`](Self::approve) instead.
     ///
     /// # Errors
     ///
@@ -906,11 +1008,164 @@ impl Engine {
             )
             .await;
         match answered {
-            Ok(task) => RunInfo::of(&task),
+            Ok(task) => self.info(&task).await,
             // The message itself was checked above: what the backend refuses is the run's state.
             Err(BackendError::InvalidParams(_)) => Err(self.refused(run, Expected::Waiting).await),
             Err(e) => Err(EngineError::of_backend(e, Some(run))),
         }
+    }
+
+    /// Answer the approval `run` waits for ([`RunState::AwaitingApproval`]): `call_id` is the call's,
+    /// as [`RunInfo::approval`] (or [`EngineEvent::ApprovalAsked`](crate::EngineEvent::ApprovalAsked))
+    /// names it. [`Decision::Approve`] runs that call once, with the arguments the request showed,
+    /// in the journaled step `tool:<call id>:approved`, so neither a restart nor a replay runs it
+    /// again; [`Decision::Refuse`] answers the call with the person's reason, and the run goes on
+    /// without it. Either way the run works again.
+    ///
+    /// [`answer`](Self::answer) reaches an approval too, as text: only a clear yes (`yes`, `ok`,
+    /// ...) runs the call, and anything else refuses it. This is the call a host's two buttons
+    /// make. Two clicks on the same approval are read once: the answer's message id is the run's,
+    /// the call's and the version of the run that asked.
+    ///
+    /// # Errors
+    ///
+    /// * [`EngineError::NotAwaitingApproval`] (class `Rejected`) for a run that awaits no approval
+    ///   (it works, or waits on a plain question) or the approval of another call, which is named;
+    ///   nothing is delivered;
+    /// * [`EngineError::Finished`] for a run that has ended, [`EngineError::NotFound`] for one this
+    ///   engine has not (a schedule's firing included: nobody approves one);
+    /// * [`EngineError::Stopped`] after [`shutdown`](Self::shutdown), and the store's failures.
+    pub async fn approve(
+        &self,
+        run: RunId,
+        call_id: &str,
+        decision: Decision,
+    ) -> Result<RunInfo, EngineError> {
+        let _writing = self.writable().await?;
+        let shared = &self.shared;
+        let view = shared
+            .backend
+            .owned_view(&shared.caller, &run.to_string())
+            .await
+            .map_err(|e| EngineError::of_backend(e, Some(run)))?
+            .ok_or_else(|| EngineError::NotFound(format!("run {run}")))?;
+        if view.status.is_terminal() {
+            return Err(EngineError::Finished { run });
+        }
+        let awaited = shared
+            .approval_of(&view)
+            .map(|(approval, _)| approval.call_id);
+        if awaited.as_deref() != Some(call_id) {
+            let state = self
+                .get(run)
+                .await?
+                .ok_or_else(|| EngineError::NotFound(format!("run {run}")))?
+                .state;
+            return Err(EngineError::NotAwaitingApproval {
+                run,
+                call_id: call_id.to_owned(),
+                state,
+                awaited,
+            });
+        }
+        // The answer the agent reads (ADR 0050 slice H8: `approves`), under an id of this approval
+        // of this park: a second click reaches the same message, which the run reads once.
+        let say = Say::with_id(
+            format!("approval:{run}:{call_id}:{}", view.version),
+            decision.answer_text(),
+        );
+        let answered = shared
+            .backend
+            .submit(
+                shared.caller.clone(),
+                message(&say),
+                Some(run.to_string()),
+                None,
+            )
+            .await;
+        match answered {
+            Ok(task) => self.info(&task).await,
+            Err(BackendError::InvalidParams(_)) => Err(self.refused(run, Expected::Waiting).await),
+            Err(e) => Err(EngineError::of_backend(e, Some(run))),
+        }
+    }
+
+    /// What became of the approval of `call_id` in `run`, as the store has it: `Some(true)` for a
+    /// yes (the call's step `tool:<call id>:approved` is in the journal, or the head says it is
+    /// approved), `Some(false)` for a no
+    /// (the call was answered without that step: the person's refusal), and `None` while the run
+    /// still waits for it, before the park that asks is committed, or when the run ended before
+    /// the answer (a cancel). Nothing is inferred from an absence alone: a no needs the call's
+    /// answer in the run's history.
+    pub(crate) async fn approval_outcome(
+        &self,
+        run: RunId,
+        call_id: &str,
+    ) -> Result<Option<bool>, EngineError> {
+        let shared = &self.shared;
+        let Some(view) = shared
+            .runtime
+            .view(run)
+            .await
+            .map_err(|e| EngineError::of_run_read(e, run))?
+        else {
+            return Ok(None);
+        };
+        // The approved step is journaled before its transition commits: a yes is known from it
+        // while the head still says the approval waits.
+        let step = adam_llm_agent::approval_step(call_id);
+        let journal = shared
+            .store
+            .journal_list(run)
+            .await
+            .map_err(EngineError::Store)?;
+        if journal.iter().any(|entry| entry.name == step) {
+            return Ok(Some(true));
+        }
+        let kept = view
+            .state
+            .get("approval")
+            .cloned()
+            .and_then(|approval| serde_json::from_value::<adam_llm_agent::Approval>(approval).ok())
+            .filter(|approval| approval.call_id == call_id);
+        if let Some(approval) = kept {
+            return Ok(approval.approved.then_some(true));
+        }
+        // Refused: the call has its answer in the history, and no approved step ran it.
+        let state = shared
+            .runtime
+            .state(run)
+            .await
+            .map_err(|e| EngineError::of_run_read(e, run))?;
+        let answered = state
+            .and_then(|state| serde_json::from_value::<adam_llm_agent::Conversation>(state).ok())
+            .is_some_and(|state| {
+                state.messages.iter().any(|message| {
+                    matches!(message, adam_model::Message::Tool { call_id: id, .. } if id == call_id)
+                })
+            });
+        Ok(answered.then_some(false))
+    }
+
+    /// `task` as the host reads it: a run the task says waits on a question is
+    /// [`AwaitingApproval`](RunState::AwaitingApproval) when its state says the question is a
+    /// hook's approval, read now from the run's head.
+    async fn info(&self, task: &Task) -> Result<RunInfo, EngineError> {
+        let info = RunInfo::of(task)?;
+        if info.state != RunState::Waiting {
+            return Ok(info);
+        }
+        let run = info.run;
+        let view = self
+            .shared
+            .runtime
+            .view(run)
+            .await
+            .map_err(|e| EngineError::of_run_read(e, run))?;
+        Ok(match view {
+            Some(view) => self.shared.with_approval(info, &view),
+            None => info,
+        })
     }
 
     /// Cancel `run`: it ends [`Cancelled`](RunState::Cancelled), and a step in flight is stopped.
@@ -927,7 +1182,7 @@ impl Engine {
             .cancel(&shared.caller, &run.to_string())
             .await
         {
-            Ok(task) => RunInfo::of(&task),
+            Ok(task) => self.info(&task).await,
             // The run ended under the cancel: cancelled by another call, or otherwise.
             Err(BackendError::InvalidParams(_)) => match self.get(run).await {
                 Ok(Some(info)) if info.state == RunState::Cancelled => Ok(info),
@@ -1068,12 +1323,12 @@ impl Engine {
             .list(&shared.caller, &tasks)
             .await
             .map_err(|e| EngineError::of_backend(e, None))?;
+        let mut items = Vec::with_capacity(page.tasks.len());
+        for task in &page.tasks {
+            items.push(self.info(task).await?);
+        }
         Ok(Page {
-            items: page
-                .tasks
-                .iter()
-                .map(RunInfo::of)
-                .collect::<Result<_, _>>()?,
+            items,
             next_page_token: page.next_page_token,
             total: page.total_size,
         })
@@ -1237,7 +1492,7 @@ impl Engine {
                 BackendError::UnsupportedOperation(why) => EngineError::Refused(why),
                 e => EngineError::of_backend(e, None),
             })?;
-        let info = RunInfo::of(&task)?;
+        let info = self.info(&task).await?;
         Ok(Turn {
             conversation: info.conversation.clone(),
             run: info.run,
@@ -1330,7 +1585,7 @@ impl Engine {
                 BackendError::UnsupportedOperation(why) => EngineError::Refused(why),
                 e => EngineError::of_backend(e, None),
             })?;
-        RunInfo::of(&task)
+        self.info(&task).await
     }
 
     /// The agent's commands (`commands/<name>.md`), in name order: what a person may type as
@@ -1354,9 +1609,10 @@ impl Engine {
             .await
             .map_err(|e| EngineError::of_backend(e, Some(run)))?;
         match task {
-            Some(task) => RunInfo::of(&task).map(Some),
+            Some(task) => self.info(&task).await.map(Some),
             None => match self.firing_view(run).await? {
-                Some((view, _)) => RunInfo::of(&shared.backend.unowned_task(&view)).map(Some),
+                Some((view, _)) => RunInfo::of(&shared.backend.unowned_task(&view))
+                    .map(|info| Some(shared.with_approval(info, &view))),
                 None => Ok(None),
             },
         }
@@ -1434,6 +1690,7 @@ impl Engine {
                 Err(e) => return Err(EngineError::of_run_read(e, id)),
             };
             let info = RunInfo::of(&shared.backend.unowned_task(&view))?;
+            let info = shared.with_approval(info, &view);
             items.push(Firing { info, trigger });
         }
         Ok(Page {
@@ -1547,7 +1804,7 @@ impl Engine {
             .map_err(|e| EngineError::of_backend(e, None))?;
         let latest: Option<&Task> = page.tasks.first();
         match latest {
-            Some(task) => RunInfo::of(task),
+            Some(task) => self.info(task).await,
             None => Err(EngineError::NotFound(format!(
                 "conversation {conversation}"
             ))),

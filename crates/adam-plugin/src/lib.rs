@@ -318,8 +318,9 @@ impl Default for HookLimits {
     }
 }
 
-/// An ordered set of plugins, with their limits.
-#[derive(Default)]
+/// An ordered set of plugins, with their limits. A clone shares the plugins (`Arc`s): a host that
+/// gives one set to several agents (`adam_assembly::BoundDef::hooks`) runs the same plugins in each.
+#[derive(Clone, Default)]
 pub struct HookSet {
     pub(crate) plugins: Vec<Arc<dyn Plugin>>,
     limits: HookLimits,

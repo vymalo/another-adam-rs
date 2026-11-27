@@ -42,6 +42,7 @@ uuid.workspace = true
 [dev-dependencies]
 adam-admission-local.workspace = true
 adam-model-openai = { workspace = true, features = ["aws-lc"] }
+adam-store-testkit.workspace = true
 secrecy.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["io-std", "io-util", "macros", "rt-multi-thread", "time"] }

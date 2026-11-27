@@ -25,6 +25,7 @@ use std::sync::Arc;
 use adam_engine::Engine;
 use adam_engine::adam_assembly::AgentFolder;
 use adam_engine::adam_core::{DynStore, MemoryStore};
+use adam_engine::adam_llm_agent::ToolSet;
 use adam_engine::adam_model::DynModel;
 use adam_model_openai::{OpenAiCompatible, OpenAiConfig};
 use secrecy::SecretString;
@@ -54,7 +55,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("agent folder: {warning:?}");
     }
     let store: DynStore = Arc::new(MemoryStore::new());
+    // The host's own tool, and the hook that asks the person before it runs (ADR 0047 slice 5).
+    let notes = app::Notes::default();
     let engine = Engine::builder(store, folder.def, model, alias)
+        .tools(ToolSet::new().tool(app::save_note(notes)))
+        .plugin(app::AsksBeforeSaving)
         .start()
         .await?;
 

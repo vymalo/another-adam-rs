@@ -281,6 +281,32 @@ extension, and a host starts, lists, talks to and closes a session (`Engine::hel
 `events`, `files`: `RuntimeTaskBackend::owned_view` now accepts a round of the caller's session). A remote subagent is
 still refused.
 
+*Amended 2026-11-27 (slice 5 built):* **approvals in the engine**, as the adapter over ADR 0050's H8 that the note of
+2026-11-18 made slice 5. The host's hooks reach every agent: `EngineBuilder::hooks(HookSet)` and `.plugin(plugin)`, over
+the new `adam_assembly::BoundDef::hooks`, which runs them before the plugins a file names (`HookSet` became `Clone`). A
+run parked on a hook's approval is a state of its own, `RunState::AwaitingApproval` (the enum was `#[non_exhaustive]`
+for it), rather than a field on `Waiting`: a typed answer runs the call only when it is a clear yes, so a host must
+show a yes and a no, and a host that matched `Waiting` to show a text box would have read "sure, go ahead" as a
+refusal. `RunInfo::approval` is the `ApprovalRequest` (`call_id`, `tool`, the hook's `question`, the `arguments` the call
+runs with), read from the run's head (`Conversation::approval`) for a run the task says waits; its arguments are what
+the call's step shows (`StepIo::shown_input`, through `EngineBuilder::step_io`'s redactor, the one the engine's steps
+use), never the raw ones. The answer is a typed method, `Engine::approve(run, call_id, Decision)` (`Approve`, or
+`Refuse(Option<String>)`, whose reason is never read as a yes), which sends the plain follow-up H8 reads, under an id
+of the approval's park so two clicks are read once; `answer`, `steer` and `send` still reach an approval as text. An
+answer for another call, or for a run that awaits none, is the new `EngineError::NotAwaitingApproval` (`Rejected`),
+and nothing is delivered. The stream says `EngineEvent::ApprovalAsked` and `ApprovalAnswered { call_id, approved }`,
+both read from the store: a yes from the journaled step `tool:<call id>:approved`, a no only from the call's answer in
+the history, never from an absence. The proofs, `crates/adam-engine/tests/approval.rs`: a yes runs the same call once
+across two restarts of the engine over one SQLite file, and the restarted engine shows the approval without asking the
+hook; a replay after the park's commit is lost never asks twice, and the stream offers the approval once; a no refuses
+the call, the model reads the person's words and the run goes on; another call's id, a working run, a run waiting on a
+question, an ended run and an unknown one are refused with their classes. The example chat has a tool of its host's
+and a hook that asks before it (`/approve`, `/deny`). **Not built: announcing approvals to A2A clients**, a new
+extension by confirmed decision 4: today the A2A front shows a parked approval as any `input-required` with its question,
+and only the live `input_required` event (`"approval": true`) marks it one. It is a follow-up, as is an A2A test that drives an approval end to end. Not
+built either: ADR 0036's access tiers deciding what is asked (decision 6's last sentence); a host decides in its own
+hook.
+
 ## Decisions the owner confirmed
 
 Confirmed on 2026-11-16, all six as written.

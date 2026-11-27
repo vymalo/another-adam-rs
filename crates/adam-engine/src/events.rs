@@ -16,7 +16,7 @@ use serde_json::json;
 use tokio::sync::watch;
 
 use crate::engine::{Ended, Shared};
-use crate::{Engine, EngineError, RunInfo};
+use crate::{ApprovalRequest, Engine, EngineError, RunInfo};
 
 /// How long a stream waits for an event before it reads the run from the store anyway: the events
 /// are a latency aid, and the store decides when a run has ended.
@@ -56,6 +56,25 @@ pub enum EngineEvent {
     /// decision 9), while the run works: at most every two seconds. A host that shows the report
     /// on request reads [`Engine::resources`](crate::Engine::resources) instead.
     Resources(crate::ResourceReport),
+    /// A hook asked the person to approve a tool call, and the run waits
+    /// ([`RunState::AwaitingApproval`](crate::RunState::AwaitingApproval)): what the host renders
+    /// with a yes and a no, which [`Engine::approve`](crate::Engine::approve) answers. Read from
+    /// the store, once per approval in a stream (a stream opened on a run that already waits starts
+    /// with it), so a reader that fell behind still hears it.
+    ApprovalAsked(ApprovalRequest),
+    /// The approval of `call_id` was answered, as the store has it: `approved` when the call ran in
+    /// its step `tool:<call id>:approved`, `false` when it was answered without it (refused) and
+    /// the run went on. Said once for each approval the stream heard of: one it said with
+    /// [`ApprovalAsked`](Self::ApprovalAsked), or one a reader that reads only after the answer
+    /// finds in the run's live events (the agent's `input_required` with `"approval": true`), which
+    /// it hears answered without an `ApprovalAsked`: an approval that no longer waits is not
+    /// offered. A run that ends before the answer (a cancel) says none.
+    ApprovalAnswered {
+        /// The call that was asked about.
+        call_id: String,
+        /// Whether the person approved it.
+        approved: bool,
+    },
 }
 
 /// The events of one run, from [`Engine::events`]: a [`Stream`] of
@@ -67,11 +86,13 @@ pub enum EngineEvent {
 ///   worker has stopped with the run unfinished ([`Engine::shutdown`], the last [`Engine`]
 ///   dropped, or the worker failed: nothing would step the run), or the store's error when a read
 ///   fails.
+/// * It says a hook's approval as [`EngineEvent::ApprovalAsked`], and its answer as
+///   [`EngineEvent::ApprovalAnswered`], both read from the store.
 /// * It is bounded in memory whatever the reader does: the engine's ring holds
 ///   [`Limits::event_capacity`](crate::Limits::event_capacity) events, shared by every reader,
 ///   and a reader that does not keep up loses the oldest instead of holding more. A stream holds
 ///   besides only the run's recent events it started with (at most
-///   [`REPLAY_EVENTS_PER_RUN`](adam_runtime::REPLAY_EVENTS_PER_RUN)) and at most two items.
+///   [`REPLAY_EVENTS_PER_RUN`](adam_runtime::REPLAY_EVENTS_PER_RUN)) and at most four items.
 /// * It does not keep the engine alive: drop every [`Engine`] and the worker stops, whatever
 ///   streams are open.
 pub struct RunEvents {
@@ -102,12 +123,20 @@ impl RunEvents {
             subscription,
             engine,
             worker,
-            queue: VecDeque::with_capacity(2),
+            queue: VecDeque::with_capacity(4),
             ended: false,
             report_at: Instant::now() + REPORT_INTERVAL,
+            asked: None,
+            owed: None,
         };
         if info.state.is_terminal() {
             follow.end(EngineEvent::Ended(info));
+        } else if let Some(approval) = info.approval {
+            follow.asked = Some(approval.call_id.clone());
+            follow.owed = Some(approval.call_id.clone());
+            follow
+                .queue
+                .push_back(Ok(EngineEvent::ApprovalAsked(approval)));
         }
         let inner = futures::stream::unfold(follow, |mut follow| async move {
             let item = follow.next().await?;
@@ -138,14 +167,20 @@ struct Follow {
     engine: Weak<Shared>,
     /// Says when the worker has stopped: then nothing steps the run any more.
     worker: watch::Receiver<Option<Ended>>,
-    /// What is ready to be handed out: at most two items (`Live` then `Ended`, `Behind` then
-    /// `Snapshot` or `Ended`).
+    /// What is ready to be handed out: at most four items (`Live` or `Behind`, then an approval's
+    /// answer, a new approval, and `Snapshot` or `Ended`).
     queue: VecDeque<Result<EngineEvent, EngineError>>,
     /// Nothing more is received once the queue is empty.
     ended: bool,
     /// When the next [`EngineEvent::Resources`] may be handed out: a report is sent at most every
     /// [`REPORT_INTERVAL`], not on every live event of a busy run.
     report_at: Instant,
+    /// The call whose approval this stream said ([`EngineEvent::ApprovalAsked`]) while it waited.
+    asked: Option<String>,
+    /// The call whose answer this stream owes ([`EngineEvent::ApprovalAnswered`]): one it said, or
+    /// one the agent's `input_required` event named, which a reader that reads late may find
+    /// answered already.
+    owed: Option<String>,
 }
 
 impl Follow {
@@ -178,9 +213,21 @@ impl Follow {
             match heard {
                 Heard::Received(Some(Received::Event(event))) => {
                     let status = matches!(event, RunEvent::Status { .. });
+                    let approval = approval_named(&event);
+                    // The end of the owed call's step: its approved step ran (or it was refused).
+                    let approval_heard = approval.is_some()
+                        || self
+                            .owed
+                            .as_deref()
+                            .is_some_and(|call| ends_the_step_of(&event, call));
                     self.queue.push_back(Ok(EngineEvent::Live(event)));
-                    // A status is a prompt to read the record: it says whether the run ended.
-                    if status {
+                    if let Some(call) = approval {
+                        self.owed = Some(call);
+                    }
+                    // A status is a prompt to read the record: it says whether the run ended. So is
+                    // an approval asked, and the end of its call's step: the store says whether it
+                    // still waits, and how it was answered.
+                    if status || approval_heard {
                         self.read(false).await;
                     }
                 }
@@ -211,15 +258,54 @@ impl Follow {
             return;
         };
         match engine.get(self.run).await {
-            Ok(Some(info)) if info.state.is_terminal() => self.end(EngineEvent::Ended(info)),
             Ok(Some(info)) => {
-                if snapshot {
+                if let Err(error) = self.approvals(&engine, &info).await {
+                    self.fail(error);
+                } else if info.state.is_terminal() {
+                    self.end(EngineEvent::Ended(info));
+                } else if snapshot {
                     self.queue.push_back(Ok(EngineEvent::Snapshot(info)));
                 }
             }
             Ok(None) => self.fail(EngineError::NotFound(format!("run {}", self.run))),
             Err(error) => self.fail(error),
         }
+    }
+
+    /// Say what the store shows of the run's approvals since the last read: the answer this stream
+    /// owes, once the store has it, then an approval the run waits for that it has not said.
+    async fn approvals(&mut self, engine: &Engine, info: &RunInfo) -> Result<(), EngineError> {
+        let waits_for = info.approval.as_ref().map(|a| a.call_id.as_str());
+        if let Some(owed) = self.owed.clone()
+            && waits_for != Some(owed.as_str())
+        {
+            match engine.approval_outcome(self.run, &owed).await? {
+                Some(approved) => {
+                    self.queue.push_back(Ok(EngineEvent::ApprovalAnswered {
+                        call_id: owed,
+                        approved,
+                    }));
+                    self.owed = None;
+                    self.asked = None;
+                }
+                // Never answered: the run ended first (a cancel).
+                None if info.state.is_terminal() => {
+                    self.owed = None;
+                    self.asked = None;
+                }
+                // Not committed yet, or the store moved between the two reads: a later read says it.
+                None => {}
+            }
+        }
+        if let Some(approval) = &info.approval
+            && self.asked.as_deref() != Some(approval.call_id.as_str())
+        {
+            self.asked = Some(approval.call_id.clone());
+            self.owed = Some(approval.call_id.clone());
+            self.queue
+                .push_back(Ok(EngineEvent::ApprovalAsked(approval.clone())));
+        }
+        Ok(())
     }
 
     fn end(&mut self, last: EngineEvent) {
@@ -231,6 +317,28 @@ impl Follow {
         self.queue.push_back(Err(error));
         self.ended = true;
     }
+}
+
+/// The call `event` says the agent asked the person to approve: its `input_required` event with
+/// `"approval": true` (ADR 0050 slice H8), emitted before the park is committed.
+fn approval_named(event: &RunEvent) -> Option<String> {
+    let RunEvent::Custom { kind, payload } = event else {
+        return None;
+    };
+    if kind != "input_required" || payload.get("approval") != Some(&serde_json::Value::Bool(true)) {
+        return None;
+    }
+    payload
+        .get("call_id")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
+}
+
+/// Whether `event` ends the step of the call `call` (`tool:<call>`, completed or failed).
+fn ends_the_step_of(event: &RunEvent, call: &str) -> bool {
+    matches!(event, RunEvent::Step(step)
+        if matches!(step.state, adam_runtime::StepState::Completed | adam_runtime::StepState::Failed)
+            && step.id.strip_prefix("tool:") == Some(call))
 }
 
 /// What a stream heard while it waited.

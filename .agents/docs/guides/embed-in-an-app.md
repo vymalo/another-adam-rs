@@ -1,0 +1,56 @@
+# Embed adam in an application: the evidence
+
+For people: [Embed adam in an application](../../../docs/guides/embed-in-an-app.md). That page decides; this one gives
+the code each claim stands on, the invariants to check and the proofs. It covers the approvals of ADR 0047 slice 5 so
+far; the rest of the engine's evidence is in `crates/adam-engine/README.md` (*Tests*). Checked on 2026-11-27 on the
+branch that built slice 5, over ADR 0050 slice H8.
+
+## Approvals: where the code is
+
+| Claim | Code |
+|---|---|
+| the host's hooks reach every agent, before a file's plugins | `EngineBuilder::hooks`, `plugin` (`crates/adam-engine/src/engine.rs:252`, `:260`), given at `start` (`:405`) to `BoundDef::hooks` (`crates/adam-assembly/src/assembly.rs:290`), folded first into each node's set (`:888`) |
+| what an approval shows of its call is what the step shows | `EngineBuilder::step_io` (`crates/adam-engine/src/engine.rs:270`); `StepIo::shown_input`, `redacted` (`crates/adam-llm-agent/src/step_io.rs:112`, `:126`); the `input_required` event's question through the agent's redactor (`crates/adam-llm-agent/src/agent.rs:4770`) |
+| a run parked on a hook's approval is `AwaitingApproval` | `Shared::approval_of` (`crates/adam-engine/src/engine.rs:747`): parked and waiting, `Conversation::approval` not approved, and `pending_wait.call_id` the same call; `Engine::info` (`:1153`) reads the head for a run the task says is `Waiting`; `RunInfo::awaiting` (`crates/adam-engine/src/types.rs:297`) |
+| `approve` checks the call, then sends the plain follow-up | `Engine::approve` (`crates/adam-engine/src/engine.rs:1038`): the owned view, `Finished` for an ended run, `NotAwaitingApproval` (`crates/adam-engine/src/error.rs:54`) unless `approval_of` names the call; the message id `approval:<run>:<call id>:<version>`; `Decision::answer_text` (`crates/adam-engine/src/types.rs:254`) |
+| the stream says an approval and its answer from the store | `Follow::approvals` (`crates/adam-engine/src/events.rs:277`); a read on a status, on `input_required` with `"approval": true` (`approval_named`, `:324`) and on the end of the owed call's step (`ends_the_step_of`, `:338`); `Engine::approval_outcome` (`crates/adam-engine/src/engine.rs:1100`) |
+
+## Invariants to check
+
+1. **A yes is known only from the journal or the head.** `approval_outcome` answers `true` when the step
+   `tool:<call id>:approved` is journaled (before its transition commits) or the head says `approved`.
+2. **A no is never inferred from an absence.** It needs the call's result in the run's history without the approved
+   step. An ask heard before its park is committed (or whose commit was lost) reads as no answer yet.
+3. **One `ApprovalAsked` per approval in a stream** (`Follow::asked`), and one `ApprovalAnswered` per approval it heard
+   of (`Follow::owed`). A cancel before the answer says none.
+4. **`approve` delivers nothing it refuses**: the check of the call comes before the submit, so a wrong call id leaves
+   the run waiting and its model uncalled.
+5. **A refusal never reads as a yes**: a reason that `adam_llm_agent::approves` accepts is sent as `no: <reason>`.
+6. **No more than the step**: `ApprovalRequest::arguments` is `StepIo::shown_input`, never the raw arguments, and both
+   questions go through `StepIo::redacted`.
+
+## The proofs
+
+`crates/adam-engine/tests/approval.rs`, each seen failing once against the change in the last column, then passing:
+
+| Test | Holds | Red against |
+|---|---|---|
+| `a_yes_runs_the_same_call_once_across_restarts` (`:305`, Unix) | three engines over one SQLite file: the approval after a restart without asking the hook, the call run once across two restarts, the next engine's model reading its result once | `Decision::Approve` sent as `no`; `approval_of` that reads no approval |
+| `a_replay_never_asks_twice` (`:453`) | a `FaultyStore` loses the park's commit: the hook asked once, `ApprovalAsked` once over more than a poll, the lost attempt's ask not taken for an answer, the call run once | `ApprovalAsked` pushed at every read; a no read from an absence |
+| `a_no_refuses_the_call_and_the_run_goes_on` (`:541`) | the redacted request, the refusal's words reaching the model, the run's answer, `ApprovalAnswered { false }`, no secret in any event | a refusal sent as `yes`; the raw arguments shown |
+| `a_refusal_that_says_ok_is_still_a_no` (`:600`) | `refuse_because("OK")` runs nothing, the model reads `no: OK` | an `ok` reason sent as it is |
+| `an_answer_for_another_call_or_no_approval_is_refused` (`:640`) | another call's id, a working run, a run waiting on `ask_user`, an ended and an unknown run refused with their classes; a `send` of `Yes.` is `Answered` | no check of the call id; a `send` to an approval delivered as a steer |
+
+Also: `crates/adam-assembly/tests/plugins.rs` `the_hosts_hooks_run_in_every_agent_before_the_files_plugins` (red against
+a fold that leaves the host's set out), `crates/adam-llm-agent/src/step_io.rs` `the_shown_input_is_the_steps_own` (red
+against an input not cut), `crates/adam-engine/src/error.rs` `every_backend_refusal_keeps_its_class` (the new variant's
+class), and `crates/adam-engine/tests/example.rs` `the_example_asks_before_saving_a_note`.
+
+## Not proven
+
+* **A2A clients see no approval as one.** The A2A front reads the parked question as any `input-required`; the new
+  extension of ADR 0047 confirmed decision 4 is not built.
+* **The order of a refusal among live events.** A no is not journaled, so its `ApprovalAnswered` comes at the commit of
+  the transition that read it, which may be after the model's next words; the example's test allows both places.
+* **A race between two answers.** `approve` reads the approval, then submits: an answer delivered by another call in
+  between is read first, and the second is the run's next message, as for `answer`.

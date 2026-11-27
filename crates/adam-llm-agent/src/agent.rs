@@ -4762,10 +4762,12 @@ impl LlmAgent {
                 } => {
                     state.repeats = None;
                     let asked = approval_question(&call.name, &question);
+                    // The hook's words may name the call's arguments: the event says them through the
+                    // agent's redactor, as the call's step says its input (ADR 0047 slice 5).
                     ctx.emit(RunEvent::Custom {
                         kind: "input_required".into(),
                         payload: json!({
-                            "question": asked,
+                            "question": self.step_io.scrub(&asked),
                             "call_id": call.id,
                             "approval": true,
                         }),
