@@ -1214,7 +1214,9 @@ record's shape; `src/agent.rs` (`a_recorded_model_call_reads_a_journal_from_befo
 usage reported with zeros; **a subagent's calls (and its own child's) reported on the root's task under the root's step**,
 none on the children's runs, and the root's totals holding all of them per provider and model; a replayed call reported
 under the id its record holds (and a journal from before, under the run and the turn); a call made again after a transient
-failure reported under another id, and only the kept try's call in the totals. `src/agent.rs` pins the record's `call` member.
+failure reported under another id, and only the kept try's call in the totals; `each_report_carries_the_window_its_aliases_profile_names`
+(ADR 0086: the window of a call's own alias as the client resolves it, the profile's over the configured one, a subagent's
+on another alias its own). `src/agent.rs` pins the record's `call` member.
 
 `tests/sandbox_usage.rs`: what tools report is one entry per shape in the run's state, in the order each shape first appeared; a run
 that reported nothing writes no `sandbox_usage` and a state from before it loads; a call that ended in a `Permanent` error is counted; a
@@ -1489,6 +1491,8 @@ is in [the architecture](../../docs/architecture.md#compaction-a-long-history-is
   compacts once instead of failing; the request after a compaction breaks the prefix on purpose. A run that has
   compacted does not replay on a build without this slice.
 
-Proof: `tests/compaction.rs`, `tests/prefix.rs`, the units of `src/compaction.rs` and `src/conversation.rs`.
+Proof: `tests/compaction.rs`, `tests/prefix.rs`, the units of `src/compaction.rs` and `src/conversation.rs`. The window
+is `ModelClient::context_window` of the run's live alias, so a profile's `contextWindow` is the budget's
+(ADR 0086, `the_budget_is_taken_from_the_window_of_the_models_profile`, a session's `contextWindow` still narrowing it).
 
 New in slice 4 ([ADR 0045](../../docs/decisions/0045-a-subagent-can-run-in-the-background-as-a-session.md)): `SessionTools::with_limits(SessionLimits)` (default 16 open, 4 working, 20 rounds; the `MAX_*` constants are the defaults). A start refuses past `max_open` and `max_working`; **`subagent_send` now also refuses a send that would start a round past `max_working`** (a steer into a working round is not one); a send past `max_rounds` is refused and a close never. The specs do not mention the limits, so they stay byte-stable. A session that sat idle past the runtime's TTL refuses a send as closed and says why; its report, if still due, is told once. Tests in `tests/sessions.rs` (three stores): `each_limit_refuses_in_words`, `an_idle_expired_session_refuses_a_send_as_closed`, `an_expired_sessions_report_is_still_told_once`, `a_parent_that_fails_stops_its_rounds`, `a_cancel_frees_the_working_slots_for_the_next_task`, `limits_do_not_change_the_specs`.

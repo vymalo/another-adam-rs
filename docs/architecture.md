@@ -493,7 +493,10 @@ its `model_preset` and the profile (`crates/adam-assembly/src/assembly.rs`), and
 per model: the folder's `limits.max_output_tokens`, its preset's, the profile's, the profile's base preset, then
 128,000, then the smallest of that, the model's `maxOutputTokensLimit` and what the window leaves after 20,000 tokens
 and the agent's history (`crates/adam-assembly/src/assembly.rs`, `output_cap`; the margin and the compaction budget
-are `crates/adam-llm-agent/src/compaction.rs`). A profile's `endpoint` is the deployment's own **endpoint label**
+are `crates/adam-llm-agent/src/compaction.rs`). The window is the profile's `contextWindow`, else
+`MODEL_CONTEXT_WINDOW` for the alias `MODEL` names, alias by alias, so a subagent on another model has its own
+(`adam_model::resolve_context_window`, [ADR 0086](decisions/0086-the-context-window-follows-the-model-and-the-history-budget-is-200k.md);
+the evidence is on [the page for agents](../.agents/docs/architecture.md#the-models-window-adr-0086-slice-w1)). A profile's `endpoint` is the deployment's own **endpoint label**
 for the model — a label only, never a provider, a host, a URL or a key — which a served `model-pick/v1` choice
 carries beside its alias; a malformed one is omitted, never a refusal of the file (ANR-623,
 `crates/adam-model/src/profiles.rs`). An embedded engine takes the same profiles from its host
@@ -867,7 +870,7 @@ stateDiagram-v2
 
 | Part | Rule |
 |---|---|
-| **Budget** | the smaller of `MODEL_CONTEXT_WINDOW` less 20,000 less `max_output_tokens` (the cap resolved for the agent's model, ADR 0064), and `limits.max_history_tokens`; none when neither is set (a window with no room left counts as none) |
+| **Budget** | the smaller of the model's window (its profile's `contextWindow`, else `MODEL_CONTEXT_WINDOW` for the alias `MODEL` names; ADR 0086) less 20,000 less `max_output_tokens` (the cap resolved for the agent's model, ADR 0064), and `limits.max_history_tokens`; none when neither is set (a window with no room left counts as none) |
 | **Estimate** | the last call's reported prompt tokens plus characters / 4 of what came after; with no report, characters / 4 of the instructions, the tools and every message |
 | **Cut** | at the start of a turn (an assistant message, never the first message), so a call is never parted from its result; the newest 1 to 8 turns worth at most a quarter of the budget stay verbatim; fewer than two turns to drop, eight compactions made by the run (a run that continues another carries the earlier ones as one record, which is not one of its eight), or a request that would still be over the budget with no summary, shortens instead |
 | **Summary** | the agent's own model, the request as it stands (same system, tools and history) plus one built-in instruction as the last message, `tool_choice: none`, `min(4,096, cap)` output tokens, or 4,096 when the cap is `0` (the run's resolved cap, ADR 0064), capped at 16 KiB; its usage is reported under an id of its own (`<run>-k<n>-<suffix>`); the person sees one step, "Summarise the conversation" |

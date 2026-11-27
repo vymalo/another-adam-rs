@@ -6,7 +6,8 @@ use futures::stream::{self, BoxStream, StreamExt};
 
 use crate::{
     ContentPart, DynModel, ImageLimits, InputModalities, Message, ModelClient, ModelDelta,
-    ModelError, ModelRequest, ModelResponse, ToolCall,
+    ModelError, ModelProfile, ModelProfiles, ModelRequest, ModelResponse, ToolCall,
+    resolve_context_window,
 };
 
 /// One call a [`MockModel`] received.
@@ -62,6 +63,7 @@ pub struct MockModel {
     inner: Mutex<Inner>,
     provider: Option<String>,
     context_windows: Vec<(String, u64)>,
+    profiles: ModelProfiles,
     images: Option<ImageLimits>,
 }
 
@@ -95,10 +97,21 @@ impl MockModel {
         self
     }
 
-    /// Say `window` as the [`ModelClient::context_window`] of the alias `model`.
+    /// Say `window` as the [`ModelClient::context_window`] of the alias `model`, as
+    /// `MODEL_CONTEXT_WINDOW` does for the real client: a profile's `contextWindow`
+    /// ([`with_profiles`](Self::with_profiles)) wins over it.
     #[must_use]
     pub fn with_context_window(mut self, model: impl Into<String>, window: u64) -> Self {
         self.context_windows.push((model.into(), window));
+        self
+    }
+
+    /// Answer `profiles` as [`ModelClient::profile`], as the real client does with the
+    /// deployment's `MODEL_ALIASES_FILE`: a profile's `contextWindow` is then its alias's
+    /// [`ModelClient::context_window`]. A mock has no profile by default.
+    #[must_use]
+    pub fn with_profiles(mut self, profiles: ModelProfiles) -> Self {
+        self.profiles = profiles;
         self
     }
 
@@ -188,10 +201,16 @@ impl ModelClient for MockModel {
     }
 
     fn context_window(&self, model: &str) -> Option<u64> {
-        self.context_windows
+        let configured = self
+            .context_windows
             .iter()
             .find(|(alias, _)| alias == model)
-            .map(|(_, window)| *window)
+            .map(|(_, window)| *window);
+        resolve_context_window(self.profile(model), configured)
+    }
+
+    fn profile(&self, model: &str) -> Option<&ModelProfile> {
+        self.profiles.profile(model)
     }
 
     fn input_modalities(&self, _model: &str) -> InputModalities {
@@ -358,6 +377,28 @@ mod tests {
                 .message
                 .text(),
             "b"
+        );
+    }
+
+    /// The mock answers its window through the one rule the real client does: the profile's
+    /// `contextWindow` wins over the window it was told, alias by alias.
+    #[test]
+    fn a_profiles_window_wins_over_the_told_one() {
+        let profiles = ModelProfiles::parse_json(
+            r#"{"profiles": {"big": {"contextWindow": 400000}, "plain": {}}}"#,
+        )
+        .expect("valid");
+        let mock = MockModel::new()
+            .with_context_window("big", 131_072)
+            .with_context_window("plain", 8192)
+            .with_profiles(profiles);
+        assert_eq!(mock.context_window("big"), Some(400_000), "the profile");
+        assert_eq!(mock.context_window("plain"), Some(8192), "the told one");
+        assert_eq!(mock.context_window("other"), None, "nobody said");
+        assert!(mock.profile("big").is_some());
+        assert!(
+            MockModel::new().profile("big").is_none(),
+            "no profile by default"
         );
     }
 }

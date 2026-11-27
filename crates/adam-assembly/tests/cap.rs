@@ -344,3 +344,39 @@ async fn the_resolved_cap_reaches_the_request_of_a_run() {
     worker.stop().await;
     assert_eq!(model.requests()[0].max_output_tokens, Some(65_536));
 }
+
+/// ADR 0086 decisions 1 and 3: a subagent whose `model:` names another alias has its own window,
+/// its profile's `contextWindow`, which the client answers for that alias (no `MODEL_CONTEXT_WINDOW`
+/// ever reached it); the window clamps that subagent's cap, and not the root's.
+#[test]
+fn a_subagent_on_another_alias_has_its_own_profiles_window() {
+    let profiles = profiles(r#"{"profiles": {"plain": {}, "small": {"contextWindow": 131072}}}"#);
+    let assembly = def(&[
+        (
+            INSTRUCTIONS,
+            &instructions("name: coder\nmodel: plain", "Root."),
+        ),
+        (
+            "agent/subagents/helper.md",
+            &instructions("description: Helps.\nmodel: small", "Helper."),
+        ),
+    ])
+    .bind(ToolSet::new())
+    .unwrap()
+    .model_profiles(profiles.clone())
+    .model(Arc::new(MockModel::new().with_profiles(profiles)), "plain")
+    .unwrap();
+    let cap_of = |name: &str| {
+        assembly
+            .info()
+            .iter()
+            .find(|info| info.name == name)
+            .unwrap()
+            .limits
+            .max_output_tokens
+    };
+    // The root's alias has no window: the 128,000 fallback.
+    assert_eq!(cap_of("coder"), 128_000);
+    // The subagent's: 131,072 - 20,000 - the 100,000 default history.
+    assert_eq!(cap_of("coder/helper"), 11_072);
+}

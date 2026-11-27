@@ -31,6 +31,35 @@ bindings ([ADR 0031](../../docs/decisions/0031-swagger-ui-and-the-a2a-rest-bindi
 * The chart was rendered, not applied to a cluster; how it reaches the cluster after the tag bump is
   outside this repository.
 
+## The model's window (ADR 0086, slice W1)
+
+Built 2026-11-27. The invariant: **one rule answers a model alias's window**, and every reader asks the client.
+
+* The rule: `adam_model::resolve_context_window` (`crates/adam-model/src/profiles.rs:221`): the profile's
+  `contextWindow`, else the window configured for that alias outside the profiles (`MODEL_CONTEXT_WINDOW`), else
+  `None`; a hand-built `0` falls through. The loader refuses `0` and anything above `MAX_CONTEXT_WINDOW` (2^53 − 1,
+  `profiles.rs:211`) in `window` (`profiles.rs:624`), like a cap of `0`. A preset has no window: it is a fact of the
+  model, and a preset carries no limit of the model either.
+* The clients answer through it: the trait default (`crates/adam-model/src/client.rs:44`, the profile only),
+  `MockModel` (`crates/adam-model/src/mock.rs:203`) and `OpenAiCompatible` (`crates/adam-model-openai/src/lib.rs:985`);
+  `GateModel` and `Arc<T>` forward. `ModelConfig::client` gives the client both `MODEL_CONTEXT_WINDOW` for `MODEL`
+  and the profiles (`crates/adam-service/src/config.rs:1347`, `:1358`).
+* The readers ask the client per alias: the compaction budget of the live alias
+  (`crates/adam-llm-agent/src/agent.rs:3741`, narrowed by a session's `context_window` in
+  `compaction::effective_window`), each `usage/v1` report (`agent.rs:4224`), and the output cap's clamp
+  (`crates/adam-assembly/src/assembly.rs:758`). A subagent is built on the same client with its own alias, so its
+  window is its own profile's.
+* Not covered: the engine's `EngineBuilder::models` reaches the assembly, not the client the host built; an embedded
+  host gives its client the same profiles (`with_profiles`) for a profile's window to apply.
+
+Tests: `profiles.rs` `a_context_window_is_one_to_two_to_the_53_minus_one_tokens`,
+`the_profiles_window_wins_over_the_configured_one`; `client.rs` `the_default_window_is_the_profiles`; `mock.rs`
+`a_profiles_window_wins_over_the_told_one`; `adam-model-openai` `a_profiles_window_wins_over_the_configured_one_alias_by_alias`;
+`adam-service` `a_profiles_context_window_wins_over_model_context_window`; `adam-llm-agent` `tests/usage.rs`
+`each_report_carries_the_window_its_aliases_profile_names` and `tests/compaction.rs`
+`the_budget_is_taken_from_the_window_of_the_models_profile`; `adam-assembly` `tests/cap.rs`
+`a_subagent_on_another_alias_has_its_own_profiles_window`.
+
 ## Signed turns on re-entry (ADR 0068, slice T3a-3)
 
 For people: [Signed turns](../../docs/architecture.md#signed-turns-each-assistant-and-tool-turn-is-signed-when-it-is-committed).

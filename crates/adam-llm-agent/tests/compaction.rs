@@ -1459,6 +1459,46 @@ async fn a_sessions_context_window_starts_compaction_sooner() {
     assert_eq!(state.compactions.len(), 1, "{:?}", state.compactions);
 }
 
+/// A model whose profile names a `contextWindow` of `window` (ADR 0086), over the 400,000 configured
+/// for its alias.
+fn profiled(window: u64) -> MockModel {
+    let profiles = adam_model::ModelProfiles::parse_json(&format!(
+        r#"{{"profiles": {{"test-model": {{"contextWindow": {window}}}}}}}"#
+    ))
+    .expect("valid profiles");
+    MockModel::new()
+        .with_context_window("test-model", 400_000)
+        .with_profiles(profiles)
+}
+
+#[tokio::test]
+async fn the_budget_is_taken_from_the_window_of_the_models_profile() {
+    // ADR 0086 decision 1: the profile's 26,096 wins over the configured 400,000, so the budget is
+    // 2,000 and 2,500 reported tokens compact the run, as `with_a_window_the_reported_tokens_trigger_it`.
+    let small = Rig::with(profiled(26_096), 0, with_cap);
+    assert_eq!(small.mock.context_window("test-model"), Some(26_096));
+    script_reports(&small.mock, 2_500, true);
+    let run = small.start().await;
+    let (_, state) = small.finish(run).await;
+    assert_eq!(state.compactions.len(), 1, "{:?}", state.compactions);
+
+    // A profile's larger window leaves the same run room: nothing is compacted.
+    let large = Rig::with(profiled(100_000), 0, with_cap);
+    script_reports(&large.mock, 2_500, false);
+    let run = large.start().await;
+    let (_, state) = large.finish(run).await;
+    assert!(state.compactions.is_empty(), "{:?}", state.compactions);
+
+    // ADR 0086 decision 6: a session's `contextWindow` narrows the profile's window.
+    let narrowed = Rig::with(profiled(100_000), 0, with_cap);
+    script_reports(&narrowed.mock, 9_000, true);
+    let run = narrowed
+        .start_session(json!({"contextWindow": 32_096}))
+        .await;
+    let (_, state) = narrowed.finish(run).await;
+    assert_eq!(state.compactions.len(), 1, "{:?}", state.compactions);
+}
+
 #[tokio::test]
 async fn a_sessions_context_window_is_the_minimum_with_the_models_never_instead_of_it() {
     // The model's window leaves a budget of 2,000. A session that asks for more does not widen it.

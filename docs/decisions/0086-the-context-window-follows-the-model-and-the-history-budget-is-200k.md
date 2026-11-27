@@ -8,6 +8,18 @@ ADR's choices for the owner to confirm. Amends [ADR 0032](0032-usage-per-model-c
 and builds on [ADR 0064](0064-model-profiles-reasoning-effort-and-output-cap-follow-the-model.md) (model profiles) and
 [ADR 0054](0054-a-child-session-can-be-configured-within-what-its-folder-allows.md) (a session's `context_window`).
 
+*Amended 2026-11-27:* **slice W1 is built.** A profile's `contextWindow` is read (1 to 2^53 − 1, else the document is
+refused, as a cap of `0` is) and is the window of its alias over `MODEL_CONTEXT_WINDOW`, which is unchanged otherwise.
+The one rule is `adam_model::resolve_context_window`: every `ModelClient` answers `context_window` through it, the
+trait's default included (it now answers the profile's window where it answered `None`; no method is added), so the
+compaction budget, the clamp of the output cap and each `usage/v1` report read the same window per alias, and a
+subagent on another alias has its own. A preset sets no window: it is a fact of the model, and presets carry no limit
+of the model either. `MAX_CONTEXT_WINDOW` moved to `adam-model` (`adam-service` re-exports it). The people's pages
+named under W3 (`docs/reference/environment.md`, `docs/reference/agent-files.md`, the architecture's compaction
+budget) already say that the profile's window wins; W3 still owns the 200,000 default. One limit, not decided here:
+`EngineBuilder::models` gives the profiles to the assembly only, so an embedded host gives its client the same
+profiles for their windows to apply.
+
 ## Context
 
 The history budget decides when a run compacts. It is the smaller of two values

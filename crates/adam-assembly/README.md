@@ -190,7 +190,8 @@ every agent a `ModelBinding` for each other profiled model, for `Say::with_model
 **Output cap.** With `model_profiles(profiles)`, each agent's cap is, narrowest first: its folder's
 `limits.max_output_tokens`, the preset its `model_preset` names, the profile's `maxOutputTokens`, the profile's base
 preset, then `adam_model::DEFAULT_MAX_OUTPUT_TOKENS` (128,000). It is then the smallest of that, the model's
-`maxOutputTokensLimit` and, when the client knows the alias's context window, what the window leaves after
+`maxOutputTokensLimit` and, when the client knows the alias's context window (`ModelClient::context_window`: the
+profile's `contextWindow`, else `MODEL_CONTEXT_WINDOW` for the alias `MODEL` names; ADR 0086), what the window leaves after
 `adam_llm_agent::WINDOW_MARGIN_TOKENS` (20,000) and the history the agent keeps (`max_history_tokens`, or half the
 window when it is `0`; an omitted key keeps the 100,000 default; at least 1). A lowered cap is logged once per agent and model. A **preset** above the
 model's limit is `Error::OutputCap` (a preset is the deployment's promise); the folder's value is clamped, and a
@@ -905,6 +906,9 @@ place each:
   both called `linear`, two tokens, each server called once with its own), patterns select MCP tools in the
   file's order and the model is offered their descriptions and schemas, a clash with a registered tool and
   with a subagent name, unconnected and failing servers name the agent and the `mcp.json` (an unset variable
+* `tests/cap.rs`: the output cap's order and clamps (ADR 0064), and
+  `a_subagent_on_another_alias_has_its_own_profiles_window` (ADR 0086: its profile's `contextWindow` clamps that
+  subagent's cap, not the root's).
   sends no request, a stdio server without the policy, a server that is down), a parent run calls an MCP tool on
   memory and PostgreSQL (the journal has `tool:c1`, the token is in no journal, state, event or `Debug`), a
   committed call is not repeated when a later transition is retried, a transient failure later in the turn calls

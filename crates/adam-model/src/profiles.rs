@@ -1,7 +1,9 @@
 //! The per-model profiles of `MODEL_ALIASES_FILE` ([ADR 0063](https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0063-a-reasoning-effort-is-one-setting.md),
 //! [ADR 0064](https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0064-model-profiles-reasoning-effort-and-output-cap-follow-the-model.md)):
-//! which reasoning levels a model takes and how they are sent, its output cap, the members merged into
-//! its requests, the deployment's endpoint label for it, and the named presets.
+//! which reasoning levels a model takes and how they are sent, its output cap, its context window
+//! ([ADR 0086](https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0086-the-context-window-follows-the-model-and-the-history-budget-is-200k.md)),
+//! the members merged into its requests, the deployment's endpoint label for it, and the named
+//! presets.
 //!
 //! The types are pure data: no file is read here. [`ModelProfiles::parse_json`] parses and validates a
 //! document and reports every problem it finds, naming the profile (or preset) and the key; the binary
@@ -19,6 +21,7 @@
 //!       "reasoningEfforts": ["low", "medium", "high", "max"],
 //!       "reasoningWire": "reasoning_effort",
 //!       "maxOutputTokensLimit": 131072,
+//!       "contextWindow": 400000,
 //!       "endpoint": "gateway-a"
 //!     },
 //!     "small-chat": {
@@ -202,6 +205,29 @@ pub const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 128_000;
 /// is malformed and omitted, never truncated into a different endpoint's name.
 pub const MAX_ENDPOINT_LABEL_LEN: usize = 128;
 
+/// The largest context window a model may be said to have, in tokens: 2^53 − 1, the largest whole
+/// number a JSON reader is sure to hold exactly. A profile's `contextWindow` above it refuses the
+/// document, and `MODEL_CONTEXT_WINDOW` above it refuses to start.
+pub const MAX_CONTEXT_WINDOW: u64 = 9_007_199_254_740_991;
+
+/// The context window of a model, in tokens ([ADR 0086](https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0086-the-context-window-follows-the-model-and-the-history-budget-is-200k.md)
+/// decision 1): its profile's `contextWindow`, else `configured` (the window the deployment set for
+/// that alias outside the profiles, `MODEL_CONTEXT_WINDOW`), else `None`.
+///
+/// This is the one rule every [`ModelClient::context_window`](crate::ModelClient::context_window)
+/// answers by, so the compaction budget, the clamp of the output cap and each `usage/v1` report
+/// read the same window for an alias. A hand-built profile's `0`, which the loader refuses, is no
+/// window and falls through.
+pub fn resolve_context_window(
+    profile: Option<&ModelProfile>,
+    configured: Option<u64>,
+) -> Option<u64> {
+    profile
+        .and_then(|p| p.context_window)
+        .filter(|window| *window > 0)
+        .or(configured)
+}
+
 /// The endpoint label a profile's `endpoint` names, when it is one.
 ///
 /// The member is a **label only**: the deployment's own name for a model endpoint, never a
@@ -259,6 +285,10 @@ pub struct ModelProfile {
     pub max_output_tokens: Option<u32>,
     /// The model's own documented maximum for one request: a cap above it is refused.
     pub max_output_tokens_limit: Option<u32>,
+    /// The model's context window, in tokens, 1 to [`MAX_CONTEXT_WINDOW`] (ADR 0086): the window
+    /// the history budget, the output cap and each `usage/v1` report use for this model, over
+    /// `MODEL_CONTEXT_WINDOW` ([`resolve_context_window`]). A fact of the model, so no preset sets it.
+    pub context_window: Option<u64>,
     /// Members merged into this model's requests only; never one the runtime owns
     /// ([`RESERVED_EXTRA_BODY_KEYS`]).
     pub extra_body: Option<serde_json::Map<String, Value>>,
@@ -563,6 +593,7 @@ struct RawProfile {
     reasoning_effort: Option<String>,
     max_output_tokens: Option<u32>,
     max_output_tokens_limit: Option<u32>,
+    context_window: Option<u64>,
     extra_body: Option<serde_json::Map<String, Value>>,
     preset: Option<String>,
     fallback: Option<String>,
@@ -583,6 +614,21 @@ fn cap(value: Option<u32>, at: &str, problems: &mut Vec<String>) -> Option<u32> 
     match value {
         Some(0) => {
             problems.push(format!("{at} must be at least 1"));
+            None
+        }
+        value => value,
+    }
+}
+
+/// A window outside 1 to [`MAX_CONTEXT_WINDOW`] is no window a model has: a problem, not a value.
+fn window(value: Option<u64>, at: &str, problems: &mut Vec<String>) -> Option<u64> {
+    match value {
+        Some(0) => {
+            problems.push(format!("{at} must be at least 1"));
+            None
+        }
+        Some(tokens) if tokens > MAX_CONTEXT_WINDOW => {
+            problems.push(format!("{at} must be at most {MAX_CONTEXT_WINDOW}"));
             None
         }
         value => value,
@@ -709,6 +755,10 @@ fn convert_profile(
     if max_output_tokens_limit.is_none() && raw.max_output_tokens_limit.is_some() {
         ok = false;
     }
+    let context_window = window(raw.context_window, &at("contextWindow"), problems);
+    if context_window.is_none() && raw.context_window.is_some() {
+        ok = false;
+    }
     ok.then_some(ModelProfile {
         reasoning_efforts,
         reasoning_wire,
@@ -716,6 +766,7 @@ fn convert_profile(
         reasoning_effort,
         max_output_tokens,
         max_output_tokens_limit,
+        context_window,
         extra_body: raw.extra_body,
         preset: raw.preset,
         fallback: raw.fallback,
@@ -736,8 +787,7 @@ mod tests {
         assert_eq!(value, back, "via {json}");
     }
 
-    /// The example of ADR 0064, translated to JSON, with an unknown `contextWindow` (a fact of ADR
-    /// 0054 slice 11 that this loader ignores).
+    /// The example of ADR 0064, translated to JSON, with the `contextWindow` of ADR 0086.
     fn example() -> serde_json::Value {
         json!({
             "presets": {
@@ -836,6 +886,7 @@ mod tests {
             reasoning_effort: Some(ReasoningEffort::Low),
             max_output_tokens: Some(64_000),
             max_output_tokens_limit: Some(131_072),
+            context_window: Some(400_000),
             extra_body: Some(serde_json::Map::from_iter([(
                 "enable_thinking".to_owned(),
                 json!(false),
@@ -849,11 +900,14 @@ mod tests {
             serde_json::to_value(&profile).unwrap()["reasoningEfforts"],
             json!(["low", "high"])
         );
-        // An unknown member (a fact of ADR 0054 slice 11) is ignored, not refused.
+        assert_eq!(
+            serde_json::to_value(&profile).unwrap()["contextWindow"],
+            json!(400_000)
+        );
+        // An unknown member (a fact a later slice may read) is ignored, not refused.
         let with_unknown = json!({
             "reasoningEfforts": ["low"],
             "reasoningWire": "reasoning_effort",
-            "contextWindow": 1000000,
             "temperature": 0.2
         });
         let parsed: ModelProfile = serde_json::from_value(with_unknown).unwrap();
@@ -878,6 +932,7 @@ mod tests {
         );
         assert_eq!(large.reasoning_wire, Some(ReasoningWire::ReasoningEffort));
         assert_eq!(large.max_output_tokens_limit, Some(131_072));
+        assert_eq!(large.context_window, Some(1_000_000));
         assert_eq!(
             profiles
                 .preset_of("large-coder")
@@ -1167,6 +1222,92 @@ mod tests {
             problems[0].contains(r#"presets."huge".maxOutputTokens"#),
             "{problems:?}"
         );
+    }
+
+    /// ADR 0086 decision 1: a window is 1 to 2^53 − 1 tokens, as `MODEL_CONTEXT_WINDOW` is; `0` and
+    /// anything larger refuse the document, naming the profile and the key. Absent is no window.
+    #[test]
+    fn a_context_window_is_one_to_two_to_the_53_minus_one_tokens() {
+        let window_of = |value: serde_json::Value| {
+            let doc = json!({ "profiles": { "m": { "contextWindow": value } } });
+            ModelProfiles::parse_json(&doc.to_string())
+                .map(|profiles| profiles.profile("m").and_then(|p| p.context_window))
+        };
+        assert_eq!(window_of(json!(1)), Ok(Some(1)));
+        assert_eq!(window_of(json!(400_000)), Ok(Some(400_000)));
+        assert_eq!(
+            window_of(json!(MAX_CONTEXT_WINDOW)),
+            Ok(Some(MAX_CONTEXT_WINDOW))
+        );
+        assert_eq!(MAX_CONTEXT_WINDOW, (1 << 53) - 1);
+
+        let problems = window_of(json!(0)).unwrap_err();
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(
+            problems[0].contains(r#"profiles."m".contextWindow"#),
+            "{problems:?}"
+        );
+        assert!(problems[0].contains("at least 1"), "{problems:?}");
+
+        let problems = window_of(json!(MAX_CONTEXT_WINDOW + 1)).unwrap_err();
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(
+            problems[0].contains(r#"profiles."m".contextWindow"#),
+            "{problems:?}"
+        );
+        assert!(
+            problems[0].contains("at most 9007199254740991"),
+            "{problems:?}"
+        );
+
+        // Not a whole number of tokens: refused by the reader, naming the profile.
+        for bad in [json!(-1), json!(1.5), json!("400000")] {
+            let problems = window_of(bad.clone()).unwrap_err();
+            assert_eq!(problems.len(), 1, "{bad}: {problems:?}");
+            assert!(
+                problems[0].contains(r#"profiles."m""#),
+                "{bad}: {problems:?}"
+            );
+        }
+
+        // Absent: the profile names no window.
+        let absent = json!({ "profiles": { "m": {} } });
+        let profiles = ModelProfiles::parse_json(&absent.to_string()).unwrap();
+        assert_eq!(profiles.profile("m").unwrap().context_window, None);
+        // A preset is not a model: it has no window to give, and a member of that name is ignored.
+        let preset = json!({ "presets": { "p": { "contextWindow": 0 } } });
+        assert!(ModelProfiles::parse_json(&preset.to_string()).is_ok());
+    }
+
+    /// ADR 0086 decision 1: the profile's window wins, then the configured one, then none; a
+    /// hand-built `0` the loader refuses is no window.
+    #[test]
+    fn the_profiles_window_wins_over_the_configured_one() {
+        let windowed = ModelProfile {
+            context_window: Some(400_000),
+            ..ModelProfile::default()
+        };
+        let bare = ModelProfile::default();
+        let zero = ModelProfile {
+            context_window: Some(0),
+            ..ModelProfile::default()
+        };
+        assert_eq!(
+            resolve_context_window(Some(&windowed), Some(131_072)),
+            Some(400_000)
+        );
+        assert_eq!(resolve_context_window(Some(&windowed), None), Some(400_000));
+        assert_eq!(
+            resolve_context_window(Some(&bare), Some(131_072)),
+            Some(131_072)
+        );
+        assert_eq!(resolve_context_window(None, Some(131_072)), Some(131_072));
+        assert_eq!(
+            resolve_context_window(Some(&zero), Some(131_072)),
+            Some(131_072)
+        );
+        assert_eq!(resolve_context_window(Some(&bare), None), None);
+        assert_eq!(resolve_context_window(None, None), None);
     }
 
     #[test]

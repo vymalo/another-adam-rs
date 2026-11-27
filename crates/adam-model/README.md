@@ -19,7 +19,7 @@ the provider asked to wait, and the runtime owns backoff.
 
 | Item | What |
 |---|---|
-| `ModelClient` (trait) | `complete(ModelRequest) -> ModelResponse` and `stream(ModelRequest) -> BoxStream<ModelDelta>`; four default methods, `provider() -> Option<&str>` (a label for reports, `openai` for the OpenAI-compatible client), `context_window(alias) -> Option<u64>` (the window the deployment configured for that alias), `input_modalities(alias) -> InputModalities` (text only unless the deployment declared images) and `profile(alias) -> Option<&ModelProfile>` (the deployment's profile of that model, `None` when it declared none); each `None`/text-only unless the client says |
+| `ModelClient` (trait) | `complete(ModelRequest) -> ModelResponse` and `stream(ModelRequest) -> BoxStream<ModelDelta>`; four default methods, `provider() -> Option<&str>` (a label for reports, `openai` for the OpenAI-compatible client), `context_window(alias) -> Option<u64>` (the window the deployment configured for that alias; by default the `contextWindow` of the alias's `profile`, ADR 0086), `input_modalities(alias) -> InputModalities` (text only unless the deployment declared images) and `profile(alias) -> Option<&ModelProfile>` (the deployment's profile of that model, `None` when it declared none); each `None`/text-only unless the client says |
 | `ModelClient::profile(model) -> Option<&ModelProfile>` | the deployment's profile of the model that alias names (`MODEL_ALIASES_FILE`), `None` by default: nothing of a profile is applied. `Arc<T>` forwards it. Hosts will read it for the cap resolved per call once the model is chosen at run time (ADR 0064 slice 5, not built; the cap itself is built per agent, slice 2); the OpenAI-compatible client sends a request's level through its wire |
 | `DynModel` | `Arc<dyn ModelClient>` |
 | `ModelRequest`, `ModelResponse`, `ModelDelta` | request (`model`, `system`, `messages`, `tools`, `ToolChoice`, `max_output_tokens`, `temperature`, `top_p`, `headers` (a credential-like name is refused: `is_credential_header`), `extra_body` (merged over the body; `RESERVED_BODY_KEYS` refused), `reasoning_effort`: the level this call asks for, absent sends nothing (ADR 0063), `metadata`, `prompt_cache_key`: a stable key per conversation, which the agent loop sets and a client may send; `run`: the root run the call belongs to, which the agent loop sets from in-process state and an injector reads ([ADR 0067](../../docs/decisions/0067-a-model-call-through-an-injector-names-its-run-and-a-refusal-parks-the-run.md)), skipped in JSON when `None`; **new public fields, break `ModelRequest` struct literals**: use `ModelRequest::new`). `ModelRequest`'s `PartialEq` and `Serialize` include `run`: two requests of different runs are not equal, and a test that compares requests of two runs clears it first. Response and streamed chunks. `ModelDelta` is `#[non_exhaustive]` since `ToolCallComplete` (below): a `match` over it needs one more arm |
@@ -35,7 +35,7 @@ the provider asked to wait, and the runtime owns backoff.
 | `SignedRequests`, `TURN_SIGNATURE_HEADER`, `request_target` | every model request signed ([ADR 0068](../../docs/decisions/0068-adam-signs-its-own-history.md), *Amended 2026-11-25 (the request signature)*): `SignedRequests::new(inner, turn_keys)` wraps any provider and adds to every call `X-Run-Id`, the prompt headers and `Turn-Signature`, adam's attached JWS (`adam-request/v1`) over the run, the method, the request target, the SHA-256 of the exact body, the prompt's id (`null` without one), `iat` and a nonce, signed anew for each attempt (`adam_core::turn::sign_request`). A call it cannot sign is not sent: `InvalidRequest` (no run, no target, an unreadable prompt id), `Transient` (keys unreachable), `Auth` (keys refuse). It forwards `rejected` and `parks`. `request_target(url)` is the path and query an HTTP client sends. Depends on `adam-core` for the keys |
 | `Refusal`, `ProblemType`, `Park`, `FIRST_PARK`, `MAX_PARK`, `MODEL_LOCKED_SLUG` | what a client asks `parks` about: `Refusal { status, problem, retry_after }` (no body, no header; `#[non_exhaustive]`, built with `Refusal::new(status)`, `.with_slug(..)`, `.with_problem(..)`, `.with_retry_after(..)`, read with `.slug()`), whose `problem` is `ProblemType::Absent` (no problem document, no `type`, `about:blank`), `Slug(word)` or `Unreadable` (a `type` that is there and is no word); the answer, `Park::No`, `OnTimer(Duration)` or `UntilWoken` (closed on purpose); `FIRST_PARK` is 30 s, the first step of the agent's backoff, and `MAX_PARK` 24 h, the longest timer whatever `Retry-After` says; `MODEL_LOCKED_SLUG` is `model_locked` and `OVER_LIMIT_SLUG` is `over_limit`, the slug a `402` reads as (see *Refusals*) |
 | `RenewingCredentials` | a test double: `token-1`, `token-2`, ... moved on by each rejection, which it asks to retry; `issued()`, `rejections()` |
-| `MockModel`, `RecordedCall` | scripted `ModelClient` that records requests; always compiled, no feature flag; `.with_provider(label)` and `.with_context_window(alias, n)` say what a real client would |
+| `MockModel`, `RecordedCall` | scripted `ModelClient` that records requests; always compiled, no feature flag; `.with_provider(label)`, `.with_context_window(alias, n)` and `.with_profiles(ModelProfiles)` say what a real client would; its window is resolved as the real client's, the profile's first |
 
 ```rust
 use adam_model::{Message, MockModel, ModelClient, ModelRequest};
@@ -113,7 +113,8 @@ total (AG-UI's rule for a producer); applying it twice changes nothing. `total_t
 usage recorded before the parts existed reads the same. **Breaking:** `Usage` is `#[non_exhaustive]`
 with three new fields, so code outside this crate builds it with `Usage::new(input, output)` and the
 `with_*` methods instead of a struct literal. `ModelClient`'s two new methods have defaults: no
-implementation has to change.
+implementation has to change. The default `context_window` now answers the profile's `contextWindow`
+(ADR 0086): a client that overrides `profile` and not `context_window` says its profiles' windows.
 
 The persisted JSON shapes of `Message` are shown in the crate docs
 (`src/lib.rs`) and are meant to stay stable.
@@ -135,17 +136,19 @@ A message names an image by reference and never holds its bytes (ADR 0044).
 ## Per-model profiles
 
 `MODEL_ALIASES_FILE` (ADR 0063, ADR 0064) declares, for each model a deployment can call, whether it takes a
-reasoning setting, which levels it accepts, how they are sent, its output cap and the members merged into its
-requests only. The types live here; the file is read by the binary (`adam-service`'s `ModelConfig`), and nothing
+reasoning setting, which levels it accepts, how they are sent, its output cap, its context window
+([ADR 0086](../../docs/decisions/0086-the-context-window-follows-the-model-and-the-history-budget-is-200k.md))
+and the members merged into its requests only. The types live here; the file is read by the binary (`adam-service`'s `ModelConfig`), and nothing
 in this crate touches the file system.
 
 | Item | What |
 |---|---|
 | `ReasoningEffort` | `None`, `Minimal`, `Low`, `Medium`, `High`, `XHigh`, `Max`, spelled `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`. Closed on purpose, `ALL` lowest first, exhaustive `as_str`/`FromStr`, serde lower case, `Ord` in that order. `none` is a real level (some models reason unless it is sent); **absent** sends nothing |
 | `ReasoningWire` | `ReasoningEffort` (`{"reasoning_effort": ...}`, the only one verified on the deployment's gateway), `ReasoningObject` (`{"reasoning": {"effort": ...}}`), `ThinkingBudget` (`{"thinking": {"type": "enabled", "budget_tokens": n}}`); serde snake case |
-| `ModelProfile` | serde camelCase, `Default`, unknown members ignored: `reasoning_efforts`, `reasoning_wire`, `reasoning_budgets`, `reasoning_effort`, `max_output_tokens`, `max_output_tokens_limit`, `extra_body`, `preset`, `fallback` (the model a run continues on, once, when this one is locked: another profile of the document), `endpoint` (the deployment's own **endpoint label** for the model: a label only, never a provider, a host, a URL or a key; what a `model-pick/v1` choice carries beside its alias, ANR-623, read by `endpoint_of`). A profile with only a cap or only an extra body is valid. **Breaking:** `ModelProfile::fallback`, `Preset::fallback` and `ModelProfile::endpoint` are new public fields of structs that are not `#[non_exhaustive]`: a literal needs them (or `..Default::default()`) |
+| `ModelProfile` | serde camelCase, `Default`, unknown members ignored: `reasoning_efforts`, `reasoning_wire`, `reasoning_budgets`, `reasoning_effort`, `max_output_tokens`, `max_output_tokens_limit`, `context_window` (`contextWindow`, the model's window in tokens, 1 to `MAX_CONTEXT_WINDOW`; profile only, no preset sets it), `extra_body`, `preset`, `fallback` (the model a run continues on, once, when this one is locked: another profile of the document), `endpoint` (the deployment's own **endpoint label** for the model: a label only, never a provider, a host, a URL or a key; what a `model-pick/v1` choice carries beside its alias, ANR-623, read by `endpoint_of`). A profile with only a cap or only an extra body is valid. **Breaking:** `ModelProfile::fallback`, `Preset::fallback`, `ModelProfile::endpoint` and `ModelProfile::context_window` are new public fields of structs that are not `#[non_exhaustive]`: a literal needs them (or `..Default::default()`) |
 | `Preset`, `ModelProfiles` | a named bundle (`reasoning_effort`, `max_output_tokens`) and the document (`profiles` by model id, `presets` by name). `profile(id)`, `preset(name)`, `preset_of(id)`, `endpoint_of(id)` |
 | `ModelProfiles::parse_json(text)` | parse and validate, **JSON only for now** (the workspace has no YAML parser). `Err(Vec<String>)` lists every problem, each naming the profile (or preset) and the key, but not the file: the caller adds the path. A file with any problem is refused whole |
+| `MAX_CONTEXT_WINDOW`, `resolve_context_window(profile, configured)` | 2^53 − 1, the largest window (a profile's and `MODEL_CONTEXT_WINDOW`'s); and **the one rule** of a model's window (ADR 0086): the profile's `contextWindow`, else the window configured for that alias outside the profiles, else `None`. `ModelClient::context_window`'s default, `MockModel` and `OpenAiCompatible` answer through it, so the history budget, the output cap and each `usage/v1` report read the same window for an alias, a subagent's included |
 | `DEFAULT_MAX_OUTPUT_TOKENS` | 128,000: the cap a call asks for when its folder, its preset and its model's profile set none (ADR 0064). The assembly resolves it per model and clamps it to the model's limit and window; the loop's `Limits` default is the same value |
 
 The rules, all of them refusals at load: a level outside the vocabulary; an unknown wire; a duplicate level (the
@@ -154,7 +157,7 @@ list is sorted lowest first); a budget for an undeclared level, a declared level
 reason" would send `thinking: {type: enabled, ...}`: leave `none` out or use another wire); an effort outside the
 model's levels (a profile's own, or a preset's); an unknown preset; efforts without a
 wire, a wire with no efforts, or budgets without `thinking_budget`; a cap of `0`, or above
-`maxOutputTokensLimit` (a preset's too); a `fallback` that names itself or a model with no profile; an `extra_body` member the runtime owns (`RESERVED_EXTRA_BODY_KEYS`:
+`maxOutputTokensLimit` (a preset's too); a `contextWindow` of `0` or above 2^53 − 1; a `fallback` that names itself or a model with no profile; an `extra_body` member the runtime owns (`RESERVED_EXTRA_BODY_KEYS`:
 `model`, `messages`, `tools`, `tool_choice`, `stream`, `reasoning_effort`, `max_tokens`,
 `max_completion_tokens`). `reasoningEfforts: []` says the model takes no reasoning setting.
 `endpoint` is the one member that never refuses the document: a blank, non-string or over-long label
@@ -230,7 +233,10 @@ tests in `src/error.rs` (`class_table`,
 `a_source_is_kept_and_printed_once`), `src/credentials.rs` (a fixed key and an empty one, giving up, `Debug` without values, a header replaced by name, the double's renewal; the injector's one header on both attempts, its refusal of a call with no run, and its giving up; `the_injector_parks_by_the_table` (with the clamp to `MAX_PARK`), `an_unreadable_problem_type_parks_nothing`, `the_other_providers_never_park`, and `the_injector_sends_the_prompt_statement_and_the_envelope_when_the_run_has_them`), `src/prompt.rs` (a compact JWS kept as it came, every malformed value refused without its content, the 8 KiB bound, `Debug` without values, the serde round trip), `src/signed.rs` (the request target; a cloud call signed over its run, body and statement's `jti`, anew each time; a device call that names its run and binds the envelope's `nonce`; no prompt signed `null`; no run and an unreadable prompt id refused; keys that cannot sign send nothing, with their class), `src/error.rs` also `a_refusal_is_classed_by_its_status`, `a_refusals_retry_after_is_said_for_a_rate_limit_only` and `a_refusal_shows_its_status_and_slug_only`, `src/mock.rs` and `src/types.rs` (the usage accounting:
 `a_part_above_its_total_is_added_in_and_one_within_it_is_left`, `usages_add_part_by_part_and_saturate`), and
 `src/profiles.rs` (the seven levels and the three wires, the ADR 0064 example, and every refusal: an unknown level or
-wire, a duplicate, the budgets, the caps, the preset references, the reserved extra-body members). No external
+wire, a duplicate, the budgets, the caps, the preset references, the reserved extra-body members;
+`a_context_window_is_one_to_two_to_the_53_minus_one_tokens` and
+`the_profiles_window_wins_over_the_configured_one`), `src/client.rs`'s `the_default_window_is_the_profiles`
+and `src/mock.rs`'s `a_profiles_window_wins_over_the_told_one`. No external
 service, no environment variables. [`adam-model-openai`](../adam-model-openai/README.md)
 tests a real implementation against a mock HTTP server.
 

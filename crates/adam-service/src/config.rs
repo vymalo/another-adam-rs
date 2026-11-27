@@ -48,7 +48,7 @@
 //! | `MODEL_ALIASES_FILE` | the per-model profiles (ADR 0063, ADR 0064): **JSON only for now**, one object with `profiles` and `presets`; a file that cannot be read or does not parse is a startup error naming the file and the key ([`ModelConfig::profiles`]) | unset (no profile) |
 //! | `MODEL_EXTRA_BODY` | a JSON object merged into every chat-completions request, to make a gateway or a model emit its reasoning (`{"reasoning_effort":"medium"}`); **not secret**; an invalid value is a startup error ([`ModelConfig::extra_body`]) | unset (nothing added) |
 //! | `MODEL_ECHO_REASONING` | send the reasoning of earlier turns back, under this member name (`reasoning_content` or `reasoning`), for a provider that requires it (DeepSeek's thinking mode with tools); `false` or unset sends none ([`ModelConfig::echo_reasoning`]) | unset (never sent) |
-//! | `MODEL_CONTEXT_WINDOW` | the context window of the model `MODEL` names, in tokens (1 to 9007199254740991): what each `usage/v1` call report of a call on that alias says as `contextWindow`; an invalid value is a startup error ([`ModelConfig::context_window`]) | unset (no `contextWindow`) |
+//! | `MODEL_CONTEXT_WINDOW` | the context window of the model `MODEL` names, in tokens (1 to 9007199254740991), used only when that model's profile names no `contextWindow` (ADR 0086): the window its history budget, its output cap and each `usage/v1` call report on that alias take; an invalid value is a startup error ([`ModelConfig::context_window`]) | unset (the profile's, else none) |
 //! | `MODEL_PROMPT_CACHE_KEY` | `off` or `conversation`: with `conversation` each request carries a `prompt_cache_key` that is the same for every request of one conversation (a SHA-256 of its id cut to 32 hex digits), so that a gateway with a prompt cache routes them together; anything else is a startup error ([`ModelConfig::prompt_cache_key`]) | `off` |
 //! | `MODEL_INPUT_MODALITIES` | `text` or `text,image`: what the model `MODEL` names can read. With `image`, an image the person sends or a tool returns reaches the model, within the four limits below; without it a request carries a line of text in the image's place. Never guessed from a model name ([`ModelConfig::images`]) | `text` |
 //! | `MODEL_IMAGE_MAX_BYTES` | the most bytes of one image sent to the model (1 to 4194304); needs `image` in `MODEL_INPUT_MODALITIES` | `1048576` |
@@ -1142,8 +1142,8 @@ pub struct ModelConfig {
     pub echo_reasoning: Option<ReasoningField>,
     /// `MODEL_CONTEXT_WINDOW`: the context window, in tokens, of the model [`alias`](Self::alias)
     /// names. The client says it for that alias only ([`OpenAiCompatible::with_context_window`]),
-    /// so a call report says how full the context is; an agent whose files name another alias
-    /// reports none. `None` when unset.
+    /// and only when the alias's profile names no `contextWindow`, which wins (ADR 0086): an agent
+    /// whose files name another alias has its own profile's window, or none. `None` when unset.
     pub context_window: Option<u64>,
     /// `MODEL_PROMPT_CACHE_KEY`: whether the client sends the conversation's `prompt_cache_key`.
     pub prompt_cache_key: PromptCacheKey,
@@ -1266,11 +1266,13 @@ impl ModelConfig {
         let model_aliases_file = parse_file(&get, "MODEL_ALIASES_FILE", problems);
         let profiles = parse_profiles(model_aliases_file.as_deref(), problems);
         let context_window = parse_context_window(&get("MODEL_CONTEXT_WINDOW"), problems);
+        // The window the client will answer for `MODEL` (ADR 0086): the profile's, else the variable's.
+        let window = adam_model::resolve_context_window(profiles.profile(&alias), context_window);
         if warns_no_output_limit(model_aliases_file.as_deref(), &profiles, &alias) {
             tracing::warn!(
                 model = %alias,
                 fallback = DEFAULT_MAX_OUTPUT_TOKENS,
-                window = context_window,
+                window,
                 "MODEL_ALIASES_FILE gives no maxOutputTokensLimit for this alias: its output cap \
                  is the 128,000 fallback, clamped to the context window when one is known \
                  (ADR 0064)"
@@ -1279,7 +1281,7 @@ impl ModelConfig {
             tracing::info!(
                 model = %alias,
                 fallback = DEFAULT_MAX_OUTPUT_TOKENS,
-                window = context_window,
+                window,
                 "no MODEL_ALIASES_FILE: every model's output cap is the 128,000 fallback, \
                  clamped to the context window when one is known (ADR 0064)"
             );
@@ -1690,8 +1692,8 @@ fn parse_extra_body(
 }
 
 /// The largest `MODEL_CONTEXT_WINDOW`: the largest count a `usage/v1` report may carry (2^53 - 1,
-/// the largest integer a JSON number keeps exactly).
-pub const MAX_CONTEXT_WINDOW: u64 = 9_007_199_254_740_991;
+/// the largest integer a JSON number keeps exactly), the same bound as a profile's `contextWindow`.
+pub use adam_model::MAX_CONTEXT_WINDOW;
 
 /// `MODEL_CONTEXT_WINDOW`: a whole number of tokens from 1 to [`MAX_CONTEXT_WINDOW`], or a problem.
 fn parse_context_window(raw: &Option<String>, problems: &mut Vec<String>) -> Option<u64> {
@@ -3183,6 +3185,55 @@ mod tests {
             assert!(mentions(&problems, "MODEL_CONTEXT_WINDOW"), "{problems:?}");
             assert_eq!(model.context_window, None, "{bad}");
         }
+    }
+
+    /// ADR 0086 decision 1: a profile's `contextWindow` is its alias's window, over
+    /// `MODEL_CONTEXT_WINDOW`, and an alias `MODEL` does not name (a subagent's) has its own.
+    #[test]
+    fn a_profiles_context_window_wins_over_model_context_window() {
+        use adam_model::ModelClient as _;
+        let dir = std::env::temp_dir().join(format!("adam-service-windows-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("model-profiles.json");
+        let shown: &'static str = Box::leak(file.display().to_string().into_boxed_str());
+        let client_with = |profiles: &str| {
+            std::fs::write(&file, profiles).unwrap();
+            let mut vars = model_vars();
+            vars.insert("MODEL_ALIASES_FILE", shown);
+            vars.insert("MODEL_CONTEXT_WINDOW", "131072");
+            let (model, problems) = model_problems(&vars);
+            assert!(problems.is_empty(), "{problems:?}");
+            model.client().expect("a usable client")
+        };
+
+        let client = client_with(
+            r#"{"profiles": {"large": {"contextWindow": 400000}, "small": {"contextWindow": 64000}}}"#,
+        );
+        assert_eq!(
+            client.context_window("large"),
+            Some(400_000),
+            "the profile wins"
+        );
+        assert_eq!(
+            client.context_window("small"),
+            Some(64_000),
+            "another alias"
+        );
+        assert_eq!(client.context_window("other"), None, "nobody said");
+
+        // A profile without a window leaves `MODEL_CONTEXT_WINDOW` for its alias.
+        let client = client_with(r#"{"profiles": {"large": {}}}"#);
+        assert_eq!(client.context_window("large"), Some(131_072));
+
+        // A window the loader refuses names the file, the profile and the key.
+        std::fs::write(&file, r#"{"profiles": {"large": {"contextWindow": 0}}}"#).unwrap();
+        let mut vars = model_vars();
+        vars.insert("MODEL_ALIASES_FILE", shown);
+        let (_, problems) = model_problems(&vars);
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(problems[0].contains(shown), "{problems:?}");
+        assert!(problems[0].contains("contextWindow"), "{problems:?}");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

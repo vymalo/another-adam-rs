@@ -87,7 +87,9 @@
 //! * **[`with_profiles`](OpenAiCompatible::with_profiles)** gives the client the deployment's
 //!   per-model profiles (`MODEL_ALIASES_FILE`, ADR 0063 and ADR 0064): a request's
 //!   `reasoning_effort` goes out through the profile's `reasoningWire`, after the extra body, which
-//!   it wins over where the two would duplicate a member.
+//!   it wins over where the two would duplicate a member; a profile's `contextWindow` is the
+//!   window [`ModelClient::context_window`] answers for its alias, over
+//!   [`with_context_window`](OpenAiCompatible::with_context_window) (ADR 0086).
 
 #![warn(missing_docs)]
 
@@ -417,8 +419,10 @@ impl OpenAiCompatible {
 
     /// Say that the model the alias `model` names has a context window of `window` tokens, as the
     /// deployment knows it (`MODEL_CONTEXT_WINDOW`): what [`ModelClient::context_window`] answers
-    /// for that alias, and nothing for any other. The client sends nothing of it; a report of a
-    /// call says it, so a screen can show how full the context is.
+    /// for that alias when its profile ([`with_profiles`](Self::with_profiles)) names no
+    /// `contextWindow`, and nothing for any other (ADR 0086). The client sends nothing of it; the
+    /// history budget and the output cap are taken from it, and a report of a call says it, so a
+    /// screen can show how full the context is.
     #[must_use]
     pub fn with_context_window(mut self, model: impl Into<String>, window: u64) -> Self {
         self.context_windows.insert(model.into(), window);
@@ -975,8 +979,14 @@ impl ModelClient for OpenAiCompatible {
         Some(PROVIDER)
     }
 
+    /// The profile's `contextWindow` for `model`, else the window
+    /// [`with_context_window`](OpenAiCompatible::with_context_window) gave that alias
+    /// ([`adam_model::resolve_context_window`], ADR 0086).
     fn context_window(&self, model: &str) -> Option<u64> {
-        self.context_windows.get(model).copied()
+        adam_model::resolve_context_window(
+            self.profiles.profile(model),
+            self.context_windows.get(model).copied(),
+        )
     }
 
     fn input_modalities(&self, model: &str) -> InputModalities {
@@ -1083,6 +1093,32 @@ mod tests {
         let shared: adam_model::DynModel = std::sync::Arc::new(client);
         assert_eq!(shared.provider(), Some("openai"));
         assert_eq!(shared.context_window("glm-5.3"), Some(131_072));
+    }
+
+    /// ADR 0086 decision 1: the profile's window for an alias wins, then the window the deployment
+    /// gave that alias (`MODEL_CONTEXT_WINDOW`), then none; another alias with a profile has its
+    /// own window, which `MODEL_CONTEXT_WINDOW` never gave.
+    #[test]
+    fn a_profiles_window_wins_over_the_configured_one_alias_by_alias() {
+        let profiles = ModelProfiles::parse_json(
+            r#"{"profiles":{"main":{"contextWindow":400000},"sub":{"contextWindow":64000},"bare":{}}}"#,
+        )
+        .unwrap();
+        let client = OpenAiCompatible::new(config("https://x.example/v1"))
+            .unwrap()
+            .with_context_window("main", 131_072)
+            .with_context_window("bare", 32_768)
+            .with_profiles(profiles);
+        assert_eq!(client.context_window("main"), Some(400_000), "the profile");
+        assert_eq!(client.context_window("sub"), Some(64_000), "another alias");
+        assert_eq!(
+            client.context_window("bare"),
+            Some(32_768),
+            "the configured"
+        );
+        assert_eq!(client.context_window("unknown"), None, "nobody said");
+        let shared: adam_model::DynModel = std::sync::Arc::new(client);
+        assert_eq!(shared.context_window("sub"), Some(64_000));
     }
 
     #[test]
