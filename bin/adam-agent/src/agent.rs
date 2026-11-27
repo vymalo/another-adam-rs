@@ -283,7 +283,7 @@ pub async fn agents(
         .limits
         .as_ref()
         .and_then(|limits| limits.max_inline_upload_bytes);
-    let (agents, commands, card, choices, efforts) = match workers {
+    let (agents, commands, card, choices, efforts, session_bounds) = match workers {
         Some(parts) => {
             let profiles = parts.profiles;
             let assembly = assemble_parked(
@@ -327,6 +327,9 @@ pub async fn agents(
                 // The card says the levels the backend reads; a card that already lists
                 // `reasoning/v1` keeps its own entry.
                 .map(|card| adam_service::card_with_reasoning(card, &efforts, &name));
+            // What a person's `start.config` is held to: the bounds the session tools use, so the
+            // two cannot disagree (ADR 0054 decision 2).
+            let session_bounds = assembly.session_bounds().to_vec();
             let root = name.clone();
             let scheduler = adam_schedule::SchedulerAgent::new(&name);
             (
@@ -346,11 +349,16 @@ pub async fn agents(
                 card,
                 choices,
                 Some(efforts),
+                session_bounds,
             )
         }
         None => {
             let starter = LlmStarter::new(&name);
             let helpers = def.clone();
+            // The bounds of a person's `start.config` on each helper, from the folder and the
+            // deployment's settings alone (`AgentDef::session_bounds`, given `session_limits` and
+            // `session_max_parallel`): the very function a worker's assembly calls.
+            let bounds = def.session_bounds();
             // A control plane connects no MCP server, so it cannot expand a prompt: a message that
             // names the prompt of one of the folder's servers is refused, not sent to the model as
             // plain text.
@@ -368,6 +376,7 @@ pub async fn agents(
                 // card lists neither.
                 None,
                 None,
+                bounds,
             )
         }
     };
@@ -394,7 +403,7 @@ pub async fn agents(
         None => agents,
     };
     Ok(match sessions {
-        Some(sessions) => agents.child_sessions(sessions),
+        Some(sessions) => agents.child_sessions(sessions.with_bounds(session_bounds)),
         None => agents,
     })
 }

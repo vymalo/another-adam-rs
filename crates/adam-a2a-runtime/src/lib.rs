@@ -52,6 +52,7 @@ mod steps;
 mod subscribe;
 mod text_stream;
 mod tier;
+mod uploads;
 mod usage;
 mod vymalo;
 mod words;
@@ -81,6 +82,7 @@ pub use prompt_statement::PAYLOAD_PROMPT_STATEMENT;
 pub use push::StorePushStore;
 pub use reasoning::CONTEXT_REASONING_EFFORT;
 pub use tier::CONTEXT_ACCESS_TIER;
+pub use uploads::CONTEXT_UPLOADS;
 pub use usage::MAX_TOKEN_COUNT;
 pub use vymalo::{
     ASK_SURFACE_PREFIX, CONTEXT_A2UI_RENDERER, CONTEXT_LOCALE, CONTEXT_MENTIONS,

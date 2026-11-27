@@ -15,8 +15,8 @@ use adam_a2a::{
 };
 use adam_a2a_runtime::{
     CONTEXT_A2UI_RENDERER, CONTEXT_CALLER, CONTEXT_LOCALE, CONTEXT_MENTIONS, CONTEXT_THREAD_TOOLS,
-    CONTEXT_UI_CATALOG, CONTEXT_UI_REF, RuntimeTaskBackend, UNREADABLE_CALLER, asked_by_an_agent,
-    vymalo_inbound,
+    CONTEXT_UI_CATALOG, CONTEXT_UI_REF, CONTEXT_UPLOADS, RuntimeTaskBackend, UNREADABLE_CALLER,
+    asked_by_an_agent, vymalo_inbound,
 };
 use adam_core::{DynStore, MemoryStore, RunId};
 use adam_llm_agent::{Conversation, LlmAgent, Tool, ToolCtx, ToolError, ToolOutput};
@@ -623,6 +623,52 @@ async fn the_interface_language_of_an_activated_message_is_the_runs_context_and_
         .unwrap();
     assert!(!rig.state(&four).await.context.contains_key(CONTEXT_LOCALE));
     wait_task(&rig, &four.id, TaskState::Completed).await;
+    stop.send(()).unwrap();
+    handle.await.unwrap();
+}
+
+/// A message whose request activated `uploads/v1` leaves the activation, with its limits, in the run's
+/// context; the next one that did not takes it away (a run never uploads on an earlier message's
+/// offer). No credential is in it.
+#[tokio::test]
+async fn an_activated_uploads_message_is_the_runs_context_and_a_later_plain_one_clears_it() {
+    let rig = Rig::new();
+    for _ in 0..2 {
+        rig.model.push_text("ok");
+    }
+    let (stop, handle) = rig.worker();
+    let uploads = adam_a2a::UPLOADS_EXTENSION;
+    let one = rig
+        .backend
+        .submit(
+            alice().with_extensions([uploads]),
+            with_metadata(
+                Message::new(Role::User, vec![Part::text("send the report")]),
+                json!({uploads: {"maxBytes": 1_073_741_824u64, "ttlSecs": 300}}),
+            ),
+            None,
+            Some("ctx-u".into()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        rig.state(&one).await.context[CONTEXT_UPLOADS],
+        json!({"maxBytes": 1_073_741_824u64, "ttlSecs": 300})
+    );
+    wait_task(&rig, &one.id, TaskState::Completed).await;
+
+    let mut next = Message::new(Role::User, vec![Part::text("and now?")]);
+    next.reference_task_ids = Some(vec![one.id.clone()]);
+    let two = rig
+        .backend
+        .submit(alice(), next, None, Some("ctx-u".into()))
+        .await
+        .unwrap();
+    assert!(
+        !rig.state(&two).await.context.contains_key(CONTEXT_UPLOADS),
+        "a message that did not activate the extension takes the offer away"
+    );
+    wait_task(&rig, &two.id, TaskState::Completed).await;
     stop.send(()).unwrap();
     handle.await.unwrap();
 }

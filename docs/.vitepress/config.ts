@@ -34,7 +34,7 @@ const sidebar = [
     collapsed: true,
     items: [
       { text: "Use", items: pages("guides", [], ["write-an-agent.md"]) },
-      { text: "Deploy", items: pages("guides", [], ["deploy-the-coder.md"]) },
+      { text: "Deploy", items: pages("guides", [], ["deploy-the-coder.md", "releases.md"]) },
       {
         text: "Operate",
         items: pages("guides", [], [
@@ -51,7 +51,7 @@ const sidebar = [
     text: "Reference",
     collapsed: true,
     items: [
-      { text: "A2A server (OpenAPI)", link: "/api/a2a-server" },
+      ...pages("api"),
       // rustdoc of the library crates, built by the docs-site workflow into /rust/ (not a VitePress page);
       // target "_self" makes it a full page load, since the client router skips links with a target.
       { text: "Rust API", link: "/rust/adam/index.html", target: "_self" },
@@ -88,6 +88,9 @@ const sidebar = [
 
 // Prose writes <agent> or <ThreadShare> meaning a placeholder; Vue would read it as a component and fail the build.
 // Only real HTML elements pass through, everything else is shown as the text it is.
+// The API page (api/a2a-server.md) also uses `script` and the components of vitepress-openapi: allowed there, nowhere else.
+const API_ONLY = ["script", "oaspec", "oaoperation"];
+const isApiPage = (relativePath = "") => /^api\/[\w-]+\.md$/.test(relativePath);
 const HTML = new Set(
   "a abbr blockquote br code details dd div dl dt em figcaption figure h1 h2 h3 h4 h5 h6 hr i img kbd li ol p picture pre small source span strong sub summary sup table tbody td tfoot th thead tr u ul video".split(" "),
 );
@@ -98,10 +101,11 @@ export function escapeUnknownTags(md: any) {
   for (const rule of ["html_inline", "html_block"]) {
     const original = md.renderer.rules[rule];
     md.renderer.rules[rule] = (tokens: any, i: number, ...rest: any[]) => {
+      const env = rest[1] as { relativePath?: string } | undefined;
       const content: string = tokens[i].content;
       const tags = [...content.matchAll(/<\/?([A-Za-z][\w-]*)/g)].map((m) => m[1].toLowerCase());
       const wellFormed = /^\s*(<\/?[A-Za-z][\w-]*(\s+[\w:-]+(="[^"]*")?)*\s*\/?>\s*)+$/.test(content) || tokens[i].type === "html_block";
-      if (wellFormed && tags.every((t) => HTML.has(t))) return original(tokens, i, ...rest);
+      if (wellFormed && tags.every((t) => HTML.has(t) || (API_ONLY.includes(t) && isApiPage(env?.relativePath)))) return original(tokens, i, ...rest);
       return md.utils.escapeHtml(content).replace(/\{\{/g, "&#123;&#123;");
     };
   }

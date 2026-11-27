@@ -1,15 +1,23 @@
 ---
 name: adam-upgrade
-description: "Move a repository that consumes adam-rs from revision A to revision B: find the breaking changes between them (trait methods, env vars, paths, decisions), migrate the code, and pin the coder image by tag and digest. Use for 'bump adam-rs', 'update the adam pin', 'sha-xxxxxxx of the coder image', or when a build broke after changing an adam git rev."
+description: "Move a repository that consumes adam-rs from revision A to revision B: find the breaking changes between them (trait methods, env vars, paths, decisions), migrate the code, and pin the coder image by tag and digest (a release X.Y.Z@sha256 in production, or a sha-<7>). Use for 'bump adam-rs', 'update the adam pin', 'move to release X.Y.Z', 'sha-xxxxxxx of the coder image', or when a build broke after changing an adam git rev."
 ---
 
 # Upgrade a consumer of adam-rs
 
-A consumer pins adam-rs in up to three places, which must move together: git dependencies on the
-adam crates (`rev = "<40-hex sha>"`), the coder image (`ghcr.io/vymalo/another-adam-rs/coder`,
-tag `sha-<7>` plus digest) and any files copied from the repository (agent folders, WireMock
-mappings, scripts). adam-rs has no changelog and no semver releases: the history and the docs are
-the changelog.
+A consumer pins adam-rs in up to four places, which must move together: git dependencies on the
+adam crates (`rev = "<40-hex sha>"`), the coder image (`ghcr.io/vymalo/another-adam-rs/coder`, a
+tag plus its digest), the chart if it installs one, and any files copied from the repository (agent
+folders, WireMock mappings, scripts).
+
+adam-rs has **releases** (ADR 0084): a tag `vX.Y.Z` cut by release-please, one version for every
+crate, the image and the chart, with `CHANGELOG.md`. A release publishes the image
+`ghcr.io/vymalo/another-adam-rs/coder:X.Y.Z` (and `:X.Y`, the newest patch of the minor; never
+`latest`) and the chart `oci://ghcr.io/vymalo/another-adam-rs/charts/coder` at version `X.Y.Z`
+(its `image.tag` is `X.Y.Z`), both signed with cosign keyless. **Production pins a release:
+`X.Y.Z@sha256:<digest>`.** Every commit of `main` also has a development image `sha-<7>`;
+between two commits the history and the docs are the changelog. Before 1.0 a breaking change moves
+the minor (`0.6.x` to `0.7.0`), so read every minor you cross.
 
 Every adam-rs path below is in `vymalo/another-adam-rs` at the revision you pin (replace `main`
 by that revision). Entry point for people:
@@ -25,10 +33,12 @@ https://github.com/vymalo/another-adam-rs/blob/main/.agents/docs/README.md (ADR 
 
 ## Procedure
 
-1. **Name A and B.** A is the sha you pin now (the `rev` of every adam crate; the image tag's
-   `sha-<7>` is the first seven characters of a commit). B is the commit you want: the image of a
-   commit exists only if CI pushed it, so choose B from the commits on `main` whose image
-   exists (step 7). Clone adam-rs next to your repository to read it
+1. **Name A and B.** A is what you pin now (the `rev` of every adam crate; the image tag is
+   `X.Y.Z` for a release or `sha-<7>`, the first seven characters of a commit). B is a release
+   `vX.Y.Z` (production) or a commit whose image exists: the image of a commit exists only if CI
+   pushed it, so choose B from the commits on `main` whose image exists (step 7). The `rev` of a
+   release is the full sha of its tag's commit (`git rev-parse vX.Y.Z^{commit}`), never the tag
+   name. Clone adam-rs next to your repository to read it
    (`git clone https://github.com/vymalo/another-adam-rs`).
 2. **List what changed**, from the adam-rs clone:
 
@@ -39,9 +49,11 @@ https://github.com/vymalo/another-adam-rs/blob/main/.agents/docs/README.md (ADR 
      crates/adam-a2a/src/backend.rs crates/adam-host/src/lib.rs
    ```
 
-   Commits whose subject has `!` (for example `feat(runtime)!:`) say they break;
+   Between two releases read `CHANGELOG.md` first (`git diff vA..vB -- CHANGELOG.md`), then the same
+   log with `vA..vB`. Commits whose subject has `!` (for example `feat(runtime)!:`) say they break;
    `git log --format='%h %s' A..B | grep '!:'` lists them. Commits that only say
-   `chore(deploy): bump coder to sha-<7>` are image bumps: they are not changes.
+   `chore(deploy): bump coder to sha-<7>` are image bumps, and `chore: release main` is a release
+   moving the versions: neither is a change.
 3. **Read the docs that changed**: a crate's README is updated in the same change as its public
    API, environment variables or tests, so `git diff A..B -- crates/<crate>/README.md` for each
    crate you use is the migration note. The configuration tables (`bin/adam-agent/README.md`
@@ -94,6 +106,7 @@ https://github.com/vymalo/another-adam-rs/blob/main/.agents/docs/README.md (ADR 
 | [ADR 0065](https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0065-resource-governance-admission-pools-and-os-limits.md) slice 3 (2026-11-24, Linux only) | the process pool and the OS limits of a command: a `Governor` (`adam_code_tools::governor`, an `Admission` seat of `Pool::Processes` plus a `Confine`) holds a seat per command (`run`, `run_command`, the checks; not background commands, language servers or git yet) and confines it with `adam-confine` (`Rlimits`; `SystemdScope` where a systemd user manager delegates memory, cpu and pids); `MAX_PROCESSES` (1 to 256, default 4), `MAX_GIT_PROCESSES` (1 to 64, default 2), `COMMAND_MEMORY_MAX` (bytes, at least 64 MiB) and `COMMAND_CPU_MAX` (millicores, at least 100) are **new exit-78 variables** (anything out of range refuses to start). **Breaking:** `adam_code_tools::ShellOutcome` gained `stopped` (the `Stopped` limit that ended the command, or `None`); `adam_agent_fs::Limits` gained `max_processes`, `command_memory` and `command_cpu`; `adam_service::WorkerSettings` gained `max_processes`, `max_git_processes`, `command_memory_max` and `command_cpu_max`; `adam_code_tools::RunError` gained `Busy` and `Confine` (a full pool is retryable, `RateLimited`, never a failed run). A folder's `limits:` gains `max_processes`, `command_memory` and `command_cpu`, which only lower the deployment's. No `Store` change | add the fields to literals; match `Busy` and `Confine` where you match `RunError`; read `ShellOutcome::stopped` where you report a command's end; set the four variables on a worker that must not take the machine (the defaults follow its size); an embedder builds a `Governor` with `adam-confine`'s `best_effort()` and `adam-admission-local`; on macOS and Windows only the pool applies, `describe()` names the rest |
 | [ADR 0065](https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0065-resource-governance-admission-pools-and-os-limits.md) slice 3, background commands, language servers and git (2026-11-24) | a process that outlives its call takes a seat of `Pool::Processes` and holds it until its group is gone: new `adam_code_tools::shell::{Hold, seat_of, spawn_seated}`; `start_command` and a language server use them, so `BACKGROUND_COMMANDS_MAX` and `LANGUAGE_SERVERS_MAX` count inside `MAX_PROCESSES`. Every git of a container takes a seat of `Pool::Git` after one call of the new `adam_workspace::govern_git(admission, wait)` (the coder's `serve` makes it; a library user that never calls it is unchanged). **Breaking:** `adam_coder::tools::lsp::server::Want` gained `governor: Option<Governor>` and `StartError` gained `Seat(Refused)`, so a literal `Want` stops compiling and a `match` over `StartError` needs the arm. The chart gained `config.maxProcesses`, `config.maxGitProcesses`, `config.commandMemoryMax` and `config.commandCpuMax`, each rendering nothing when unset | add `governor: None` (or the process's) to a `Want` literal and a `Seat` arm to a `match`; call `govern_git` once in a host that wants `MAX_GIT_PROCESSES` honoured; expect a busy pool to make a background command, a language server or a git wait up to a minute and then fail as retryable; size `MAX_PROCESSES` for the servers and background commands too (an idle language server keeps its seat) |
 | [ADR 0065](https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0065-resource-governance-admission-pools-and-os-limits.md) decision 8, device rules (2026-11-24) | `Engine::set_device_state` now lowers the engine's admission: new `adam_budget::{DeviceRules, Constraint, Throttled, LOW_BATTERY_PERCENT}`, `EngineBuilder::device_rules`, `Engine::set_device_rules` and `Engine::admission`; `adam-budget` now depends on `adam-device-state`. The engine wraps the admission it was given in `Throttled` (a host with no device sees no change). No breaking change, no `Store` change | none; a host that pushes a device and wants the old behaviour passes `DeviceRules::OFF` to `device_rules`; no new background command and no ask-first on a metered network are not enforced yet |
+| [ADR 0082](https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0082-the-sql-adapters-keep-their-rules-in-the-database.md) P0 (2026-11-27) | **PostgreSQL 18 is the floor**: `PgStore::migrate` refuses an older server with `StoreError::InvalidInput` (class `Invalid`, exit 78) before any lock or DDL; schema version 7 (no new table or function yet: the step the store's database functions arrive in; a later slice that adds one bumps the version again); `adam_postgres::AdamSqlState` (`AD001` to `AD004`) and `adam_store_postgres::MIN_SERVER_VERSION_NUM` are new public items; the coder chart's `Cluster` pins `database.imageName` at 18.7 by tag and digest (a render change) | upgrade every PostgreSQL the store uses to 18 or later **before** the release (a process of the earlier release runs on 18 too); with the chart, back the database up and read `deploy/coder/README.md` "PostgreSQL 18" (an existing `Cluster` on 17 takes an offline in-place major upgrade, only within one distribution); nothing to change in code, and a version 6 database becomes 7 at startup with no rewrite |
    A consumer that uses `DynStore` or `MemoryStore` and implements no `Store` is not affected by
    the `Store` rows. Add the commits you find in step 2 to your own list when you handle them.
 5. **Move every pin together**: all `rev =` lines of the adam crates to B (a mix gives two copies
@@ -113,8 +126,21 @@ https://github.com/vymalo/another-adam-rs/blob/main/.agents/docs/README.md (ADR 
      https://ghcr.io/v2/vymalo/another-adam-rs/coder/manifests/sha-<7> | grep -i '^docker-content-digest'
    ```
 
-   `200` and a `docker-content-digest` line mean the tag exists; pin it as
-   `ghcr.io/vymalo/another-adam-rs/coder:sha-<7>@sha256:<digest>`. Check it is B: read the
+   For a release, ask for `manifests/X.Y.Z` instead (or run `sh tools/release/registry-digest.sh
+   ghcr.io/vymalo/another-adam-rs/coder X.Y.Z` in the adam-rs clone). `200` and a
+   `docker-content-digest` line mean the tag exists; pin it as
+   `ghcr.io/vymalo/another-adam-rs/coder:X.Y.Z@sha256:<digest>` (or `:sha-<7>@sha256:<digest>`); with
+   the chart, `--set image.tag=X.Y.Z@sha256:<digest>` renders that pair. A release's digest is not its
+   commit's `sha-<7>` digest: the release builds the image again with provenance and an SBOM. Check
+   a release's signature:
+
+   ```sh
+   cosign verify ghcr.io/vymalo/another-adam-rs/coder:X.Y.Z \
+     --certificate-identity "https://github.com/vymalo/another-adam-rs/.github/workflows/release.yml@refs/tags/vX.Y.Z" \
+     --certificate-oidc-issuer https://token.actions.githubusercontent.com
+   ```
+
+   Check the image is B: read the
    manifest's `config.digest`, fetch that blob (`curl -sL` with the token, `.../blobs/<config digest>`)
    and compare `.config.Labels["org.opencontainers.image.revision"]` with B's full sha. If the
    manifest request answers an index (a `manifests` list), take the platform's manifest first.
@@ -134,7 +160,10 @@ https://github.com/vymalo/another-adam-rs/blob/main/.agents/docs/README.md (ADR 
 * Pinning an image tag whose commit CI did not push (a tag that does not exist, or a package that
   is private: the token request still answers, the manifest request does not return `200`).
 * Moving the crates and not the image (or the other way): the A2A behaviour of the two differs.
-* A tag alone is not a pin: a digest is.
+* A tag alone is not a pin: a digest is. A release tag `X.Y.Z` is never moved by the release
+  workflow, but `X.Y` is, and a registry tag can be moved by hand: pin the digest.
+* A `sha-<7>` in production: development images are unsigned and carry no provenance; production
+  pins a release.
 * Skipping a commit marked `!` because the build still compiles: runtime behaviour (leases,
   claims, A2A states) can change without a compile error; read the ADRs the log names.
 * Files copied from the repository drift: re-copy them from B and diff them against yours.

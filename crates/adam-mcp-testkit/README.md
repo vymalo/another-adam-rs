@@ -103,3 +103,4 @@ a timeout) stops counting in `in_flight()`.
 
 `tests/stdio.rs` (see [`adam-mcp`](../adam-mcp/README.md#tests)). The rest of the kit is exercised by the tests
 that use it: `ThreadToolsServer` by `adam-mcp`'s `tests/endpoint.rs` and `adam-ui`'s `tests/`.
+`set_structured_answer(name, body, is_error)` answers a tool with a fixed JSON body (as `structuredContent` and as text), the shape of the real `request_upload`; `adam-mcp`'s `tests/upload.rs` uses it.

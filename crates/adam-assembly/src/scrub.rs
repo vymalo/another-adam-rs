@@ -98,6 +98,10 @@ impl Tool for Scrubbed {
         self.inner.required_state()
     }
 
+    fn events(&self) -> Vec<adam_llm_agent::EventSpec> {
+        self.inner.events()
+    }
+
     fn asks_user(&self) -> bool {
         self.inner.asks_user()
     }
@@ -265,6 +269,38 @@ mod tests {
         async fn call(&self, _ctx: &ToolCtx, _args: Value) -> Result<ToolOutput, ToolError> {
             Ok(ToolOutput::text("x"))
         }
+    }
+
+    /// A tool that declares a custom event, which the scrub must forward (ADR 0050, slice H5).
+    struct Announces;
+
+    #[async_trait]
+    impl Tool for Announces {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "announces".into(),
+                description: String::new(),
+                parameters: json!({"type": "object"}),
+            }
+        }
+        fn events(&self) -> Vec<adam_llm_agent::EventSpec> {
+            vec![adam_llm_agent::EventSpec::new("demo.published").published()]
+        }
+        async fn call(&self, _ctx: &ToolCtx, _args: Value) -> Result<ToolOutput, ToolError> {
+            Ok(ToolOutput::text("x"))
+        }
+    }
+
+    #[test]
+    fn the_events_are_the_wrapped_tools() {
+        let plain =
+            |tool: Arc<dyn Tool>| Scrubbed::new(tool, Arc::new(|t: &str| t.to_owned()), None);
+        assert_eq!(
+            plain(Arc::new(Announces)).events(),
+            vec![adam_llm_agent::EventSpec::new("demo.published").published()],
+            "a wrapper that dropped the declaration would make every emit of the tool refused"
+        );
+        assert!(plain(Arc::new(Reader)).events().is_empty());
     }
 
     #[test]

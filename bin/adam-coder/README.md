@@ -767,8 +767,24 @@ artifact; the orchestration layer keeps the bytes in its artifact store and show
   `To show it in your answer, write ![description](<filename>).`, then how to use it by its SHA-256 (as the picture of an `ask_user` option, and in a `show` `Image` block) (`adam_runtime::Artifact::shared_line`, the line a `files: true` MCP server's image has too): the person's screen resolves an image's source
   against the files shared in the run, so the prompt says to use the file's name, never its path in the worktree; the bytes are in the artifact only, never in the
   history, the step's output or the run's final output (which lists the artifact's name, type and size).
+* **A file over the inline threshold goes by reference** (`uploads/v1`, the agent's side). The threshold is the folder's
+  `limits.max_inline_upload_bytes`, else `UPLOADS_INLINE_MAX_BYTES`, else 10 MiB (`adam_service::inline_upload_threshold`, the number
+  the card is served under; `ToolEnv::inline_upload_threshold`), and the inline form is never over 4 MiB whatever it says: with the
+  default, a file of 4 MiB or less is the `raw` artifact above and a larger one is uploaded. The tool asks the thread tools of
+  the run for a slot (`request_upload`, `adam_ui::Ui::upload` over `adam_mcp::Uploader`), `PUT`s the bytes to the bucket and returns an
+  artifact that names the `uploadId` and holds **no bytes** (`adam_runtime::Artifact::upload_ref`: a JSON artifact of media type
+  `application/vnd.adam.upload-ref+json`, which the A2A server serves as one `data` part `{}` with `filename`, `mediaType` and
+  `metadata["…/uploads/v1"].uploadId`). Neither the artifact, the journal, the step's output nor the run's final output holds a
+  byte of the file or the slot's URL. The model reads `Shared <filename> (<type>) by upload: …`. It needs a message of the
+  conversation that **activated** `uploads/v1` (the run's context, `vymalo.uploads`, `{maxBytes?, ttlSecs?}`) and a usable
+  thread-tools grant; a file larger than `maxBytes` is refused before a slot is asked, and a file larger than 256 MiB is
+  refused whatever it says (the bytes are held in memory while they go). **Without them, or when the slot or the `PUT` is
+  refused, the result is an error the model reads** (`too large to share inline and uploads are not available`, or the
+  orchestrator's code and text) and **nothing is put inline**. A text file has the values the redactor knows taken out
+  **before** it is hashed and sent, as an inline file does. Tests: `tests/share_upload.rs`.
 * **Bounded.** A run keeps at most 6 MiB of files in all (`MAX_RUN_FILE_BYTES`, enforced by the agent loop: a file that would
-  go over is not shared and the result, marked as an error, says so), because a file is journaled with the run.
+  go over is not shared and the result, marked as an error, says so), because a file is journaled with the run. A file sent by
+  reference is not journaled and costs none of it.
 * **Scrubbed.** The coder's tools are wrapped by its `Redactor`; a file that is valid UTF-8 has the values the redactor knows
   taken out of it, and a file that is not text is left as it is.
 * **Noted.** A file that was shared is written to the run's notes (`RunNotes::shared`, once however often it is shared): it is
@@ -895,7 +911,7 @@ The card also lists `child-sessions/v1` ([ADR 0045](../../docs/decisions/0045-a-
 slice 6 part c; [`a2a-server.md`](../../docs/reference/a2a-server.md#child-sessions-child-sessionsv1)): `explorer` and `reviewer` are offered
 to a person as sessions they open, talk to and close from their client, with `maxOpen` the effective `SESSION_MAX_OPEN` (16 by default;
 `limits.max_open_sessions` of the folder's root may lower it, never raise it). `serve` reads it from the files alone, with
-`config.service.sessions.limits`, so `all` and `control-plane` list and serve the same; the control plane registers the helpers' starters
+`config.service.sessions.limits`, so `all` and `control-plane` list and serve the same (and, with `config.service.sessions.max_parallel_tool_calls`, the same **bounds** for a person's `start.config`: the control plane gets them from `AgentDef::session_bounds`, a worker from its assembly, one function); the control plane registers the helpers' starters
 (`coder/explorer`, `coder/reviewer`) beside `CoderStarter` and a worker steps the rounds. `app.rs` (`Coder::new_with`, the control-plane
 constructors) is unchanged. The card entry is not in `tests/fixtures/agent/card.json`: that is `agent_card_for`'s card, which `serve` extends.
 
@@ -2159,6 +2175,7 @@ way; every problem is reported at once at startup):
 | `A2A_BEARER_TOKENS` | comma-separated accepted tokens (fail closed: none = no server) | required by `all` and `control-plane` |
 | `PUBLIC_URL` | where clients reach the JSON-RPC endpoint (agent card) | required by `all` and `control-plane` |
 | `LISTEN_ADDR` | bind address: the A2A server, or a worker's `/healthz` listener | `0.0.0.0:8080` |
+| `ACTIVITY_LISTEN_ADDR`, `ACTIVITY_BEARER_TOKENS` | `GET /internal/activity` alone on a listener of its own, behind tokens of its own (none an A2A token; the address without tokens is exit 78), and gone from `LISTEN_ADDR` ([ADR 0083](../../docs/decisions/0083-the-activity-route-has-a-listener-and-tokens-of-its-own.md), `adam-service`) | unset: the route stays on `LISTEN_ADDR` behind the A2A tokens (deprecated) |
 | `A2A_PUSH_ALLOWED_URLS` | turns A2A push notifications **on** and names the webhooks they may reach: comma-separated URL prefixes or hosts ([`adam-service`](../../crates/adam-service/README.md#environment)); a client's webhook that matches none, is not `https` or is a private address is refused | unset: off, the card says so |
 | `A2A_PUSH_ALLOW_PRIVATE` | also allow loopback, private and link-local webhooks and `http` to loopback: development only | `false` |
 | `A2A_PUSH_GIVE_UP_AFTER_SECS`, `A2A_PUSH_REQUEST_TIMEOUT_SECS` | how long a notification may keep failing before delivery to that webhook is abandoned (1 to 604800), and how long one request may take (1 to 120) | `3600`, `15` |
@@ -2585,7 +2602,7 @@ characters are not registered. The same redactor scrubs the input and the output
 SIGTERM stops accepting connections and lets in-flight steps finish and commit
 (see [Roles](#roles) for what stops in which order); a step cut short by a hard kill
 is taken over by the next start when its lease expires. Logs are JSON on stdout
-(`RUST_LOG` filters; unset, the filter is `info,rmcp=warn`: the MCP client library logs a whole `peer_info` at INFO, then "task cancelled" and "serve finished", each time the thread-tools endpoint is connected (once per grant, again after the 60 s `LISTING_TTL`, and on every call). Setting `RUST_LOG` replaces the default whole). The startup line prints the configuration with the gateway (`MODEL_BASE_URL`), the GitHub API and MCP addresses and `PUBLIC_URL` as scheme and host only, the database URL as `[REDACTED]`: a deployment keeps them in secrets.
+(`RUST_LOG` filters; unset, the filter is `info,rmcp=warn`. **Keep `rmcp` at `warn` or above in any log that leaves the process:** `rmcp` logs each tool result it receives at `debug`, and the answer of `request_upload` is a presigned URL, the bucket's only credential for that upload. Setting `RUST_LOG=debug` or `rmcp=debug` puts it in the log. Why the default has it: the MCP client library logs a whole `peer_info` at INFO, then "task cancelled" and "serve finished", each time the thread-tools endpoint is connected (once per grant, again after the 60 s `LISTING_TTL`, and on every call). Setting `RUST_LOG` replaces the default whole). The startup line prints the configuration with the gateway (`MODEL_BASE_URL`), the GitHub API and MCP addresses and `PUBLIC_URL` as scheme and host only, the database URL as `[REDACTED]`: a deployment keeps them in secrets.
 
 Deployment: `docker/coder/Dockerfile` and the chart in `deploy/coder/`.
 

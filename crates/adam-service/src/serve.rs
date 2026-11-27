@@ -13,6 +13,11 @@
 //! | `control-plane` | `a2a-server`, `notify` | the runtime knows the agent as a starter only: no model, no tools; `push-delivery` when `A2A_PUSH_ALLOWED_URLS` is set |
 //! | `worker` | `worker`, `health`, `notify` | `/healthz` on [`ServiceConfig::listen_addr`], no A2A |
 //!
+//! With [`ServiceConfig::activity`] set (`ACTIVITY_LISTEN_ADDR`), every role also runs `activity`:
+//! `GET /internal/activity` alone on a listener of its own, behind `ACTIVITY_BEARER_TOKENS`, and
+//! the route is then gone from [`ServiceConfig::listen_addr`]. Unset, the route stays there behind
+//! the A2A tokens (deprecated; ADR 0083).
+//!
 //! `notify` is the [`adam_notify_postgres::PgNotify`] listener and publisher: live events and
 //! wake-up/cancel signals cross processes over Postgres `LISTEN`/`NOTIFY`, so a worker takes a
 //! run another process started at once instead of at its next poll, and a control plane streams
@@ -517,10 +522,10 @@ pub enum ServeError {
          `Agents::agent_modes` what the folder declares"
     )]
     AgentModes,
-    /// The listener cannot be bound.
+    /// A listener cannot be bound: `LISTEN_ADDR`'s, or the activity listener's.
     #[error("binding {addr}")]
     Bind {
-        /// The address from `LISTEN_ADDR`.
+        /// The address from `LISTEN_ADDR`, or from `ACTIVITY_LISTEN_ADDR`.
         addr: SocketAddr,
         /// What the operating system said.
         #[source]
@@ -533,6 +538,13 @@ pub enum ServeError {
     /// the host's own.
     #[error(transparent)]
     Host(#[from] HostError),
+    /// [`serve_on_with_activity`] was given an activity listener and the configuration has no
+    /// `ACTIVITY_LISTEN_ADDR`, so no token of its own to serve it with: it is never served open,
+    /// nor behind the A2A tokens (fail closed).
+    #[error(
+        "an activity listener was given and ACTIVITY_LISTEN_ADDR is not set: it has no tokens of its own"
+    )]
+    ActivityWithoutTokens,
     /// Push notifications are on and their webhook client cannot be built (no TLS backend), or
     /// the allow-list cannot be read. A mistake of the deployment (or the build): a restart with
     /// other code or configuration fixes it.
@@ -585,12 +597,14 @@ fn a2a_features(
     config: &ServiceConfig,
     service: &Service,
 ) -> Result<(ServerOptions, Option<PushDeliverer>), ServeError> {
-    let mut options = ServerOptions::default()
-        .with_docs(config.a2a.docs)
-        .with_protected_routes(crate::activity::router(
+    let mut options = ServerOptions::default().with_docs(config.a2a.docs);
+    // With a listener of its own the route is there only (ADR 0083): an A2A token never reads it.
+    if config.activity.is_none() {
+        options = options.with_protected_routes(crate::activity::router(
             service.runtime.store().clone(),
             service.runtime.agent_names(),
         ));
+    }
     let mut deliverer = None;
     if let Some(push) = &config.a2a.push {
         let policy = push.policy().map_err(|e| ServeError::Push(Box::new(e)))?;
@@ -761,7 +775,14 @@ pub async fn serve(
     agents: Agents,
     shutdown: impl Future<Output = ()> + Send,
 ) -> Result<(), ServeError> {
-    run(config, agents, Listen::Addr(config.listen_addr), shutdown).await
+    run(
+        config,
+        agents,
+        Listen::Addr(config.listen_addr),
+        None,
+        shutdown,
+    )
+    .await
 }
 
 /// [`serve`] on a listener the caller has already bound; [`ServiceConfig::listen_addr`] is not read.
@@ -779,7 +800,36 @@ pub async fn serve_on(
     listener: TcpListener,
     shutdown: impl Future<Output = ()> + Send,
 ) -> Result<(), ServeError> {
-    run(config, agents, Listen::Bound(listener), shutdown).await
+    run(config, agents, Listen::Bound(listener), None, shutdown).await
+}
+
+/// [`serve_on`], with the activity listener bound by the caller as well:
+/// [`ActivitySettings::listen_addr`](crate::ActivitySettings::listen_addr) is not read, and
+/// `activity` serves `GET /internal/activity` with
+/// [`ActivitySettings::bearer_tokens`](crate::ActivitySettings::bearer_tokens).
+///
+/// # Errors
+///
+/// As [`serve_on`], and [`ServeError::ActivityWithoutTokens`] (exit 78) when
+/// [`ServiceConfig::activity`] is `None`: a listener with no tokens of its own is never served.
+pub async fn serve_on_with_activity(
+    config: &ServiceConfig,
+    agents: Agents,
+    listener: TcpListener,
+    activity: TcpListener,
+    shutdown: impl Future<Output = ()> + Send,
+) -> Result<(), ServeError> {
+    if config.activity.is_none() {
+        return Err(ServeError::ActivityWithoutTokens);
+    }
+    run(
+        config,
+        agents,
+        Listen::Bound(listener),
+        Some(activity),
+        shutdown,
+    )
+    .await
 }
 
 /// Where the server listens: an address to bind once the store is ready, or a bound listener.
@@ -793,7 +843,11 @@ enum Listen {
 /// ([`ServiceConfig::uploads_inline_max_bytes`]), else
 /// [`DEFAULT_UPLOADS_INLINE_MAX_BYTES`](adam_a2a::DEFAULT_UPLOADS_INLINE_MAX_BYTES). Both are
 /// already inside the ceiling the deployment's configuration enforced.
-fn inline_upload_threshold(folder: Option<u64>, env: Option<u64>) -> u64 {
+///
+/// Public so that a tool that holds a file (the coder's `share_file`) decides with the very number
+/// the card is served under.
+#[must_use]
+pub fn inline_upload_threshold(folder: Option<u64>, env: Option<u64>) -> u64 {
     folder
         .or(env)
         .unwrap_or(adam_a2a::DEFAULT_UPLOADS_INLINE_MAX_BYTES)
@@ -803,6 +857,7 @@ async fn run(
     config: &ServiceConfig,
     agents: Agents,
     listen: Listen,
+    activity_listener: Option<TcpListener>,
     shutdown: impl Future<Output = ()> + Send,
 ) -> Result<(), ServeError> {
     let role = config.role;
@@ -867,9 +922,13 @@ async fn run(
             .push(adam_a2a::ExtensionConfig::prompt_statement());
     }
     // The card entry has no params (the contract's). The inline threshold is the folder's, else
-    // the environment's, else the default (10 MiB); the upload tool of the next card reads it.
-    let _inline_upload_threshold =
-        inline_upload_threshold(uploads_inline_max_bytes, config.uploads_inline_max_bytes);
+    // the environment's, else the default (10 MiB); a tool that holds a file reads it through
+    // [`inline_upload_threshold`] (the coder's `share_file` is built with it). Said once.
+    tracing::info!(
+        inline_upload_threshold =
+            inline_upload_threshold(uploads_inline_max_bytes, config.uploads_inline_max_bytes),
+        "uploads/v1: a file over this many bytes goes by reference"
+    );
     if let Some(card) = card.as_mut()
         && !card
             .extensions
@@ -949,12 +1008,44 @@ async fn run(
     // acknowledged, which a client that is not sending delays by up to 40 ms.
     let listener = no_delay(listener);
     tracing::info!(%addr, %role, workers, worker_id = worker_id.as_deref(), "listening");
+    // The activity listener (ADR 0083), bound before anything runs too.
+    let activity = match (&config.activity, activity_listener) {
+        (Some(settings), given) => {
+            let listener = match given {
+                Some(listener) => listener,
+                None => TcpListener::bind(settings.listen_addr)
+                    .await
+                    .map_err(|source| ServeError::Bind {
+                        addr: settings.listen_addr,
+                        source,
+                    })?,
+            };
+            let addr = listener.local_addr().map_err(ServeError::LocalAddr)?;
+            tracing::info!(%addr, "serving GET /internal/activity on its own listener");
+            Some((listener, settings.bearer_tokens.clone()))
+        }
+        (None, _) => {
+            tracing::info!(
+                "GET /internal/activity is served on LISTEN_ADDR behind A2A_BEARER_TOKENS: \
+                 deprecated, set ACTIVITY_LISTEN_ADDR and ACTIVITY_BEARER_TOKENS (ADR 0083)"
+            );
+            None
+        }
+    };
 
     let health_auth = AuthConfig::BearerTokens(config.a2a_bearer_tokens.clone());
-    let health_routes = crate::activity::router(
-        service.runtime.store().clone(),
-        service.runtime.agent_names(),
-    );
+    let activity_routes = || {
+        crate::activity::router(
+            service.runtime.store().clone(),
+            service.runtime.agent_names(),
+        )
+    };
+    // A worker's probe listener keeps the route only when it has no listener of its own.
+    let health_app = if activity.is_some() {
+        A2aServer::health_router()
+    } else {
+        A2aServer::health_router_with_routes(health_auth, activity_routes())
+    };
     let host = Host::new(role)
         .control_plane_drain(Some(SERVER_DRAIN))
         // Workers are never cut short here; the orchestrator's grace period bounds the wait.
@@ -978,14 +1069,32 @@ async fn run(
         }
         // No A2A here, but probes still need an answer: the same `/healthz` the A2A router serves.
         _ => host.worker("health", |stop| async move {
-            axum::serve(
-                listener,
-                A2aServer::health_router_with_routes(health_auth, health_routes),
-            )
-            .with_graceful_shutdown(stop.cancelled_owned())
-            .await
-            .map_err(Into::into)
+            axum::serve(listener, health_app)
+                .with_graceful_shutdown(stop.cancelled_owned())
+                .await
+                .map_err(Into::into)
         }),
+    };
+    // The activity route on its own listener, with its own tokens: nothing of A2A, no `/healthz`.
+    // It stops with the tier that serves the process's other listener.
+    let host = match activity {
+        Some((listener, tokens)) => {
+            let app =
+                A2aServer::protected_router(AuthConfig::BearerTokens(tokens), activity_routes());
+            let listener = no_delay(listener);
+            let serve_activity = move |stop: CancellationToken| async move {
+                axum::serve(listener, app)
+                    .with_graceful_shutdown(stop.cancelled_owned())
+                    .await
+                    .map_err(Into::into)
+            };
+            if role.runs_control_plane() {
+                host.control_plane("activity", serve_activity)
+            } else {
+                host.worker("activity", serve_activity)
+            }
+        }
+        None => host,
     };
     // With workers, `notify` is a worker component that stops when the `worker` component is done
     // (or gone): the host cancels the components of a tier together, and a step finishing after

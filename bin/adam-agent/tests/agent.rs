@@ -2597,3 +2597,186 @@ fn the_shipped_examples_say_how_their_tools_load() {
     assert_eq!(loading("researcher"), ToolsLoading::Eager);
     assert_eq!(loading("painter"), ToolsLoading::Eager);
 }
+
+// ------------------------------------------------------------- start.config on a split deployment
+
+/// A root, `chat`, with one helper whose file holds `limits: max_turns: 5, max_parallel: 2`.
+fn config_folder() -> tempfile::TempDir {
+    let folder = folder_with("---\nname: chat\ndescription: Chats.\ntools: []\n---\nHello.\n");
+    std::fs::create_dir_all(folder.path().join("agent/subagents")).unwrap();
+    std::fs::write(
+        folder.path().join("agent/subagents/helper.md"),
+        "---\ndescription: Helps.\nlimits:\n  max_turns: 5\n  max_parallel: 2\n---\n\
+         Your name is Helper.\nIn one sentence: I help with small jobs.\n",
+    )
+    .unwrap();
+    folder
+}
+
+/// A service over `store` that also serves `child-sessions/v1` for the helpers `agents` gives, as
+/// `adam_service::serve` composes it.
+fn service_with_sessions(agents: Agents, store: &DynStore) -> Service {
+    let sessions = agents.child_sessions.clone();
+    service_over(agents, store).with_child_sessions(sessions)
+}
+
+/// The start of a session on `helper` that a person sends, with `config`.
+fn start_with(config: serde_json::Value) -> Message {
+    let mut message = user("hello helper");
+    message.context_id = Some("ctx-split".to_owned());
+    message.metadata = Some(std::collections::HashMap::from([(
+        adam_a2a::CHILD_SESSIONS_EXTENSION.to_owned(),
+        json!({"start": {"agent": "helper", "description": "Help me", "keepOpen": true,
+                         "config": config}}),
+    )]));
+    message
+}
+
+fn activated() -> Caller {
+    alice().with_extensions([adam_a2a::CHILD_SESSIONS_EXTENSION])
+}
+
+/// ADR 0054, ANR-1093: the control plane of a split deployment (no model, no bound agent) knows
+/// the bounds of every helper, and they are the ones a worker binds, so a person's `start.config`
+/// is admitted there and not refused outright. Both are asked of the same folder and settings.
+#[tokio::test]
+async fn a_control_plane_knows_the_bounds_a_worker_binds() {
+    let folder = config_folder();
+    let def = def_of(&folder).session_max_parallel(8);
+    let front = build(def.clone(), None, None).await.unwrap();
+    let model: DynModel = PersonaModel::new();
+    let parts = WorkerParts {
+        max_parallel: 8,
+        ..worker_parts(model)
+    };
+    let back = build(def, None, Some(parts)).await.unwrap();
+    let bounds = |agents: &Agents| {
+        agents
+            .child_sessions
+            .as_ref()
+            .expect("the root has a helper")
+            .agents()
+            .iter()
+            .map(|helper| (helper.name.clone(), helper.bounds.clone()))
+            .collect::<Vec<_>>()
+    };
+    let front_bounds = bounds(&front);
+    assert_eq!(front_bounds, bounds(&back));
+    let helper = front_bounds[0]
+        .1
+        .as_ref()
+        .expect("a control plane knows them");
+    assert_eq!(
+        (helper.max_turns, helper.max_parallel_tool_calls),
+        (5, 2),
+        "the folder narrows the deployment's 8"
+    );
+}
+
+/// A person's `start.config` on a control plane, a worker in another process over the same store
+/// stepping the round: a config within the helper's bounds is admitted and recorded in the header
+/// of round 1, one above a bound is refused naming the option, and nothing starts for it.
+#[tokio::test]
+async fn a_start_config_on_a_control_plane_is_admitted_by_the_workers_bounds() {
+    let store = store();
+    let folder = config_folder();
+    let def = def_of(&folder).session_max_parallel(8);
+    let front = service_with_sessions(build(def.clone(), None, None).await.unwrap(), &store);
+    assert!(
+        front.child_sessions().is_some(),
+        "the control plane serves sessions"
+    );
+    let model: DynModel = PersonaModel::new();
+    let parts = WorkerParts {
+        max_parallel: 8,
+        ..worker_parts(model)
+    };
+    let back = service_over(build(def, None, Some(parts)).await.unwrap(), &store);
+    let worker = Worker::start(&back);
+
+    // Above a bound: refused, naming the option, and nothing is written.
+    for (config, words) in [
+        (
+            json!({"maxTurns": 6}),
+            "start.config.maxTurns is 6; at most 5",
+        ),
+        (
+            json!({"maxParallelToolCalls": 3}),
+            "start.config.maxParallelToolCalls is 3; at most 2",
+        ),
+        (json!({"timeLimit": 31}), "start.config.timeLimit"),
+    ] {
+        match front
+            .backend
+            .submit(activated(), start_with(config.clone()), None, None)
+            .await
+        {
+            Err(adam_a2a::BackendError::InvalidParams(why)) => {
+                assert!(why.contains(words), "{config}: {why}");
+            }
+            other => panic!("{config}: expected InvalidParams, got {other:?}"),
+        }
+    }
+
+    // Within them: admitted, recorded in the header, reported, and the worker steps the round.
+    let task = front
+        .backend
+        .submit(
+            activated(),
+            start_with(json!({"maxTurns": 5, "maxParallelToolCalls": 2})),
+            None,
+            None,
+        )
+        .await
+        .expect("a config within the helper's bounds starts a session");
+    // The header as the front reads it: the parent is the one the stored round names.
+    let (_, session) =
+        adam_runtime::parse_session_conversation_id(&task.context_id).expect("a child context");
+    let record = store
+        .load_run(session)
+        .await
+        .unwrap()
+        .expect("the round is stored");
+    let (parent, _) = adam_runtime::parse_session_conversation_id(
+        record
+            .conversation_id
+            .as_deref()
+            .expect("a session conversation"),
+    )
+    .expect("a child context");
+    let header = front
+        .runtime
+        .session_view(&parent, session)
+        .await
+        .unwrap()
+        .expect("the session exists")
+        .header
+        .expect("the round carries the session");
+    let config = header.config.expect("the header holds the config");
+    assert_eq!(config.max_turns, Some(5));
+    assert_eq!(config.max_parallel_tool_calls, Some(2));
+    assert_eq!(config.max_tool_calls, None, "nothing is filled in");
+    let said_config = task
+        .metadata
+        .as_ref()
+        .and_then(|m| m.get(adam_a2a::CHILD_SESSIONS_EXTENSION))
+        .map(|object| object["config"].clone());
+    assert_eq!(
+        said_config,
+        Some(json!({"maxTurns": 5, "maxParallelToolCalls": 2}))
+    );
+    for _ in 0..1000 {
+        let now = front
+            .backend
+            .get(&activated(), &task.id)
+            .await
+            .unwrap()
+            .expect("the round exists");
+        if now.status.state == TaskState::Completed {
+            worker.stop().await;
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("the worker never completed round 1");
+}

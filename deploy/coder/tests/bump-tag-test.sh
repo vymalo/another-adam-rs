@@ -63,11 +63,26 @@ case "$out" in unchanged*) ok "a quoted current tag counts as current" ;; *) bad
 
 # 4. Malformed tags are refused before the file is touched.
 cp "$work/before.yaml" "$work/refuse.yaml"
-for tag in latest sha-abc123 sha-abc12345 sha-ABCDEF1 sha-abcdefg v1.2.3 ""; do
+for tag in latest sha-abc123 sha-abc12345 sha-ABCDEF1 sha-abcdefg v1.2.3 1.2 1.2.3.4 01.2.3 1.2.3-rc.1 "1.2.3 " "1.2.3
+x" ""; do
   run "$work/refuse.yaml" "$tag"
   if [ "$rc" -eq 2 ]; then ok "refuses tag '$tag' (exit 2)"; else bad "tag '$tag': rc=$rc, want 2"; fi
 done
 if cmp -s "$work/before.yaml" "$work/refuse.yaml"; then ok "refused tags leave the file alone"; else bad "a refused tag changed the file"; fi
+
+# 4b. A release's X.Y.Z is applied like a sha tag (release.yml, on the chart it packages: ADR 0084).
+cp "$work/before.yaml" "$work/release.yaml"
+run "$work/release.yaml" 0.6.0
+if [ "$rc" -eq 0 ] && [ "$out" = "changed: image.tag sha-0000000 -> 0.6.0" ]; then
+  ok "a release version is applied and reported"
+else
+  bad "a release version: rc=$rc out='$out'"
+fi
+if grep -q '^  tag: 0.6.0$' "$work/release.yaml"; then ok "image.tag holds the release version"; else bad "image.tag was not set to 0.6.0"; fi
+changed=$(diff "$work/before.yaml" "$work/release.yaml" | grep -c '^[<>]' || true)
+if [ "$changed" -eq 2 ]; then ok "a release changes exactly one line"; else bad "release: $changed diff lines, want 2"; fi
+run "$work/release.yaml" 0.6.0
+case "$out" in unchanged*) ok "the same release again is a no-op" ;; *) bad "release, second run: '$out'" ;; esac
 
 # 5. Wrong argument count is a usage error.
 run "$work/refuse.yaml"

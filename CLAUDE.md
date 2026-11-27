@@ -76,6 +76,7 @@ cargo test -p adam --test ui              # `#[tool]` compile tests; the rustc-w
 docker compose up -d --wait               # the databases and mocks the tests use (docs/guides/testing.md)
 npm --prefix tools/docs-check ci          # once per clone
 node tools/docs-check/check-docs.mjs
+git config core.hooksPath .githooks       # once per clone: the local Conventional Commits hook
 ```
 
 MSRV is `rust-version` in `Cargo.toml` (CI job `msrv`). Database suites need `ADAM_TEST_POSTGRES_URL` and
@@ -84,8 +85,9 @@ MSRV is `rust-version` in `Cargo.toml` (CI job `msrv`). Database suites need `AD
 ## Commits and pull requests
 
 Conventional Commits (`feat(scope): ...`, `fix`, `docs`, `test`; the workflow writes `chore(deploy): bump
-coder to sha-<7>`). Nothing here enforces it and there is no pull request template (*verified 2026-10-03*).
-Work on a branch, open a pull request against `main`; never edit `deploy/coder/values.yaml` `image.tag` by
+coder to sha-<7>`), enforced by `tools/commit-lint.sh` in the local hook (`git config core.hooksPath .githooks`, once
+per clone) and in CI (`commit-lint.yml`, the commits and the pull request's title): release-please reads the subjects to
+choose the next version (ADR 0084). There is no pull request template (*verified 2026-11-27*). Work on a branch, open a pull request against `main`; never edit `deploy/coder/values.yaml` `image.tag` by
 hand (the coder workflow bumps it).
 
 ## Skills

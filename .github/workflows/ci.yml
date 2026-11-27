@@ -54,6 +54,9 @@ jobs:
       # one are gone. The scan is what keeps them from coming back by habit; the script says what it reads.
       - name: The dev stack and CI carry no container engine
         run: sh tools/check-dev-stack.sh
+      # ADR 0084: every version a release moves is marked for release-please, and the Cargo lines agree.
+      - name: The release's version lines are marked and agree
+        run: sh tools/release/check-versions.sh
       - run: cargo fmt --all --check
 
   # The two clippy arms: the default features, and the optional ones (or their code never runs in CI).
@@ -314,13 +317,17 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Oldest and newest supported servers.
+        # The oldest and newest supported MongoDB. PostgreSQL is 18 in both rows: 18 is the floor
+        # (ADR 0082, decision 11) and the newest server CI runs until a change adds a newer one.
         include:
-          - { postgres: "12", mongodb: "5.0" }
-          - { postgres: "17", mongodb: "8.0" }
+          - { mongodb: "5.0" }
+          - { mongodb: "8.0" }
     services:
       postgres:
-        image: postgres:${{ matrix.postgres }}
+        # PostgreSQL 18.7, the store's floor (ADR 0082, decision 11), by tag and digest (the OCI index of
+        # docker.io/library/postgres:18.7, *verified 2026-11-27* from the registry). Every Postgres of
+        # CI is this image: keep ci.yml, coder.yml and compose.yaml in step.
+        image: postgres:18.7@sha256:64c8b0d31e4ab6ea665e8426ea406a94bf52de3c05b3a4a8bf713704eefa9328
         env:
           POSTGRES_PASSWORD: postgres
           POSTGRES_DB: adam_test
@@ -381,7 +388,10 @@ jobs:
       issues: write
     services:
       postgres:
-        image: postgres:17
+        # PostgreSQL 18.7, the store's floor (ADR 0082, decision 11), by tag and digest (the OCI index of
+        # docker.io/library/postgres:18.7, *verified 2026-11-27* from the registry). Every Postgres of
+        # CI is this image: keep ci.yml, coder.yml and compose.yaml in step.
+        image: postgres:18.7@sha256:64c8b0d31e4ab6ea665e8426ea406a94bf52de3c05b3a4a8bf713704eefa9328
         env:
           POSTGRES_PASSWORD: postgres
           POSTGRES_DB: adam_test

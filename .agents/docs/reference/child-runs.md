@@ -54,6 +54,7 @@ clamped by `SessionBounds::clamp` **before** the round-limit check).
 | `max_rounds` | `sessions.rs`: `a_sessions_own_max_rounds_is_enforced_by_a_send` |
 | a config beyond the bounds is refused; one within is recorded | `sessions.rs`: `a_start_config_beyond_the_bounds_is_refused_and_one_within_is_recorded` |
 | round 2 carries the config, clamped to the bounds of now | `sessions.rs`: `round_two_carries_the_config_clamped_to_the_bounds_of_now`; `SessionBounds::clamp` in `crates/adam-runtime/src/session.rs` |
+| the control plane's bounds are a worker's (ANR-1093): one function, `crates/adam-assembly/src/bounds.rs` `bounds_of`, called by `Assembly` and `AgentDef::session_bounds` | `adam-assembly/tests/session_bounds.rs`: `a_definition_computes_the_bounds_a_worker_binds_without_binding`, `the_roster_of_the_bounds_is_the_workers`, `the_definitions_parallel_limit_is_the_workers_unless_it_says_another`; `adam-agent/tests/agent.rs`: `a_control_plane_knows_the_bounds_a_worker_binds`, `a_start_config_on_a_control_plane_is_admitted_by_the_workers_bounds`; `adam-service` `every_role_reads_max_parallel_for_the_session_bounds` |
 
 ## Session interleavings
 

@@ -213,10 +213,15 @@ impl Drop for Echo {
     }
 }
 
-/// A port nothing listens on.
-async fn closed_port() -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    listener.local_addr().unwrap().port()
+/// A port that refuses every connection, for as long as the returned socket is held.
+///
+/// The socket is bound and never listens, so the kernel answers a connect with a reset and no other
+/// process can be given the port while the test runs (a port freed by dropping a listener can be).
+fn refusing_port() -> (TcpSocket, u16) {
+    let socket = TcpSocket::new_v4().unwrap();
+    socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let port = socket.local_addr().unwrap().port();
+    (socket, port)
 }
 
 /// What the proxy answered to a request that it did not tunnel.
@@ -748,7 +753,7 @@ async fn a_name_that_does_not_resolve_is_502_and_one_that_is_too_slow_is_504() {
 #[tokio::test]
 async fn an_address_that_refuses_the_connection_is_502() {
     let (logs, _guard) = capture();
-    let port = closed_port().await;
+    let (_reserved, port) = refusing_port();
     let proxy = Proxy::start(
         config(&[port], &["down.test"]),
         Names::default().with("down.test", &[LOCALHOST]),

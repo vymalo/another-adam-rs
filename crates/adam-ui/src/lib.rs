@@ -67,6 +67,8 @@ use adam_llm_agent::ToolSet;
 #[cfg(feature = "thread-tools")]
 use adam_mcp::McpPolicy;
 
+#[cfg(feature = "thread-tools")]
+pub use adam_mcp::{UploadError, UploadRequest, Uploaded};
 pub use ask::{ASK_USER, AskUser, DEFAULT_ASK_LEAD};
 pub use cache::{CatalogCache, MAX_CACHED_CATALOGS};
 pub use catalog::{
@@ -82,7 +84,7 @@ pub use surface::{
 #[cfg(feature = "thread-tools")]
 pub use thread_tools::{
     Clock, GET_UI_CATALOG, LISTING_TTL, META_KEY, TURN_OUTPUT, TURN_OUTPUT_DELIVERED, ThreadTools,
-    ThreadToolsClient,
+    ThreadToolsClient, UploadAccess,
 };
 
 pub use adam_a2a_runtime::{comparable, is_format_or_control};
@@ -172,6 +174,41 @@ impl Ui {
     /// agent's sources, on an agent that has no thread-tools source (an embedded one); never both.
     pub fn screen(&self) -> ScreenSource {
         ScreenSource::new(Arc::clone(&self.state))
+    }
+
+    /// What the run's `context` allows for `uploads/v1`, or the reason it allows nothing
+    /// ([`ThreadToolsClient::upload_access`]).
+    ///
+    /// # Errors
+    ///
+    /// A sentence for the model: no message offered uploads, or the run has no usable grant.
+    #[cfg(feature = "thread-tools")]
+    pub fn upload_access(
+        &self,
+        context: &serde_json::Map<String, serde_json::Value>,
+    ) -> Result<UploadAccess, String> {
+        match &self.state.client {
+            Some(client) => client.upload_access(context),
+            None => Err("this agent has no thread tools".to_owned()),
+        }
+    }
+
+    /// Send `bytes` to the bucket by reference ([`ThreadToolsClient::upload`]).
+    ///
+    /// # Errors
+    ///
+    /// [`UploadError`]: the orchestrator's refusal, the endpoint or the bucket.
+    #[cfg(feature = "thread-tools")]
+    pub async fn upload(
+        &self,
+        access: &UploadAccess,
+        request: &UploadRequest,
+        bytes: Vec<u8>,
+    ) -> Result<Uploaded, UploadError> {
+        match &self.state.client {
+            Some(client) => client.upload(access, request, bytes).await,
+            None => Err(UploadError::BadSlot("no thread tools".to_owned())),
+        }
     }
 
     /// The catalogs this process has read.

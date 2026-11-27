@@ -39,6 +39,13 @@ main (`deploy/coder/bump-tag.sh`, also run as a dry run on pull requests). The i
 `ADAM_BUILD_REVISION`, so the agent card's `version` ends in `+<sha7>` and `build/v1` says the commit and the digest of the
 agent's files ([ADR 0028](../../docs/decisions/0028-the-card-says-which-build-answers.md)): the tag and the card agree.
 
+That is development. A **release** `vX.Y.Z` publishes this chart as `oci://ghcr.io/vymalo/another-adam-rs/charts/coder`
+at version `X.Y.Z` with `image.tag: X.Y.Z`, set in the packaged copy and never in `values.yaml`; `Chart.yaml`'s `version` and `appVersion`
+are release-please's, and move with the crates' version
+([Releases](../../docs/guides/releases.md), [ADR 0084](../../docs/decisions/0084-releases-are-cut-by-release-please-and-production-pins-a-version.md)).
+Production pins `image.tag: X.Y.Z@sha256:<digest>`. `tests/render-goldens.sh` writes the four goldens again, which a
+release does on its branch (the chart's version is in two labels of every object).
+
 ## Where a run's commands run
 
 The chart's default keeps every command in the coder's own pod (`RUN_ENVIRONMENT=local`). With
@@ -359,6 +366,7 @@ rollout):
 | Value | Default | |
 |---|---|---|
 | `database.enabled` | `true` | The chart creates a CloudNativePG `Cluster` named `<release>-db` (`database.name`, `owner`, `instances`, `storage`) and every pod reads `DATABASE_URL` from the `uri` key of the Secret CNPG creates, `<release>-db-app`. The render is the one this chart always had (`tests/golden/combined.yaml`). |
+| `database.imageName` | `ghcr.io/cloudnative-pg/postgresql:18.7-system-trixie@sha256:c437b7c6…` (the full digest is in `values.yaml`) | The `Cluster`'s PostgreSQL image, by tag and digest. With `database.enabled: true` only; empty is refused, and so is a tag whose major is below 18 (below). |
 | `database.instances` | `1` | Instances of the `Cluster`. With `database.enabled: true` only. |
 | `database.resources` | `{}` | CPU and memory requests and limits of each instance. Empty renders nothing, so the default render is unchanged. |
 | `database.existingSecret.name` | `""` | With `database.enabled: false`: a Secret in the release namespace that holds the connection string. Required then, refused with `enabled: true`. |
@@ -375,6 +383,34 @@ database:
 ```
 
 Backups and a transaction-mode pooler are not part of this chart.
+
+### PostgreSQL 18
+
+The store refuses a server older than PostgreSQL 18 at startup
+([ADR 0082](../../docs/decisions/0082-the-sql-adapters-keep-their-rules-in-the-database.md),
+decision 11): `migrate()` fails with class `Invalid` and the pod exits 78, before any DDL. The chart
+therefore pins the `Cluster`'s image, `database.imageName`, at 18.7 by tag and digest. It used to name
+no image, so the operator's default applied, and that default is the operator release's own: 17 up
+to CloudNativePG 1.27, 18 in 1.28 to 1.30, 19 on its main branch (*verified 2026-11-27*:
+`pkg/versions/versions.go` at the tags `v1.25.0` to `v1.30.0` and at `main`). This chart names no
+operator release, so only a pin makes the floor hold. The `system` flavour on Debian `trixie` is the
+flavour of the operator's default since 1.28.
+
+**An existing `Cluster` changes image on the upgrade that brings this pin.** CloudNativePG (1.26 or
+later) upgrades the major version in place when `imageName` names a higher one: offline, with
+`pg_upgrade`, and only between images of the same distribution (*verified 2026-11-27*: its
+documentation, "Offline In-Place Major Upgrades", at `v1.26.0`). Before that upgrade:
+
+* back the database up (this chart makes no backups);
+* look at the image the `Cluster` runs now (`kubectl get cluster <release>-db -o jsonpath='{.status.image}'`).
+  On a 17 image of Debian `bookworm` (the default of CloudNativePG 1.27 and older), set
+  `database.imageName` to the bookworm variant of 18,
+  `ghcr.io/cloudnative-pg/postgresql:18.7-system-bookworm@sha256:17b1b2d8b41398e4a5aa5466b49c866cb500dcaf08e9a4923ca443f2cd13c25a`
+  (*verified 2026-11-27* from ghcr.io), so the in-place upgrade stays on one distribution; on an 18
+  image the pin is a change of minor version, which the operator rolls out as usual;
+* with `database.enabled: false`, upgrade the existing server to 18 before the coder.
+
+A coder of an older release runs on 18 as well (it needs 12 or later), so the database can move first.
 
 ```sh
 helm template coder deploy/coder \
@@ -406,6 +442,8 @@ What the existing database must be:
   and a later release's migration runs as the same role. The tables are named with the prefix
   `adam_`, so the database can be shared with other applications' tables but not with another
   coder release (two would share one ledger): give each release its own database.
+* **The server is PostgreSQL 18 or later.** An older one is refused at startup (exit 78), before
+  any DDL ([PostgreSQL 18](#postgresql-18)).
 * **Reach the primary directly**, for example the `-rw` Service of a CNPG cluster. The runtime
   signals wake-ups and cancels with `LISTEN`/`NOTIFY` on the store's pool
   (`crates/adam-store-postgres`, `adam-notify-postgres`), which needs session-level connections;
@@ -786,6 +824,24 @@ control plane that runs for as long as a task does: delivery is a loop in the po
 leases. `extraEnv` may not set `A2A_PUSH_ALLOWED_URLS` or `A2A_CARD_SIGNING_KEY_FILE` while the value that sets it is on. The
 extended agent card needs no value: it is `card.extended` in the agent's folder.
 
+## The activity port (`activity.*`)
+
+`GET /internal/activity` says how busy the coder is (`{"busy": N, "nextDueAt": "..."}`, no run content), for a caller
+that scales the service. **Off by default**, and then nothing of it is rendered (the goldens do not move): the route is on
+the A2A port behind the A2A tokens, a form that is **deprecated**. On, the route has a port of its own and tokens of its own,
+so its caller holds no A2A token and gets no path to the A2A port
+([ADR 0083](../../docs/decisions/0083-the-activity-route-has-a-listener-and-tokens-of-its-own.md)).
+
+| Value | Renders | Effect |
+|---|---|---|
+| `activity.enabled` | `ACTIVITY_LISTEN_ADDR`, `ACTIVITY_BEARER_TOKENS`, a container port and a Service port `activity` | **turns it on**: the pods the Service selects (the StatefulSet, or the front with `topology: split`) serve the route alone on `activity.port`; the A2A port stops serving it |
+| `activity.port` (8081) | `ACTIVITY_LISTEN_ADDR=0.0.0.0:<port>` | not 8080 (A2A) nor `githubMcp.port` |
+| `activity.tokensSecret.name`, `.key` (`ACTIVITY_BEARER_TOKENS`) | a `secretKeyRef` | **required**: a Secret you (or another ExternalSecret) manage, comma-separated tokens under `key`. The chart never takes a token as a value, and refuses `ACTIVITY_*` in `config.extraEnv`. A token that is also an A2A token makes the process exit 78 |
+| `activity.allowedNamespace` | a second ingress rule of the NetworkPolicy | **required** with `networkPolicy.enabled`: that namespace reaches `activity.port`, and only it |
+
+**The render is a contract**: another-agentic-platform renders its parity goldens from this chart, so a change to what it
+renders for these values is said in the pull request.
+
 ## Swagger UI
 
 Every A2A server serves Swagger UI at `/docs` and its OpenAPI document at `/openapi.json`, both public, both bindings
@@ -1059,7 +1115,9 @@ that the pods can write to it, and a hit across two pods.
   `WhyThatFunction/home-os`, 2026-09-29).
 * The CNPG `Cluster` fields and the `<cluster>-app` Secret with a `uri` key are
   from the CloudNativePG documentation; not yet checked against the installed
-  operator version on the cluster.
+  operator version on the cluster. Which operator release and which PostgreSQL image a deployed
+  `Cluster` runs today is *unverified*, so whether the `database.imageName` pin is a minor or a major
+  upgrade for it is too ([PostgreSQL 18](#postgresql-18)).
 * Rendered with Helm v4.3.2 (`helm lint`, `helm template`, `tests/render-check.sh`); kubeconform checks the core
   kinds and the two CRDs in CI; not applied to a cluster.
 * The git sandbox ([above](#the-git-sandbox)): the render's guarantees are asserted by `tests/render-check.sh`; that the sandbox container of a pod made from

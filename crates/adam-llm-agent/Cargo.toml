@@ -41,8 +41,8 @@ uuid.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
 schemars = { workspace = true, features = ["derive"] }
 proptest.workspace = true
-adam-store-mongodb = { path = "../adam-store-mongodb", version = "0.1.0" }
-adam-store-postgres = { path = "../adam-store-postgres", version = "0.1.0" }
+adam-store-mongodb = { path = "../adam-store-mongodb", version = "0.1.0" } # x-release-please-version
+adam-store-postgres = { path = "../adam-store-postgres", version = "0.1.0" } # x-release-please-version
 adam-store-testkit.workspace = true
 adam-model-openai = { workspace = true, features = ["aws-lc"] }
 secrecy.workspace = true

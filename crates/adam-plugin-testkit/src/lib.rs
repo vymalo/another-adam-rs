@@ -11,10 +11,14 @@
 #![warn(missing_docs)]
 
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
 
 use adam_error::ErrorClass;
-use adam_plugin::{HookError, HookResult, HookedCall, HookedMessage, HookedText, Plugin, Verdict};
+use adam_plugin::{
+    HookError, HookEvent, HookResult, HookedCall, HookedMessage, HookedText, Plugin, Subscriptions,
+    Verdict,
+};
 
 /// A plugin that lets every call through, counting how often it was asked.
 #[derive(Default)]
@@ -157,6 +161,117 @@ impl Plugin for Sleeps {
     }
 }
 
+/// An observer that records every event it is offered (ADR 0050, slice H5), with the subscriptions
+/// it is given.
+pub struct Records {
+    subscriptions: Subscriptions,
+    seen: Mutex<Vec<HookEvent>>,
+}
+
+impl Records {
+    /// An observer that subscribes to `subscriptions`.
+    #[must_use]
+    pub fn new(subscriptions: Subscriptions) -> Self {
+        Self {
+            subscriptions,
+            seen: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// The events it was offered, in order.
+    pub fn events(&self) -> Vec<HookEvent> {
+        self.seen
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// The names of the events it was offered, in order.
+    pub fn names(&self) -> Vec<String> {
+        self.events().iter().map(|e| e.name().to_owned()).collect()
+    }
+}
+
+impl Plugin for Records {
+    fn name(&self) -> &str {
+        "records"
+    }
+
+    fn subscriptions(&self) -> Subscriptions {
+        self.subscriptions.clone()
+    }
+
+    fn observe(&self, event: &HookEvent) -> Result<(), HookError> {
+        self.seen
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(event.clone());
+        Ok(())
+    }
+}
+
+/// The cases every hook set must pass about custom events (ADR 0050, slice H5), against a factory:
+/// what the set's plugins declare is valid and agrees with itself, every subscription can match
+/// something, and an observer is offered a custom event only when its subscriptions name it.
+///
+/// Invoked at module level, like [`plugin_conformance!`]; the two do not share a name.
+#[macro_export]
+macro_rules! events_conformance {
+    ($make:expr) => {
+        #[test]
+        fn the_declared_events_are_valid_and_agree_with_each_other() {
+            let set = ($make)();
+            adam_plugin::declared(set.declared_events().iter())
+                .expect("every declared event is valid, and two of a name are equal");
+        }
+
+        #[test]
+        fn every_subscription_can_match_something() {
+            let set = ($make)();
+            set.check_events(&[])
+                .expect("each pattern's namespace is core or declared by the set");
+        }
+
+        #[test]
+        fn an_observer_is_offered_a_custom_event_only_when_it_subscribes() {
+            let header = || adam_plugin::EventHeader {
+                key: "r/tool:c/probe.hit/0".into(),
+                run: "r".into(),
+                root_run: "r".into(),
+                agent: "a".into(),
+                at: "t".into(),
+            };
+            let custom = |name: &str| {
+                adam_plugin::HookEvent::custom(name, 1, header(), &serde_json::json!({}), &|s| {
+                    s.to_owned()
+                })
+            };
+            let probe = std::sync::Arc::new($crate::Records::new(
+                adam_plugin::Subscriptions::of(["probe.*"]).expect("a namespace pattern"),
+            ));
+            let core =
+                std::sync::Arc::new($crate::Records::new(adam_plugin::Subscriptions::core()));
+            let set = ($make)().with(probe.clone()).with(core.clone());
+            let report = set.observe(&[
+                custom("probe.hit"),
+                custom("elsewhere.miss"),
+                adam_plugin::HookEvent::new(adam_plugin::EventKind::ToolCompleted, header()),
+            ]);
+            assert_eq!(report.failed, 0);
+            assert_eq!(
+                probe.names(),
+                ["probe.hit"],
+                "its namespace, and no core event"
+            );
+            assert_eq!(
+                core.names(),
+                ["tool.completed"],
+                "the default is the core catalogue"
+            );
+        }
+    };
+}
+
 /// The cases every hook set must pass, against a factory.
 ///
 /// ```ignore
@@ -289,7 +404,7 @@ macro_rules! plugin_conformance {
 
         #[test]
         fn a_hook_past_its_deadline_is_transient_and_denies() {
-            let set = ($make)().with(std::sync::Arc::new($crate::Sleeps(std::time::Duration::from_millis(40))));
+            let set = ($make)().with(std::sync::Arc::new($crate::Sleeps(std::time::Duration::from_secs(2))));
             let mut arguments = a_call();
             let mut call = adam_plugin::HookedCall {
                 tool: "ls",

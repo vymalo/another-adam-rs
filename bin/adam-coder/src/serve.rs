@@ -44,6 +44,20 @@ use crate::{
     ToolEnv, WorkerConfig, agent_card_for, coder_tools,
 };
 
+/// The folder's `limits.max_inline_upload_bytes`, when it sets one: the first of the three places
+/// the inline threshold of `uploads/v1` comes from (then `UPLOADS_INLINE_MAX_BYTES`, then the
+/// default), read once for the card and once for `share_file`.
+fn folder_inline_upload_limit(files: &AgentFiles) -> Option<u64> {
+    files
+        .def()
+        .ok()?
+        .manifest()
+        .frontmatter
+        .limits
+        .as_ref()?
+        .max_inline_upload_bytes
+}
+
 /// The complete coder agent for a role that runs workers: the model client, the GitHub client and
 /// the workspaces, assembled from `files`. The clients are only constructed here; nothing calls the
 /// model or GitHub until a worker steps a run. `redactor` is built from the whole configuration, so
@@ -55,6 +69,7 @@ async fn build_agent(
     redactor: Redactor,
     files: &AgentFiles,
     sessions: adam_service::SessionSettings,
+    inline_upload_threshold: u64,
 ) -> anyhow::Result<(CoderAgent, Janitor, CommandsSweep)> {
     let model: DynModel = worker.model.client().context("building the model client")?;
     if worker.commands_can_read_the_app_key() {
@@ -211,7 +226,10 @@ async fn build_agent(
             .with_credentials_hint(worker.github.check_hint())
             // The URL a message announces for the conversation's tools is an MCP server's: the
             // deployment's policy (MCP_ALLOW_INSECURE, timeouts) decides.
-            .with_mcp_policy(worker.mcp.policy()),
+            .with_mcp_policy(worker.mcp.policy())
+            // A file over the threshold `uploads/v1` serves (the same number the card is built
+            // with) goes to the bucket by reference, not inline.
+            .with_inline_upload_threshold(inline_upload_threshold),
     );
     // The GitHub MCP server holds no credentials: the deployment binds its name and its origin
     // (`GITHUB_MCP_URL`) to the coder's own credentials, which give each call the token that fits
@@ -407,7 +425,9 @@ pub async fn serve(
         .def()
         .map_err(|e| *e)
         .context("reading the agent definition")?
-        .session_limits(config.service.sessions.limits);
+        .session_limits(config.service.sessions.limits)
+        // The same `MAX_PARALLEL_TOOL_CALLS` every role reads, so the bounds below are a worker's.
+        .session_max_parallel(config.service.sessions.max_parallel_tool_calls);
     let sessions = helpers.child_sessions();
     // The files' schedules (ADR 0060), run by the roles that run workers.
     let schedules = helpers.manifest().schedules.clone();
@@ -415,7 +435,7 @@ pub async fn serve(
     // Only a role that runs workers builds the agent: model, GitHub client, workspaces, MCP
     // servers. A control plane starts, delivers to, cancels and views runs, which needs the
     // agent's name and `init` only (`CoderStarter`), so it takes no model or GitHub configuration.
-    let (agents, prompts) = match &config.worker {
+    let (agents, prompts, session_bounds) = match &config.worker {
         Some(worker) => {
             let (agent, janitor, sweep) = build_agent(
                 worker,
@@ -423,11 +443,19 @@ pub async fn serve(
                 Redactor::from_config(&config),
                 &files,
                 config.service.sessions,
+                adam_service::inline_upload_threshold(
+                    folder_inline_upload_limit(&files),
+                    config.service.uploads_inline_max_bytes,
+                ),
             )
             .await?;
             // The prompts of the MCP servers the deployment adds (`ADAM_EXTRA_MCP_FILE`) are
             // commands too; the coder's own `github` server has a bearer per call and gives none.
             let prompts = agent.assembly().prompt_commands().to_vec();
+            // What a person's `start.config` is held to: the bounds the session tools use, so the
+            // two cannot disagree (ADR 0054 decision 2). A control plane gets the same ones from
+            // the files and the settings (`AgentDef::session_bounds`), without binding the agent.
+            let session_bounds = agent.assembly().session_bounds().to_vec();
             // The models a message may pick (`model-pick/v1`): the root's choices, the same list
             // its card advertises.
             let choices = agent.model_choices();
@@ -459,16 +487,23 @@ pub async fn serve(
                     .map_err(Into::into)
                 }),
                 prompts,
+                session_bounds,
             )
         }
         // The starters of the helpers too, so a person's session round can be started here and a
         // worker steps it.
-        None => (
-            Agents::new(AGENT_NAME, move |builder| {
-                helpers.session_starters(builder.starter(CoderStarter))
-            }),
-            Vec::new(),
-        ),
+        None => {
+            // The bounds of a person's `start.config` on each helper, from the files and the
+            // deployment's settings alone: the very function a worker's assembly calls.
+            let session_bounds = helpers.session_bounds();
+            (
+                Agents::new(AGENT_NAME, move |builder| {
+                    helpers.session_starters(builder.starter(CoderStarter))
+                }),
+                Vec::new(),
+                session_bounds,
+            )
+        }
     };
     // A control plane connects no MCP server, so it cannot expand a prompt: a message that names the
     // prompt of one of the files' servers is refused, not sent to the model as plain text.
@@ -499,17 +534,11 @@ pub async fn serve(
         None => agents,
     };
     let agents = match sessions {
-        Some(sessions) => agents.child_sessions(sessions),
+        Some(sessions) => agents.child_sessions(sessions.with_bounds(session_bounds)),
         None => agents,
     };
     // The largest upload the card lists (`uploads/v1`): the folder's, else the environment's.
-    let agents = match files.def().ok().and_then(|def| {
-        def.manifest()
-            .frontmatter
-            .limits
-            .as_ref()?
-            .max_inline_upload_bytes
-    }) {
+    let agents = match folder_inline_upload_limit(&files) {
         Some(bytes) => agents.uploads_inline_max_bytes(bytes),
         None => agents,
     };

@@ -13,6 +13,7 @@ A page here that has a page for people sits at the same relative path, and the t
 | [Skills](skills.md) | none | the skills this repository provides, how consumers install them, how to write and keep one |
 | [Concepts: the evidence](concepts.md) | [Concepts](../../docs/concepts.md) | where the code defines each term of the glossary |
 | [Architecture: the evidence](architecture.md) | [Architecture](../../docs/architecture.md) | what was verified, when and how, and what is still unverified |
+| [Releases: the procedure and the evidence](guides/releases.md) | [Releases](../../docs/guides/releases.md) | the files of the release flow, the invariants to check, how to read a release's digests and rehearse a release, and what stays unverified until a tag |
 | [Upgrade an adam deployment: evidence](guides/upgrade-an-adam-deployment.md) | [Upgrade an adam deployment](../../docs/guides/upgrade-an-adam-deployment.md) | the commands to name A and B, the pin by digest, the migration code and the schema versions |
 | [The egress proxy and run-pod network: evidence](guides/egress-and-run-pod-network.md) | [The egress proxy and the network of run pods](../../docs/guides/egress-and-run-pod-network.md) | the commands to read the proxy and its policies, and where the chart renders each rule |
 | [Read a stuck run: queries](guides/read-a-stuck-run.md) | [Read a run's state when it is stuck](../../docs/guides/read-a-stuck-run.md) | the read-only queries on the run store and the code each claim stands on |
@@ -20,6 +21,8 @@ A page here that has a page for people sits at the same relative path, and the t
 | [Errors: rules to check](reference/errors.md) | [Errors](../../docs/reference/errors.md) | the rules every error enum keeps |
 | [Agent files: the decisions to keep](reference/agent-files.md) | [Agent files](../../docs/reference/agent-files.md) | the owner's decisions behind the folder format |
 | [Child runs: the tests](reference/child-runs.md) | [Child runs](../../docs/reference/child-runs.md) | the test of every failure interleaving, and how the tests make each happen |
+| [ADR 0081: the evidence](decisions/0081-an-agent-keeps-a-self-improvement-memory-near-it-and-what-holds-becomes-the-deployments-memory.md) | [ADR 0081](../../docs/decisions/0081-an-agent-keeps-a-self-improvement-memory-near-it-and-what-holds-becomes-the-deployments-memory.md) | the paper, the code the memory decision was checked against, the draft's values and the proof of each slice |
+| [0082: the evidence](decisions/0082-the-sql-adapters-keep-their-rules-in-the-database.md) | [ADR 0082](../../docs/decisions/0082-the-sql-adapters-keep-their-rules-in-the-database.md) | the survey of every rule the SQL adapters enforce in Rust, with `path:line`, the sources of the facts, and each slice's decisive cases and mutations |
 
 ## Still mixed
 

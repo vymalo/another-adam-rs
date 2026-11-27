@@ -21,7 +21,7 @@ orchestration layer writes what a client sends and reads. The system's pages wer
 |---|---|---|---|---|---|
 | A2UI v1.0 | `https://a2ui.org/a2a-extension/a2ui/v1.0` | always | always | yes: surfaces are drawn, and the renderer's offer is read on every turn | A2UI's own specification (not ours); the card entry is in [`ui-catalog-v2`](https://vymalo.github.io/another-agentic-system/api/ui-catalog-v2) |
 | UI catalog v2 | `https://agents.vymalo.com/a2a/extensions/ui-catalog/v2` | always | always | yes | [`ui-catalog-v2`](https://vymalo.github.io/another-agentic-system/api/ui-catalog-v2) |
-| Thread tools | `https://agents.vymalo.com/a2a/extensions/thread-tools/v1` | always | always | yes, except the contract's `request_upload` tool, which no code calls (see `uploads/v1`) | [`thread-tools-v1`](https://vymalo.github.io/another-agentic-system/api/thread-tools-v1) |
+| Thread tools | `https://agents.vymalo.com/a2a/extensions/thread-tools/v1` | always | always | yes, and the contract's `request_upload` tool is called by the coder's `share_file` (see `uploads/v1`) | [`thread-tools-v1`](https://vymalo.github.io/another-agentic-system/api/thread-tools-v1) |
 | Mentions | `https://agents.vymalo.com/a2a/extensions/mentions/v1` | always | always | yes: the mentioned agents are the run's context, and `ask_agent` asks them | [`mentions-v1`](https://vymalo.github.io/another-agentic-system/api/mentions-v1) |
 | Steer | `https://agents.vymalo.com/a2a/extensions/steer/v1` | always | always | yes | [`steer-v1`](https://vymalo.github.io/another-agentic-system/api/steer-v1) |
 | Steps | `https://agents.vymalo.com/a2a/extensions/steps/v1` | always | always | yes | [`steps-v1`](https://vymalo.github.io/another-agentic-system/api/steps-v1) |
@@ -33,19 +33,22 @@ orchestration layer writes what a client sends and reads. The system's pages wer
 | Commands | `https://agents.vymalo.com/a2a/extensions/commands/v1` | when the agent has any command: a file in `commands/`, or a prompt of one of its MCP servers | the same | yes | [`commands-v1`](https://vymalo.github.io/another-agentic-system/api/commands-v1) |
 | Child sessions | `https://agents.vymalo.com/a2a/extensions/child-sessions/v1` | when the root agent has a subagent, local or remote | the same | yes | [`child-sessions-v1`](https://vymalo.github.io/another-agentic-system/api/child-sessions-v1) |
 | Locale | `https://agents.vymalo.com/a2a/extensions/locale/v1` | when `DEFAULT_LOCALE` is set | the same | yes | [`locale-v1`](https://vymalo.github.io/another-agentic-system/api/locale-v1) |
-| Reasoning | `https://agents.vymalo.com/a2a/extensions/reasoning/v1` | when the deployment profiles the model (`MODEL_ALIASES_FILE`) and the model takes a level | the same | yes | no page of its own; the system describes how it reads it in [`model-pick-v1`](https://vymalo.github.io/another-agentic-system/api/model-pick-v1), and adam's side is [ADR 0063](../decisions/0063-a-reasoning-effort-is-one-setting.md) |
+| Reasoning | `https://agents.vymalo.com/a2a/extensions/reasoning/v1` | when the deployment profiles the model (`MODEL_ALIASES_FILE`) and the model takes a level | the same | yes: a named level reaches every model call; the echo of the effort on the task is not built yet | no page of its own; the system describes how it reads it in [`model-pick-v1`](https://vymalo.github.io/another-agentic-system/api/model-pick-v1), and adam's side is [ADR 0063](../decisions/0063-a-reasoning-effort-is-one-setting.md) |
 | Model pick | `https://agents.vymalo.com/a2a/extensions/model-pick/v1` | when the deployment offers a model besides the agent's own | the same | yes | [`model-pick-v1`](https://vymalo.github.io/another-agentic-system/api/model-pick-v1) |
 | Prompt statement | `https://agents.vymalo.com/a2a/extensions/prompt-statement/v1` | with `MODEL_AUTH=injector` or a turn signing key | the same | yes, on adam's side: the headers go on every model call | no contract page yet; adam's side is [ADR 0077](../decisions/0077-a-model-call-carries-the-prompt-statement-and-the-persons-envelope.md) |
-| Uploads | `https://agents.vymalo.com/a2a/extensions/uploads/v1` | always | always | **no**: the card lists it and nothing serves it | [`uploads-v1`](https://vymalo.github.io/another-agentic-system/api/uploads-v1) |
+| Uploads | `https://agents.vymalo.com/a2a/extensions/uploads/v1` | always | always | **partly**: the coder's `share_file` sends a file over the inline threshold by reference; a folder agent has no tool that does, and `files: true` results from MCP servers still go inline | [`uploads-v1`](https://vymalo.github.io/another-agentic-system/api/uploads-v1) |
 
 ## What to read from it
 
-* **A listed URI is not a promise, in one case.** `uploads/v1` is on every card and no adam code asks for an upload
-  slot: a client that sends a file too large for a message to an adam agent gets no help from it. The orchestration
-  layer's side is built; this is the gap tracked as
-  [vymalo/another-adam-rs#282](https://github.com/vymalo/another-adam-rs/issues/282) and row 10 of
-  [Parity](parity.md). The inline threshold that decides what is "too large" (`UPLOADS_INLINE_MAX_BYTES`) is read and not
-  used yet.
+* **A listed URI is not a promise, in one case, and only for part of it.** `uploads/v1` is on every card. The coder's
+  `share_file` serves it: a file over the inline threshold (the folder's `limits.max_inline_upload_bytes`, else
+  `UPLOADS_INLINE_MAX_BYTES`, else 10 MiB, and never more than the 4 MiB an artifact holds) goes to the bucket by
+  reference, but only when a message of the conversation activated the extension and the run holds a thread-tools grant;
+  otherwise it is refused, never inlined. **A folder agent (`adam-agent`) has no such tool**, and a file an MCP server
+  returns with `files: true` still goes inline, so a client that sends a large file through them gets no help: the rest of
+  the gap tracked as [vymalo/another-adam-rs#282](https://github.com/vymalo/another-adam-rs/issues/282) and row 10 of
+  [Parity](parity.md). The orchestration layer's side is built; the end-to-end through it is not (it is proven here on a
+  fake thread-tools endpoint and a mock bucket).
 * **A conditional row is listed exactly when it is served.** The process adds the entry when its own configuration makes
   it true (a locale, a profiled model, a subagent, a signed model call), and a card that already lists the URI keeps its
   own entry. A deployment that sets none of them lists none of them.

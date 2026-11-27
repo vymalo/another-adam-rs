@@ -22,6 +22,7 @@ These pages are for people. The procedures and evidence that coding agents use l
 |---|---|---|
 | Use | [Write an agent](guides/write-an-agent.md) | you want an agent that is a folder of Markdown, or one with `#[tool]` functions |
 | Deploy | [Deploy the coder](guides/deploy-the-coder.md) | you are installing the image and the Helm chart on Kubernetes |
+| Deploy | [Releases](guides/releases.md) | you want a fixed version for production: what a release is, how one is cut, which tag to pin, how to check its signature |
 | Operate | [Upgrade an adam deployment](guides/upgrade-an-adam-deployment.md) | you move a running coder to a newer image: what to read, what needs your hand, what the database does |
 | Operate | [The egress proxy and the network of run pods](guides/egress-and-run-pod-network.md) | a build in a run pod cannot reach a host, or you want to let it |
 | Operate | [Read a run's state when it is stuck](guides/read-a-stuck-run.md) | a task does not finish: is it waiting, or is it stuck, and where to look in the store |

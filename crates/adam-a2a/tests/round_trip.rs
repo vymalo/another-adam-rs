@@ -736,6 +736,52 @@ async fn health_router_serves_healthz_and_nothing_else() {
     }
 }
 
+/// `A2aServer::protected_router` is the given routes alone, behind their own bearer: the token it
+/// was given answers, nothing else does, and every other path (`/healthz` and the card included)
+/// is a plain 404, with a token or without.
+#[tokio::test]
+async fn protected_router_serves_its_routes_behind_its_token_and_nothing_else() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let routes = axum::Router::new().route("/internal/thing", axum::routing::get(|| async { "x" }));
+    let auth = AuthConfig::BearerTokens(vec![SecretString::from("own-token")]);
+    tokio::spawn(async move {
+        axum::serve(listener, A2aServer::protected_router(auth, routes))
+            .await
+            .unwrap();
+    });
+    let bearer = |token: &'static str| [("Authorization", token)];
+    let ok = raw(
+        addr,
+        "GET",
+        "/internal/thing",
+        &bearer("Bearer own-token"),
+        "",
+    )
+    .await;
+    assert_eq!(ok.status, 200);
+    assert_eq!(ok.body.trim_end_matches('\n').lines().last(), Some("x"));
+    for headers in [
+        &[][..],
+        &bearer("Bearer other-token")[..],
+        &bearer("own-token")[..],
+    ] {
+        let refused = raw(addr, "GET", "/internal/thing", headers, "").await;
+        assert_eq!(refused.status, 401, "{headers:?}");
+    }
+    for (method, path) in [
+        ("GET", "/healthz"),
+        ("GET", "/.well-known/agent-card.json"),
+        ("POST", "/"),
+        ("GET", "/tasks"),
+    ] {
+        for headers in [&[][..], &bearer("Bearer own-token")[..]] {
+            let response = raw(addr, method, path, headers, "{}").await;
+            assert_eq!(response.status, 404, "{method} {path} {headers:?}");
+        }
+    }
+}
+
 #[tokio::test]
 async fn the_client_gets_a_typed_error_on_a_bad_token() {
     let server = TestServer::start(TestServer::bearer()).await;

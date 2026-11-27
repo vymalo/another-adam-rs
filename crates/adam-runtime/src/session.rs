@@ -426,6 +426,9 @@ pub struct SessionSummary {
     /// The round whose report the session has: the latest one that worked (a closing round has
     /// none), which is the latest round itself unless a closing round follows it.
     pub report: ReportRound,
+    /// The configuration the session runs with, as its latest round's header says
+    /// ([`SessionHeader::config`], ADR 0054); `None` when it has none.
+    pub config: Option<SessionConfig>,
 }
 
 /// The round a session's report is of ([`SessionSummary::report`]).
@@ -1112,6 +1115,7 @@ pub(crate) fn page_of_sessions(
                 idle_expired: read.idle_expired,
                 started_by: latest.parent_id,
                 report,
+                config: read.header.as_ref().and_then(|h| h.config.clone()),
             })
         })
         .collect();

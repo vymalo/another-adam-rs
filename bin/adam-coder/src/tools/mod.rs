@@ -344,6 +344,11 @@ pub struct ToolEnv {
     /// The language servers by language ([`lsp`]): the closed table of the images. A test points a
     /// language at the scripted server; production never changes it.
     pub language_table: ServerTable,
+    /// The size over which `share_file` sends a file by reference (`uploads/v1`) instead of inline:
+    /// the agent folder's `limits.max_inline_upload_bytes`, else `UPLOADS_INLINE_MAX_BYTES`, else
+    /// 10 MiB (`adam_service::inline_upload_threshold`, the number the card is served under). The
+    /// inline form is never larger than `MAX_ARTIFACT_FILE_BYTES` whatever this says.
+    pub inline_upload_threshold: u64,
     /// What a tool wants to add to its own result without being the one that builds it (a slot
     /// made while reading: which commit it holds): by call, taken by [`Gated`] when the call ends.
     notices: std::sync::Mutex<std::collections::HashMap<String, Vec<String>>>,
@@ -373,6 +378,7 @@ impl ToolEnv {
             references: References::default(),
             commands: Commands::new(),
             language_table: ServerTable::production(),
+            inline_upload_threshold: adam_a2a::DEFAULT_UPLOADS_INLINE_MAX_BYTES,
             notices: std::sync::Mutex::default(),
         }
     }
@@ -409,6 +415,14 @@ impl ToolEnv {
     #[must_use]
     pub fn with_unavailable_wait(mut self, wait: Duration) -> Self {
         self.unavailable_wait = Some(wait);
+        self
+    }
+
+    /// Send a file over `bytes` by reference (`uploads/v1`): see
+    /// [`inline_upload_threshold`](Self::inline_upload_threshold).
+    #[must_use]
+    pub fn with_inline_upload_threshold(mut self, bytes: u64) -> Self {
+        self.inline_upload_threshold = bytes;
         self
     }
 
@@ -1041,6 +1055,10 @@ impl Tool for Gated {
         self.inner.required_state()
     }
 
+    fn events(&self) -> Vec<adam_llm_agent::EventSpec> {
+        self.inner.events()
+    }
+
     fn asks_user(&self) -> bool {
         self.inner.asks_user()
     }
@@ -1237,6 +1255,10 @@ impl Tool for Redacting {
 
     fn required_state(&self) -> Vec<StateKey> {
         self.inner.required_state()
+    }
+
+    fn events(&self) -> Vec<adam_llm_agent::EventSpec> {
+        self.inner.events()
     }
 
     fn asks_user(&self) -> bool {
@@ -1917,6 +1939,49 @@ mod access_forwarding_tests {
         async fn call(&self, _ctx: &ToolCtx, _args: Value) -> Result<ToolOutput, ToolError> {
             Ok(ToolOutput::text("x"))
         }
+    }
+
+    /// A tool that declares a custom event (ADR 0050, slice H5).
+    struct Announces;
+
+    #[async_trait::async_trait]
+    impl Tool for Announces {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "announces".into(),
+                description: "x".into(),
+                parameters: serde_json::json!({"type": "object"}),
+            }
+        }
+
+        fn events(&self) -> Vec<adam_llm_agent::EventSpec> {
+            vec![adam_llm_agent::EventSpec::new("demo.published").published()]
+        }
+
+        async fn call(&self, _ctx: &ToolCtx, _args: Value) -> Result<ToolOutput, ToolError> {
+            Ok(ToolOutput::text("x"))
+        }
+    }
+
+    /// Both layers forward what the tool declares, or an emit of a wrapped tool is refused as
+    /// undeclared.
+    #[test]
+    fn gated_and_redacting_forward_the_tools_events() {
+        let root = tempfile::tempdir().unwrap();
+        let workspaces = Workspaces::new(
+            root.path().join("work"),
+            Arc::new(ScopedToken::new("github.com", "t")),
+        );
+        let env = Arc::new(ToolEnv::new(
+            workspaces,
+            Arc::new(MemoryCodeHost::new()),
+            CoderSettings::new(),
+        ));
+        let want = vec![adam_llm_agent::EventSpec::new("demo.published").published()];
+        let gated = Gated::layer(env)(Arc::new(Announces));
+        assert_eq!(gated.events(), want, "Gated");
+        let redacting = Redacting::layer(Redactor::new(["secret-value-0123456789"]))(gated);
+        assert_eq!(redacting.events(), want, "Redacting over Gated");
     }
 
     /// Both layers say what the tool says about its schema: a layer that did not would make an MCP

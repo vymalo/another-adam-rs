@@ -142,6 +142,7 @@ mod agent;
 mod compaction;
 mod conversation;
 mod early;
+mod events;
 mod fn_tool;
 mod gate;
 mod history;
@@ -177,6 +178,13 @@ pub use adam_plugin::{
     HookedModelRequest, HookedText, MESSAGE_RECEIVED, MODEL_REQUEST, MessageFile, ModelCallKind,
     ObserveLimits, Plugin, Verdict,
 };
+/// Custom events (ADR 0050, slice H5): what a tool or an agent declares ([`EventSpec`]), who may see
+/// it ([`Visibility`]), how an observer subscribes ([`Subscriptions`]), and why a declaration is
+/// refused ([`DeclarationError`]).
+pub use adam_plugin::{
+    DATA_MAX, DeclarationError, EventSpec, RESERVED_NAMESPACES, STEP_EVENTS_MAX, Subscriptions,
+    TRANSITION_EVENTS_MAX, Visibility,
+};
 pub use adam_runtime::{Artifact, StepEvent, StepIcon, StepKind, StepOutput, StepState};
 pub use agent::{
     BuildError, CLOSING_TURN, DEFAULT_MAX_PARALLEL, DEFAULT_WAIT_POLL, Limits, LlmAgent,
@@ -198,6 +206,7 @@ pub use conversation::{
     REASONING_EFFORT_CONTEXT_KEY, RENDERER_OFFER_CONTEXT_KEY, Repeats, STOPPED_BY_THE_PERSON,
     loaded_note, user_message,
 };
+pub use events::{EmitError, RecordedEvent};
 pub use fn_tool::FnTool;
 #[cfg(feature = "schema")]
 pub use fn_tool::{FnToolBuilder, TypedFnToolBuilder};

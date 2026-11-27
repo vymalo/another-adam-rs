@@ -9,18 +9,21 @@ cover moving a Rust program's git dependency on adam: that is the `adam-upgrade`
 
 ## How the tag moves
 
-adam-rs has no semver releases and no changelog: the history, the decisions and the READMEs are the changelog. An
-image is `ghcr.io/vymalo/another-adam-rs/coder:sha-<7>`, the first seven characters of a commit of `main`
-([how a change reaches the chart](deploy-the-coder.md#how-a-change-reaches-the-chart)). CI pushes the image only after its
-smoke tests pass, then commits `chore(deploy): bump coder to sha-<7>` to the chart's `image.tag`. A deployment moves in one of two
-ways:
+There are two kinds of tag. A **release** is `X.Y.Z`: the image `ghcr.io/vymalo/another-adam-rs/coder:X.Y.Z` and the
+chart `oci://ghcr.io/vymalo/another-adam-rs/charts/coder` at the same version, signed, with a changelog
+([Releases](releases.md)). A **development** image is `sha-<7>`, the first seven characters of a commit of `main`
+([how a change reaches the chart](deploy-the-coder.md#how-a-change-reaches-the-chart)): CI pushes it only after its smoke
+tests pass, then commits `chore(deploy): bump coder to sha-<7>` to the chart's `image.tag`. A deployment moves in one of
+three ways:
 
 | You | The tag moves when |
 |---|---|
+| pin a release, `X.Y.Z@sha256:<digest>` (production) | you change the pin, after you have read the changelog between the two versions |
 | render the chart from `main` | the bump commit lands: the next `helm upgrade` takes it, so you have not chosen the moment |
-| pin `image.tag` in your own values | you change that line, after you have read what is between the old and the new commit |
+| pin a `sha-<7>` in your own values | you change that line, after you have read what is between the old and the new commit |
 
-A deployment you care about pins. A new package on the registry is private until its owner publishes it:
+A deployment you care about pins; production pins a release. Between two releases, `CHANGELOG.md` lists what changed;
+between two commits, the history, the decisions and the READMEs do. A new package on the registry is private until its owner publishes it:
 check an anonymous pull before you point a deployment at it.
 
 ## The steps
@@ -35,7 +38,7 @@ sequenceDiagram
     participant D as Database
 
     P->>K: which tag runs now (A)
-    P->>G: pick B: a commit of main whose image exists
+    P->>G: pick B: a release, or a commit of main whose image exists
     P->>G: read what changed from A to B: commits with !, the decisions, the READMEs
     P->>P: take a database backup, fix what the table below says
     P->>H: helm template with the new tag and your values
@@ -49,8 +52,9 @@ sequenceDiagram
     P->>K: read the agent card, send one task
 ```
 
-1. **Name A and B.** A is the tag running now. B is a commit of `main` whose image exists: not every commit
-   has one, and a commit whose subject only says `chore(deploy): bump coder` changes nothing itself.
+1. **Name A and B.** A is the tag running now. B is a release ([Releases](releases.md)) or a commit of `main` whose
+   image exists: not every commit has one, and a commit whose subject only says `chore(deploy): bump coder` changes
+   nothing itself. Between two releases, read `CHANGELOG.md` first.
 2. **Read what changed.** Look at the commits between A and B that touch `deploy`, `docker`, `bin`, `crates` and
    `docs/decisions`. A subject with `!` says it breaks. The pages that change with the code are
    [the chart](../../deploy/coder/README.md), [Deploy the coder](deploy-the-coder.md),

@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Map, Value};
 
-use crate::HookSet;
+use crate::{DeclarationError, EventSpec, HookSet, Subscriptions, declared};
 
 /// The longest a text field of an event is, in bytes.
 pub const FIELD_MAX: usize = 4 * 1024;
@@ -76,9 +76,38 @@ pub enum EventKind {
     RunError,
     /// The runtime committed a transition that kept an artifact (H4).
     ArtifactKept,
+    /// A custom event (ADR 0050, slice H5): a tool declared it and emitted it. Its name is
+    /// [`HookEvent::name`]; [`EventKind::name`] says `custom`, which is no event's name.
+    Custom,
 }
 
 impl EventKind {
+    /// Every core event of the catalogue: [`EventKind::Custom`] is not one.
+    pub const ALL: [EventKind; 22] = [
+        EventKind::RunStarted,
+        EventKind::TurnStarted,
+        EventKind::ModelResponded,
+        EventKind::ModelFailed,
+        EventKind::UsageRecorded,
+        EventKind::ToolStarted,
+        EventKind::ToolCompleted,
+        EventKind::ToolFailed,
+        EventKind::ToolDenied,
+        EventKind::TurnEnded,
+        EventKind::CompactionEnded,
+        EventKind::RunCancelled,
+        EventKind::ChildStarted,
+        EventKind::ChildEnded,
+        EventKind::SessionStarted,
+        EventKind::SessionRoundStarted,
+        EventKind::SessionRoundEnded,
+        EventKind::SessionClosed,
+        EventKind::RunParked,
+        EventKind::RunEnded,
+        EventKind::RunError,
+        EventKind::ArtifactKept,
+    ];
+
     /// The event's name, as the catalogue and a program's payload spell it.
     #[must_use]
     pub fn name(self) -> &'static str {
@@ -105,6 +134,7 @@ impl EventKind {
             EventKind::RunEnded => "run.ended",
             EventKind::RunError => "run.error",
             EventKind::ArtifactKept => "artifact.kept",
+            EventKind::Custom => "custom",
         }
     }
 }
@@ -127,8 +157,11 @@ pub struct EventHeader {
 /// What an observer receives: a core event with its header and its bounded, scrubbed fields.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HookEvent {
-    /// Which event.
+    /// Which event. [`EventKind::Custom`] for an event a tool declared; its name is in
+    /// [`HookEvent::custom`].
     pub kind: EventKind,
+    /// The name of a custom event (`demo.published`); `None` for a core event.
+    pub custom: Option<String>,
     /// Who and when.
     pub header: EventHeader,
     /// The event's fields, by name.
@@ -143,10 +176,33 @@ impl HookEvent {
     pub fn new(kind: EventKind, header: EventHeader) -> Self {
         HookEvent {
             kind,
+            custom: None,
             header,
             fields: BTreeMap::new(),
             cut: Vec::new(),
         }
+    }
+
+    /// A custom event (ADR 0050, slice H5) called `name`: its `version` and its `data`, the data
+    /// scrubbed with `scrub` and held to the JSON bound like any JSON field. A custom event is
+    /// always [`EventKind::Custom`]; the loop builds one for each event a record holds.
+    #[must_use]
+    pub fn custom(
+        name: &str,
+        version: u32,
+        header: EventHeader,
+        data: &Value,
+        scrub: &dyn Fn(&str) -> String,
+    ) -> Self {
+        let mut event = HookEvent::new(EventKind::Custom, header);
+        event.custom = Some(name.to_owned());
+        event.plain("version", version).json("data", data, scrub)
+    }
+
+    /// The event's name: the catalogue's for a core event, the declared one for a custom event.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        self.custom.as_deref().unwrap_or_else(|| self.kind.name())
     }
 
     /// The same event with a text field: scrubbed with `scrub`, then cut at [`FIELD_MAX`].
@@ -190,7 +246,7 @@ impl HookEvent {
     #[must_use]
     pub fn to_value(&self) -> Value {
         let mut map = Map::new();
-        map.insert("name".into(), self.kind.name().into());
+        map.insert("name".into(), self.name().into());
         map.insert("key".into(), self.header.key.clone().into());
         map.insert("run".into(), self.header.run.clone().into());
         map.insert("root_run".into(), self.header.root_run.clone().into());
@@ -327,7 +383,33 @@ impl HookSet {
         self
     }
 
-    /// Offers `events`, in order, to every plugin's `observe`, in declaration order.
+    /// The custom events the plugins declare (ADR 0050, slice H5), in plugin order.
+    #[must_use]
+    pub fn declared_events(&self) -> Vec<EventSpec> {
+        self.plugins.iter().flat_map(|p| p.events()).collect()
+    }
+
+    /// Whether every plugin's subscriptions can match something, given the events `others` (the
+    /// tools' and the agent's) declare beside the plugins' own: the declarations are valid and do not
+    /// conflict, and each pattern's namespace is core or declared. The agent's build calls this.
+    ///
+    /// # Errors
+    /// The first [`DeclarationError`].
+    pub fn check_events(&self, others: &[EventSpec]) -> Result<(), DeclarationError> {
+        let own = self.declared_events();
+        let all = declared(own.iter().chain(others))?;
+        let namespaces: std::collections::BTreeSet<String> = all
+            .values()
+            .map(|spec| spec.namespace().to_owned())
+            .collect();
+        for plugin in &self.plugins {
+            plugin.subscriptions().check(plugin.name(), &namespaces)?;
+        }
+        Ok(())
+    }
+
+    /// Offers `events`, in order, to every plugin's `observe`, in declaration order, when the
+    /// plugin's [`subscriptions`](crate::Plugin::subscriptions) match the event.
     ///
     /// An observer's error, panic or missed deadline is counted in the report and dropped: the
     /// next plugin and the next event are offered as if it had answered. Once the flush has taken
@@ -336,12 +418,17 @@ impl HookSet {
     pub fn observe(&self, events: &[HookEvent]) -> FlushReport {
         let mut report = FlushReport::default();
         let started = Instant::now();
+        // Asked once per flush, not per event: a plugin's subscriptions do not change under it.
+        let wanted: Vec<Subscriptions> = self.plugins.iter().map(|p| p.subscriptions()).collect();
         for (at, event) in events.iter().enumerate() {
             if started.elapsed() > self.observe_limits.per_flush {
                 report.dropped = events.len() - at;
                 break;
             }
-            for plugin in &self.plugins {
+            for (plugin, subscriptions) in self.plugins.iter().zip(&wanted) {
+                if !subscriptions.matches(event) {
+                    continue;
+                }
                 let begun = Instant::now();
                 let outcome = catch_unwind(AssertUnwindSafe(|| plugin.observe(event)));
                 match outcome {

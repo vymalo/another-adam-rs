@@ -1,0 +1,316 @@
+name: release
+
+# A release, on the tag `vX.Y.Z` that release-please.yml cuts when its pull request merges (ADR 0084):
+#
+#   ghcr.io/vymalo/another-adam-rs/coder:X.Y.Z and :X.Y     the image, with buildx provenance (mode=max) and
+#                                                          an SBOM in its index, signed with cosign, keyless
+#   oci://ghcr.io/vymalo/another-adam-rs/charts/coder      the chart deploy/coder at version X.Y.Z, whose
+#                                                          image.tag is X.Y.Z, signed the same way
+#
+# Never `latest`, and nothing here moves on main: coder.yml keeps pushing `sha-<7>` and bumping
+# values.yaml for development. Production pins `X.Y.Z@sha256:<digest>`.
+#
+# The image is built again here, from the tag's commit, with the build arguments coder.yml uses. It is
+# not a retag of coder.yml's `sha-<7>`: that image is loaded into the runner's Docker and pushed with
+# `docker push`, which carries no provenance or SBOM, and those exist only when buildx builds and pushes
+# the image itself. So the release (1) waits for coder.yml's image job to pass on this very commit (the
+# smoke tests and every compose scenario), (2) builds with the cache main wrote and pushes the result by
+# digest only, with no tag, (3) runs the container smoke tests on that digest, (4) signs it, and only
+# then (5) names it X.Y.Z and X.Y. A tag therefore only ever points at a signed, smoke-tested digest.
+# The release digest is not the digest of `sha-<7>`.
+#
+# `id-token: write` (what Fulcio certifies, and a credential that can be exchanged for cloud roles) is
+# granted to the one job that signs, `publish`; `packages: write` to the two that write to GHCR. A
+# job-level `permissions:` block replaces the workflow-level one, so each restates what it needs.
+#
+# Verify a release (the identity is this file at the tag; renaming the file breaks every verify):
+#   cosign verify ghcr.io/vymalo/another-adam-rs/coder:X.Y.Z \
+#     --certificate-identity "https://github.com/vymalo/another-adam-rs/.github/workflows/release.yml@refs/tags/vX.Y.Z" \
+#     --certificate-oidc-issuer https://token.actions.githubusercontent.com
+
+on:
+  push:
+    tags: ["v*"]
+
+# Two runs for one tag must not race for its names. Not cancel-in-progress: a cancelled run can leave a
+# signed digest without its tags, which a re-run finishes.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  IMAGE: ghcr.io/vymalo/another-adam-rs/coder
+  CHART: ghcr.io/vymalo/another-adam-rs/charts/coder
+  CHART_REPO: oci://ghcr.io/vymalo/another-adam-rs/charts
+  HELM_VERSION: v4.3.2
+
+jobs:
+  # The tag is a release of main whose every marked version is the tag's, and coder.yml's image job passed
+  # on its commit. Nothing is built before that holds.
+  gate:
+    name: the tag, its versions and coder.yml on its commit
+    runs-on: ubuntu-latest
+    # coder.yml's image job can take 90 minutes; it starts when the release pull request merges, at the
+    # same moment as release-please, so this job usually waits for it.
+    timeout-minutes: 150
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      version: ${{ steps.tag.outputs.version }}
+      minor: ${{ steps.tag.outputs.minor }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: The tag is vX.Y.Z on main, and every marked version says X.Y.Z
+        id: tag
+        run: |
+          set -eu
+          tag=${GITHUB_REF#refs/tags/}
+          sh tools/release/check-versions.sh "$tag"
+          version=${tag#v}
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "::error::$tag points at $GITHUB_SHA, which is not on main; a release is cut from main by release-please"
+            exit 1
+          fi
+          if grep -Eq '^ARG WORKSPACE_TAG=.*PENDING' docker/coder/Dockerfile; then
+            echo "::error file=docker/coder/Dockerfile::WORKSPACE_TAG is a placeholder; there is no image to release"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "minor=${version%.*}" >> "$GITHUB_OUTPUT"
+      - name: Wait for coder.yml's image job to pass on this commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          JOB: build, smoke-test and push the image
+        run: |
+          set -eu
+          deadline=$(( $(date +%s) + 140 * 60 ))
+          runs="$RUNNER_TEMP/coder-runs"
+          while :; do
+            gh api "repos/$GITHUB_REPOSITORY/actions/workflows/coder.yml/runs?head_sha=$GITHUB_SHA&per_page=50" \
+              --jq '.workflow_runs[] | "\(.id) \(.status) \(.conclusion // "none")"' > "$runs"
+            passed=
+            pending=
+            while read -r id status conclusion; do
+              if [ "$status" != completed ]; then
+                pending=1
+              elif [ "$conclusion" = success ]; then
+                job=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$id/jobs?per_page=100" \
+                  --jq ".jobs[] | select(.name == \"$JOB\") | .conclusion")
+                if [ "$job" = success ]; then passed=$id; fi
+              fi
+            done < "$runs"
+            if [ -n "$passed" ]; then
+              echo "coder.yml run $passed passed its image job on $GITHUB_SHA"
+              exit 0
+            fi
+            if [ -s "$runs" ] && [ -z "$pending" ]; then
+              echo "::error::no coder.yml run on $GITHUB_SHA passed its image job. Re-run it, or run coder.yml by hand on this tag (workflow_dispatch), then re-run this workflow."
+              exit 1
+            fi
+            if [ "$(date +%s)" -gt "$deadline" ]; then
+              echo "::error::coder.yml has not finished on $GITHUB_SHA after 140 minutes"
+              exit 1
+            fi
+            sleep 60
+          done
+
+  # Build with provenance and an SBOM, push by digest only, and run the container smoke tests on that digest.
+  build:
+    name: build and smoke-test the release image
+    needs: gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+    services:
+      # The coder's database for the container smoke test, as in coder.yml.
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres" --health-interval 2s --health-retries 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      # The build arguments coder.yml passes, so the binaries say the same revision (ADR 0028). The cache is
+      # read from main's (coder.yml writes it) and not written: a tag's run adds nothing main lacks.
+      - id: build
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+        with:
+          context: .
+          file: docker/coder/Dockerfile
+          platforms: linux/amd64
+          build-args: |
+            ADAM_BUILD_REVISION=${{ github.sha }}
+          labels: |
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.version=${{ needs.gate.outputs.version }}
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
+          provenance: mode=max
+          sbom: true
+          cache-from: type=gha
+      - name: Pull the pushed digest for the smoke tests
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -eu
+          docker pull "$IMAGE@$DIGEST"
+          docker tag "$IMAGE@$DIGEST" coder:release
+      - name: The six binaries are static and start in a foreign image
+        run: sh docker/coder/test/static-smoke.sh coder:release
+      - name: Container smoke test
+        env:
+          EXPECT_REVISION: ${{ github.sha }}
+        run: sh docker/coder/test/container-smoke.sh coder:release
+      - name: Container smoke test of adam-agent
+        env:
+          EXPECT_REVISION: ${{ github.sha }}
+        run: sh docker/coder/test/agent-smoke.sh coder:release
+
+  # Sign the image's digest, then name it X.Y.Z and X.Y; package the chart with image.tag X.Y.Z, push it and
+  # sign it. The only job with an OIDC token.
+  publish:
+    name: sign, tag and publish the chart
+    needs: [gate, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    env:
+      VERSION: ${{ needs.gate.outputs.version }}
+      MINOR: ${{ needs.gate.outputs.minor }}
+      DIGEST: ${{ needs.build.outputs.digest }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+      - uses: sigstore/cosign-installer@7e8b541eb2e61bf99390e1afd4be13a184e9ebc5 # v3.10.1
+      - uses: azure/setup-helm@2f5e7bc67f1f9972ab16657bb795f36d8f04de0e # v5.1.0
+        with:
+          version: ${{ env.HELM_VERSION }}
+      # cosign and imagetools read the docker config; helm push reads its own (logged in below).
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Keyless: the certificate binds the digest to this workflow file at this tag, and the Rekor entry makes
+      # it public. The index is signed, and with it the provenance and SBOM manifests it carries.
+      - name: Sign the image
+        run: |
+          set -eu
+          case "$DIGEST" in sha256:*) ;; *) echo "::error::no digest from the build job"; exit 1 ;; esac
+          cosign sign --yes "$IMAGE@$DIGEST"
+
+      # A published X.Y.Z is never moved: the same digest is a re-run (nothing to do), another digest stops
+      # the release. X.Y follows the newest patch of its minor.
+      - name: Name the signed digest X.Y.Z and X.Y
+        env:
+          GHCR_USER: ${{ github.actor }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -eu
+          rc=0
+          current=$(sh tools/release/registry-digest.sh "$IMAGE" "$VERSION") || rc=$?
+          if [ "$rc" -eq 0 ] && [ "$current" != "$DIGEST" ]; then
+            echo "::error::$IMAGE:$VERSION is already published at $current; this run built $DIGEST. A released tag is never moved."
+            exit 1
+          elif [ "$rc" -ne 0 ] && [ "$rc" -ne 3 ]; then
+            echo "::error::could not tell whether $IMAGE:$VERSION is published; not tagging past that"
+            exit 1
+          fi
+          # A carbon copy of the index, so each tag names the very digest that was signed.
+          docker buildx imagetools create --prefer-index=false \
+            -t "$IMAGE:$VERSION" -t "$IMAGE:$MINOR" "$IMAGE@$DIGEST"
+          for tag in "$VERSION" "$MINOR"; do
+            got=$(sh tools/release/registry-digest.sh "$IMAGE" "$tag")
+            if [ "$got" != "$DIGEST" ]; then
+              echo "::error::$IMAGE:$tag is $got, not the signed $DIGEST"
+              exit 1
+            fi
+          done
+          echo "$IMAGE:$VERSION@$DIGEST (also :$MINOR)" >> "$GITHUB_STEP_SUMMARY"
+
+      # The chart of the tag's commit, with image.tag set to X.Y.Z in the copy that is packaged. values.yaml on
+      # main keeps coder.yml's `sha-<7>`.
+      - name: Package the chart with image.tag X.Y.Z
+        run: |
+          set -eu
+          work="$RUNNER_TEMP/chart"
+          mkdir -p "$work/src" "$work/out"
+          cp -R deploy/coder "$work/src/coder"
+          sh deploy/coder/bump-tag.sh "$work/src/coder/values.yaml" "$VERSION"
+          helm lint "$work/src/coder"
+          images=$(helm template coder "$work/src/coder" --namespace release-check \
+            | grep -oE "${IMAGE}:[^\" ]+" | sort -u)
+          if [ "$images" != "$IMAGE:$VERSION" ]; then
+            echo "::error::the packaged chart renders '$images', want $IMAGE:$VERSION"
+            exit 1
+          fi
+          helm package "$work/src/coder" --destination "$work/out"
+          test -f "$work/out/coder-$VERSION.tgz"
+
+      # `helm push` overwrites a published version silently, so ask first. Published and signed: someone already
+      # released it, stop. Published and not signed: an earlier run died between push and sign, sign it. Not
+      # published: push. Anything else: the registry did not answer, stop.
+      - name: Push the chart, unless it is published
+        id: chart
+        env:
+          GHCR_USER: ${{ github.actor }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -eu
+          rc=0
+          digest=$(sh tools/release/registry-digest.sh "$CHART" "$VERSION") || rc=$?
+          if [ "$rc" -eq 0 ]; then
+            if cosign download signature "$CHART@$digest" > /dev/null 2>&1; then
+              echo "::error::$CHART:$VERSION is already published and signed ($digest)"
+              exit 1
+            fi
+            echo "$CHART:$VERSION is published ($digest) and not signed: signing it, not pushing"
+          elif [ "$rc" -eq 3 ]; then
+            printf '%s' "$GHCR_TOKEN" | helm registry login ghcr.io --username "$GHCR_USER" --password-stdin
+            helm push "$RUNNER_TEMP/chart/out/coder-$VERSION.tgz" "$CHART_REPO"
+            digest=$(sh tools/release/registry-digest.sh "$CHART" "$VERSION")
+          else
+            echo "::error::could not tell whether $CHART:$VERSION is published; not pushing past that"
+            exit 1
+          fi
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+
+      - name: Sign the chart
+        env:
+          CHART_DIGEST: ${{ steps.chart.outputs.digest }}
+        run: |
+          set -eu
+          case "$CHART_DIGEST" in sha256:*) ;; *) echo "::error::no chart digest"; exit 1 ;; esac
+          cosign sign --yes "$CHART@$CHART_DIGEST"
+          {
+            echo "$CHART:$VERSION@$CHART_DIGEST"
+            echo
+            echo "helm install coder $CHART_REPO/coder --version $VERSION"
+          } >> "$GITHUB_STEP_SUMMARY"

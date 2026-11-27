@@ -924,6 +924,9 @@ impl RuntimeTaskBackend {
         // A message that activated `locale/v1` names the interface language of this message, or
         // names none and takes an earlier one away; one that did not is read as it always was.
         vymalo::locale_into(caller, &message, &mut inbound);
+        // A message that activated `uploads/v1` says so, with its limits, in the run's context: the
+        // tool that holds a file over its inline cap asks for a slot only then.
+        crate::uploads::put(caller, &message, &mut inbound);
         // A message that activated `prompt-statement/v1` brings the statement and the person's
         // envelope its run's model calls carry; a malformed entry is refused before anything is
         // written (ADR 0077).

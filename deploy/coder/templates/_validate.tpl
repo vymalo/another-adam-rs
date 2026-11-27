@@ -16,6 +16,16 @@ from service.yaml, which every render contains, so they always run.
 {{- if and (not .Values.database.enabled) (not $dbSecret) -}}
 {{- fail "database.enabled=false needs database.existingSecret.name (a Secret in the release namespace whose key, `uri` by default, holds the Postgres connection string): every pod needs DATABASE_URL" -}}
 {{- end -}}
+{{- /* The Cluster's PostgreSQL: 18 or later (adam ADR 0082, decision 11; the store refuses an older server at startup, exit 78). A tag whose major is below 18 is refused here, at render time. */ -}}
+{{- if .Values.database.enabled -}}
+{{- $dbImage := default "" .Values.database.imageName | toString | trim -}}
+{{- if not $dbImage -}}
+{{- fail "database.imageName is empty: the Cluster's PostgreSQL image, 18 or later, by tag and digest (the operator's own default is its release's, 17 up to CloudNativePG 1.27)" -}}
+{{- end -}}
+{{- if regexMatch ":([0-9]|1[0-7])([.@-]|$)" $dbImage -}}
+{{- fail (printf "database.imageName %s is older than PostgreSQL 18, the coder's floor (adam ADR 0082): the store refuses it at startup" $dbImage) -}}
+{{- end -}}
+{{- end -}}
 {{- $placement := include "coder.placement" . -}}
 {{- if eq $placement "a2a-only" -}}
 {{- fail "workspace.placement a2a-only is refused for the coder: every tool of the coder needs a workspace (a2a-only is for hosts whose agents only call remote agents). Use shared, affinity or isolated" -}}
@@ -91,6 +101,46 @@ from service.yaml, which every render contains, so they always run.
 {{- range $path, $name := dict "A2A_PUSH_ALLOWED_URLS" (include "coder.a2aPush" .) "A2A_CARD_SIGNING_KEY_FILE" (include "coder.a2aCardSigning" .) -}}
 {{- if and $name (hasKey $.Values.config.extraEnv $path) -}}
 {{- fail (printf "config.extraEnv.%s is set while the a2a.* value that sets it is on: the chart sets it itself" $path) -}}
+{{- end -}}
+{{- end -}}
+{{- /* GET /internal/activity on a port of its own (values `activity`, adam ADR 0083). */ -}}
+{{- if not (kindIs "bool" .Values.activity.enabled) -}}
+{{- fail (printf "activity.enabled must be true or false, got %q" (toString .Values.activity.enabled)) -}}
+{{- end -}}
+{{- range $name := list "ACTIVITY_LISTEN_ADDR" "ACTIVITY_BEARER_TOKENS" -}}
+{{- if hasKey $.Values.config.extraEnv $name -}}
+{{- fail (printf "config.extraEnv.%s is set: the activity listener is set by activity.* only, and its tokens come from a Secret (activity.tokensSecret), never from a value" $name) -}}
+{{- end -}}
+{{- end -}}
+{{- if .Values.activity.enabled -}}
+{{- $activityPort := int64 .Values.activity.port -}}
+{{- if or (lt $activityPort 1) (gt $activityPort 65535) -}}
+{{- fail (printf "activity.port must be a port number (1 to 65535), got %q" (toString .Values.activity.port)) -}}
+{{- end -}}
+{{- if eq $activityPort 8080 -}}
+{{- fail "activity.port is 8080, the A2A port: the activity route needs a port of its own" -}}
+{{- end -}}
+{{- if and .Values.githubMcp.enabled (eq $activityPort (int64 .Values.githubMcp.port)) -}}
+{{- fail (printf "activity.port is githubMcp.port (%d): the GitHub MCP sidecar listens there, pick another port" $activityPort) -}}
+{{- end -}}
+{{- $activitySecret := default "" .Values.activity.tokensSecret.name | toString | trim -}}
+{{- if not $activitySecret -}}
+{{- fail "activity.enabled needs activity.tokensSecret.name: the Secret (in the release namespace) whose key holds the activity listener's tokens. The chart never takes a token as a value, and the process refuses to start without one (fail closed)" -}}
+{{- end -}}
+{{- if not (regexMatch "^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$" $activitySecret) -}}
+{{- fail (printf "activity.tokensSecret.name must be the name of a Secret, got %q" $activitySecret) -}}
+{{- end -}}
+{{- if not (regexMatch "^[-._a-zA-Z0-9]+$" (default "" .Values.activity.tokensSecret.key | toString)) -}}
+{{- fail (printf "activity.tokensSecret.key must be a key of a Secret (letters, digits, -, _ and .), got %q" (toString .Values.activity.tokensSecret.key)) -}}
+{{- end -}}
+{{- if .Values.networkPolicy.enabled -}}
+{{- $activityNs := default "" .Values.activity.allowedNamespace | toString | trim -}}
+{{- if not $activityNs -}}
+{{- fail "activity.enabled with networkPolicy.enabled needs activity.allowedNamespace: the namespace whose pods may reach the activity port (and only that port)" -}}
+{{- end -}}
+{{- if not (regexMatch "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$" $activityNs) -}}
+{{- fail (printf "activity.allowedNamespace must be the name of a namespace, got %q" $activityNs) -}}
+{{- end -}}
 {{- end -}}
 {{- end -}}
 {{- if .Values.githubMcp.enabled -}}

@@ -489,3 +489,30 @@ Only `Deny` shortens; a hook that cannot decide never lets a summary through. Th
 still may only rewrite `temperature`, `max_output_tokens` and `metadata`, and a `Stop` fails the run. Both run inside
 the step, so a replay of the recorded summary asks neither. The summary the model returns is unchanged: an empty answer
 is still "no summary" and drops the turns.
+
+*Amended 2026-11-27 (slice **H5** built):* a tool declares custom events with `Tool::events() -> Vec<EventSpec>` (defaulted, so no
+implementer breaks), the agent's builder with `LlmAgentBuilder::event(EventSpec)`, and a plugin with `Plugin::events`;
+`EventSpec { name, version, schema, visibility }` and `Visibility::{Hooks, Clients}` are in `adam-plugin`. `try_build` refuses
+a name that does not match `^[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*){1,4}$`, one whose first segment is a core namespace
+(compared without regard to case), two declarations of one name that differ and a version of 0 (`BuildError::Event`, which a
+binary reports as exit 78); `build()` leaves an agent with no custom event when a declaration is refused. A tool emits
+only what it or the agent declared, with `ToolCtx::emit_event(name, data) -> Result<(), EmitError>` (class `Invalid`):
+data is scrubbed with the call's scrubber and then held to 4 KiB, a step holds 16 events and a transition 256, **one counter
+for all the calls of a transition** (`Conversation::event_budget`, made when the state is loaded and never serialized),
+and a refused emit takes none of the budget. The accepted events are the new `HookedOutput::events` (`name`, `version`,
+`data`), recorded in the call's step with its result; **delivery reads the record**, after the step and in call order, in
+`conclude`: each event goes to the observers that subscribe to it with the key `<run>/tool:<call id>/<name>/<index>`, and one
+declared `Clients` also goes out as `RunEvent::Custom { kind: <name>, payload: { version, key, data } }`, which
+`adam-a2a-runtime` already serves as a data part, so no extension and no `RunEvent` variant is added. The record holds the
+name and the version and not the visibility, so a build that no longer declares a name delivers it to nobody. Two readings
+of the ADR to confirm: **`Plugin::subscriptions` defaults to `Subscriptions::core()` (every core event, no custom one), not
+`none()`**, because every observer written for slices H2 to H7 already receives the core events and `none()` would silence
+them; a custom event reaches an observer only when a pattern (an exact name, `ns.*` or `*`) names it, and the exact
+subscription to a core name (`tool.completed`) is legal although declaring one is not. A pattern whose namespace is neither
+core nor declared, and an exact core name that is not in the catalogue, is a `DeclarationError::DeadSubscription` at build.
+**Not built in this slice:** `HookCtx::emit_event` (the plugin side of emitting; plugins have no `HookCtx` yet, so
+`Plugin::events` declares for subscriptions and conflicts and no more), a validation of the data against its `schema` (the
+schema is carried for a consumer; the loop bounds the size), and `#[tool(events(..))]` for the macro. Proof:
+`crates/adam-llm-agent/tests/custom_events.rs` (an undeclared or reserved name is refused, a replay after a crash delivers
+the event again with the same key, the 16 and 256 bounds), `crates/adam-a2a-runtime/tests/custom_events.rs` (an A2A client
+reads `demo.published` and not `demo.kept`) and `events_conformance!` in `adam-plugin-testkit`.

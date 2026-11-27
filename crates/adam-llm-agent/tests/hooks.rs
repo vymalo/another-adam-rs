@@ -15,8 +15,8 @@ use std::time::Duration;
 use adam_core::{DynStore, MemoryStore, RunId, RunStatus};
 use adam_llm_agent::{
     Conversation, HookDecision, HookResult, HookSet, HookedCall, HookedModelRequest, HookedOutput,
-    HookedText, LlmAgent, Plugin, Tool, ToolAccess, ToolCtx, ToolError, ToolOutput, Verdict,
-    user_message,
+    HookedText, LlmAgent, Plugin, RecordedEvent, Tool, ToolAccess, ToolCtx, ToolError, ToolOutput,
+    Verdict, user_message,
 };
 use adam_model::{Message, MockModel, ToolCall, ToolSpec};
 use adam_runtime::{RunView, Runtime, RuntimeBuilder};
@@ -522,6 +522,11 @@ fn old_and_new_step_records_decode_both_ways() {
             .by("a-plugin"),
         ],
         args: Some(json!({"path": "a"})),
+        events: vec![RecordedEvent {
+            name: "demo.published".into(),
+            version: 1,
+            data: json!({"n": 1}),
+        }],
     };
     let new_json = serde_json::to_value(&new).unwrap();
     // A build that predates hooks reads the record as the output it flattened, and ignores the rest.

@@ -81,13 +81,18 @@ x-pusher: &pusher
 
 services:
   postgres:
-    image: postgres:16
+    # PostgreSQL 18.7, the store's floor (ADR 0082, decision 11), by tag and digest (the OCI index
+    # of docker.io/library/postgres:18.7, *verified 2026-11-27* from the registry). From 18 the image
+    # keeps its data under /var/lib/postgresql/18/docker and refuses a mount at
+    # /var/lib/postgresql/data, so the volume is mounted one level up, and it is a new volume: a
+    # PostgreSQL 16 volume is not upgraded in place (`docker volume rm` the old one when done).
+    image: postgres:18.7@sha256:64c8b0d31e4ab6ea665e8426ea406a94bf52de3c05b3a4a8bf713704eefa9328
     restart: "no"
     environment:
       POSTGRES_PASSWORD: postgres # dummy, local only, on internal networks
       POSTGRES_DB: postgres
     volumes:
-      - postgres-data:/var/lib/postgresql/data
+      - postgres-18-data:/var/lib/postgresql
       - ./postgres-init.sql:/docker-entrypoint-initdb.d/10-bench.sql:ro
     networks: [slot-1, slot-2]
     healthcheck:
@@ -191,5 +196,5 @@ networks:
   egress: {}
 
 volumes:
-  postgres-data:
+  postgres-18-data:
   git-data:

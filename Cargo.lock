@@ -659,10 +659,12 @@ dependencies = [
  "rmcp",
  "secrecy",
  "serde_json",
+ "sha2 0.10.9",
  "thiserror",
  "tokio",
  "tracing",
  "url",
+ "wiremock",
 ]
 
 [[package]]
@@ -786,6 +788,7 @@ dependencies = [
  "adam-error",
  "adam-plugin-testkit",
  "serde_json",
+ "thiserror",
 ]
 
 [[package]]
@@ -990,6 +993,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "tracing",
+ "wiremock",
 ]
 
 [[package]]

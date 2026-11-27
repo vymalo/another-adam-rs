@@ -50,8 +50,9 @@ use adam_a2a::{BackendError, CHILD_SESSIONS_EXTENSION, Caller, ChildSessionInfo,
 use adam_core::{ConversationScope, RunId, RunQuery, RunRecord, Timestamp};
 use adam_runtime::{
     Inbound, MAX_SESSION_PAGE, RoundOutcome, RunView, RuntimeError, SESSION_CLOSE_KIND,
-    SESSION_STATE_KEY, SessionHeader, SessionLimits, SessionState, SessionSummary, SessionView,
-    closing_round_payload, parse_session_conversation_id, session_conversation_id,
+    SESSION_STATE_KEY, SessionBounds, SessionConfig, SessionHeader, SessionLimits, SessionState,
+    SessionSummary, SessionView, closing_round_payload, parse_session_conversation_id,
+    session_conversation_id,
 };
 use async_trait::async_trait;
 use serde_json::{Map, Value, json};
@@ -134,6 +135,13 @@ pub struct ChildSessionAgent {
     /// idle expiry does not stop by itself: the process that serves the front holds no endpoint, so
     /// a reader of such a session starts a closing round, which a worker steps and which cancels it.
     pub remote: bool,
+    /// What a `start.config` for this helper is held to ([ADR 0054], decision 2), as the assembly
+    /// computed it from the helper's folder and the deployment. `None` when the process that serves
+    /// the front does not know them (a role that binds no agent): such a helper takes **no**
+    /// `start.config`, which fails closed.
+    ///
+    /// [ADR 0054]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md
+    pub bounds: Option<SessionBounds>,
 }
 
 impl ChildSessionAgent {
@@ -149,7 +157,16 @@ impl ChildSessionAgent {
             description: description.into(),
             within: None,
             remote: false,
+            bounds: None,
         }
+    }
+
+    /// What a `start.config` for this helper is held to, by [`SessionBounds::admit`], the function
+    /// the model's `subagent_start` uses too.
+    #[must_use]
+    pub fn with_bounds(mut self, bounds: SessionBounds) -> Self {
+        self.bounds = Some(bounds);
+        self
     }
 
     /// Mark the helper as one whose rounds work on a task of another agent.
@@ -252,6 +269,22 @@ impl ChildSessions {
         self
     }
 
+    /// The bounds of each helper, by the name the card lists (`Assembly::session_bounds`): what a
+    /// `start.config` is held to. A name no helper has is ignored; a helper not named keeps what it
+    /// had.
+    #[must_use]
+    pub fn with_bounds(
+        mut self,
+        bounds: impl IntoIterator<Item = (String, SessionBounds)>,
+    ) -> Self {
+        for (name, bounds) in bounds {
+            if let Some(agent) = self.agents.iter_mut().find(|a| a.name == name) {
+                agent.bounds = Some(bounds);
+            }
+        }
+        self
+    }
+
     /// The helpers, in the order the card lists them.
     pub fn agents(&self) -> &[ChildSessionAgent] {
         &self.agents
@@ -344,6 +377,9 @@ pub(crate) struct Start {
     pub agent: String,
     pub description: String,
     pub keep_open: bool,
+    /// What the person asked of the session, already admitted by the helper's bounds; `None` when
+    /// they asked nothing, which is the folder's settings.
+    pub config: Option<SessionConfig>,
 }
 
 /// What a message asks of the child-sessions extension.
@@ -422,11 +458,119 @@ fn parse_start(start: &Value, sessions: &ChildSessions) -> Result<Start, String>
         Some(Value::Bool(keep)) => *keep,
         Some(_) => return Err("`start.keepOpen` is true or false".into()),
     };
+    let config = match object.get("config") {
+        None | Some(Value::Null) => None,
+        Some(value) => {
+            let helper = sessions
+                .by_name(agent)
+                .ok_or("`start.agent` names no helper")?;
+            parse_config(value, helper)?
+        }
+    };
     Ok(Start {
         agent: agent.to_owned(),
         description: description.trim().to_owned(),
         keep_open,
+        config,
     })
+}
+
+/// The options of `start.config`, as the wire spells them, and as the model's tool and the
+/// refusals of [`SessionBounds::admit`] spell them.
+const CONFIG_OPTIONS: [(&str, &str); 7] = [
+    ("maxTurns", "max_turns"),
+    ("maxToolCalls", "max_tool_calls"),
+    ("maxOutputTokens", "max_output_tokens"),
+    ("contextWindow", "context_window"),
+    ("maxParallelToolCalls", "max_parallel_tool_calls"),
+    ("timeLimit", "time_limit"),
+    ("maxRounds", "max_rounds"),
+];
+
+/// The options a remote helper refuses: every one but `timeLimit` and `maxRounds` (ADR 0054
+/// decision 4), the rule `subagent_start` applies to a remote subagent.
+const REMOTE_REFUSED: [&str; 5] = [
+    "maxTurns",
+    "maxToolCalls",
+    "maxOutputTokens",
+    "contextWindow",
+    "maxParallelToolCalls",
+];
+
+/// `start.config`, read and admitted ([ADR 0054], decisions 1 and 2): **an unknown member is
+/// refused** (an ignored narrowing fails open), and the values are held to the helper's bounds by
+/// [`SessionBounds::admit`], the one function the model's tool uses, with its words naming
+/// `start.config.<member>`. `None` when no option is asked for.
+///
+/// [ADR 0054]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md
+fn parse_config(
+    value: &Value,
+    helper: &ChildSessionAgent,
+) -> Result<Option<SessionConfig>, String> {
+    let object = value
+        .as_object()
+        .ok_or("`start.config` is not an object of options")?;
+    let mut wire = serde_json::Map::new();
+    for (key, value) in object {
+        if !CONFIG_OPTIONS.iter().any(|(camel, _)| camel == key) {
+            let options: Vec<&str> = CONFIG_OPTIONS.iter().map(|(camel, _)| *camel).collect();
+            return Err(format!(
+                "`start.config.{}` is not an option; the options are: {}",
+                key.chars().take(80).collect::<String>().escape_debug(),
+                options.join(", ")
+            ));
+        }
+        match value {
+            Value::Null => continue,
+            // A whole number of 32 bits; a `0` goes on to `admit`, which says it by option.
+            Value::Number(n) if n.as_u64().is_some_and(|n| u32::try_from(n).is_ok()) => {}
+            _ => {
+                return Err(format!(
+                    "`start.config.{key}` is a whole number, at most {}",
+                    u32::MAX
+                ));
+            }
+        }
+        wire.insert(key.clone(), value.clone());
+    }
+    let asked =
+        SessionConfig::from_value(Value::Object(wire)).map_err(|why| why.message().to_owned())?;
+    if asked.is_empty() {
+        return Ok(None);
+    }
+    if helper.remote
+        && let Some(option) = REMOTE_REFUSED
+            .iter()
+            .find(|option| object.get(**option).is_some_and(|v| !v.is_null()))
+    {
+        return Err(format!(
+            "`start.config.{option}` is not an option of a remote helper; it takes only \
+             timeLimit and maxRounds"
+        ));
+    }
+    let Some(bounds) = &helper.bounds else {
+        return Err(
+            "`start.config` is not available for this helper: its bounds are not known here".into(),
+        );
+    };
+    let admitted = bounds.admit(asked).map_err(|why| {
+        // Its words name `config.<snake_name>`; here the member is `start.config.<camelName>`.
+        let mut words = why.message().to_owned();
+        for (camel, snake) in CONFIG_OPTIONS {
+            words = words.replace(&format!("config.{snake}"), &format!("start.config.{camel}"));
+        }
+        words
+    })?;
+    Ok(Some(admitted))
+}
+
+/// `config` as the A2A session object says it: camelCase, only the options that are set. `None`
+/// when none is, so the key is left out.
+pub(crate) fn config_value(config: &SessionConfig) -> Option<Value> {
+    if config.is_empty() {
+        return None;
+    }
+    serde_json::to_value(config).ok()
 }
 
 fn parse_close(close: &Value) -> Result<bool, String> {
@@ -708,7 +852,7 @@ impl RuntimeTaskBackend {
             .map(|h| h.round)
             .filter(|n| *n > 0)
             .unwrap_or(session.round);
-        json!({
+        let mut object = json!({
             "session": session.id,
             "parentContextId": round.parent_context,
             "agent": name,
@@ -718,7 +862,14 @@ impl RuntimeTaskBackend {
             "by": if round.by_person { "person" } else { "agent" },
             "state": wire_state(session.state, latest.is_some_and(|h| h.closing && h.closed)),
             "closing": session.closed && session.state == SessionState::Working,
-        })
+        });
+        if let Some(config) = latest
+            .and_then(|h| h.config.as_ref())
+            .and_then(config_value)
+        {
+            object["config"] = config;
+        }
+        object
     }
 
     /// `task`, a task of `context`, with what this extension says to `caller`: the sessions of a
@@ -851,7 +1002,7 @@ impl RuntimeTaskBackend {
             Ok(Some(view)) => a2a_state_word(&task_state(&view)),
             _ => Value::Null,
         };
-        json!({
+        let mut object = json!({
             "session": s.id,
             "contextId": session_conversation_id(context, s.id),
             "agent": name,
@@ -859,7 +1010,11 @@ impl RuntimeTaskBackend {
             "keepOpen": s.keep_open,
             "state": wire_state(s.state, s.closes()),
             "round": {"number": s.round, "taskId": s.latest_run, "state": round_state},
-        })
+        });
+        if let Some(config) = s.config.as_ref().and_then(config_value) {
+            object["config"] = config;
+        }
+        object
     }
 
     /// The task behind `task_id` for a request that reads or stops it: a root task of this agent,
@@ -1138,7 +1293,9 @@ impl RuntimeTaskBackend {
             // Only a request that activated the extension gets here, so the person sees the
             // session and can answer a round of it (ADR 0045 decision 9).
             visible: true,
-            config: None,
+            // What the person asked, admitted by the helper's bounds when the message was read:
+            // a replay reads it from here and never recomputes it (ADR 0054 decision 3).
+            config: start.config,
         };
         put_header(&mut inbound, &header).map_err(BackendError::InvalidParams)?;
         self.runtime
@@ -1503,6 +1660,7 @@ mod tests {
                     description: "Plans".into(),
                     within: None,
                     remote: false,
+                    bounds: None,
                 },
                 ChildSessionAgent {
                     name: "researcher".into(),
@@ -1510,6 +1668,7 @@ mod tests {
                     description: "Looks things up".into(),
                     within: Some(Duration::from_secs(60)),
                     remote: false,
+                    bounds: None,
                 },
             ],
             16,
@@ -1531,6 +1690,7 @@ mod tests {
             description: String::new(),
             within: None,
             remote: false,
+            bounds: None,
         };
         assert!(ChildSessions::new([], 4).is_err());
         assert!(ChildSessions::new([one("a", "x/a")], 0).is_err());
@@ -1657,7 +1817,8 @@ mod tests {
             Asked::Start(Start {
                 agent: "planner".into(),
                 description: "Plan it".into(),
-                keep_open: true
+                keep_open: true,
+                config: None,
             })
         );
         let default_close = asked(
@@ -1708,6 +1869,127 @@ mod tests {
         );
     }
 
+    /// The bounds a helper of `sessions()` is held to in the `config` tests: the loop's own.
+    fn bounded() -> ChildSessions {
+        sessions().with_bounds([
+            ("planner".to_owned(), SessionBounds::default()),
+            ("researcher".to_owned(), SessionBounds::default()),
+        ])
+    }
+
+    fn start_with(config: Value) -> Result<Asked, String> {
+        asked(
+            &message(Some(json!({"start": {
+                "agent": "planner", "description": "d", "config": config
+            }}))),
+            &bounded(),
+        )
+    }
+
+    #[test]
+    fn a_start_carries_its_config_in_camel_case_admitted_by_the_bounds() {
+        let Ok(Asked::Start(start)) = start_with(json!({
+            "maxTurns": 20, "maxToolCalls": 100, "maxOutputTokens": 2048,
+            "contextWindow": 60000, "maxParallelToolCalls": 4, "timeLimit": 10, "maxRounds": 5
+        })) else {
+            panic!("a config within the bounds is admitted");
+        };
+        let config = start.config.expect("the config is read");
+        assert_eq!(config.max_turns, Some(20));
+        assert_eq!(config.max_tool_calls, Some(100));
+        assert_eq!(config.max_output_tokens, Some(2048));
+        assert_eq!(config.context_window, Some(60_000));
+        assert_eq!(config.max_parallel_tool_calls, Some(4));
+        assert_eq!(config.time_limit, Some(10));
+        assert_eq!(config.max_rounds, Some(5));
+        // No config, a null one and an empty one all mean the folder's settings.
+        for entry in [json!(null), json!({})] {
+            let Ok(Asked::Start(start)) = start_with(entry) else {
+                panic!("admitted");
+            };
+            assert_eq!(start.config, None);
+        }
+    }
+
+    #[test]
+    fn an_unknown_config_member_is_refused_naming_it() {
+        let why = start_with(json!({"maxTurns": 3, "turbo": 1})).unwrap_err();
+        assert!(why.contains("start.config.turbo"), "{why}");
+        // The model's snake_case spelling is not the wire's.
+        let why = start_with(json!({"max_turns": 3})).unwrap_err();
+        assert!(why.contains("start.config.max_turns"), "{why}");
+        assert!(why.contains("maxTurns"), "it lists the options: {why}");
+        let why = start_with(json!(7)).unwrap_err();
+        assert!(why.contains("start.config"), "{why}");
+    }
+
+    #[test]
+    fn a_config_value_outside_its_bound_is_refused_naming_the_option() {
+        for (member, value) in [
+            ("maxTurns", json!(51)),
+            ("maxToolCalls", json!(201)),
+            ("maxOutputTokens", json!(4097)),
+            ("maxParallelToolCalls", json!(11)),
+            ("timeLimit", json!(31)),
+            ("maxRounds", json!(21)),
+            ("maxTurns", json!(0)),
+        ] {
+            let why = start_with(json!({ member: value })).unwrap_err();
+            assert!(why.contains(&format!("start.config.{member}")), "{why}");
+            assert!(!why.contains("config.max_"), "no snake_case name: {why}");
+        }
+        for value in [json!(-1), json!("5"), json!(1.5), json!(5_000_000_000_u64)] {
+            let why = start_with(json!({"maxTurns": value})).unwrap_err();
+            assert!(why.contains("start.config.maxTurns"), "{why}");
+        }
+    }
+
+    #[test]
+    fn max_output_tokens_zero_is_refused() {
+        let why = start_with(json!({"maxOutputTokens": 0})).unwrap_err();
+        assert!(why.contains("start.config.maxOutputTokens"), "{why}");
+        assert!(why.contains("is 0"), "{why}");
+    }
+
+    #[test]
+    fn a_helper_with_no_bounds_takes_no_config_and_a_remote_one_only_two_options() {
+        // Fail closed: nothing knows what an unbounded helper allows.
+        let unbounded = sessions();
+        let ask = |sessions: &ChildSessions, config: Value| {
+            asked(
+                &message(Some(json!({"start": {
+                    "agent": "planner", "description": "d", "config": config
+                }}))),
+                sessions,
+            )
+        };
+        assert!(ask(&unbounded, json!({"maxTurns": 3})).is_err());
+        assert!(matches!(ask(&unbounded, json!({})), Ok(Asked::Start(_))));
+        let remote = ChildSessions::new(
+            [ChildSessionAgent::new("planner", "root/planner", "Plans").remote()],
+            16,
+        )
+        .unwrap()
+        .with_bounds([("planner".to_owned(), SessionBounds::default())]);
+        let why = ask(&remote, json!({"maxTurns": 3})).unwrap_err();
+        assert!(why.contains("start.config.maxTurns"), "{why}");
+        assert!(why.contains("remote"), "{why}");
+        let Ok(Asked::Start(start)) = ask(&remote, json!({"timeLimit": 5, "maxRounds": 3})) else {
+            panic!("a remote helper takes timeLimit and maxRounds");
+        };
+        assert_eq!(start.config.and_then(|c| c.time_limit), Some(5));
+    }
+
+    #[test]
+    fn a_config_reads_back_in_camel_case_and_an_empty_one_not_at_all() {
+        let config = SessionConfig::from_value(json!({"maxTurns": 3, "timeLimit": 2})).unwrap();
+        assert_eq!(
+            config_value(&config),
+            Some(json!({"maxTurns": 3, "timeLimit": 2}))
+        );
+        assert_eq!(config_value(&SessionConfig::default()), None);
+    }
+
     #[test]
     fn a_close_is_read_strictly() {
         let s = sessions();
@@ -1747,6 +2029,7 @@ mod tests {
                 started_by: None,
                 updated_at: adam_core::store::now(),
             },
+            config: None,
         }
     }
 

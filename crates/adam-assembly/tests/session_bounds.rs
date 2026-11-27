@@ -266,3 +266,151 @@ fn every_subagents_bounds_reach_its_session_tools() {
         "the reviewer says nothing: 30 minutes, its parallelism from the deployment"
     );
 }
+
+/// The A2A front's helpers carry the very bounds the session tools hold a `config` to, so a
+/// person's `start.config` and the model's `config` cannot disagree (ADR 0054 decision 2); the
+/// definition alone, which binds no model, knows none, and its front refuses a `start.config`.
+#[cfg(feature = "sessions")]
+#[test]
+fn the_front_holds_a_start_config_to_the_bounds_of_the_tools() {
+    let assembly = assemble(family("  max_turns: 7"), SessionLimits::default(), Some(3)).unwrap();
+    let front = assembly.child_sessions().expect("the root has a helper");
+    let helper = front.agents().first().expect("a helper");
+    assert_eq!(helper.name, "reviewer");
+    assert_eq!(helper.bounds.as_ref(), Some(&bound_of(&assembly)));
+    assert_eq!(helper.bounds.as_ref().map(|b| b.max_turns), Some(7));
+    let alone = family("  max_turns: 7").child_sessions().expect("a helper");
+    assert_eq!(alone.agents()[0].bounds, None, "no model, no bounds");
+}
+
+/// ADR 0054, ANR-1093: a role that binds no agent (the control plane of a split deployment) gets
+/// the bounds from the folder and the deployment's settings alone, and they are **the very ones a
+/// worker binds**: one function makes both. Every folder, session limit and `MAX_PARALLEL_TOOL_CALLS`
+/// of the table is asked of both, and they must agree helper by helper, field by field.
+#[test]
+fn a_definition_computes_the_bounds_a_worker_binds_without_binding() {
+    let folders = [
+        "",
+        "  max_turns: 20\n  max_tool_calls: 40\n  max_output_tokens: 2048\n  max_minutes: 7",
+        "  max_turns: 5\n  max_parallel: 2",
+        // Above the deployment's `MAX_PARALLEL_TOOL_CALLS` below: clamped to it.
+        "  max_parallel: 30\n  max_minutes: 0",
+        "  max_parallel: 1",
+    ];
+    let deployments = [
+        (SessionLimits::default(), None),
+        (SessionLimits::new(16, 4, 9).unwrap(), Some(6)),
+        (SessionLimits::new(8, 2, 2).unwrap(), Some(32)),
+        (SessionLimits::new(100, 32, 50).unwrap(), Some(1)),
+    ];
+    for folder in folders {
+        for (limits, parallel) in deployments {
+            let worker = assemble(family(folder), limits, parallel).unwrap();
+            let mut control_plane = family(folder).session_limits(limits);
+            if let Some(n) = parallel {
+                control_plane = control_plane.session_max_parallel(n);
+            }
+            let control_plane = control_plane.session_bounds();
+            assert_eq!(
+                control_plane,
+                worker.session_bounds(),
+                "folder {folder:?}, {limits:?}, MAX_PARALLEL_TOOL_CALLS {parallel:?}"
+            );
+        }
+    }
+}
+
+/// The same for a root with two helpers, so the roster and its order agree too, and for a root
+/// with no helper, which has no bounds.
+#[test]
+fn the_roster_of_the_bounds_is_the_workers() {
+    let root = def(&[
+        (
+            "agent/instructions.md",
+            &instructions("name: coder", "You are the root."),
+        ),
+        (
+            "agent/subagents/explorer.md",
+            &instructions(
+                "description: Explores.\nlimits:\n  max_minutes: 5",
+                "You explore.",
+            ),
+        ),
+        (
+            "agent/subagents/reviewer.md",
+            &instructions("description: Reviews a change.", "You review."),
+        ),
+    ])
+    .session_limits(SessionLimits::new(16, 4, 9).unwrap());
+    let worker = root
+        .clone()
+        .bind(tools(&[]))
+        .unwrap()
+        .max_parallel(6)
+        .model(Arc::new(MockModel::new()), "m")
+        .unwrap();
+    let root = root.session_max_parallel(6);
+    assert_eq!(root.session_bounds(), worker.session_bounds());
+    assert_eq!(root.session_bounds().len(), 2);
+
+    let alone = def(&[(
+        "agent/instructions.md",
+        &instructions("name: solo", "You are alone."),
+    )]);
+    assert!(alone.session_bounds().is_empty());
+}
+
+/// The model's window is a fact of the model alias, which a role that binds no model does not
+/// have: the control plane admits the window by the floor alone, **exactly as a worker's `admit`
+/// does** (`context_window: None`); the ceiling is enforced where the run is, by the minimum with
+/// the model's window.
+#[test]
+fn no_role_knows_the_models_window_when_it_admits() {
+    let bounds = family("").session_bounds();
+    assert_eq!(bounds[0].1.context_window, None);
+}
+
+/// A start the folder allows is admitted by the control plane's bounds, one above is refused naming
+/// the option, with the same words a worker's would.
+#[test]
+fn the_bounds_of_a_definition_admit_and_refuse_like_a_workers() {
+    let bound = family("  max_turns: 5\n  max_parallel: 2")
+        .session_max_parallel(8)
+        .session_bounds()
+        .remove(0)
+        .1;
+    let asked = |value| SessionConfig::from_value(value).expect("a config");
+    assert!(
+        bound
+            .admit(asked(json!({"maxTurns": 5, "maxParallelToolCalls": 2})))
+            .is_ok()
+    );
+    let why = bound
+        .admit(asked(json!({"maxTurns": 6})))
+        .expect_err("one turn more than the folder allows");
+    assert_eq!(why.option(), Some("max_turns"));
+    assert!(why.message().contains("at most 5"), "{why}");
+}
+
+/// `AgentDef::session_max_parallel` is the deployment's value for the agents too: a worker that
+/// binds the definition without `BoundDef::max_parallel` runs at it, and a `BoundDef::max_parallel`
+/// wins, so the one value a binary gives both places cannot make the roles disagree.
+#[test]
+fn the_definitions_parallel_limit_is_the_workers_unless_it_says_another() {
+    let definition = family("").session_max_parallel(4);
+    let worker = definition
+        .clone()
+        .bind(tools(&[]))
+        .unwrap()
+        .model(Arc::new(MockModel::new()), "m")
+        .unwrap();
+    assert_eq!(bound_of(&worker).max_parallel_tool_calls, 4);
+    assert_eq!(definition.session_bounds(), worker.session_bounds());
+    let override_ = definition
+        .bind(tools(&[]))
+        .unwrap()
+        .max_parallel(7)
+        .model(Arc::new(MockModel::new()), "m")
+        .unwrap();
+    assert_eq!(bound_of(&override_).max_parallel_tool_calls, 7);
+}
