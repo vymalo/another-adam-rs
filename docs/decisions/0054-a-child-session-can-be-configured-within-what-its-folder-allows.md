@@ -307,7 +307,8 @@ where a store is involved (`crates/adam-llm-agent/tests/sessions.rs` holds the s
   root that has subagents (`guide_for` takes the helper names: the section needs no bounds, but `SessionTools` is not built at bind
   because a `SessionAgent` needs them), so it is in
   `AgentInfo::prompt`, in `LlmAgent::instructions` and in `fixed_chars`. It has no limit and no count, so it is the same bytes
-  under any `SessionLimits`. **The table generates the argument lists, and the drift test covers the descriptions:** each spec's `required` is built
+  under any `SessionLimits`. **The table generates the argument lists; the descriptions are written twice and no test compares
+  them:** each spec's `required` is built
   from it (`required_of`), a unit test holds each spec's `properties` keys (and `required`) to the table's arguments, and the specs stay
   pinned byte for byte by `tests/fixtures/session-tools.json`. The drift test (`tests/sessions.rs`,
   `the_guide_and_the_specs_name_the_same_tools_and_arguments`) holds the guide's tools,
