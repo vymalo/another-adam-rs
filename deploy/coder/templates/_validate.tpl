@@ -16,6 +16,16 @@ from service.yaml, which every render contains, so they always run.
 {{- if and (not .Values.database.enabled) (not $dbSecret) -}}
 {{- fail "database.enabled=false needs database.existingSecret.name (a Secret in the release namespace whose key, `uri` by default, holds the Postgres connection string): every pod needs DATABASE_URL" -}}
 {{- end -}}
+{{- /* The Cluster's PostgreSQL: 18 or later (adam ADR 0082, decision 11; the store refuses an older server at startup, exit 78). A tag whose major is below 18 is refused here, at render time. */ -}}
+{{- if .Values.database.enabled -}}
+{{- $dbImage := default "" .Values.database.imageName | toString | trim -}}
+{{- if not $dbImage -}}
+{{- fail "database.imageName is empty: the Cluster's PostgreSQL image, 18 or later, by tag and digest (the operator's own default is its release's, 17 up to CloudNativePG 1.27)" -}}
+{{- end -}}
+{{- if regexMatch ":([0-9]|1[0-7])([.@-]|$)" $dbImage -}}
+{{- fail (printf "database.imageName %s is older than PostgreSQL 18, the coder's floor (adam ADR 0082): the store refuses it at startup" $dbImage) -}}
+{{- end -}}
+{{- end -}}
 {{- $placement := include "coder.placement" . -}}
 {{- if eq $placement "a2a-only" -}}
 {{- fail "workspace.placement a2a-only is refused for the coder: every tool of the coder needs a workspace (a2a-only is for hosts whose agents only call remote agents). Use shared, affinity or isolated" -}}

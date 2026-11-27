@@ -1123,6 +1123,23 @@ helm_db > "$out"
 check "database default: the CNPG Cluster and its app Secret, key uri" dburl_is 1 coder-db-app uri
 check "database default: no existing Secret is named" lacks 'coder-db-uri'
 check "database default: no instances override and no resources in the Cluster" lacks '^  resources:'
+# The Cluster's PostgreSQL (adam ADR 0082, decision 11): pinned at 18 by tag and digest, so the operator's default,
+# which is its release's (17 up to CloudNativePG 1.27), never decides it. The render is read by another repository.
+check "database default: the Cluster's image is PostgreSQL 18, by tag and digest" \
+  dhas Cluster '^  imageName: "ghcr\.io/cloudnative-pg/postgresql:18\.[0-9]+-[a-z]+-[a-z]+@sha256:[0-9a-f]{64}"$'
+check "... and it is the image of values.yaml" \
+  has "^  imageName: \"$(awk '/^  imageName: /{print $2}' "$chart/values.yaml")\"$"
+helm_db --set database.imageName=registry.example:5000/pg/postgresql:18.7-standard-trixie > "$out"
+check "database.imageName is the Cluster's image (a mirror's port is not a version)" \
+  dhas Cluster '^  imageName: "registry\.example:5000/pg/postgresql:18\.7-standard-trixie"$'
+for old in postgresql:17.6-system-trixie postgresql:17 postgresql:9.6 'postgresql:16@sha256:0000000000000000000000000000000000000000000000000000000000000000'; do
+  check "database.imageName $old (below 18) is refused" fails helm_db --set "database.imageName=ghcr.io/cloudnative-pg/$old"
+done
+message=$(helm_db --set database.imageName=ghcr.io/cloudnative-pg/postgresql:17.6 2>&1 || true)
+check "... the error names the floor" says "$message" 'older than PostgreSQL 18'
+check "an empty database.imageName is refused" fails helm_db --set database.imageName=
+# shellcheck disable=SC2086
+check "an empty database.imageName with an existing database is fine (no Cluster)" helm_db $extdb --set database.imageName=
 # shellcheck disable=SC2086
 helm_db --set database.instances=3 --set database.resources.requests.cpu=500m --set database.resources.requests.memory=1Gi --set database.resources.limits.memory=2Gi > "$out"
 check "database.instances 3 renders on the Cluster" has '^  instances: 3$'

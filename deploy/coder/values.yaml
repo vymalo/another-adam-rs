@@ -673,9 +673,17 @@ database:
   existingSecret:
     name: ""
     key: uri
-  # name, owner, instances and storage are for the Cluster of enabled: true only.
+  # name, owner, imageName, instances and storage are for the Cluster of enabled: true only.
   name: adam
   owner: adam
+  # The PostgreSQL image of the Cluster, by tag and digest: 18.7, the coder's floor (adam ADR 0082,
+  # decision 11; the store refuses an older server at startup, exit 78). Pinned because the
+  # operator's own default is its release's (17 up to CloudNativePG 1.27, 18 in 1.28 to 1.30, 19
+  # after), and this chart names no operator release. CloudNativePG upgrades the major version of
+  # an existing Cluster in place when this changes, offline, and only between images of the same
+  # distribution: a Cluster on a bookworm image sets the bookworm variant (chart README,
+  # "Database"). The OCI index of the tag, verified 2026-11-27 from ghcr.io.
+  imageName: ghcr.io/cloudnative-pg/postgresql:18.7-system-trixie@sha256:c437b7c6c00aa7e66f5d6de1dd83602391fdebd4ff776ffb1ab7aaba5e7351ad
   instances: 1
   # CPU and memory requests and limits of each database instance, as on any container. Empty (the
   # default) renders nothing. Starting points for three instances are in the chart README.
