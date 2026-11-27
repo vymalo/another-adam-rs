@@ -1,6 +1,6 @@
 [package]
 name = "adam-memory"
-description = "The L1 self-improvement memory port of adam-rs: problems and their attempts, keyed by deployment, caller, agent and kind, and the in-folder adapter L1 is stored in"
+description = "The memory ports of adam-rs: the L1 self-improvement memory of problems and attempts, keyed by deployment, caller, agent and kind with its in-folder adapter, and the L2 Memory port of lessons, keyed within the adapter's configured scope by audience"
 readme = "README.md"
 version.workspace = true
 edition.workspace = true
