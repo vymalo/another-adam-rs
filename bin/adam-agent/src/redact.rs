@@ -75,7 +75,34 @@ pub fn secret_values_named(
             .iter()
             .map(|token| token.expose_secret().to_owned()),
     );
-    if let Ok(url) = url::Url::parse(config.service.database_url.expose_secret())
+    collect(
+        secrets,
+        config.service.database_url.expose_secret(),
+        vars,
+        named,
+    )
+}
+
+/// The secret values an `export` knows, which reads no model or A2A configuration: the password
+/// of `database_url` (as written and decoded), and from `vars` the value of each variable named
+/// like a secret (`MODEL_API_KEY`, `A2A_BEARER_TOKENS` and each of its tokens, ...) or in `named`
+/// (the `${VAR}` of the agent's `mcp.json` files), as [`secret_values_named`] reads them.
+pub fn export_secret_values(
+    database_url: &str,
+    vars: impl IntoIterator<Item = (String, String)>,
+    named: &BTreeSet<String>,
+) -> Vec<String> {
+    collect(Vec::new(), database_url, vars, named)
+}
+
+/// `secrets`, the password of `database_url` and the secrets of `vars`, longest first.
+fn collect(
+    mut secrets: Vec<String>,
+    database_url: &str,
+    vars: impl IntoIterator<Item = (String, String)>,
+    named: &BTreeSet<String>,
+) -> Vec<String> {
+    if let Ok(url) = url::Url::parse(database_url)
         && let Some(password) = url.password()
     {
         secrets.push(password.to_owned());

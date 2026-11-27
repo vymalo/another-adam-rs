@@ -51,7 +51,7 @@ use adam_store_mongodb::MongoStore;
 use adam_store_postgres::{PgStore, pool_size_from_env};
 #[cfg(feature = "store-sqlite")]
 use adam_store_sqlite::SqliteStore;
-use secrecy::ExposeSecret as _;
+use secrecy::{ExposeSecret as _, SecretString};
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 
@@ -672,12 +672,16 @@ pub fn claim_scope_for(placement: Placement) -> ClaimScope {
 /// Postgres is built lazily: the connection is opened by [`ChosenStore::ready`] after the
 /// process's own configuration is checked. SQLite opens its file and takes the process lock now,
 /// and MongoDB connects now, because both answer the store before the service is built.
-async fn choose_store(config: &ServiceConfig, kind: StoreKind) -> Result<ChosenStore, ServeError> {
+async fn choose_store(
+    database_url: &SecretString,
+    notify_local_only: bool,
+    kind: StoreKind,
+) -> Result<ChosenStore, ServeError> {
     let backend = kind.backend();
     match kind {
         #[cfg(feature = "store-postgres")]
         StoreKind::Postgres => {
-            let pg_config = PgConfig::parse(config.database_url.expose_secret())
+            let pg_config = PgConfig::parse(database_url.expose_secret())
                 .map_err(|source| ServeError::Connect { backend, source })?;
             let pool_size =
                 pool_size_from_env().map_err(|source| ServeError::Connect { backend, source })?;
@@ -688,8 +692,8 @@ async fn choose_store(config: &ServiceConfig, kind: StoreKind) -> Result<ChosenS
             // Events and wake-up/cancel signals cross processes over `NOTIFY` on the store's own
             // pool. The listener opens its own connection; the runtime holds the two halves.
             let broadcast = adam_runtime::BroadcastSink::default();
-            let notify = PgNotify::new(pool, pg_config, broadcast.clone())
-                .local_only(config.notify_local_only);
+            let notify =
+                PgNotify::new(pool, pg_config, broadcast.clone()).local_only(notify_local_only);
             let live = LiveSignals {
                 broadcast: broadcast.clone(),
                 sink: Arc::new(notify.event_sink()),
@@ -737,7 +741,7 @@ async fn choose_store(config: &ServiceConfig, kind: StoreKind) -> Result<ChosenS
         }),
         #[cfg(feature = "store-mongodb")]
         StoreKind::Mongo { database } => {
-            let store = MongoStore::connect(config.database_url.expose_secret(), &database)
+            let store = MongoStore::connect(database_url.expose_secret(), &database)
                 .await
                 .map_err(|source| ServeError::Connect { backend, source })?;
             store.migrate().await.map_err(ServeError::Migrate)?;
@@ -756,6 +760,26 @@ async fn choose_store(config: &ServiceConfig, kind: StoreKind) -> Result<ChosenS
             scheme: "mongodb".into(),
         }),
     }
+}
+
+/// The store `database_url` names, connected and migrated, for a command that reads the store and
+/// serves nothing (`adam-agent export`, `adam-coder export`): the scheme picks the adapter as for
+/// [`serve`], and no notification listener, server or worker is started.
+///
+/// `sqlite://` is opened as `ROLE=all` opens it: the process takes the file's lock, so the process
+/// that serves the file must be stopped first (one process per file, ADR 0053).
+///
+/// # Errors
+///
+/// As [`serve`] for the store: [`ServeError::UnsupportedScheme`], [`ServeError::StoreNotBuilt`],
+/// [`ServeError::SqliteWithoutPath`] (exit 78), [`ServeError::Connect`] and [`ServeError::Migrate`]
+/// (the store's class decides).
+pub async fn open_store(database_url: &SecretString) -> Result<DynStore, ServeError> {
+    let kind = store_kind(database_url.expose_secret(), Role::All)?;
+    // Events of this process stay in it: it starts and steps no run.
+    let chosen = choose_store(database_url, true, kind).await?;
+    chosen.ready().await?;
+    Ok(chosen.store)
 }
 
 /// Run the service until `shutdown` resolves (SIGTERM in a binary).
@@ -882,7 +906,7 @@ async fn run(
     // `DATABASE_URL`'s scheme picks the store (ADR 0053, decision 3). A scheme or a role the
     // binary cannot serve is a configuration error before anything connects.
     let kind = store_kind(config.database_url.expose_secret(), role)?;
-    let chosen = choose_store(config, kind).await?;
+    let chosen = choose_store(&config.database_url, config.notify_local_only, kind).await?;
     let store = chosen.store.clone();
     let push_events = chosen.live.broadcast.clone();
     let options = options_for(config, options);

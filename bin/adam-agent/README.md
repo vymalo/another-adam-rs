@@ -289,6 +289,44 @@ Exit codes are `adam-service`'s: 0 after a clean shutdown, 78 configuration (inc
 component stopped), 1 anything else. A failure is one structured log line with the whole cause chain, and
 nothing on stderr.
 
+## Export
+
+`adam-agent export` writes the folder's runs as training records, one JSON Lines record per run
+([ADR 0085](../../docs/decisions/0085-runs-are-exported-as-training-records.md), the record is
+[`adam-export`](../../crates/adam-export/README.md)'s). It serves nothing: no A2A server, no worker, no schedule, no
+MCP server. Without `export` as its first argument the binary serves, as before.
+
+```sh
+ADAM_AGENT_DIR=dev/agents/assistant DATABASE_URL=sqlite:///var/lib/adam/adam.sqlite \
+EXPORT_PSEUDONYM_KEY=... adam-agent export --require lang=rust --out runs.jsonl
+```
+
+| Flag | What |
+|---|---|
+| `--agent NAME` | an agent the folder registers: the root, or a subagent as `<root>/<name>` (repeatable). Default: every one |
+| `--status done\|failed\|all` | which runs: `done` (default), `failed`, or `all` (every status, unfinished runs included) |
+| `--require KIND=VALUE` | a facet every record must have, `lang=rust`, `dep=axum` (repeatable: all of them) |
+| `--since RFC3339`, `--until RFC3339` | only runs last updated at or after, and before, an instant |
+| `--include-compacted` | keep runs whose history a compaction replaced |
+| `--include-reasoning` | keep the reasoning text a run kept |
+| `--out PATH` | write to `PATH` (created or truncated, mode `0600`) instead of standard output |
+| `--help` | the usage, on standard output |
+
+It reads `ADAM_AGENT_DIR` and `DATABASE_URL` as serving does, `ADAM_EXTRA_MCP_FILE` when set, and
+`EXPORT_PSEUDONYM_KEY`: the key of the pseudonymous ids, read as bytes (set and empty: exit 78; unset: a random key,
+said in the log, so the ids link to nothing else). No model or A2A variable is needed. The runtime registers the
+starters a control plane registers (the root's and each subagent's), which is what joins a run's transcript.
+
+Every string is scrubbed of the secrets the process holds: the password of `DATABASE_URL`, the value of every
+variable named like a secret (`MODEL_API_KEY`, each of `A2A_BEARER_TOKENS`, ...) and of every variable the folder's
+`mcp.json` reads (`redact::export_secret_values`). The log is on standard error, and the summary is its one
+`export finished` line (`seen`, `written`, `filtered`, `not_a_conversation`, `unreadable`). Exit codes: 0, 64 for a
+wrong command line, otherwise as serving (78 configuration or files, 69 a store that is down, 71 an `--out` that
+cannot be created). `--current-tools` (attach the agent's current prompt and tools) is not available yet: it is a
+usage error (64), and a record says `tools_source: "none"`.
+
+`sqlite://` holds one process per file: stop the process that serves the file before exporting it.
+
 ## Library
 
 The binary is `main.rs` over a small library, so everything it does is testable without a process:
@@ -374,6 +412,12 @@ model, `tini` as PID 1, SIGTERM exits 0), then the compose scenarios.
   the official A2A client against a model scripted by the prompt, and the same database after an edit and a
   restart saying the edited words**, a researcher answering with its source through a stateless MCP server, `MAX_PARALLEL_TOOL_CALLS` at 1 and at 2 read in the model's request (the `after_previous` property and sentence absent and present), a control plane and a worker in two processes completing a task over one
   database, and the MCP cases of the section above as a process.
+* Export: `src/export.rs` (`only_a_first_argument_export_is_the_subcommand`, `the_export_parses_the_contract_s_flags`,
+  `the_export_needs_the_database_and_the_folder_only`, `the_export_s_secrets_are_the_database_password_and_the_named_variables`);
+  `tests/binary.rs` `export_writes_the_runs_of_the_folder_as_records` (SQLite, no service): a chat folder serves one
+  task, then `export --out` with only `DATABASE_URL`, `ADAM_AGENT_DIR` and `EXPORT_PSEUDONYM_KEY` writes it as one
+  record (mode `0600`, the pasted A2A token scrubbed, a pseudonym id, the same under the same key on stdout), the
+  summary on stderr; `--bogus` is 64 and an empty key 78. The parser itself is tested in `adam-service`.
 * The mock models `mock-assistant` (`dev/wiremock/mock-openai/mappings/agent-script.json`) and `mock-researcher`
   (`researcher-cards.json`, the script of `[mock:cards]`) are probed by the `compose` job of `ci.yml`; the container
   smoke test and the compose scenarios (`dev/agent-e2e.sh`, and `dev/agent-cards-e2e.sh`, which serves the researcher

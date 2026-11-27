@@ -32,6 +32,7 @@
 //! | [`janitor`] | [`Janitor`]: the sweep that removes the workspaces of finished runs, a worker component of the process |
 //! | [`app`] | [`Coder`]: runtime + A2A backend + router (an [`adam_service::Service`] for the coder's agent); [`Coder::control_plane`] for a process that only starts runs; [`LiveSignals`]: events and wake-up signals, in-process or across processes (from `adam-service`) |
 //! | [`config`] | the binary's environment variables (the ones every agent binary shares are `adam-service`'s) |
+//! | [`export`] | `adam-coder export`: the coder's runs as training records (ADR 0085), with no server, worker or MCP server |
 //! | [`serve()`] | the whole process: the agent files, the model, GitHub, the workspaces and the MCP servers, then `adam_service::serve` for the store and the A2A server and workers its `ROLE` runs (through `adam_host::Host`), until a shutdown future resolves |
 //!
 //! # Composition
@@ -85,6 +86,7 @@ pub mod agent;
 pub mod app;
 pub mod config;
 pub mod exit;
+pub mod export;
 pub mod files;
 pub mod github_mcp;
 pub use adam_service::harden;

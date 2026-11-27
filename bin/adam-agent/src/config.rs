@@ -106,27 +106,7 @@ impl Config {
         let mut problems = Vec::new();
         let service = ServiceConfig::parse(&lookup, &mut problems);
 
-        // No default and no embedded copy: a silent persona would hide a missing mount.
-        let agent_dir = match lookup(AGENT_DIR_ENV).filter(|v| !v.trim().is_empty()) {
-            None => {
-                problems.push(format!(
-                    "{AGENT_DIR_ENV} is required: the folder that holds `agent/` (or `agent/` itself); \
-                     this binary serves the agent that folder describes and has none of its own"
-                ));
-                PathBuf::new()
-            }
-            Some(raw) => {
-                let path = PathBuf::from(raw);
-                if !path.is_dir() {
-                    problems.push(format!(
-                        "{AGENT_DIR_ENV} {:?} is not a directory (name the folder that holds \
-                         `agent/`, or `agent/` itself)",
-                        path.display().to_string()
-                    ));
-                }
-                path
-            }
-        };
+        let agent_dir = parse_agent_dir(&lookup, &mut problems);
 
         // The workers' variables: a control plane neither needs nor validates them.
         let worker = service.worker.is_some().then(|| WorkerConfig {
@@ -150,6 +130,35 @@ impl Config {
             agent_dir,
             worker,
         })
+    }
+}
+
+/// `ADAM_AGENT_DIR`, required and an existing directory, read by every role and by `export`.
+/// A problem is added to `problems` and an empty path returned when it is not.
+pub(crate) fn parse_agent_dir(
+    lookup: &impl Fn(&str) -> Option<String>,
+    problems: &mut Vec<String>,
+) -> PathBuf {
+    // No default and no embedded copy: a silent persona would hide a missing mount.
+    match lookup(AGENT_DIR_ENV).filter(|v| !v.trim().is_empty()) {
+        None => {
+            problems.push(format!(
+                "{AGENT_DIR_ENV} is required: the folder that holds `agent/` (or `agent/` itself); \
+                 this binary serves the agent that folder describes and has none of its own"
+            ));
+            PathBuf::new()
+        }
+        Some(raw) => {
+            let path = PathBuf::from(raw);
+            if !path.is_dir() {
+                problems.push(format!(
+                    "{AGENT_DIR_ENV} {:?} is not a directory (name the folder that holds \
+                     `agent/`, or `agent/` itself)",
+                    path.display().to_string()
+                ));
+            }
+            path
+        }
     }
 }
 

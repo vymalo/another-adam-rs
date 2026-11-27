@@ -2606,6 +2606,43 @@ is taken over by the next start when its lease expires. Logs are JSON on stdout
 
 Deployment: `docker/coder/Dockerfile` and the chart in `deploy/coder/`.
 
+## Export
+
+`adam-coder export` writes the coder's runs as training records, one JSON Lines record per run
+([ADR 0085](../../docs/decisions/0085-runs-are-exported-as-training-records.md), the record is
+[`adam-export`](../../crates/adam-export/README.md)'s). It serves nothing: no A2A server, no worker, no janitor, no
+schedule, no MCP server. Without `export` as its first argument the binary serves, as before.
+
+```sh
+DATABASE_URL=postgres://... EXPORT_PSEUDONYM_KEY=... \
+  adam-coder export --require lang=rust --require dep=axum --out runs.jsonl
+```
+
+| Flag | What |
+|---|---|
+| `--agent NAME` | `coder`, or a subagent as `coder/<name>` (repeatable). Default: every agent it registers |
+| `--status done\|failed\|all` | which runs: `done` (default), `failed`, or `all` (every status, unfinished runs included) |
+| `--require KIND=VALUE` | a facet every record must have, `lang=rust`, `dep=cratestack` (repeatable: all of them) |
+| `--since RFC3339`, `--until RFC3339` | only runs last updated at or after, and before, an instant |
+| `--include-compacted` | keep runs whose history a compaction replaced |
+| `--include-reasoning` | keep the reasoning text a run kept |
+| `--out PATH` | write to `PATH` (created or truncated, mode `0600`) instead of standard output |
+| `--help` | the usage, on standard output |
+
+It reads `DATABASE_URL`, `ADAM_AGENT_DIR` (unset: the embedded files), `ADAM_EXTRA_MCP_FILE` when set, and
+`EXPORT_PSEUDONYM_KEY`: the key of the pseudonymous ids, read as bytes (set and empty: exit 78; unset: a random key,
+said in the log, so the ids link to nothing else). No model, GitHub or A2A variable is needed. The runtime registers
+the starters a control plane registers (`CoderStarter` and each subagent's), which is what joins a run's transcript.
+
+Every string is scrubbed by the coder's `Redactor`: `Redactor::from_config` when the environment also reads as a
+serving configuration (the model key, the GitHub token or App key, the A2A tokens), else the password of
+`DATABASE_URL`; and in both cases the value of every variable named like a secret and of every variable the agent's
+`mcp.json` reads (`src/export.rs`). The log is on standard error, and the summary is its one `export finished` line
+(`seen`, `written`, `filtered`, `not_a_conversation`, `unreadable`). Exit codes: 0, 64 for a wrong command line,
+otherwise as below (78 configuration, files or an unknown `--agent`, 69 a store that is down, 71 an `--out` that
+cannot be created). `--current-tools` (attach the agent's current prompt and tools) is not available yet: it is a
+usage error (64), and a record says `tools_source: "none"`.
+
 ## Errors
 
 The library errors it composes are classified (see
@@ -2649,6 +2686,11 @@ Everything is offline (`cargo test -p adam-coder`; with
 `ADAM_TEST_POSTGRES_URL` set the Postgres variants run too, each case in a
 database of its own, so the role needs `CREATEDB`):
 
+* **Export** (`src/export.rs`: `only_a_first_argument_export_is_the_subcommand`, `the_export_parses_the_contract_s_flags`,
+  `without_a_serving_configuration_the_scrub_knows_the_named_secrets`, `with_a_serving_configuration_the_scrub_knows_its_secrets_too`;
+  `tests/binary.rs` `export_over_an_empty_store_writes_nothing_and_exits_0`: only `DATABASE_URL`, a fresh SQLite file,
+  exit 0 with nothing on stdout, the summary and the random key said on stderr, an unknown `--agent` 78,
+  `--current-tools` 64). The parser itself is tested in `adam-service`.
 * **Language servers** (`tests/language_servers.rs`, real processes of the scripted server `adam-lsp-script`; `tests/real_language_servers.rs`, gated):
   no server on `PATH` (nothing started, the program named), diagnostics pushed and pulled and only errors and warnings, UTF-16 and UTF-8 columns,
   a secret in a diagnostic and in stderr, indexing past `wait` (a partial result, then the same pid answers), a crash (the scrubbed stderr tail, then a new

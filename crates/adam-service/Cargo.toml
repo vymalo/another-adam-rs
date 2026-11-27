@@ -18,6 +18,9 @@ store-sqlite = ["dep:adam-store-sqlite"]
 store-mongodb = ["dep:adam-store-mongodb"]
 # `McpSettings`: the deployment's policy for the MCP servers of an agent folder (`MCP_ALLOW_*`).
 mcp = ["dep:adam-mcp", "dep:adam-agent-fs"]
+# `export`: the `export` command of a binary (ADR 0085): its arguments, `EXPORT_PSEUDONYM_KEY` and
+# the run over `adam-export`.
+export = ["dep:adam-export"]
 
 [dependencies]
 a2a-lf.workspace = true
@@ -27,6 +30,7 @@ adam-a2a-runtime.workspace = true
 adam-agent-fs = { workspace = true, optional = true }
 adam-core.workspace = true
 adam-error.workspace = true
+adam-export = { workspace = true, optional = true }
 jiff.workspace = true
 adam-host.workspace = true
 adam-mcp = { workspace = true, optional = true }
@@ -60,7 +64,10 @@ adam-store-postgres.workspace = true
 # The TLS server of the `MODEL_CA_FILE` test; already in the tree under reqwest.
 rustls = { workspace = true, features = ["aws_lc_rs"] }
 async-trait.workspace = true
+# The starter the `export` test registers.
+adam-llm-agent.workspace = true
 serde_json.workspace = true
+tempfile.workspace = true
 tokio = { workspace = true, features = ["net", "io-util", "macros", "rt-multi-thread", "time"] }
 
 [lints]

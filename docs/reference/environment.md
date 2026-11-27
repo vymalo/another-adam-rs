@@ -141,6 +141,17 @@ cross-process listener: SQLite's notifier is always in-process, and MongoDB has 
 | `ADAM_REFERENCES_FILE` | `adam-coder`, roles that run workers: a file `{"references": [{"name", "url", "branch"?, "description"}]}` of repositories the coder may **read** beside the one it works on and never write, **added** to the `references:` of the agent's files; it must be an existing file of valid references whose addresses the workspaces' policy accepts (an allowed host, an owner a GitHub App acts for), and a name the agent already declares is exit 78. See [References](workspace-and-environments.md#references) | unset |
 | `A2A_ALLOW_INSECURE_REMOTES` | `adam-agent`, roles that run workers: let a remote subagent (`a2a:`) be at plain `http` on another machine, such as a service of the same cluster; without it such a URL is exit 78. **The messages and the bearer then cross the pod network in clear text**: protect it with a NetworkPolicy that admits only the caller, or mesh mTLS. Plain `http` goes only to the card's own host, and never from an `https` card. Its token is the environment's too: `auth: bearer:VAR` names the variable ([remote subagents](agent-files.md#remote-subagents-a2a)) | `false` |
 
+## Export (`adam-agent export`, `adam-coder export`)
+
+The `export` command writes runs as training records ([ADR 0085](../decisions/0085-runs-are-exported-as-training-records.md)).
+It reads `DATABASE_URL`, `ADAM_AGENT_DIR`, `ADAM_EXTRA_MCP_FILE` and the variable below, and requires no model, GitHub
+or A2A variable. It scrubs from every record the database's password, the value of every variable named like a secret
+(`*_KEY`, `*_TOKEN`, `*_SECRET`, `*_PASSWORD`, ...) and of every variable the agent's `mcp.json` reads.
+
+| Variable | Meaning | Default |
+|---|---|---|
+| `EXPORT_PSEUDONYM_KEY` | the key the run, parent and conversation ids are pseudonyms under (HMAC-SHA256), read as bytes: two exports under one key link, and without it no pseudonym leads back to the store. **A secret**: keep it as one. Set and empty is exit 78 | unset: a random key for each export, said in the log; its ids link to nothing else |
+
 ## The coder (`adam-coder`)
 
 | Variable | Meaning | Default |

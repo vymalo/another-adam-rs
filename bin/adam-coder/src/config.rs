@@ -797,6 +797,27 @@ impl std::fmt::Debug for WorkerConfig {
     }
 }
 
+/// `ADAM_AGENT_DIR`, read through `get` (blank is unset): an existing directory, or `None` for the
+/// copy embedded in the binary. Every role reads it, and so does `export`. A problem is added to
+/// `problems` when it names no directory.
+pub(crate) fn parse_agent_dir(
+    get: &impl Fn(&str) -> Option<String>,
+    problems: &mut Vec<String>,
+) -> Option<PathBuf> {
+    let raw = get(AGENT_DIR_ENV)?;
+    let path = PathBuf::from(raw);
+    if path.is_dir() {
+        Some(path)
+    } else {
+        problems.push(format!(
+            "{AGENT_DIR_ENV} {:?} is not a directory (name the folder that holds \
+             `agent/`, or `agent/` itself; unset it to use the copy embedded in the binary)",
+            path.display().to_string()
+        ));
+        None
+    }
+}
+
 impl Config {
     /// Read the process environment.
     ///
@@ -820,22 +841,7 @@ impl Config {
         // The role, the database, the front and the worker settings: the same for every binary.
         let service = ServiceConfig::parse(&lookup, &mut problems);
 
-        let agent_dir = match get(AGENT_DIR_ENV) {
-            None => None,
-            Some(raw) => {
-                let path = PathBuf::from(raw);
-                if path.is_dir() {
-                    Some(path)
-                } else {
-                    problems.push(format!(
-                        "{AGENT_DIR_ENV} {:?} is not a directory (name the folder that holds \
-                         `agent/`, or `agent/` itself; unset it to use the copy embedded in the binary)",
-                        path.display().to_string()
-                    ));
-                    None
-                }
-            }
-        };
+        let agent_dir = parse_agent_dir(&get, &mut problems);
 
         let max_access_tier = match get("MAX_ACCESS_TIER") {
             None => crate::tier::DEFAULT_MAX,

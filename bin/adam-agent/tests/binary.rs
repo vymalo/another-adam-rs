@@ -1364,3 +1364,97 @@ fn write_mcp_json(agent: &tempfile::TempDir, url: &str) {
     )
     .unwrap();
 }
+
+/// `adam-agent export` end to end, over SQLite and with no other service: a chat folder serves one
+/// task, the process stops, and the export, given only `DATABASE_URL`, `ADAM_AGENT_DIR` and
+/// `EXPORT_PSEUDONYM_KEY` (no model, no A2A token, no `PUBLIC_URL`), writes that run as one record
+/// to its file, owner-only, with the person's words, the answer, the A2A token the person pasted
+/// scrubbed, and a pseudonym for the run's id. Its log is on stderr, its summary one line; the same
+/// key gives the same pseudonyms. A wrong command line is exit 64, an empty key exit 78.
+#[tokio::test]
+async fn export_writes_the_runs_of_the_folder_as_records() {
+    let (model, _seen) = mount_persona_model().await;
+    let dir = tempfile::tempdir().unwrap();
+    let database_url = format!("sqlite://{}", dir.path().join("adam.sqlite").display());
+    let agent = chat();
+    let mut env = valid_env(&database_url, agent.path());
+    env.retain(|(k, _)| k != "MODEL_BASE_URL");
+    env.push(pair("MODEL_BASE_URL", model.uri()));
+    let mut p = Proc::spawn(&env);
+    let addr = p.ready().await;
+    let (state, said) = talk(addr, &format!("hi, my token is {A2A_TOKEN}")).await;
+    assert_eq!(state, TaskState::Completed, "{said}\n{}", p.logs());
+    p.stop_cleanly().await;
+
+    let out = dir.path().join("runs.jsonl");
+    let export_env = |key: &str| {
+        vec![
+            pair("DATABASE_URL", database_url.clone()),
+            pair("ADAM_AGENT_DIR", agent.path().to_string_lossy()),
+            pair("EXPORT_PSEUDONYM_KEY", key),
+            // Named like a secret: what the person pasted is known to the scrub.
+            pair("A2A_BEARER_TOKENS", A2A_TOKEN),
+        ]
+    };
+    let run_export = |env: Vec<(String, String)>, args: Vec<String>| async move {
+        Command::new(env!("CARGO_BIN_EXE_adam-agent"))
+            .arg("export")
+            .args(args)
+            .env_clear()
+            .env("PATH", std::env::var("PATH").unwrap_or_default())
+            .envs(env)
+            .stdin(Stdio::null())
+            .output()
+            .await
+            .expect("adam-agent export runs")
+    };
+    let args = vec![
+        "--out".to_owned(),
+        out.display().to_string(),
+        "--status".to_owned(),
+        "all".to_owned(),
+    ];
+    let done = run_export(export_env("k1"), args.clone()).await;
+    let stderr = String::from_utf8_lossy(&done.stderr);
+    assert_eq!(done.status.code(), Some(0), "{stderr}");
+    assert!(done.stdout.is_empty(), "nothing on stdout with --out");
+    let summary = stderr
+        .lines()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .find(|l| l["fields"]["message"] == "export finished")
+        .unwrap_or_else(|| panic!("no summary line:\n{stderr}"));
+    assert_eq!(summary["fields"]["written"], 1, "{stderr}");
+
+    let text = std::fs::read_to_string(&out).unwrap();
+    let records: Vec<Value> = text
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(records.len(), 1, "{text}");
+    let record = &records[0];
+    assert_eq!(record["schema"], "adam.export/v1");
+    assert_eq!(record["agent"], "chat");
+    assert_eq!(record["status"], "done");
+    assert!(!text.contains(A2A_TOKEN), "the token was scrubbed: {text}");
+    assert!(text.contains("hi, my token is"), "{text}");
+    assert!(text.contains("Hi! I'm Chat."), "{text}");
+    let id = record["id"].as_str().unwrap().to_owned();
+    assert_eq!(id.len(), 32, "a pseudonym: {id}");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = std::fs::metadata(&out).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
+
+    // To stdout this time, under the same key: the same pseudonym.
+    let again = run_export(export_env("k1"), vec!["--status=all".to_owned()]).await;
+    assert_eq!(again.status.code(), Some(0));
+    let again: Value = serde_json::from_slice(&again.stdout).expect("one record on stdout");
+    assert_eq!(again["id"], id.as_str());
+
+    let usage = run_export(export_env("k1"), vec!["--bogus".to_owned()]).await;
+    assert_eq!(usage.status.code(), Some(64));
+    let empty_key = run_export(export_env(""), Vec::new()).await;
+    assert_eq!(empty_key.status.code(), Some(78));
+}

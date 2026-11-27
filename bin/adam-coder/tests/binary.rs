@@ -3637,3 +3637,48 @@ async fn the_prompts_of_the_extra_mcp_servers_are_commands_of_the_coder() {
     assert_eq!(status.code(), Some(0), "{}", front.logs());
     db.finish().await;
 }
+
+/// `adam-coder export` needs only `DATABASE_URL` (the embedded agent files when `ADAM_AGENT_DIR`
+/// is unset): over a fresh SQLite file it exits 0 with nothing on stdout, logs its summary on
+/// stderr, and a wrong command line is exit 64.
+#[tokio::test]
+async fn export_over_an_empty_store_writes_nothing_and_exits_0() {
+    let dir = tempfile::tempdir().unwrap();
+    let database_url = format!("sqlite://{}", dir.path().join("adam.sqlite").display());
+    let export = |args: &[&str]| {
+        let args: Vec<String> = args.iter().map(|a| (*a).to_owned()).collect();
+        let database_url = database_url.clone();
+        async move {
+            Command::new(env!("CARGO_BIN_EXE_adam-coder"))
+                .arg("export")
+                .args(args)
+                .env_clear()
+                .env("PATH", std::env::var("PATH").unwrap_or_default())
+                .env("DATABASE_URL", database_url)
+                .stdin(Stdio::null())
+                .output()
+                .await
+                .expect("adam-coder export runs")
+        }
+    };
+    let done = export(&["--status", "all"]).await;
+    let stderr = String::from_utf8_lossy(&done.stderr);
+    assert_eq!(done.status.code(), Some(0), "{stderr}");
+    assert!(
+        done.stdout.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&done.stdout)
+    );
+    let summary = stderr
+        .lines()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .find(|l| l["fields"]["message"] == "export finished")
+        .unwrap_or_else(|| panic!("no summary line:\n{stderr}"));
+    assert_eq!(summary["fields"]["written"], 0);
+    assert!(
+        stderr.contains("EXPORT_PSEUDONYM_KEY is unset"),
+        "a random key is said: {stderr}"
+    );
+    assert_eq!(export(&["--agent", "nobody"]).await.status.code(), Some(78));
+    assert_eq!(export(&["--current-tools"]).await.status.code(), Some(64));
+}

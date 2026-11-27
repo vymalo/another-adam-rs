@@ -6,6 +6,9 @@
 //! workers finish the steps they are in before the process exits; a step cut short by a hard kill
 //! is picked up by another replica when its lease expires. The work is done by
 //! [`adam_agent::serve`].
+//!
+//! `adam-agent export [...]` serves nothing: it writes the folder's runs as training records
+//! ([`adam_agent::export`], ADR 0085) and exits.
 
 use std::future::Future;
 use std::process::ExitCode;
@@ -24,15 +27,25 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 /// the same logger as everything else.
 #[tokio::main]
 async fn main() -> ExitCode {
+    // `adam-agent export ...` writes records to standard output, so its log goes to standard error.
+    let export = adam_agent::export::subcommand(std::env::args_os().skip(1));
     // `RUST_LOG` when set, else `info` with the MCP client library quiet (`adam_service::logging`).
-    tracing_subscriber::fmt()
+    let logger = tracing_subscriber::fmt()
         .json()
-        .with_env_filter(adam_service::logging::env_filter())
-        .init();
+        .with_env_filter(adam_service::logging::env_filter());
+    if export.is_some() {
+        logger.with_writer(std::io::stderr).init();
+    } else {
+        logger.init();
+    }
 
     // Before anything else is read: a same-user child (an MCP server's command) cannot read this
     // process's `/proc/<pid>/environ`, where the model key and the database URL are.
     adam_service::harden::make_non_dumpable();
+
+    if let Some(args) = export {
+        return export_runs(args).await;
+    }
 
     // Its errors name variables, never their values.
     let config = match Config::from_env().context("reading the configuration") {
@@ -43,6 +56,26 @@ async fn main() -> ExitCode {
     match adam_agent::serve(config, shutdown_signal()).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => fail(&anyhow::Error::from(e)),
+    }
+}
+
+/// `adam-agent export`: 0 when the records are written, 64 for a wrong command line, otherwise
+/// the code of the error, as for serving.
+async fn export_runs(args: Vec<std::ffi::OsString>) -> ExitCode {
+    use adam_service::export::{Command, EX_USAGE, parse_args, usage};
+    match parse_args(args) {
+        Ok(Command::Help) => {
+            println!("{}", usage("adam-agent"));
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            tracing::error!(error = %e, code = EX_USAGE, usage = %usage("adam-agent"), "adam-agent export: wrong command line");
+            ExitCode::from(EX_USAGE)
+        }
+        Ok(Command::Export(args)) => match adam_agent::export::run(&args).await {
+            Ok(_) => ExitCode::SUCCESS,
+            Err(e) => fail(&anyhow::Error::from(e)),
+        },
     }
 }
 
