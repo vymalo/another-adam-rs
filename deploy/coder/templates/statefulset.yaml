@@ -607,11 +607,12 @@ spec:
         {{- if $turnSigning }}
         - name: turn-signing
           secret:
-            # The ExternalSecret's own Secret: the chart copies the key from AWS and never carries it.
-            secretName: {{ include "coder.secretName" . }}
+            # The generated Secret, or the ExternalSecret's: the chart copies the key from AWS and never
+            # carries it. Generated, a one-shot Job wrote it and a PushSecret pushes it back to AWS.
+            secretName: {{ include "coder.turnKeySecretName" . }}
             defaultMode: 0440
             items:
-              - key: TURN_SIGNING_KEY.pem
+              - key: {{ include "coder.turnKeyItemKey" . }}
                 path: private-key.pem
               {{- if include "coder.turnVerifyKeys" . }}
               - key: TURN_VERIFY_KEYS.json
