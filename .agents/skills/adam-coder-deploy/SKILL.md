@@ -89,6 +89,10 @@ https://github.com/vymalo/another-adam-rs/blob/main/deploy/coder/README.md.
      with `database.existingSecret.name` (and `.key`, `uri` by default) reads `DATABASE_URL` of every
      pod from a Secret you provide and renders no `Cluster`. The role must be able to create tables
      in its default schema: every role migrates at startup (`deploy/coder/README.md`, "Database").
+     The server must be **PostgreSQL 18 or later** (ADR 0082; an older one is exit 78 before any DDL):
+     the `Cluster` pins `database.imageName` at 18.7 by tag and digest, and an existing `Cluster` on 17
+     takes an offline major upgrade on the release that brings the pin (back it up first; keep its
+     distribution: `deploy/coder/README.md`, "PostgreSQL 18").
    * `workspace.placement`: empty, `isolated`, `affinity` or `shared` (ADR 0002,
      `docs/decisions/0002-workspace-placement.md`); `replicaCount` above 1 needs one.
    * `github.auth: token` (default) or `app` (`github.app.id`, `.privateKeySecret`, and exactly

@@ -1,6 +1,6 @@
 # 0082. The SQL adapters keep their rules in the database
 
-Status: **Accepted** (2026-11-27). Nothing is built. The owner decided on 2026-11-27:
+Status: **Accepted** (2026-11-27). Slice P0 is built (2026-11-27); P1–P7, S1 and S2 are not. The owner decided on 2026-11-27:
 
 > *"If something can be done in SQL, we better use SQL rather than rust"*
 >
@@ -142,6 +142,12 @@ the caller's transaction, or in the implicit transaction of a lone statement.
     changes with the binary and needs no migration, as today. A column a SQL-standard body uses cannot be altered or
     dropped until the function is dropped: such a migration drops and recreates the function in the same transaction. **A test applies the migrations to a fresh database and calls every function**,
     and fails when the set of functions in the schema differs from the list.
+
+    *Amended 2026-11-27 (slice P0):* version 7 is the **first** version that carries functions, not the only one. P0
+    stamps 7 and creates none, and each slice ships on its own, so a database a P0 release stamped 7 never runs the
+    migration again: a slice that adds, changes or drops a function bumps the version once more (P1 is 8 if it adds
+    one, and so on). That is this decision's own rule, "a changed function always comes with a version bump", applied
+    to the slices. SQLite's version 2 is unchanged by this note.
 11. **The minimum is PostgreSQL 18, the owner's floor.** `BEGIN ATOMIC` needs 14; the owner set 18, which the
     community supports until 2030-11-14 (*verified 2026-11-27*: postgresql.org, versioning policy). `migrate()` refuses
     an older server with `Invalid`, before any DDL, so a binary exits 78 rather than half-migrating. CI's oldest server
@@ -150,6 +156,11 @@ the caller's transaction, or in the implicit transaction of a lone statement.
     move to 18. The chart's CloudNativePG cluster names no image, so P0 either pins one at 18 or shows that the
     operator's default is 18 or later; the chart's render is read by another repository, so a pin is said in the pull
     request.
+
+    *Amended 2026-11-27 (slice P0):* the chart **pins** the image (`database.imageName`, PostgreSQL 18.7 by tag and
+    digest). The operator's default is its release's own (17 up to CloudNativePG 1.27, 18 in 1.28 to 1.30, 19 on its
+    main branch), and the chart names no operator release, so no default can be shown to hold. Every PostgreSQL of CI
+    and both compose stacks (the dev stack and the bench) run 18.7, pinned by tag and digest.
 12. **What PostgreSQL 18 gives the store.** One feature is adopted, two are not:
     - **Adopted: the served document is a virtual generated column** of the runs table, `served`: the head when it is a
       JSON object and current, or when the state is the JSON `null` tombstone, else the state, the expression the reads repeat today. It is
@@ -216,18 +227,24 @@ One pull request per adapter area. Each keeps the conformance suites green, brea
 to see a case fail, and adds its functions to the fresh-database test. No slice turns an inline statement into a
 function unless decision 1 says it carries a rule.
 
-| Slice | Area | Decisive test |
-|---|---|---|
-| P0 | the version 7 step, the SQLSTATE table, the refusal below 18, CI, compose and the chart on 18 | migrate a fresh database and call every function; a server below 18 is refused before any DDL |
-| P1 | the `served` column; the reads select it, inline | the listing cases and the body cases on which document a read serves |
-| P2 | the claim function; renewal and release stay inline | concurrent claims are exclusive; a pinned run never goes to another worker; an ended lease is taken over |
-| P3 | the `sched_at` function, the inline create, the headless commit | one winner among concurrent commits; a stale version and a missing run come back as outcomes |
-| P4 | the journal append | non-determinism is detected; concurrent writers agree on the first entry |
-| P5 | the commit with a head, a body and blob references | the body suite and the three body resolutions |
-| P6 | the push claim and the push commit; put, list and delete stay inline | the push cases |
-| P7 | purge, blob sweep, body collection | purge and sweep cases |
-| S1 | SQLite: the view, the `sched_at` and digest triggers, version 2 | the store suite, and a version 1 file upgrades |
-| S2 | SQLite: the journal trigger, the one-statement claim and purge, the body collection trigger | non-determinism, claim, purge and compaction cases |
+| Slice | Area | Decisive test | Status |
+|---|---|---|---|
+| P0 | the version 7 step, the SQLSTATE table, the refusal below 18, CI, compose and the chart on 18 | migrate a fresh database and call every function; a server below 18 is refused before any DDL | built 2026-11-27 |
+| P1 | the `served` column; the reads select it, inline | the listing cases and the body cases on which document a read serves | to do |
+| P2 | the claim function; renewal and release stay inline | concurrent claims are exclusive; a pinned run never goes to another worker; an ended lease is taken over | to do |
+| P3 | the `sched_at` function, the inline create, the headless commit | one winner among concurrent commits; a stale version and a missing run come back as outcomes | to do |
+| P4 | the journal append | non-determinism is detected; concurrent writers agree on the first entry | to do |
+| P5 | the commit with a head, a body and blob references | the body suite and the three body resolutions | to do |
+| P6 | the push claim and the push commit; put, list and delete stay inline | the push cases | to do |
+| P7 | purge, blob sweep, body collection | purge and sweep cases | to do |
+| S1 | SQLite: the view, the `sched_at` and digest triggers, version 2 | the store suite, and a version 1 file upgrades | to do |
+| S2 | SQLite: the journal trigger, the one-statement claim and purge, the body collection trigger | non-determinism, claim, purge and compaction cases | to do |
+
+*2026-11-27, P0 built:* `migrate()` refuses a server older than 18 with `Invalid` before any lock or DDL; schema
+version 7 is the step the functions arrive in (none yet; each later slice that adds one bumps the version, decision
+10's note); the `AD001`–`AD004` table is `adam_postgres::AdamSqlState`, and `classify` and the store follow it; a
+fresh-database test compares the schema's functions with its list (empty) and calls each; CI, the dev stack, the
+bench and the chart run PostgreSQL 18.7. The proofs are on the [agent page](../../.agents/docs/decisions/0082-the-sql-adapters-keep-their-rules-in-the-database.md#p0-built-2026-11-27).
 
 ## Consequences
 

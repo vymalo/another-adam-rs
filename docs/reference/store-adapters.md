@@ -108,7 +108,7 @@ cron tick across all replicas. A second message on a conversation that has an op
 
 ## How each adapter keeps the contract
 
-| Guarantee | PostgreSQL 12+ (`tokio-postgres`) | MongoDB 5.0+ (standalone is enough) | SQLite 3.35+ (`rusqlite`, one file, one process) |
+| Guarantee | PostgreSQL 18+ (`tokio-postgres`) | MongoDB 5.0+ (standalone is enough) | SQLite 3.35+ (`rusqlite`, one file, one process) |
 |---|---|---|---|
 | Commit CAS | `UPDATE .. WHERE version = $n RETURNING` | `findOneAndUpdate({_id, version: n}, {$inc: {version: 1}})` | `UPDATE .. WHERE id = ? AND version = ? RETURNING`, inside one `BEGIN IMMEDIATE` |
 | Journal first-writer-wins | `INSERT .. ON CONFLICT DO NOTHING`, read winner | `insertOne` on `_id = "<run>:<seq>"`; a duplicate key means an earlier writer won, and their entry is read back | `INSERT` on the primary key `(run_id, seq)`; a unique violation reads the winner, a foreign-key violation is `NotFound` |
@@ -132,6 +132,13 @@ cron tick across all replicas. A second message on a conversation that has an op
 | `release_worker_leases`: every run lease a worker holds | the default (a no-op) until it is implemented: a restarted process waits for the TTL | the same | one `BEGIN IMMEDIATE`: `UPDATE runs SET lease_owner = NULL, lease_until = NULL WHERE lease_owner = ?`; the owner and another worker's lease are untouched |
 | Transactions | none held across calls; a commit that writes a head, a body row or blob references is one transaction (the run row locked `FOR UPDATE`, the version check, the rows, the refs and the CAS) | none (single-document writes only): the rows are written, checked for completeness, then the CAS | every change is one `BEGIN IMMEDIATE`; a commit that writes a head, a body row or refs does its whole work in it |
 | Cross-process signals | `LISTEN`/`NOTIFY` via `adam-notify-postgres` | none: workers poll | none: one process per file, `LocalNotifier` in process |
+
+**PostgreSQL 18 is the oldest server the PostgreSQL store accepts**
+([ADR 0082](../decisions/0082-the-sql-adapters-keep-their-rules-in-the-database.md), decision 11):
+`migrate()` refuses an older one with class `Invalid` before any DDL, so a binary exits 78. CI runs
+18 alone. Its schema version 7 is the step the store's database functions arrive in, and a function
+that refuses raises one of adam's own SQLSTATEs, `AD001` to `AD004`, each with its error class
+([`adam-postgres`](../../crates/adam-postgres/README.md#adams-own-sqlstates)).
 
 ## SQLite
 
