@@ -98,6 +98,18 @@ impl FolderSiMemory {
         }
     }
 
+    /// Refuses a file whose stored scope is not the one asked for: a copied folder, or a hash that
+    /// collided, must not have another scope's problem served, extended or re-stamped.
+    fn owned(&self, stored: &StoredProblem, scope: &Scope, path: &Path) -> MemoryResult<()> {
+        if stored.scope != *scope {
+            return Err(MemoryError::Corrupt {
+                path: path.display().to_string(),
+                reason: "it belongs to another scope".to_owned(),
+            });
+        }
+        Ok(())
+    }
+
     fn write_stored(&self, path: &Path, stored: &StoredProblem) -> MemoryResult<()> {
         let Some(dir) = path.parent() else {
             return Err(MemoryError::backend(io::Error::other(
@@ -138,12 +150,7 @@ impl FolderSiMemory {
                 continue;
             }
             if let Some(stored) = self.read_stored(&path)? {
-                if stored.scope != *scope {
-                    return Err(MemoryError::Corrupt {
-                        path: path.display().to_string(),
-                        reason: "it belongs to another scope".to_owned(),
-                    });
-                }
+                self.owned(&stored, scope, &path)?;
                 problems.push((path, stored.problem));
             }
         }
@@ -183,6 +190,7 @@ impl SiMemory for FolderSiMemory {
         let path = self.problem_path(scope, &prepared.root_cause);
         let stored = self.read_stored(&path)?;
         if let Some(stored) = &stored {
+            self.owned(stored, scope, &path)?;
             if stored.problem.root_cause != prepared.root_cause {
                 return Err(MemoryError::Corrupt {
                     path: path.display().to_string(),
@@ -232,6 +240,7 @@ impl SiMemory for FolderSiMemory {
         let Some(stored) = self.read_stored(&path)? else {
             return Err(MemoryError::ProblemNotFound(root_cause.to_owned()));
         };
+        self.owned(&stored, scope, &path)?;
         if stored.problem.root_cause != root_cause {
             return Err(MemoryError::Corrupt {
                 path: path.display().to_string(),
