@@ -42,6 +42,8 @@ uuid.workspace = true
 
 [dev-dependencies]
 adam-memory.workspace = true
+# The call-span tests of `agent` (ANR-1346): a subscriber that captures what a span renders.
+tracing-subscriber.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
 schemars = { workspace = true, features = ["derive"] }
 proptest.workspace = true

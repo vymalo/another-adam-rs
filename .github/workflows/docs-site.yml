@@ -75,7 +75,7 @@ jobs:
           size=$(du -sh docs/.vitepress/dist | cut -f1)
           echo "site with rustdoc: ${size}"
           echo "- site with /rust/: ${size} (GitHub Pages limit: unverified)" >> "$GITHUB_STEP_SUMMARY"
-      - uses: actions/upload-pages-artifact@v4
+      - uses: actions/upload-pages-artifact@v5
         with:
           path: docs/.vitepress/dist
 
