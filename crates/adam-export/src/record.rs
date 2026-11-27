@@ -48,6 +48,15 @@ pub struct Record {
     pub outcome: Outcome,
     /// Where `tools` and the system message come from.
     pub tools_source: ToolsSource,
+    /// Which messages carry the loss: `assistant` (every assistant message: a whole run) or
+    /// `last` (only the last message: a per-turn sample). A record written before the field
+    /// existed reads as `assistant`.
+    #[serde(default)]
+    pub train_on: TrainOn,
+    /// Where a per-turn sample stands in its run ([`Samples::Turn`](crate::Samples::Turn)); absent
+    /// from a whole-run record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sample: Option<Sample>,
     /// The conversation: an optional `system` message, then the history.
     pub messages: Vec<ChatMessage>,
     /// The tools the model was offered; empty for a chat with none, or when they are unknown.
@@ -129,6 +138,36 @@ pub struct FunctionDef {
     pub description: String,
     /// The JSON Schema of its arguments.
     pub parameters: Value,
+}
+
+/// Which messages of a record a trainer computes the loss on.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TrainOn {
+    /// Every assistant message: a whole run, whose earlier answers were made from shorter
+    /// prefixes of the same messages.
+    #[default]
+    Assistant,
+    /// Only the last message, the answer of the sample's turn: the messages before it are what
+    /// the model was sent.
+    Last,
+}
+
+/// Where a per-turn sample stands in its run (ADR 0085, slice E5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Sample {
+    /// The model call the answer is from: [`Conversation::turns`](adam_llm_agent::Conversation::turns)
+    /// when it was made, from 0.
+    pub turn: u32,
+    /// This sample's place among the run's samples, from 0, oldest first.
+    pub index: u32,
+    /// How many samples the run has (before a token budget left any out).
+    pub of: u32,
+    /// Whether `messages` and `tools` are what the model was sent at that call, as far as the
+    /// state can tell (up to scrubbing, and images written `[image]`); `false` when a later
+    /// shortening rewrote a message of the prefix, the tools are not the ones recorded for that
+    /// turn, or the turn could not be placed for sure. See the crate README.
+    pub exact: bool,
 }
 
 /// Where a record's `tools` and system message come from (ADR 0085 decision 7).

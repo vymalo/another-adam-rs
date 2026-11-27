@@ -307,8 +307,10 @@ EXPORT_PSEUDONYM_KEY=... adam-agent export --require lang=rust --out runs.jsonl
 | `--status done\|failed\|all` | which runs: `done` (default), `failed`, or `all` (every status, unfinished runs included) |
 | `--require KIND=VALUE` | a facet every record must have, `lang=rust`, `dep=axum` (repeatable: all of them) |
 | `--since RFC3339`, `--until RFC3339` | only runs last updated at or after, and before, an instant |
-| `--include-compacted` | keep runs whose history a compaction replaced |
+| `--include-compacted` | keep runs whose history a compaction replaced (with `--samples turn` they are kept anyway) |
 | `--include-reasoning` | keep the reasoning text a run kept |
+| `--samples run\|turn` | one record per run (`run`, the default), or one per assistant turn since the run's last compaction (`turn`): the request of that model call, its answer last, `train_on: "last"` and a `sample` field |
+| `--max-tokens N` | leave out a record over `N` estimated tokens (characters / 4), whole, never cut (counted as `over_budget`) |
 | `--out PATH` | write to `PATH` (created or truncated, mode `0600`) instead of standard output |
 | `--help` | the usage, on standard output |
 
@@ -320,7 +322,8 @@ starters a control plane registers (the root's and each subagent's), which is wh
 Every string is scrubbed of the secrets the process holds: the password of `DATABASE_URL`, the value of every
 variable named like a secret (`MODEL_API_KEY`, each of `A2A_BEARER_TOKENS`, ...) and of every variable the folder's
 `mcp.json` reads (`redact::export_secret_values`). The log is on standard error, and the summary is its one
-`export finished` line (`seen`, `written`, `filtered`, `not_a_conversation`, `unreadable`). Exit codes: 0, 64 for a
+`export finished` line (`seen`, `written`, `filtered`, `not_a_conversation`, `unreadable`, `over_budget`, `turns_lost_to_compaction`,
+`inexact`). Exit codes: 0, 64 for a
 wrong command line, otherwise as serving (78 configuration or files, 69 a store that is down, 71 an `--out` that
 cannot be created). `--current-tools` (attach the agent's current prompt and tools) is not available yet: it is a
 usage error (64), and a record says `tools_source: "none"`.

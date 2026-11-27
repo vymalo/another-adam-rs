@@ -13,7 +13,7 @@ use crate::facets::facets_of;
 use crate::scrub::scrub_known_shapes;
 use crate::{
     ChatMessage, ChatToolCall, FunctionCall, FunctionDef, NoSecrets, Outcome, OutcomeArtifact,
-    Pseudonyms, Record, SCHEMA, Scrub, ToolDef, ToolsSource,
+    Pseudonyms, Record, SCHEMA, Samples, Scrub, ToolDef, ToolsSource, TrainOn,
 };
 
 /// What an image part becomes: no image bytes are exported.
@@ -41,6 +41,13 @@ pub struct ExportOptions {
     pub include_reasoning: bool,
     /// The current prompt and tools of each agent, by name, for the runs that recorded none.
     pub current: BTreeMap<String, RequestShape>,
+    /// One record per run ([`Samples::Run`], the default) or one per assistant turn
+    /// ([`Samples::Turn`]) in [`export_runs`](crate::export_runs).
+    pub samples: Samples,
+    /// The most tokens a record may hold, by [`estimated_tokens`](crate::estimated_tokens): a
+    /// record over it is left out and counted ([`Summary::over_budget`](crate::Summary::over_budget)),
+    /// never cut. `None` for no bound.
+    pub max_tokens: Option<u32>,
 }
 
 impl ExportOptions {
@@ -52,7 +59,24 @@ impl ExportOptions {
             pseudonyms,
             include_reasoning: false,
             current: BTreeMap::new(),
+            samples: Samples::Run,
+            max_tokens: None,
         }
+    }
+
+    /// One record per run or per assistant turn (see [`samples`](Self::samples)).
+    #[must_use]
+    pub fn samples(mut self, samples: Samples) -> Self {
+        self.samples = samples;
+        self
+    }
+
+    /// Leave out the records over `max_tokens` estimated tokens (see
+    /// [`max_tokens`](Self::max_tokens)).
+    #[must_use]
+    pub fn max_tokens(mut self, max_tokens: Option<u32>) -> Self {
+        self.max_tokens = max_tokens;
+        self
     }
 
     /// With `scrub` for the deployment's secrets.
@@ -77,7 +101,7 @@ impl ExportOptions {
     }
 
     /// `text` without the deployment's secrets nor the well-known shapes.
-    fn clean(&self, text: &str) -> String {
+    pub(crate) fn clean(&self, text: &str) -> String {
         let scrubbed = self.scrub.scrub(text);
         match scrub_known_shapes(&scrubbed) {
             std::borrow::Cow::Borrowed(_) => scrubbed,
@@ -92,6 +116,8 @@ impl std::fmt::Debug for ExportOptions {
             .field("pseudonyms", &self.pseudonyms)
             .field("include_reasoning", &self.include_reasoning)
             .field("current", &self.current.keys().collect::<Vec<_>>())
+            .field("samples", &self.samples)
+            .field("max_tokens", &self.max_tokens)
             .finish_non_exhaustive()
     }
 }
@@ -151,25 +177,42 @@ pub fn record_with(
     recorded: Option<&RequestShape>,
     options: &ExportOptions,
 ) -> Record {
-    let pseudonyms = &options.pseudonyms;
-    let (tools_source, shape) = match (recorded, options.current.get(&run.agent)) {
-        (Some(shape), _) => (ToolsSource::Recorded, Some(shape)),
-        (None, Some(shape)) => (ToolsSource::Current, Some(shape)),
-        (None, None) => (ToolsSource::None, None),
-    };
-    let mut messages = Vec::with_capacity(conversation.messages.len() + 1);
+    let (tools_source, shape) = shape_for(run, recorded, options);
+    let mut record = head_of(run, conversation, options);
+    record.messages = Vec::with_capacity(conversation.messages.len() + 1);
     if let Some(system) = shape.and_then(|shape| shape.system.as_deref()) {
-        messages.push(ChatMessage::System {
+        record.messages.push(ChatMessage::System {
             content: options.clean(system),
         });
     }
-    messages.extend(
+    record.messages.extend(
         conversation
             .messages
             .iter()
             .map(|message| chat_message(message, options)),
     );
-    let tools = shape
+    record.tools = tools_of(shape, options);
+    record.tools_source = tools_source;
+    record
+}
+
+/// Which prompt and tools a record carries: `recorded` wins over the agent's
+/// [current](ExportOptions::current) ones.
+pub(crate) fn shape_for<'a>(
+    run: &RunMeta,
+    recorded: Option<&'a RequestShape>,
+    options: &'a ExportOptions,
+) -> (ToolsSource, Option<&'a RequestShape>) {
+    match (recorded, options.current.get(&run.agent)) {
+        (Some(shape), _) => (ToolsSource::Recorded, Some(shape)),
+        (None, Some(shape)) => (ToolsSource::Current, Some(shape)),
+        (None, None) => (ToolsSource::None, None),
+    }
+}
+
+/// The tools of `shape`, cleaned; none without one.
+pub(crate) fn tools_of(shape: Option<&RequestShape>, options: &ExportOptions) -> Vec<ToolDef> {
+    shape
         .map(|shape| {
             shape
                 .tools
@@ -177,7 +220,17 @@ pub fn record_with(
                 .map(|spec| tool_def(spec, options))
                 .collect()
         })
-        .unwrap_or_default();
+        .unwrap_or_default()
+}
+
+/// Everything of a run's record but its messages and tools (empty here, `tools_source: none`):
+/// what each of its records carries.
+pub(crate) fn head_of(
+    run: &RunMeta,
+    conversation: &Conversation,
+    options: &ExportOptions,
+) -> Record {
+    let pseudonyms = &options.pseudonyms;
     Record {
         schema: SCHEMA.to_owned(),
         id: pseudonyms.of("run", &run.id.to_string()),
@@ -210,9 +263,11 @@ pub fn record_with(
                 })
                 .collect(),
         },
-        tools_source,
-        messages,
-        tools,
+        tools_source: ToolsSource::None,
+        train_on: TrainOn::Assistant,
+        sample: None,
+        messages: Vec::new(),
+        tools: Vec::new(),
     }
 }
 
@@ -244,7 +299,7 @@ fn models_of(conversation: &Conversation) -> Vec<String> {
     models.into_iter().collect()
 }
 
-fn chat_message(message: &Message, options: &ExportOptions) -> ChatMessage {
+pub(crate) fn chat_message(message: &Message, options: &ExportOptions) -> ChatMessage {
     match message {
         Message::User { content } => ChatMessage::User {
             content: options.clean(&text_of(content)),

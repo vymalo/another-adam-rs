@@ -13,6 +13,17 @@ Slice E3 is built (2026-11-27): `Conversation::request` names the blobs of the l
 `system`, not only the agent's instructions) and tools (RFC 8785 JSON); recording is all or nothing and fails open; the
 exporter reads them with `RecordedRequest::load`.
 
+*Amended 2026-11-27:* slice E5 is built. `--samples turn` (`Samples::Turn`, `samples_of`) writes one record per
+assistant turn: the system prompt and tools recorded for that call, the history before its answer, and the answer last,
+with `train_on: "last"` and `sample: {turn, index, of, exact}` (a run record says `train_on: "assistant"`); the schema
+stays `adam.export/v1`. E3 now also keeps `Conversation::requests`, the run's distinct requests (one entry per change of
+prompt or tools, at most 64, derived from the journaled answers so a replay writes the same list), and a sample takes
+the entry at or before its turn. Limits: only the calls since the run's **last** compaction have samples (the turns
+before are counted, never rebuilt), so in turn mode a compacted run is kept by default; a sample before a later
+shortening, without a recorded entry, with a possible closing answer, from a run whose context names an interface
+language, or from a run whose answers do not add up to its calls, is `exact: false`. `--max-tokens N` leaves out a
+record over `N` tokens estimated as characters / 4, whole: a sample is never cut.
+
 ## Context
 
 adam-rs had no exporter (*verified 2026-11-27*: no export code in `crates/`, `bin/` or `bench/`). The thread exports of

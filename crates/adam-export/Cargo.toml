@@ -1,6 +1,6 @@
 [package]
 name = "adam-export"
-description = "Export adam-rs runs as training records: one JSON Lines record per run in the chat shape, with facets, outcomes, redaction and pseudonymous ids (ADR 0085)"
+description = "Export adam-rs runs as training records: one JSON Lines record per run or per assistant turn in the chat shape, with facets, outcomes, redaction and pseudonymous ids (ADR 0085)"
 readme = "README.md"
 version.workspace = true
 edition.workspace = true

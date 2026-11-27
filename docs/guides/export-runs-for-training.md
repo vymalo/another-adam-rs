@@ -2,8 +2,8 @@
 
 For agents: [the invariants, the gates and the evidence](../../.agents/docs/guides/export-runs-for-training.md)
 
-`adam-coder export` and `adam-agent export` write the runs in the store as training records, one JSON line per run, in
-the chat shape most fine-tuning tools read. Use them to train a small model on what a strong model did with adam as
+`adam-coder export` and `adam-agent export` write the runs in the store as training records, one JSON line per run (or
+per assistant turn), in the chat shape most fine-tuning tools read. Use them to train a small model on what a strong model did with adam as
 its harness: for example an instruct model that knows Rust and CrateStack and drives adam's tools well. The decision is
 [ADR 0085](../decisions/0085-runs-are-exported-as-training-records.md).
 
@@ -23,15 +23,40 @@ EXPORT_PSEUDONYM_KEY=... adam-coder export --require lang=rust --require dep=cra
 | `--status done\|failed\|all` | `done` | which runs to keep: finished, failed, or every run, unfinished ones included |
 | `--require KIND=VALUE` | none | keep a run only if it has this facet; repeat it: `lang=rust` and `dep=cratestack` are both required |
 | `--since`, `--until` | none | keep runs last updated in this window (RFC 3339) |
-| `--include-compacted` | off | keep runs whose history was summarised: their messages are not what the model saw at every turn |
+| `--include-compacted` | off | keep runs whose history was summarised: their messages are not what the model saw at every turn. With `--samples turn` such runs are kept anyway |
 | `--include-reasoning` | off | keep the model's reasoning text, when the run kept it |
+| `--samples run\|turn` | `run` | one record per run, or one per assistant turn (below) |
+| `--max-tokens N` | none | leave out a record over `N` tokens, estimated as characters / 4; a record is never cut |
 | `--out PATH` | standard output | write to a file, readable by its owner only |
 
-A wrong command line is exit 64, an unknown `--agent` or an empty key exit 78. The summary (runs seen, written, filtered, not a conversation, unreadable) goes to the log on standard error.
+A wrong command line is exit 64, an unknown `--agent` or an empty key exit 78. The summary (runs seen, records written,
+runs filtered, not a conversation, unreadable, records over the budget, turns lost to compaction, samples not exact)
+goes to the log on standard error.
 `EXPORT_PSEUDONYM_KEY` is the key of the pseudonymous ids: keep the same one to link two exports; leave it unset and
 each export gets a random key ([environment variables](../reference/environment.md)).
 
 The record, every field and the facets are described in [the crate's README](../../crates/adam-export/README.md).
+
+## One sample per turn, for a small GPU
+
+A whole run is often far longer than a small card trains on (a 12 GB card fits about 8,000 to 16,000 tokens). With
+`--samples turn` each assistant turn is its own record: what the model was sent at that call (system prompt, tools,
+the history before it) and its answer as the last message. Train on the last message only: each sample says
+`train_on: "last"`.
+
+```sh
+EXPORT_PSEUDONYM_KEY=... adam-coder export --samples turn --max-tokens 16000 --require lang=rust --out turns.jsonl
+```
+
+| What | How it is exported |
+|---|---|
+| a run compacted during a long task | kept: its samples are the turns since its **last** compaction, each starting with the compaction's summary, as the model saw it. They teach a model to go on after a compaction. The turns before are counted as lost, never rebuilt |
+| a turn whose tools changed (a group loaded) | the tools recorded for that turn, not the last turn's |
+| a sample over `--max-tokens` | left out whole and counted; cutting it would part a tool call from its result |
+| a sample the store cannot rebuild exactly | written with `sample.exact: false` (a tool result shortened after that turn, tools not recorded for it, a turn that cannot be placed for sure); keep only `exact: true` for a strict dataset |
+
+Each sample carries `sample: {turn, index, of, exact}` and the run's own fields (facets, outcome, models). The budget is
+an estimate: count with your tokenizer before training.
 
 ## What leaves the store, and what does not
 
@@ -76,7 +101,7 @@ flowchart LR
 2. **Export** the finished runs of that stack: `--status done --require lang=rust --require dep=cratestack`. Facets are
    guessed from the files and manifests a run touched, so read a sample before you trust a filter.
 3. **Curate.** Drop duplicates (the same task twice), compacted runs (left out by default) and runs longer than your
-   trainer's context. A judge model may score runs so you keep the best. **Never let a model rewrite a trajectory**:
+   trainer's context, or export per turn with a budget (`--samples turn --max-tokens N`). A judge model may score runs so you keep the best. **Never let a model rewrite a trajectory**:
    the tool results are what the tools really returned, and a rewritten one teaches the model a world that does not
    exist.
 4. **Mix and fine-tune.** adam's runs teach the harness, not the language: mix them with a general corpus for the
@@ -98,4 +123,3 @@ of your own.
 | What | Until then |
 |---|---|
 | The coder's outcome: the pull request, whether its head was verified, the checks (slice E4) | the outcome is the run's status, its error and its artifact names (the coder's `pull_request` among them) |
-| One sample per assistant turn, with its exact prefix and tools (slice E5) | one record per run |

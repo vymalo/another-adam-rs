@@ -4,6 +4,8 @@
 //!
 //! * [`record_of`] turns a run's bookkeeping ([`RunMeta`]) and its `Conversation` into a
 //!   [`Record`]. Pure.
+//! * [`samples_of`] turns it into one [`Record`] per assistant turn since the last compaction,
+//!   each the request the model was sent at that call and its answer ([`Samples::Turn`]). Pure.
 //! * [`export_runs`] lists an agent's runs from a [`Runtime`](adam_runtime::Runtime), joins each
 //!   one and writes the records a [`Filter`] accepts.
 //! * [`facets`] derives `lang` and `dep` from a transcript; [`Scrub`] and
@@ -17,6 +19,7 @@ pub mod facets;
 mod filter;
 mod pseudonym;
 mod record;
+mod sample;
 mod scrub;
 
 pub use convert::{
@@ -27,6 +30,7 @@ pub use filter::Filter;
 pub use pseudonym::{NoRandomness, Pseudonyms};
 pub use record::{
     ChatMessage, ChatToolCall, Facets, FunctionCall, FunctionDef, Outcome, OutcomeArtifact, Record,
-    SCHEMA, ToolDef, ToolsSource,
+    SCHEMA, Sample, ToolDef, ToolsSource, TrainOn,
 };
+pub use sample::{Samples, TurnRequest, estimated_tokens, samples_of, turns_lost_to_compaction};
 pub use scrub::{NoSecrets, Scrub, scrub_known_shapes};

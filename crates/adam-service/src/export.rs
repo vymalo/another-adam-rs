@@ -10,7 +10,7 @@
 //! ```text
 //! <binary> export [--agent NAME]... [--status done|failed|all] [--require KIND=VALUE]...
 //!                 [--since RFC3339] [--until RFC3339] [--include-compacted]
-//!                 [--include-reasoning] [--out PATH]
+//!                 [--include-reasoning] [--samples run|turn] [--max-tokens N] [--out PATH]
 //! ```
 
 use std::ffi::OsString;
@@ -20,7 +20,7 @@ use std::path::{Path, PathBuf};
 use adam_core::store::RunStatus;
 use adam_core::time::Timestamp;
 use adam_error::{Classify, ErrorClass};
-use adam_export::{ExportError, ExportOptions, Filter, NoRandomness, Pseudonyms, Summary};
+use adam_export::{ExportError, ExportOptions, Filter, NoRandomness, Pseudonyms, Samples, Summary};
 use adam_runtime::Runtime;
 use secrecy::SecretString;
 
@@ -37,18 +37,23 @@ pub const EX_USAGE: u8 = 64;
 pub fn usage(binary: &str) -> String {
     format!(
         "usage: {binary} export [--agent NAME]... [--status done|failed|all] [--require KIND=VALUE]... \
-         [--since RFC3339] [--until RFC3339] [--include-compacted] [--include-reasoning] [--out PATH]\n\
+         [--since RFC3339] [--until RFC3339] [--include-compacted] [--include-reasoning] \
+         [--samples run|turn] [--max-tokens N] [--out PATH]\n\
          \n\
-         Writes one JSON Lines record per run (ADR 0085) to standard output, or to PATH (created or \
-         truncated, mode 0600).\n\
+         Writes one JSON Lines record per run, or per assistant turn (ADR 0085), to standard output, \
+         or to PATH (created or truncated, mode 0600).\n\
          \n\
          --agent NAME          an agent this binary registers (repeatable); default: every one\n\
          --status STATUS       done (default), failed, or all (every status, unfinished runs included)\n\
          --require KIND=VALUE  a facet every record must have, lang=rust or dep=axum (repeatable)\n\
          --since RFC3339       only runs last updated at or after this instant\n\
          --until RFC3339       only runs last updated before this instant\n\
-         --include-compacted   keep runs whose history a compaction replaced\n\
+         --include-compacted   keep runs whose history a compaction replaced (with --samples turn \
+         they are kept anyway)\n\
          --include-reasoning   keep the reasoning text a run kept\n\
+         --samples run|turn    one record per run (default), or one per assistant turn since the \
+         run's last compaction: the request of that call, its answer last\n\
+         --max-tokens N        leave out a record over N tokens (estimated: characters / 4); never cut\n\
          --out PATH            write to PATH instead of standard output\n\
          \n\
          Reads DATABASE_URL and the agent's files as serving does, and {PSEUDONYM_KEY_ENV} (the key of \
@@ -65,6 +70,10 @@ pub struct ExportArgs {
     pub filter: Filter,
     /// `--include-reasoning`.
     pub include_reasoning: bool,
+    /// `--samples`: one record per run (the default) or per assistant turn.
+    pub samples: Samples,
+    /// `--max-tokens`: the most estimated tokens a record may hold; `None` for no bound.
+    pub max_tokens: Option<u32>,
     /// `--out`: the file to write; `None` for standard output.
     pub out: Option<PathBuf>,
 }
@@ -105,6 +114,8 @@ pub fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Command, U
     let mut until = None;
     let mut include_compacted = false;
     let mut include_reasoning = false;
+    let mut samples: Option<Samples> = None;
+    let mut max_tokens: Option<u32> = None;
     let mut out: Option<PathBuf> = None;
 
     let mut args = args.into_iter();
@@ -196,6 +207,36 @@ pub fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Command, U
                 takes_no_value("--include-reasoning")?;
                 include_reasoning = true;
             }
+            "--samples" => {
+                let raw = text("--samples", value("--samples")?)?;
+                let mode = match raw.as_str() {
+                    "run" => Samples::Run,
+                    "turn" => Samples::Turn,
+                    other => {
+                        return Err(UsageError(format!(
+                            "--samples {other:?} is not run or turn"
+                        )));
+                    }
+                };
+                if samples.replace(mode).is_some() {
+                    return Err(UsageError("--samples is given twice".into()));
+                }
+            }
+            "--max-tokens" => {
+                let raw = text("--max-tokens", value("--max-tokens")?)?;
+                let n = raw
+                    .parse::<u32>()
+                    .ok()
+                    .filter(|n| *n > 0 && !raw.starts_with('+'))
+                    .ok_or_else(|| {
+                        UsageError(format!(
+                            "--max-tokens {raw:?} is not a whole number of tokens above 0"
+                        ))
+                    })?;
+                if max_tokens.replace(n).is_some() {
+                    return Err(UsageError("--max-tokens is given twice".into()));
+                }
+            }
             "--out" => {
                 let path = value("--out")?;
                 if path.is_empty() {
@@ -238,6 +279,8 @@ pub fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Command, U
             min_turns: defaults.min_turns,
         },
         include_reasoning,
+        samples: samples.unwrap_or_default(),
+        max_tokens,
         out,
     }))
 }
@@ -340,8 +383,8 @@ impl Classify for ExportCommandError {
 
 /// Export the runs `args` asks for: open the store `database_url` names, build a runtime with
 /// what `register` puts on it (the agents' starters: what joins a run's transcript) and nothing
-/// else, and write the records to `args.out` or standard output. The summary is one `info` line
-/// of the log.
+/// else, and write the records to `args.out` or standard output. `args.samples` and
+/// `args.max_tokens` replace those of `options`. The summary is one `info` line of the log.
 ///
 /// # Errors
 ///
@@ -365,8 +408,12 @@ pub async fn run(
         out = args.out.as_deref().map(|p| p.display().to_string()),
         "exporting runs"
     );
+    let options = options
+        .clone()
+        .samples(args.samples)
+        .max_tokens(args.max_tokens);
     let mut out = open_out(args.out.as_deref())?;
-    let summary = adam_export::export_runs(&runtime, &agents, &args.filter, options, &mut out)
+    let summary = adam_export::export_runs(&runtime, &agents, &args.filter, &options, &mut out)
         .await
         .map_err(ExportCommandError::Export)?;
     tracing::info!(
@@ -375,6 +422,9 @@ pub async fn run(
         filtered = summary.filtered,
         not_a_conversation = summary.not_a_conversation,
         unreadable = summary.unreadable,
+        over_budget = summary.over_budget,
+        turns_lost_to_compaction = summary.turns_lost_to_compaction,
+        inexact = summary.inexact,
         "export finished"
     );
     Ok(summary)
@@ -447,7 +497,38 @@ mod tests {
         assert!(args.agents.is_empty());
         assert_eq!(args.filter, Filter::default());
         assert!(!args.include_reasoning);
+        assert_eq!(args.samples, Samples::Run);
+        assert_eq!(args.max_tokens, None);
         assert_eq!(args.out, None);
+    }
+
+    #[test]
+    fn samples_and_a_token_budget_read() {
+        let args = export(&["--samples", "turn", "--max-tokens", "16000"]);
+        assert_eq!(args.samples, Samples::Turn);
+        assert_eq!(args.max_tokens, Some(16_000));
+        let joined = export(&["--samples=run", "--max-tokens=8000"]);
+        assert_eq!(joined.samples, Samples::Run);
+        assert_eq!(joined.max_tokens, Some(8_000));
+        for args in [
+            &["--samples"][..],
+            &["--samples", "turns"],
+            &["--samples", "run", "--samples", "turn"],
+            &["--max-tokens"],
+            &["--max-tokens", "0"],
+            &["--max-tokens", "-5"],
+            &["--max-tokens", "+5"],
+            &["--max-tokens", "1.5"],
+            &["--max-tokens", "16k"],
+            &["--max-tokens", "99999999999"],
+            &["--max-tokens", "1", "--max-tokens", "2"],
+        ] {
+            assert!(parse(args).is_err(), "{args:?} was accepted");
+        }
+        assert_eq!(
+            parse(&["--samples", "turns"]),
+            Err(UsageError("--samples \"turns\" is not run or turn".into()))
+        );
     }
 
     #[test]

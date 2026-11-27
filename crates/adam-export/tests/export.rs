@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use adam_core::{DynStore, MemoryStore, RunId, RunStatus};
-use adam_export::{ExportOptions, Filter, Pseudonyms, Summary, export_runs};
+use adam_export::{ExportOptions, Filter, Pseudonyms, Samples, Summary, export_runs};
 use adam_llm_agent::{LlmAgent, Tool, ToolCtx, ToolError, ToolOutput, user_message};
 use adam_model::{DynModel, MockModel, ToolCall, ToolSpec};
 use adam_runtime::Runtime;
@@ -112,8 +112,16 @@ fn options() -> ExportOptions {
 }
 
 async fn export(runtime: &Runtime, filter: &Filter) -> (Summary, Vec<Value>) {
+    export_with(runtime, filter, &options()).await
+}
+
+async fn export_with(
+    runtime: &Runtime,
+    filter: &Filter,
+    options: &ExportOptions,
+) -> (Summary, Vec<Value>) {
     let mut out = Vec::new();
-    let summary = export_runs(runtime, &["coder".to_owned()], filter, &options(), &mut out)
+    let summary = export_runs(runtime, &["coder".to_owned()], filter, options, &mut out)
         .await
         .expect("export");
     let text = String::from_utf8(out).expect("utf-8");
@@ -147,6 +155,7 @@ async fn a_stack_filter_keeps_the_run_that_read_the_manifest() {
             filtered: 1,
             not_a_conversation: 0,
             unreadable: 0,
+            ..Summary::default()
         }
     );
     let [record] = lines.as_slice() else {
@@ -220,12 +229,98 @@ async fn a_stack_filter_keeps_the_run_that_read_the_manifest() {
             filtered: 2,
             not_a_conversation: 0,
             unreadable: 0,
+            ..Summary::default()
         }
     );
 
     // A failed status lists nothing: the store filters by status before a state is read.
     let (summary, _) = export(&h.runtime, &Filter::default().statuses([RunStatus::Failed])).await;
     assert_eq!(summary, Summary::default());
+
+    h.stop().await;
+}
+
+/// Per turn (ADR 0085, slice E5): the run of two model calls is two samples, each the request of
+/// its call (the recorded system prompt and tools, the history before the answer) and the answer
+/// last, `train_on: "last"`. A token budget leaves out the samples over it, whole.
+#[tokio::test]
+async fn a_turn_export_writes_one_sample_per_answer() {
+    let h = Harness::new();
+    h.mock
+        .push_tool_calls(vec![ToolCall::new(
+            "c1",
+            "read_file",
+            json!({"path": "Cargo.toml"}),
+        )])
+        .push_text("added a route");
+    h.run_to_done("add a route", "conv-axum").await;
+
+    let turns = options().samples(Samples::Turn);
+    let (summary, lines) = export_with(&h.runtime, &Filter::default(), &turns).await;
+    assert_eq!(
+        summary,
+        Summary {
+            seen: 1,
+            written: 2,
+            ..Summary::default()
+        }
+    );
+    let [first, second] = lines.as_slice() else {
+        panic!("two samples: {lines:#?}");
+    };
+    for (n, sample) in [first, second].into_iter().enumerate() {
+        assert_eq!(sample["schema"], "adam.export/v1");
+        assert_eq!(sample["train_on"], "last");
+        assert_eq!(sample["tools_source"], "recorded");
+        assert_eq!(sample["tools"][0]["function"]["name"], "read_file");
+        assert_eq!(
+            sample["sample"],
+            json!({"turn": n, "index": n, "of": 2, "exact": true})
+        );
+        assert_eq!(sample["turns"], 2, "the run's own count");
+        assert_eq!(sample["facets"]["dep"], json!(["axum"]), "the run's facets");
+        assert_eq!(sample["messages"][0]["role"], "system");
+        let raw = sample.to_string();
+        assert!(!raw.contains(GITHUB_TOKEN), "a token leaked: {raw}");
+        assert!(!raw.contains(DEPLOYMENT_SECRET), "a secret leaked: {raw}");
+    }
+    let roles = |sample: &Value| -> Vec<String> {
+        sample["messages"]
+            .as_array()
+            .expect("messages")
+            .iter()
+            .map(|m| m["role"].as_str().expect("a role").to_owned())
+            .collect()
+    };
+    assert_eq!(roles(first), ["system", "user", "assistant"]);
+    assert_eq!(first["messages"][2]["tool_calls"][0]["id"], "c1");
+    assert_eq!(
+        roles(second),
+        ["system", "user", "assistant", "tool", "assistant"]
+    );
+    assert_eq!(second["messages"][3]["tool_call_id"], "c1");
+    assert_eq!(second["messages"][4]["content"], "added a route");
+
+    // The run-mode record says every assistant message is a target, and has no `sample`.
+    let (_, run) = export(&h.runtime, &Filter::default()).await;
+    assert_eq!(run[0]["train_on"], "assistant");
+    assert!(run[0].get("sample").is_none());
+
+    // A budget between the two samples keeps the first only.
+    let tokens = |sample: &Value| -> u32 {
+        let record: adam_export::Record = serde_json::from_value(sample.clone()).expect("a record");
+        u32::try_from(adam_export::estimated_tokens(&record)).expect("small")
+    };
+    let (small, big) = (tokens(first), tokens(second));
+    assert!(small < big);
+    let (summary, lines) = export_with(
+        &h.runtime,
+        &Filter::default(),
+        &turns.clone().max_tokens(Some(small)),
+    )
+    .await;
+    assert_eq!((summary.written, summary.over_budget), (1, 1));
+    assert_eq!(lines[0]["sample"]["turn"], 0);
 
     h.stop().await;
 }

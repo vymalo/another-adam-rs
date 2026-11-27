@@ -2624,8 +2624,10 @@ DATABASE_URL=postgres://... EXPORT_PSEUDONYM_KEY=... \
 | `--status done\|failed\|all` | which runs: `done` (default), `failed`, or `all` (every status, unfinished runs included) |
 | `--require KIND=VALUE` | a facet every record must have, `lang=rust`, `dep=cratestack` (repeatable: all of them) |
 | `--since RFC3339`, `--until RFC3339` | only runs last updated at or after, and before, an instant |
-| `--include-compacted` | keep runs whose history a compaction replaced |
+| `--include-compacted` | keep runs whose history a compaction replaced (with `--samples turn` they are kept anyway) |
 | `--include-reasoning` | keep the reasoning text a run kept |
+| `--samples run\|turn` | one record per run (`run`, the default), or one per assistant turn since the run's last compaction (`turn`): the request of that model call, its answer last, `train_on: "last"` and a `sample` field |
+| `--max-tokens N` | leave out a record over `N` estimated tokens (characters / 4), whole, never cut (counted as `over_budget`) |
 | `--out PATH` | write to `PATH` (created or truncated, mode `0600`) instead of standard output |
 | `--help` | the usage, on standard output |
 
@@ -2638,7 +2640,8 @@ Every string is scrubbed by the coder's `Redactor`: `Redactor::from_config` when
 serving configuration (the model key, the GitHub token or App key, the A2A tokens), else the password of
 `DATABASE_URL`; and in both cases the value of every variable named like a secret and of every variable the agent's
 `mcp.json` reads (`src/export.rs`). The log is on standard error, and the summary is its one `export finished` line
-(`seen`, `written`, `filtered`, `not_a_conversation`, `unreadable`). Exit codes: 0, 64 for a wrong command line,
+(`seen`, `written`, `filtered`, `not_a_conversation`, `unreadable`, `over_budget`, `turns_lost_to_compaction`,
+`inexact`). Exit codes: 0, 64 for a wrong command line,
 otherwise as below (78 configuration, files or an unknown `--agent`, 69 a store that is down, 71 an `--out` that
 cannot be created). `--current-tools` (attach the agent's current prompt and tools) is not available yet: it is a
 usage error (64), and a record says `tools_source: "none"`.
