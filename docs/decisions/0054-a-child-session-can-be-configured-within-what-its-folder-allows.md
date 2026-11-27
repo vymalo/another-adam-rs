@@ -300,6 +300,22 @@ where a store is involved (`crates/adam-llm-agent/tests/sessions.rs` holds the s
   `crates/adam-llm-agent/tests/prefix.rs`.
 * Accepted when: a root with subagents has the section after its catalog and one without has none; the section is byte-equal
   under any `SessionLimits`; the drift test fails when a spec argument is renamed alone; ADR 0044's prefix test holds.
+* *Built (2026-11-27, ANR-208):* `SessionTools::guide()` and `SessionTools::guide_for(helpers)` in `sessions.rs` make the *Child
+  sessions* section from one table (`GUIDE`: each tool's name, purpose and arguments, and the options of `config` from
+  `CONFIG_OPTIONS`). It names the five tools that exist (`subagent_start`, `_send`, `_read`, `_close`, `_list`): *edit* and
+  *delete* are slices 4 and 5 and join the table with their tools. `def.rs` appends it at bind, after the skills catalog, to the
+  root that has subagents (`guide_for` takes the helper names: the section needs no bounds, but `SessionTools` is not built at bind
+  because a `SessionAgent` needs them), so it is in
+  `AgentInfo::prompt`, in `LlmAgent::instructions` and in `fixed_chars`. It has no limit and no count, so it is the same bytes
+  under any `SessionLimits`. **The table generates the argument lists; the descriptions are written twice and no test compares
+  them:** each spec's `required` is built
+  from it (`required_of`), a unit test holds each spec's `properties` keys (and `required`) to the table's arguments, and the specs stay
+  pinned byte for byte by `tests/fixtures/session-tools.json`. The drift test (`tests/sessions.rs`,
+  `the_guide_and_the_specs_name_the_same_tools_and_arguments`) holds the guide's tools,
+  arguments, required flags and `config` options to the live specs in both directions, and a second test proves the check fails
+  on a rename on either side. **Consequence:** the prompt of every agent that has subagents grows by about 1.7 KB
+  (the coder's baseline in `first_request.rs` moved by the section's size), which **changes the stable prefix and so the prompt
+  cache once** at the deploy. `tests/prefix.rs` is unchanged: it holds for any instructions, the section is part of them.
 
 **3. `tools` and `deny_tools`.** Depends on 1.
 * Files: `agent.rs` (the session withhold, both points), `sessions.rs`, `def.rs` (the bound tool names).
@@ -337,6 +353,17 @@ where a store is involved (`crates/adam-llm-agent/tests/sessions.rs` holds the s
 * Files: `agent.rs` (the check at the final answer), `crates/adam-llm-agent/Cargo.toml` (`jsonschema`), `sessions.rs`.
 * Accepted when: a matching answer is the report; a mismatch gets two corrective turns and then fails the round with the reason;
   a schema with an outside `$ref` or over 16 KiB is refused.
+* *Built (2026-11-27, ANR-220)*: `SessionConfig::report_schema` (`reportSchema` on the wire) is held by `SessionBounds::admit`
+  (`crates/adam-runtime/src/session.rs`, so the tool and the later A2A front share it): an object, at most 16 KiB
+  (`MAX_REPORT_SCHEMA_BYTES`), no `$ref` or `$dynamicRef` that does not start with `#`, and a draft 2020-12 schema that compiles
+  with nothing fetched (`jsonschema` without its default features, in `adam-runtime` and `adam-llm-agent`). A remote subagent
+  refuses it by name. The loop checks the answer at each place a round can end (`LlmAgent::report_gate`, `agent.rs`: the words that end a turn, an answer a tool announced, a tool's `final_answer`, and a closing turn): not one JSON
+  value, or one that does not match, puts the first three problems to the model as a turn (the first also tells the schema,
+  since the round is not otherwise shown its configuration), twice at most, each a model call counted in `max_turns`; then the
+  round fails with `report does not match report_schema` and the last problems. **A closing turn's answer (a limit was
+  reached, so no correction is left) must match too, or the round fails the same way**: a report that does not match is never
+  a `Done` one. A correction drops the announced answer that failed, so the corrected words are what is checked next. The count is `Conversation::report_corrections`, reset when a message reaches the run. A `format` is an annotation under draft 2020-12 and is not enforced; an answer in a code fence is not accepted (the correction says so). `subagent_start`'s
+  `config` names the option and its description tells the model to describe the shape in `prompt` too.
 
 **10. The A2A front.** Depends on 1, 4, 5 and the contract amendment in `vymalo/another-agentic-system`.
 * Files: `crates/adam-a2a-runtime/src/child_sessions.rs`, `session_events.rs`, `crates/adam-a2a` (the card's `agents[].config`).
@@ -367,3 +394,15 @@ The work proceeds with these; a different answer is a dated note here.
 6. The card lists each helper's named sets (models, tools, skills); they are not secrets, and the card already lists the helpers.
 7. `model` chooses among aliases of one endpoint; several endpoints wait for the model relay.
 8. A set reasoning effort replaces a `MODEL_EXTRA_BODY` member of the same name *(amended 2026-11-21, ADR 0063: the members the model's wire would duplicate)*.
+
+## Amended 2026-11-27 (slice 5, split in two)
+
+Slice 5 — `subagent_close {delete}` — lands in two pieces, because a working round cannot be given the closing
+round that writes the tombstone until it has ended.
+
+1. **The first piece (ANR-1213)** adds `SessionHeader.deleted`, makes `SessionView::from_rounds` answer `None` for
+   a deleted session (so it is never listed again and every tool refuses it as *no session*), and accepts
+   `delete: true` on an **idle** session, whose closing round writes the tombstone. Its runs stay in the store.
+2. **A working session is refused**, with words that say to close it first — *not* cancelled by the delete, which is
+   what decision 10 says. The cancel-then-delete order is the second piece, together with the due rule and the
+   parent parked on `AwaitSession`, and it carries its own tests on the three stores.

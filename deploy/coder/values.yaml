@@ -7,7 +7,7 @@ image:
   # Bumped on every green build of main by .github/workflows/coder.yml
   # (`sha-<first 7 of the commit>`). A plain key so the workflow can edit it.
   # sha-0000000 is the placeholder that exists before the first build.
-  tag: sha-38058c5
+  tag: sha-59d36b9
   pullPolicy: IfNotPresent
 
 # The image package may be private; name a pull secret here if so.
@@ -707,6 +707,18 @@ turnSigning:
   # `vault:<name>#v<n>`. Empty: the key's RFC 7638 thumbprint. With `#v<n>` above 1, the verify set
   # must name every earlier version, 1 to n-1, or the process refuses to start.
   keyId: ""
+  # Generate the key **in the cluster** and push it to AWS instead of pulling one a person made
+  # (the owner's `cluster-generated-secrets` convention): a one-shot Job writes a PKCS#8 PEM Ed25519
+  # key into a Secret the release owns, and a PushSecret copies it to `externalSecrets.key` under
+  # `externalSecrets.properties.turnSigningKey`. Off (default): the chart reads the key from that
+  # property, as before, and the render does not move.
+  generate:
+    enabled: false
+    # The AWS property the generated key is **pushed** to, under `externalSecrets.key` — the destination, not
+    # `externalSecrets.properties.turnSigningKey`, which is the one a person fills and the chart pulls.
+    property: turn_signing_key
+    # The image of the one-shot Job: it needs `openssl` and `kubectl`. Pin it by digest in production.
+    image: "bitnami/kubectl:1.33"
 
 externalSecrets:
   enabled: true

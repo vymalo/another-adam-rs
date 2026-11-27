@@ -2348,4 +2348,23 @@ check "refused: the tokens as a value in extraEnv, even with activity off" \
   fails helm_act --set-string config.extraEnv.ACTIVITY_BEARER_TOKENS=t
 check "refused: the address in extraEnv" fails helm_act_on --set-string config.extraEnv.ACTIVITY_LISTEN_ADDR=0.0.0.0:9100
 
+# The turn key generated in the cluster (convention cluster-generated-secrets): a one-shot Job writes it, a
+# PushSecret pushes it to AWS, and the pods mount the generated Secret instead of the ExternalSecret's.
+helm template coder "$chart" --namespace coder-ns --set image.tag=sha-abc1234 > "$out"
+check "by default no turn-key Job or PushSecret is rendered" lacks 'turn-key'
+helm template coder "$chart" --namespace coder-ns --set image.tag=sha-abc1234 \
+  --set turnSigning.generate.enabled=true > "$out"
+check "generate: a Job makes the key" dhas Job 'name: coder-turn-key'
+check "... it generates a PKCS#8 Ed25519 key with openssl" dhas Job 'openssl genpkey -algorithm ed25519'
+check "... and is idempotent: an existing key is left alone" dhas Job 'already exists'
+check "generate: a PushSecret copies it to the AWS secret" dhas PushSecret 'property: turn_signing_key'
+check "... from the Secret the Job writes" dhas PushSecret 'name: coder-turn-key'
+check "generate: the pods mount the generated Secret" dhas StatefulSet 'secretName: coder-turn-key'
+check "... with the generated key's item" dhas StatefulSet 'key: private-key.pem'
+check "generate: the ExternalSecret no longer copies a key" dlacks ExternalSecret 'TURN_SIGNING_KEY.pem'
+check "generate and a pulled key together are refused" \
+  fails helm template coder "$chart" --set image.tag=sha-abc1234 --set turnSigning.generate.enabled=true --set externalSecrets.properties.turnSigningKey=k
+check "generate without the ExternalSecret's store is refused" \
+  fails helm template coder "$chart" --set image.tag=sha-abc1234 --set turnSigning.generate.enabled=true --set externalSecrets.enabled=false
+
 if [ "$fail" -eq 0 ]; then echo "render checks passed"; else echo "render checks FAILED"; exit 1; fi

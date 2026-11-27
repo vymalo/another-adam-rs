@@ -73,10 +73,20 @@ const CREATION_ON: &str = "If the person has no repository for it and says you m
 /// gets. A pinned file, so the diff of a change to it is what a reviewer reads.
 const SKILLS: &str = include_str!("fixtures/agent/skills.txt");
 
-/// What the model is sent for `cycles` and the shipped name: the body (see [`expected_body`]) and
-/// the skills section the assembly appends after a blank line.
+/// The section the assembly appends after the skills for the session tools (ADR 0054, decision 9):
+/// the helpers of the shipped folder, `explorer` and `reviewer`, and what each tool does. A pinned
+/// file, like [`SKILLS`].
+const SESSIONS: &str = include_str!("fixtures/agent/sessions.txt");
+
+/// What the model is sent for `cycles` and the shipped name: the body (see [`expected_body`]), the
+/// skills section and the session tools' section, each appended after a blank line.
 fn expected_prompt(cycles: u32) -> String {
-    format!("{}\n\n{}", expected_body(cycles), SKILLS.trim_end())
+    format!(
+        "{}\n\n{}\n\n{}",
+        expected_body(cycles),
+        SKILLS.trim_end(),
+        SESSIONS.trim_end()
+    )
 }
 
 /// The body of `agent/instructions.md` for `cycles` and the shipped name: the snapshot with both
@@ -749,9 +759,10 @@ async fn editing_the_folder_changes_what_the_model_is_sent() {
     assert_eq!(
         system,
         format!(
-            "{}\n\nAlways answer in French.\n\n{}",
+            "{}\n\nAlways answer in French.\n\n{}\n\n{}",
             expected_body(5),
-            SKILLS.trim_end()
+            SKILLS.trim_end(),
+            SESSIONS.trim_end()
         ),
         "the shipped prompt, and the edit"
     );
@@ -1668,12 +1679,10 @@ async fn the_coders_skills_parse_and_are_in_the_catalog() {
     }
     // Neither skill bundles a file: the catalog is the whole section but for the fixed sentence.
     assert!(!info.prompt.contains("<skill_resources>"));
-    assert!(info.prompt.ends_with(SKILLS.trim_end()));
-    // And no line was added to the instructions: the body is the snapshot.
-    assert_eq!(
-        info.prompt,
-        format!("{}\n\n{}", expected_body(3), SKILLS.trim_end())
-    );
+    assert!(info.prompt.ends_with(SESSIONS.trim_end()));
+    // And no line was added to the instructions: the body is the snapshot, then the catalog, then
+    // the session tools' section.
+    assert_eq!(info.prompt, expected_prompt(3));
 }
 
 /// The deployment's model profile gives the coder's model reasoning levels (`MODEL_ALIASES_FILE`,
