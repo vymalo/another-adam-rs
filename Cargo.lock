@@ -89,7 +89,7 @@ dependencies = [
 
 [[package]]
 name = "adam"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "adam-agent-fs",
  "adam-assembly",
@@ -112,7 +112,7 @@ dependencies = [
 
 [[package]]
 name = "adam-a2a"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "a2a-client-lf",
  "a2a-lf",
@@ -149,7 +149,7 @@ dependencies = [
 
 [[package]]
 name = "adam-a2a-runtime"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "a2a-client-lf",
  "a2a-lf",
@@ -184,7 +184,7 @@ dependencies = [
 
 [[package]]
 name = "adam-acp"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "adam-error",
  "agent-client-protocol",
@@ -201,7 +201,7 @@ dependencies = [
 
 [[package]]
 name = "adam-admission-local"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "adam-admission-testkit",
  "adam-budget",
@@ -213,7 +213,7 @@ dependencies = [
 
 [[package]]
 name = "adam-admission-testkit"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "adam-budget",
  "adam-error",
@@ -222,7 +222,7 @@ dependencies = [
 
 [[package]]
 name = "adam-agent"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "a2a-client-lf",
  "a2a-lf",
@@ -261,7 +261,7 @@ dependencies = [
 
 [[package]]
 name = "adam-agent-fixture"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "adam",
  "adam-agent-fs",
@@ -270,7 +270,7 @@ dependencies = [
 
 [[package]]
 name = "adam-agent-fs"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "adam-budget",
  "adam-error",
@@ -288,7 +288,7 @@ dependencies = [
 
 [[package]]
 name = "adam-assembly"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "a2a-client-lf",
  "a2a-lf",
@@ -328,7 +328,7 @@ dependencies = [
 
 [[package]]
 name = "adam-budget"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "adam-device-state",
  "adam-error",
@@ -339,7 +339,7 @@ dependencies = [
 
 [[package]]
 name = "adam-code-tools"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "adam-admission-local",
  "adam-budget",
@@ -364,7 +364,7 @@ dependencies = [
 
 [[package]]
 name = "adam-code-tools-testkit"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "adam-code-tools",
  "adam-llm-agent",
@@ -377,7 +377,7 @@ dependencies = [
 
 [[package]]
 name = "adam-coder"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "a2a-client-lf",
  "a2a-lf",
@@ -435,7 +435,7 @@ dependencies = [
 
 [[package]]
 name = "adam-confine"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "adam-confine-testkit",
  "adam-workspace",
@@ -449,7 +449,7 @@ dependencies = [
 
 [[package]]
 name = "adam-confine-testkit"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "adam-workspace",
  "tempfile",
@@ -458,7 +458,7 @@ dependencies = [
 
 [[package]]
 name = "adam-core"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "adam-error",
  "async-trait",
@@ -478,21 +478,21 @@ dependencies = [
 
 [[package]]
 name = "adam-device-state"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "adam-device-state-testkit",
 ]
 
 [[package]]
 name = "adam-device-state-testkit"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "adam-device-state",
 ]
 
 [[package]]
 name = "adam-egress"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "adam-error",
  "async-trait",
@@ -508,7 +508,7 @@ dependencies = [
 
 [[package]]
 name = "adam-engine"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "a2a-lf",
  "adam-a2a",
@@ -541,7 +541,7 @@ dependencies = [
 
 [[package]]
 name = "adam-env-kubernetes"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "adam-error",
  "adam-workspace",
@@ -566,14 +566,14 @@ dependencies = [
 
 [[package]]
 name = "adam-error"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "thiserror",
 ]
 
 [[package]]
 name = "adam-git-sandbox"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "adam-error",
  "base64 0.22.1",
@@ -591,7 +591,7 @@ dependencies = [
 
 [[package]]
 name = "adam-hook-exec"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "adam-core",
  "adam-error",
@@ -610,7 +610,7 @@ dependencies = [
 
 [[package]]
 name = "adam-host"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "adam-error",
  "clap",
@@ -624,7 +624,7 @@ dependencies = [
 
 [[package]]
 name = "adam-llm-agent"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "adam-budget",
  "adam-core",
@@ -657,7 +657,7 @@ dependencies = [
 
 [[package]]
 name = "adam-macros"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -666,7 +666,7 @@ dependencies = [
 
 [[package]]
 name = "adam-mcp"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "adam-agent-fs",
  "adam-core",
@@ -691,7 +691,7 @@ dependencies = [
 
 [[package]]
 name = "adam-mcp-testkit"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "adam-agent-fs",
  "adam-error",
@@ -712,7 +712,7 @@ dependencies = [
 
 [[package]]
 name = "adam-memory"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "adam-core",
  "adam-error",
@@ -726,7 +726,7 @@ dependencies = [
 
 [[package]]
 name = "adam-memory-testkit"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "adam-core",
  "adam-memory",
@@ -734,7 +734,7 @@ dependencies = [
 
 [[package]]
 name = "adam-model"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "adam-core",
  "adam-error",
@@ -751,7 +751,7 @@ dependencies = [
 
 [[package]]
 name = "adam-model-oauth"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "adam-model",
  "adam-model-openai",
@@ -768,7 +768,7 @@ dependencies = [
 
 [[package]]
 name = "adam-model-openai"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "adam-core",
  "adam-error",
@@ -795,7 +795,7 @@ dependencies = [
 
 [[package]]
 name = "adam-notify-postgres"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "adam-core",
  "adam-error",
@@ -817,7 +817,7 @@ dependencies = [
 
 [[package]]
 name = "adam-notify-testkit"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "adam-core",
  "adam-runtime",
@@ -827,7 +827,7 @@ dependencies = [
 
 [[package]]
 name = "adam-plugin"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "adam-error",
  "adam-plugin-testkit",
@@ -837,7 +837,7 @@ dependencies = [
 
 [[package]]
 name = "adam-plugin-testkit"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "adam-error",
  "adam-plugin",
@@ -846,7 +846,7 @@ dependencies = [
 
 [[package]]
 name = "adam-postgres"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "adam-core",
  "adam-error",
@@ -865,7 +865,7 @@ dependencies = [
 
 [[package]]
 name = "adam-runtime"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "adam-core",
  "adam-error",
@@ -891,7 +891,7 @@ dependencies = [
 
 [[package]]
 name = "adam-schedule"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "adam-agent-fs",
  "adam-core",
@@ -911,7 +911,7 @@ dependencies = [
 
 [[package]]
 name = "adam-service"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "a2a-client-lf",
  "a2a-lf",
@@ -949,7 +949,7 @@ dependencies = [
 
 [[package]]
 name = "adam-store-mongodb"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "adam-core",
  "adam-error",
@@ -966,7 +966,7 @@ dependencies = [
 
 [[package]]
 name = "adam-store-postgres"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "adam-core",
  "adam-error",
@@ -986,7 +986,7 @@ dependencies = [
 
 [[package]]
 name = "adam-store-sqlite"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "adam-core",
  "adam-error",
@@ -1002,7 +1002,7 @@ dependencies = [
 
 [[package]]
 name = "adam-store-testkit"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "adam-core",
  "async-trait",
@@ -1016,7 +1016,7 @@ dependencies = [
 
 [[package]]
 name = "adam-ui"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "a2a-lf",
  "adam-a2a",
@@ -1043,7 +1043,7 @@ dependencies = [
 
 [[package]]
 name = "adam-workspace"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "adam-admission-local",
  "adam-budget",
