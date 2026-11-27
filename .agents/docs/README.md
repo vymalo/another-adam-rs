@@ -13,6 +13,10 @@ A page here that has a page for people sits at the same relative path, and the t
 | [Skills](skills.md) | none | the skills this repository provides, how consumers install them, how to write and keep one |
 | [Concepts: the evidence](concepts.md) | [Concepts](../../docs/concepts.md) | where the code defines each term of the glossary |
 | [Architecture: the evidence](architecture.md) | [Architecture](../../docs/architecture.md) | what was verified, when and how, and what is still unverified |
+| [Upgrade an adam deployment: evidence](guides/upgrade-an-adam-deployment.md) | [Upgrade an adam deployment](../../docs/guides/upgrade-an-adam-deployment.md) | the commands to name A and B, the pin by digest, the migration code and the schema versions |
+| [The egress proxy and run-pod network: evidence](guides/egress-and-run-pod-network.md) | [The egress proxy and the network of run pods](../../docs/guides/egress-and-run-pod-network.md) | the commands to read the proxy and its policies, and where the chart renders each rule |
+| [Read a stuck run: queries](guides/read-a-stuck-run.md) | [Read a run's state when it is stuck](../../docs/guides/read-a-stuck-run.md) | the read-only queries on the run store and the code each claim stands on |
+| [Troubleshoot by error class: evidence](guides/troubleshoot-by-error-class.md) | [Troubleshoot by error class](../../docs/guides/troubleshoot-by-error-class.md) | where each class's retry, A2A code and exit code is decided |
 | [Errors: rules to check](reference/errors.md) | [Errors](../../docs/reference/errors.md) | the rules every error enum keeps |
 | [Agent files: the decisions to keep](reference/agent-files.md) | [Agent files](../../docs/reference/agent-files.md) | the owner's decisions behind the folder format |
 | [Child runs: the tests](reference/child-runs.md) | [Child runs](../../docs/reference/child-runs.md) | the test of every failure interleaving, and how the tests make each happen |

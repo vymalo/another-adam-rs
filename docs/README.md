@@ -22,7 +22,11 @@ These pages are for people. The procedures and evidence that coding agents use l
 |---|---|---|
 | Use | [Write an agent](guides/write-an-agent.md) | you want an agent that is a folder of Markdown, or one with `#[tool]` functions |
 | Deploy | [Deploy the coder](guides/deploy-the-coder.md) | you are installing the image and the Helm chart on Kubernetes |
-| Operate | [Troubleshooting a local run](guides/run-locally.md#troubleshooting), [errors by class](reference/errors.md#what-each-class-decides), [the chart's known risks](guides/deploy-the-coder.md#known-risks) | something does not work, or you want to know what can go wrong |
+| Operate | [Upgrade an adam deployment](guides/upgrade-an-adam-deployment.md) | you move a running coder to a newer image: what to read, what needs your hand, what the database does |
+| Operate | [The egress proxy and the network of run pods](guides/egress-and-run-pod-network.md) | a build in a run pod cannot reach a host, or you want to let it |
+| Operate | [Read a run's state when it is stuck](guides/read-a-stuck-run.md) | a task does not finish: is it waiting, or is it stuck, and where to look in the store |
+| Operate | [Troubleshoot by error class](guides/troubleshoot-by-error-class.md) | a pod exited or a task failed: from the class of the error to what to do |
+| Operate | [Troubleshooting a local run](guides/run-locally.md#troubleshooting), [the chart's known risks](guides/deploy-the-coder.md#known-risks) | something does not work on your machine, or you want to know what can go wrong in a cluster |
 | Extend | [Embed adam](guides/embed-adam.md) | you host adam agents inside your own Rust program, a server |
 | Extend | [Embed adam in an application](guides/embed-in-an-app.md) | adam runs inside your application (a desktop or a phone), with no server and nothing on the network of its own |
 | Extend | [Store adapters](reference/store-adapters.md#adding-a-backend) | you add a database behind the `Store` trait |
