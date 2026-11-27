@@ -171,6 +171,11 @@ Cards of the board epic; each is one pull request, its proof seen failing first.
 | M9 + M10 | L2 in `si_recall` and retirement; a paired study in `bench/` ([ADR 0048](0048-a-benchmark-harness-for-adam-coder-and-opencode.md)) with and without memory | a retired lesson is not served; the study is a report, not a gate |
 | M11 | the harness optimizer over agent folders, on the same ports | its own ADR first |
 
+The M2 port-and-kit half (M2a) is built (*2026-11-27*): `adam-memory`'s `Memory` trait, its types,
+its in-process reference and `adam-memory-testkit`'s `memory_conformance!`, with the two-scope case.
+The PostgreSQL, MongoDB and Redis adapters remain M2b (ANR-1292, ANR-1293, ANR-1294); this slice
+claims no adapter.
+
 ## Still open
 
 | # | Question | Recommendation |

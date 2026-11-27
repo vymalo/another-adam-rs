@@ -9,8 +9,9 @@ use std::sync::{Mutex, PoisonError};
 
 use adam_core::Timestamp;
 use adam_memory::{
-    AttemptDraft, AttemptId, InProcessSiMemory, MemoryResult, Observation, Problem, Scope,
-    Settings, SiMemory,
+    AttemptDraft, AttemptId, Audience, InProcessLessonStore, InProcessMemory, InProcessSiMemory,
+    Lesson, LessonDraft, LessonSettings, Memory, MemoryResult, MemoryScope, Observation, Problem,
+    Scope, Settings, SiMemory,
 };
 
 /// A memory that stores every scope correctly but answers the first scope it saw to every recall.
@@ -115,5 +116,75 @@ impl SiMemory for DoubleWritingSiMemory {
 
     fn sweep(&self, scope: &Scope, before: Timestamp) -> MemoryResult<u64> {
         self.inner.sweep(scope, before)
+    }
+}
+
+/// A memory that writes every lesson into one bucket, whatever scope its adapters are configured
+/// with: it ignores the scope, the way a table without a scope column would.
+///
+/// Its instances share one store, so two of them are two configured scopes on one database. It
+/// passes every other case and fails
+/// [`crate::lesson_cases::two_scopes_never_see_each_other`].
+pub struct ScopeBlindMemory {
+    inner: InProcessMemory,
+}
+
+impl ScopeBlindMemory {
+    /// A double over `store`, configured with one constant scope it ignores.
+    #[must_use]
+    pub fn new(settings: LessonSettings, store: InProcessLessonStore) -> Self {
+        Self {
+            inner: InProcessMemory::shared(settings, MemoryScope::new("scope-blind"), store),
+        }
+    }
+}
+
+impl Memory for ScopeBlindMemory {
+    fn record(&self, draft: LessonDraft) -> MemoryResult<Lesson> {
+        self.inner.record(draft)
+    }
+
+    fn recall(&self, audience: &Audience) -> MemoryResult<Vec<Lesson>> {
+        self.inner.recall(audience)
+    }
+
+    fn retire(&self, audience: &Audience, root_cause: &str) -> MemoryResult<Lesson> {
+        self.inner.retire(audience, root_cause)
+    }
+}
+
+/// A memory that writes every lesson twice, the second under a derived root cause, so one record
+/// leaves two lessons.
+///
+/// It passes every other case (they write distinct keys on purpose) and fails
+/// [`crate::lesson_cases::a_record_lands_once_for_one_key`].
+pub struct DoubleWritingMemory {
+    inner: InProcessMemory,
+}
+
+impl DoubleWritingMemory {
+    /// A double with `settings`' scrub and bounds.
+    #[must_use]
+    pub fn new(settings: LessonSettings) -> Self {
+        Self {
+            inner: InProcessMemory::new(settings, MemoryScope::new("double-writing")),
+        }
+    }
+}
+
+impl Memory for DoubleWritingMemory {
+    fn record(&self, draft: LessonDraft) -> MemoryResult<Lesson> {
+        let mut second = draft.clone();
+        second.root_cause = format!("{}/again", draft.root_cause);
+        self.inner.record(draft)?;
+        self.inner.record(second)
+    }
+
+    fn recall(&self, audience: &Audience) -> MemoryResult<Vec<Lesson>> {
+        self.inner.recall(audience)
+    }
+
+    fn retire(&self, audience: &Audience, root_cause: &str) -> MemoryResult<Lesson> {
+        self.inner.retire(audience, root_cause)
     }
 }

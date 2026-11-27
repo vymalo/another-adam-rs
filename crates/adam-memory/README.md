@@ -1,10 +1,12 @@
 # adam-memory
 
-The L1 self-improvement memory of adam-rs: the problems an agent met, the attempts it made, and
-what it observed. Its only adapter is a folder of plain files the deployment gives the agent.
+The two memories of adam-rs. **L1** is the self-improvement memory next to the agent: the problems
+it met, the attempts it made, and what it observed; its only adapter is a folder of plain files the
+deployment gives the agent. **L2** is `Memory`: the lessons that held across L1 scopes, shared across
+sessions and reached over the network, keyed within the adapter's configured scope by audience.
 
 [ADR 0081](https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0081-an-agent-keeps-a-self-improvement-memory-near-it-and-what-holds-becomes-the-deployments-memory.md)
-decisions 2 to 5, slice M1.
+decisions 2 to 5 and 10; slices M1 and M2a (the L2 port and its kit; the L2 adapters are M2b).
 
 ## What is in it
 
@@ -24,9 +26,21 @@ decisions 2 to 5, slice M1.
 | `Settings`, `Limits`, `Scrubber` | The injected scrub and the bounds an adapter is built with. |
 | `FolderSiMemory` | L1's only adapter: one directory, a subdirectory per scope, one JSON file per problem, a temp file and a rename per write. |
 | `InProcessSiMemory` | The in-process reference the suite and a test use. |
+| `Memory` | The L2 port: `record`, `recall`, `retire`. `Send + Sync + 'static`; no driver type, no URL, no client in a signature. |
+| `DynMemory` | `Arc<dyn Memory>`, what a host or a tool is given. |
+| `MemoryScope` | The scope an L2 adapter is configured with; every key and query carries it. Two scopes on one store never see each other's lessons. |
+| `Audience` | Who a lesson is served to inside its scope; the promotion pass computes it, the port keeps it opaque. |
+| `Lesson` | A root cause, its remedy and rationale, anchors as text, provenance, `state`, `created`, `updated` and `retired_at`. |
+| `LessonDraft` | What a caller writes; the adapter scrubs it, checks it and stamps it. |
+| `LessonProvenance` | The L1 scopes (opaque labels) whose evidence made the lesson, and the review that approved it. |
+| `LessonState` | `Proposed`, `Active`, `Retired`. A closed set; a recall serves `Active` only. |
+| `LessonSettings`, `LessonLimits` | The injected scrub and the bounds an L2 adapter is built with. |
+| `InProcessMemory` | The in-process L2 reference the suite and a test use. |
+| `InProcessLessonStore` | The storage several `InProcessMemory` adapters share, so a test can put two scopes on one store. |
 
-The crate is the port, the values and the two adapters above. A store reached over the network is
-L2 (`Memory`, ADR 0081 decision 2), not this crate.
+The crate is the two ports, the values, L1's in-folder adapter and the two in-process references.
+The PostgreSQL, MongoDB and Redis adapters are features of crates of their own (M2b); a store
+reached over the network is L2 (ADR 0081 decision 2).
 
 ```rust
 use adam_core::RunId;
@@ -51,6 +65,34 @@ memory
 assert_eq!(memory.recall(&scope).expect("a readable memory").len(), 1);
 ```
 
+```rust
+use adam_memory::{
+    Audience, InProcessMemory, LessonDraft, LessonProvenance, LessonSettings, Memory, MemoryScope,
+    Scrubber,
+};
+
+let memory = InProcessMemory::new(
+    LessonSettings::new(Scrubber::new(|text| text.to_owned())),
+    MemoryScope::new("release-1"),
+);
+let audience = Audience::new("adam-coder");
+memory
+    .record(
+        LessonDraft::new(
+            audience.clone(),
+            "the lockfile was stale",
+            LessonProvenance::new(["scope-a", "scope-b"], "the reviewer"),
+        )
+        .remedy("regenerate the lockfile"),
+    )
+    .expect("a valid write");
+assert_eq!(memory.recall(&audience).expect("a readable memory").len(), 1);
+memory
+    .retire(&audience, "the lockfile was stale")
+    .expect("the lesson is there");
+assert!(memory.recall(&audience).expect("a readable memory").is_empty());
+```
+
 ## The key
 
 `Scope` is `deployment`, `caller`, `agent` and `Kind`; the key does not name a worker. Two workers
@@ -63,6 +105,15 @@ The digest is the first 16 hexadecimal digits of SHA-256, so a rebuild computes 
 slug is only for a person reading the folder. Every file carries its scope, and a file that belongs
 to another scope is `Corrupt` rather than served.
 
+### The L2 key
+
+An L2 adapter is configured with one `MemoryScope`; the deployment chooses it (one store several
+deployments share, or one per `adam-coder`). Every key and every query carries it, so two adapters
+over one database with two scopes never see each other's lessons. Inside the scope a lesson is keyed
+by its `Audience` and its root cause; a second record for the same key updates the lesson rather
+than opening another, and a record for a retired lesson serves it again. The port keeps the audience
+opaque: the promotion pass computes it, and a lesson never widens inside an adapter.
+
 ## Bounds
 
 `Limits::default()` is the ADR's: 64 problems per scope, 16 attempts per problem, 1 KiB a text
@@ -72,6 +123,11 @@ no anchor count; this slice's value is 16).
 A write that would break a bound is **refused**, not evicted, so the caller sees it. A sweep removes
 the attempts recorded before its cutoff and the problems it leaves empty, which frees the room
 again. Recall serves the freshest problem first.
+
+`LessonLimits::default()` is the ADR's for L2: 128 lessons an audience, 1 KiB a text field, 200
+characters a root cause, and 16 anchors a lesson. The bound counts the lessons an audience **serves**;
+a retired lesson is kept and does not count, so retiring frees a slot. There is no time-based sweep
+at L2: a lesson's evidence turns and it is retired, not deleted.
 
 ## Scrubbing and refusal
 
@@ -84,6 +140,10 @@ a host with a dotted name or `localhost` (with or without a port), an absolute o
 a drive letter, a token with two or more slashes, and a token with a code extension. It is
 conservative: a false positive refuses a write, which decision 12 makes the safe side.
 
+An L2 lesson's own text (its root cause, remedy, rationale and anchors) may not name any of those
+shapes **whatever its audience** (decision 5); its audience and provenance labels are keys the
+promotion pass chooses, and are scrubbed but not address-checked.
+
 `adam-memory` does **not** depend on `adam-llm-agent`: `adam-llm-agent` will depend on this crate
 (the `si_recall`/`si_record` tools), and a dependency back would be a cycle. The marker is a
 constant here, and a test in `adam-llm-agent` asserts it equals `adam_llm_agent::REDACTED_MARKER`,
@@ -92,10 +152,10 @@ so the two cannot drift.
 ## Errors
 
 `MemoryError` implements `adam_error::Classify`; a caller decides from the class, never from the
-variant. A refused text, a bound, an empty field or an address is `Invalid`; a full scope or
-problem is `Rejected`; an unknown problem or attempt is `NotFound`; a file that does not parse is
-`Corrupt`; a file-system failure is `Transient` (ADR 0081 decision 12: an unreachable memory is a
-transient tool error).
+variant. A refused text, a bound, an empty field or an address is `Invalid`; a full scope, problem or
+audience is `Rejected`; an unknown problem, attempt or lesson is `NotFound`; a file that does not
+parse is `Corrupt`; a storage failure is `Transient` (ADR 0081 decision 12: an unreachable memory is
+a transient tool error).
 
 ## Environment
 
@@ -113,9 +173,14 @@ variable.
 * `two_scopes_share_a_folder_and_a_restart_keeps_them_apart`;
 * `a_corrupt_file_is_reported_not_served`.
 
+`cargo test -p adam-memory --test lesson` runs
+[`memory_conformance!`](../adam-memory-testkit/README.md) against `InProcessMemory`, over one shared
+store so two configured scopes are two scopes on one store.
+
 The unit tests cover the class table, the marker, the address detector, the slug and the digest.
 
 ## A new required method
 
-`SiMemory` is a port: a new required method breaks every implementer. Say so in the pull request
-and here (CLAUDE.md rule 2). The suite in `adam-memory-testkit` is what proves an implementation.
+`SiMemory` and `Memory` are ports: a new required method breaks every implementer. Say so in the
+pull request and here (CLAUDE.md rule 2). The suites in `adam-memory-testkit` are what prove an
+implementation.

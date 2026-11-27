@@ -3,7 +3,7 @@
 use adam_error::{BoxError, Classify, ErrorClass};
 use thiserror::Error;
 
-/// An L1 memory refusal. Callers decide from [`Classify::class`], never from the variant.
+/// A memory refusal. Callers decide from [`Classify::class`], never from the variant.
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum MemoryError {
@@ -67,8 +67,17 @@ pub enum MemoryError {
         /// The bound.
         limit: usize,
     },
-    /// An attempt carried more anchors than it may.
-    #[error("an attempt carries {anchors} anchors, over the bound of {limit}")]
+    /// The audience already held as many lessons as it may.
+    #[error("the audience holds {limit} lessons already")]
+    AudienceFull {
+        /// The bound.
+        limit: usize,
+    },
+    /// No lesson with this root cause is in the audience.
+    #[error("no lesson {0:?} for this audience")]
+    LessonNotFound(String),
+    /// An attempt or a lesson carried more anchors than it may.
+    #[error("an entry carries {anchors} anchors, over the bound of {limit}")]
     TooManyAnchors {
         /// How many it carried.
         anchors: usize,
@@ -118,15 +127,19 @@ impl Classify for MemoryError {
             | Self::EmptyScope { .. }
             | Self::EmptyField { .. }
             | Self::TooManyAnchors { .. } => ErrorClass::Invalid,
-            Self::ScopeFull { .. } | Self::ProblemFull { .. } => ErrorClass::Rejected,
-            Self::ProblemNotFound(_) | Self::AttemptNotFound(..) => ErrorClass::NotFound,
+            Self::ScopeFull { .. } | Self::ProblemFull { .. } | Self::AudienceFull { .. } => {
+                ErrorClass::Rejected
+            }
+            Self::ProblemNotFound(_) | Self::AttemptNotFound(..) | Self::LessonNotFound(_) => {
+                ErrorClass::NotFound
+            }
             Self::Corrupt { .. } => ErrorClass::Corrupt,
             Self::Backend { .. } => ErrorClass::Transient,
         }
     }
 }
 
-/// A result from an L1 memory adapter.
+/// A result from a memory adapter.
 pub type MemoryResult<T> = Result<T, MemoryError>;
 
 #[cfg(test)]
@@ -176,6 +189,7 @@ mod tests {
             ),
             (MemoryError::ScopeFull { limit: 1 }, ErrorClass::Rejected),
             (MemoryError::ProblemFull { limit: 1 }, ErrorClass::Rejected),
+            (MemoryError::AudienceFull { limit: 1 }, ErrorClass::Rejected),
             (
                 MemoryError::TooManyAnchors {
                     anchors: 2,
@@ -189,6 +203,10 @@ mod tests {
             ),
             (
                 MemoryError::AttemptNotFound("a".to_owned(), "p".to_owned()),
+                ErrorClass::NotFound,
+            ),
+            (
+                MemoryError::LessonNotFound("l".to_owned()),
                 ErrorClass::NotFound,
             ),
             (
