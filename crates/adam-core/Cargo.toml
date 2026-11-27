@@ -24,6 +24,9 @@ sha2.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["sync"] }
 uuid.workspace = true
+# The run key's CSR and leaf (ADR 0086, `turn::run_cert::keyring`): PKCS#10 in, RFC 5280's validity
+# out. It signs with `ed25519-dalek` through `signature`'s traits; no driver type leaves this crate.
+x509-cert.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt", "fs"] }

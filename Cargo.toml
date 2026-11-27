@@ -80,8 +80,9 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "serd
 clap = { version = "4", default-features = false, features = ["std", "derive"] }
 # The turn signature of ADR 0068 (adam-core): pure Rust, so the engine's tree, which may hold no C crypto
 # (`aws-lc-rs` and `ring` are forbidden there, tools/embedded-deps/check.sh), signs and verifies too.
-# `fast`: the precomputed tables; `zeroize`: the private key is wiped on drop.
-ed25519-dalek = { version = "3.0.0", default-features = false, features = ["fast", "zeroize"] }
+# `fast`: the precomputed tables; `zeroize`: the private key is wiped on drop; `alloc` and `pkcs8`:
+# the SPKI of a run key's CSR (ADR 0086), which x509-cert reads through the same `spki` 0.8 types.
+ed25519-dalek = { version = "3.0.0", default-features = false, features = ["fast", "zeroize", "pkcs8", "alloc"] }
 futures = "0.3"
 # The seed of an ephemeral turn key (adam-core, ADR 0068): already in the tree under uuid.
 getrandom = "0.4"
@@ -152,6 +153,12 @@ url = "2"
 utoipa-swagger-ui = { version = "10.0.2", default-features = false, features = ["vendored", "minified"] }
 uuid = { version = "1", features = ["v4", "v7", "serde"] }
 wiremock = "0.6"
+# The run's certificate (ADR 0086, adam-core): a PKCS#10 CSR built and a leaf certificate read as DER,
+# signed with the `ed25519-dalek` the workspace already carries. Pure Rust (RFC 5280's types over
+# `der`/`spki`), so the engine's tree keeps holding neither `aws-lc-rs` nor `ring`
+# (tools/embedded-deps/check.sh); it signs through `signature`'s traits, which `ed25519-dalek`
+# implements, so no second crypto provider arrives.
+x509-cert = { version = "0.3", default-features = false, features = ["std", "builder"] }
 
 # The shipped binaries: `docker/coder/Dockerfile` builds them with `cargo build --release`, so this
 # profile is what the image carries. `codegen-units = 1` and `strip = "symbols"` take the coder binary

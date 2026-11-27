@@ -25,6 +25,13 @@ use super::{CertificateChain, TurnKeys};
 
 pub mod testkit;
 
+mod keyring;
+mod x509;
+
+pub use keyring::{
+    BadRunSubject, RENEW_RETRY_SECS, RunClock, RunKeyError, RunKeyring, RunSubject, SystemClock,
+};
+
 /// The certificate signing request a [`RunCertIssuer`] signs: the DER of a PKCS#10 request
 /// (RFC 2986), which carries the run key's public key and the name the CA writes into the leaf.
 ///
