@@ -567,3 +567,28 @@ and `adam-engine` takes them (`EngineBuilder::hooks`, `plugin`), shows a parked 
 `RunState::AwaitingApproval` with the call, and answers it with `Engine::approve`; see ADR 0047's note of the same day.
 `HookSet` is `Clone`, and the `input_required` event of an approval says its question through the agent's `StepIo`
 redactor. The A2A test that drives an approval end to end is still not built.
+
+*Amended 2026-11-27 (slice **P1** built):* `adam-hook-exec` is the `adam-hooks/1` adapter — one `Plugin` whose
+deciding points and observed events are requests to a long-lived child — and its protocol page is
+[hook programs](../reference/hooks-protocol.md). Readings to confirm:
+* **The key.** The shipped `Plugin` trait has no `HookCtx` (H1 ships `before_tool(&mut HookedCall<'_>)`), so a
+  deciding hook has no journal key to send: the adapter sends `<plugin>/<point>/<id>`, unique per request, and a
+  replay sends no request at all (proven). An observer sends the event's `header.key`, which decision 14 keeps
+  stable across replays, so a program that writes elsewhere dedupes on it.
+* **The deadline.** `HookLimits` is per `HookSet`, not per plugin, so the adapter enforces decision 8's 2 s (at
+  most 30 s) inside the call and reports `Transient`. A host whose set deadline is shorter than the adapter's
+  fails a compliant program after the fact: it must build the set with `HookSet::with_limits`.
+* **Actions** are refused (`Unsupported`) rather than silently dropped, because slice H1d is not built.
+* **A reply is scrubbed**: a verdict's reason goes through the deployment's scrubber before it is recorded, and a
+  malformed reply's serde detail is logged rather than carried into `HookError.reason`, which the journal and the
+  model read.
+* **`SAFE_VARS` is duplicated** from `adam-mcp`, where it is private; depending on `adam-mcp` would bring its
+  whole transport. The two lists must stay equal.
+* **The child runs in an empty private directory** (made by the adapter, removed when it goes, unless the
+  deployment names one), never in the agent's workspace.
+Proof: `crates/adam-hook-exec/tests/exec.rs` — a verdict and a rewrite per deciding point, garbage refused, a
+dead program transient and the set giving up, the whole child environment, a rewrite over a scrubbed span
+refused, a missed deadline, three deadlines killing the program, the restart after the backoff, sixteen calls at
+once, an observer that decides refused, and a configuration that may not override a safe variable; and
+`crates/adam-hook-exec/tests/replay.rs` — a replay asks the recorded step once and the unrecorded one twice, the
+program's own log being the evidence, and a run fails when its program never answers.
