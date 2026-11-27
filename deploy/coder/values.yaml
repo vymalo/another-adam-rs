@@ -436,9 +436,8 @@ cache:
 # and its binding that refuse every pod of the coder's ServiceAccount but the intended one (this is what lets the
 # coder make pods without being able to read the namespace's other Secrets, mount the host or run privileged), a
 # NetworkPolicy for the run pods, the egress proxy, and the git sandbox container of the coder pod (`gitSandbox`
-# below), which also takes the service-account token away from every container of that pod but the coder. Needs
-# Kubernetes 1.30 or later for the admission policy (*unverified* for the owner's cluster); the render refuses an
-# older one (`helm template --kube-version`).
+# below), which also takes the service-account token away from every container of that pod but the coder. The
+# chart needs Kubernetes 1.37 or later (ADR 0080); the render refuses an older one (`helm template --kube-version`).
 runPods:
   enabled: false
   # Accept that, with runPods.enabled false, the commands of a run (run_command, run, run_checks) run in the

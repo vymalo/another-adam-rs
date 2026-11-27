@@ -327,7 +327,7 @@ from service.yaml, which every render contains, so they always run.
 {{- fail "config.extraEnv sets ALLOW_COMMANDS_NEXT_TO_SECRETS: set runPods.allowCommandsNextToSecrets instead (the chart renders the variable from it, and only then)" -}}
 {{- end -}}
 {{- if and (include "coder.commandsReadTheAppKey" .) (not (include "coder.allowCommandsNextToSecrets" .)) -}}
-{{- fail "github.auth=app with runPods.enabled=false runs the commands of a run (run_command, run, run_checks) in the coder's own container, next to the App's private key file: a command can read the key, mint installation tokens and act as the App at any access tier, a `plan` included, and the coder refuses to start that way (exit 78), so a rollout would crash-loop. Set runPods.enabled=true (the commands then run in pods that have no key; needs Kubernetes 1.30 or later), or set runPods.allowCommandsNextToSecrets=true to accept the risk (see deploy/coder/README.md, \"The access tiers\", and docs/guides/deploy-the-coder.md, \"Upgrading an App deployment\")" -}}
+{{- fail "github.auth=app with runPods.enabled=false runs the commands of a run (run_command, run, run_checks) in the coder's own container, next to the App's private key file: a command can read the key, mint installation tokens and act as the App at any access tier, a `plan` included, and the coder refuses to start that way (exit 78), so a rollout would crash-loop. Set runPods.enabled=true (the commands then run in pods that have no key; needs Kubernetes 1.37 or later, the chart's floor), or set runPods.allowCommandsNextToSecrets=true to accept the risk (see deploy/coder/README.md, \"The access tiers\", and docs/guides/deploy-the-coder.md, \"Upgrading an App deployment\")" -}}
 {{- end -}}
 {{- if include "coder.runPods" . -}}
 {{- $rp := .Values.runPods -}}
@@ -340,8 +340,8 @@ from service.yaml, which every render contains, so they always run.
 {{- if and (not $rp.admissionPolicy.enabled) (not (eq (toString $rp.admissionPolicy.disableAcknowledged) "true")) -}}
 {{- fail "runPods.admissionPolicy.enabled=false leaves the coder able to make any pod in its namespace (mount the host, read any Secret, run privileged): the admission policy is the guard that makes the RBAC safe. Keep it, or set runPods.admissionPolicy.disableAcknowledged=true to say you know" -}}
 {{- end -}}
-{{- if and $rp.admissionPolicy.enabled (semverCompare "<1.30.0-0" .Capabilities.KubeVersion.Version) -}}
-{{- fail (printf "runPods needs Kubernetes 1.30 or later for its ValidatingAdmissionPolicy (admissionregistration.k8s.io/v1), and this cluster is %s" .Capabilities.KubeVersion.Version) -}}
+{{- if and $rp.admissionPolicy.enabled (semverCompare "<1.37.0-0" .Capabilities.KubeVersion.Version) -}}
+{{- fail (printf "runPods needs Kubernetes 1.37 or later (the chart's floor, ADR 0080) for its ValidatingAdmissionPolicy (admissionregistration.k8s.io/v1), and this cluster is %s" .Capabilities.KubeVersion.Version) -}}
 {{- end -}}
 {{- if not (and $rp.image.repository $rp.image.tag) -}}
 {{- fail "runPods.image.repository and runPods.image.tag are required (and runPods.image.digest, which the chart ships: an image is pinned by tag and digest)" -}}

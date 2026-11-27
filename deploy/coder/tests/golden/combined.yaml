@@ -27,6 +27,7 @@ spec:
       ports:
         - protocol: TCP
           port: 8080
+
 ---
 # Source: coder/templates/service.yaml
 # ClusterIP only, never exposed: the orchestrator reaches it in-cluster over A2A
@@ -51,6 +52,7 @@ spec:
       port: 8080
       targetPort: http
       protocol: TCP
+
 ---
 # Source: coder/templates/statefulset.yaml
 apiVersion: apps/v1
@@ -228,6 +230,7 @@ spec:
         resources:
           requests:
             storage: "20Gi"
+
 ---
 # Source: coder/templates/cnpg-cluster.yaml
 # The coder's own Postgres. CloudNativePG creates the database, its owner and
@@ -251,6 +254,7 @@ spec:
     initdb:
       database: adam
       owner: adam
+
 ---
 # Source: coder/templates/externalsecret.yaml
 # Secret values live in AWS Secrets Manager (`prod/meta/test-app`)

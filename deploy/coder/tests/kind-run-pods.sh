@@ -6,10 +6,10 @@
 # **as the coder's ServiceAccount**, so that the chart's admission policy applies to what the test makes, and then shows what
 # the network policies do to a run pod.
 #
-#   kind create cluster --image kindest/node:v1.35.8@sha256:07b2536e30b803ed61d1677a79df6115f798ce64c80f9e22f6ed45afd09323c0
+#   kind create cluster --image kindest/node:v1.37.0@sha256:a1ed56cfb0e7b93589bdf97c8cd566405a265939e3620fc4f5de89adff580ae5
 #   sh deploy/coder/tests/kind-run-pods.sh        (from the repository root)
 #
-# Needs docker (with BuildKit), kubectl, helm, cargo and python3, and a cluster of Kubernetes 1.30 or later (the script stops on
+# Needs docker (with BuildKit), kubectl, helm, cargo and python3, and a cluster of Kubernetes 1.37 or later (the script stops on
 # an older one) whose network plugin **enforces NetworkPolicies**: kind's own, kindnet, does on that node image, and the script
 # FAILS where a policy is not enforced. A cluster known not to enforce them (a plugin without NetworkPolicy support) can say so
 # with ADAM_TEST_CNI_MAY_IGNORE_POLICIES=1: the checks that a connection is refused then warn instead of failing, and the
@@ -104,8 +104,8 @@ until_ok() {
 
 minor=$(kubectl version -o json | python3 -c 'import json,sys; print(json.load(sys.stdin)["serverVersion"]["minor"].rstrip("+"))')
 say "the cluster is Kubernetes 1.$minor"
-if [ "$minor" -lt 30 ]; then
-  echo "the admission policy needs Kubernetes 1.30 or later" >&2
+if [ "$minor" -lt 37 ]; then
+  echo "the chart's floor is Kubernetes 1.37 (ADR 0080)" >&2
   exit 1
 fi
 
