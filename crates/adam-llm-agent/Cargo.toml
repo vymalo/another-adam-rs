@@ -39,9 +39,11 @@ thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 uuid.workspace = true
+# The two self-improvement-memory tools (`si_recall`, `si_record`, ADR 0081 decision 6): the port
+# and its types. The adapters stay with the deployment.
+adam-memory.workspace = true
 
 [dev-dependencies]
-adam-memory.workspace = true
 # The call-span tests of `agent` (ANR-1346): a subscriber that captures what a span renders.
 tracing-subscriber.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
