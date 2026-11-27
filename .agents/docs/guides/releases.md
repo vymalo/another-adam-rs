@@ -19,6 +19,12 @@ Written at `ce99d98` plus this change on 2026-11-27, amended the same day for AN
 | `tools/release/registry-digest.sh` | the digest of a ghcr.io reference by a `HEAD` of its manifest: exit 0 and the digest, 3 for no such tag or package, 1 otherwise |
 | `deploy/coder/tests/render-goldens.sh` | writes the four goldens with the values `render-check.sh` compares each against |
 | `deploy/coder/bump-tag.sh` | accepts `sha-<7 hex>` (coder.yml's bump, unchanged) or `X.Y.Z` (the copy `release.yml` packages) |
+| `.github/workflows/release.yml`, jobs `adam-agent-preflight`, `adam-agent-build`, `adam-agent-publish`, `adam-agent-smoke`, `adam-agent-tap` | after `gate`, in this order: the release exists, is published and is the App's bot's; four native builds; sign `SHA256SUMS` and attach to the release; Homebrew install on four runners; the tap pull request. `adam-agent-publish` is the second job with `id-token: write` |
+| `tools/release/write-homebrew-formula.mjs` | writes `Formula/adam-agent.rb` (four `on_macos`/`on_linux` x `on_arm`/`on_intel` stanzas, a sha256 each from `SHA256SUMS`, `license` from `[workspace.package]`, `bin.install "adam-agent"`, `test do system bin/"adam-agent", "--version" end`) and upserts the tap README's row between `<!-- cli-packages:begin/end -->`; node standard library only |
+| `tools/release/update-homebrew-tap.mjs` | rebuilds `bot/adam-agent` from the tap's default branch, refuses a version older than the base's or the open branch's (`stale`), commits as `release-please[bot]`, pushes with `--force-with-lease`, creates or edits the one pull request |
+| `tools/release/homebrew-smoke.sh` | a throwaway local tap (`brew tap-new --no-git local/adam-smoke`), the formula built from the release's `SHA256SUMS`, `brew install`, `brew test`, `adam-agent --version` says `adam-agent X.Y.Z`, and no configuration exits 78 |
+| `tools/release/test/` | `homebrew-formula.test.mjs` and its goldens (`golden/adam-agent.rb`, `golden/README.after.md`; `UPDATE_GOLDEN=1` rewrites them); `ci.yml` job `release-tools` runs it with `ruby -c` on the golden |
+| `.github/actionlint.yaml` | adds the labels `macos-26` and `macos-26-intel`, which the pinned actionlint 1.7.7 does not know |
 | `tools/commit-lint.sh`, `.github/workflows/commit-lint.yml`, `.githooks/commit-msg` | Conventional Commits on the title and every commit of a pull request, and locally |
 
 ## Invariants to check on a change
@@ -51,6 +57,24 @@ Written at `ce99d98` plus this change on 2026-11-27, amended the same day for AN
    above concluded `success`, and waits while a run has not finished that job. A hand `workflow_dispatch` on the tag
    passes it; re-run `release.yml` after it.
 7. **No `latest`, no tag on main.** `release.yml` runs on `push: tags: ["v*"]` only.
+8. **One trigger, one gate, for the binary too** (ANR-1203). The Homebrew jobs are in `release.yml` and `need: gate`: a
+   `release: published` workflow would be a second trigger beside the tag push (both follow the App's release), would not
+   wait for `gate`, and would sign under another workflow file, so the identity above would not cover the binaries.
+   The cost is a wait: the tag's push can arrive before the release exists, so `adam-agent-preflight` polls
+   `gh release view` for up to 30 minutes and requires: not a draft or prerelease, author `*[bot]` (and
+   `<vars.RELEASE_PLEASE_APP_SLUG>[bot]` when the variable is set). A tag pushed by hand has no release and stops there.
+9. **The archives are named `adam-agent_<version>_<os>_<arch>.tar.gz`**, os `linux`/`darwin`, arch `amd64`/`arm64`, and hold
+   `adam-agent`, `LICENSE-MIT` and `LICENSE-APACHE` at the top level. `adam-agent-build` checks the Linux binaries with `file`
+   (`statically linked` or `static-pie linked`), the macOS ones with `otool -L` (only `/usr/lib` and `/System/Library`),
+   and runs each: `--version` matches `^adam-agent X.Y.Z(\+|$)` and no configuration exits 78. The Linux targets are native
+   (`ubuntu-24.04`, `ubuntu-24.04-arm`) with `CC_<target>=musl-gcc`; macOS cannot be linked from Linux, so `macos-26` and
+   `macos-26-intel` build natively. `adam-agent --version` exists only since this change (`bin/adam-agent/src/main.rs`,
+   `tests/cli.rs`): before it, `--version` started the server and exited 78.
+10. **The tap is reached only after the signature and the install.** `adam-agent-tap` needs `adam-agent-smoke`, verifies
+    `SHA256SUMS` with `cosign verify-blob` against this workflow's identity at the tag, and only then writes the formula
+    from those checksums. Its token is the release App's, scoped to `another-adam-rs,homebrew-tap`; its concurrency
+    group `homebrew-tap-adam-agent` has no `queue: max` (actionlint 1.7.7 rejects the key): a pending run replaced by a newer
+    one loses nothing, because the branch is rebuilt from the newest version and a stale one is refused.
 
 ## Read a release's digests
 
@@ -93,6 +117,15 @@ node tools/docs-check/check-docs.mjs
 ```
 
 ## Unverified until a tag is pushed
+
+- the Homebrew path (ANR-1203), *verified locally 2026-11-27* only for what has no runner: `node --test "tools/release/test/*.test.mjs"`
+  (4 tests, the golden formula and README), `ruby -c` on the golden, `update-homebrew-tap.mjs` against a local bare
+  clone of the tap with a fake `gh` (created, unchanged on a second run, `stale` for an older version), `shellcheck` on the
+  smoke script, `actionlint` 1.7.7 on every workflow. *Unverified:* the four builds (musl on arm64, mimalloc and bundled
+  SQLite on the macOS runners), Homebrew being installed on `ubuntu-24.04-arm` and `macos-26-intel`, `brew tap-new --no-git`
+  and `brew install` of a local-tap formula, `cosign sign-blob --bundle` and `verify-blob` with the workflow identity,
+  the `gh release view --json author` login being `<slug>[bot]`, `gh release upload` onto a release the App made, and
+  the App's token reaching the tap;
 
 - the App token (`client-id` and the two `permission-*` inputs of `actions/create-github-app-token` v3.2.0, as vpay
   uses them) and release-please v5.0.0 opening the pull request on this repository;

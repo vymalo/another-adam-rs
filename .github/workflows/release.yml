@@ -7,6 +7,18 @@ name: release
 #   oci://ghcr.io/vymalo/another-adam-rs/charts/coder      the chart deploy/coder at version X.Y.Z, whose
 #                                                          image.tag is X.Y.Z, signed the same way
 #
+# And, from the same tag, the `adam-agent` binary for Homebrew (ADR 0084, amended 2026-11-27, ANR-1203):
+#
+#   adam-agent_X.Y.Z_<os>_<arch>.tar.gz                  linux and darwin, amd64 and arm64, on the GitHub release
+#   SHA256SUMS, SHA256SUMS.sigstore.json                 their checksums, signed with cosign, keyless (same identity)
+#   vymalo/homebrew-tap Formula/adam-agent.rb            a pull request the release App opens, monotonic in the version
+#
+# These are jobs of this workflow, not a workflow of their own on `release: published`: both events follow the
+# same App-made release, a second workflow would start beside the gate and not behind it, and the cosign identity
+# below would then name another file. They need `gate`, so a tag that the gate refuses ships no binary either.
+# `adam-agent-preflight` additionally requires the GitHub release to exist, published, authored by the release
+# App's bot, so a tag pushed by hand never reaches the tap.
+#
 # Never `latest`, and nothing here moves on main: coder.yml keeps pushing `sha-<7>` and bumping
 # values.yaml for development. Production pins `X.Y.Z@sha256:<digest>`.
 #
@@ -20,13 +32,18 @@ name: release
 # The release digest is not the digest of `sha-<7>`.
 #
 # `id-token: write` (what Fulcio certifies, and a credential that can be exchanged for cloud roles) is
-# granted to the one job that signs, `publish`; `packages: write` to the two that write to GHCR. A
+# granted to the two jobs that sign, `publish` (the image and the chart) and `adam-agent-publish` (SHA256SUMS);
+# `packages: write` to the two that write to GHCR. A
 # job-level `permissions:` block replaces the workflow-level one, so each restates what it needs.
 #
 # Verify a release (the identity is this file at the tag; renaming the file breaks every verify):
 #   cosign verify ghcr.io/vymalo/another-adam-rs/coder:X.Y.Z \
 #     --certificate-identity "https://github.com/vymalo/another-adam-rs/.github/workflows/release.yml@refs/tags/vX.Y.Z" \
 #     --certificate-oidc-issuer https://token.actions.githubusercontent.com
+# and the binaries, with the same identity:
+#   cosign verify-blob SHA256SUMS --bundle SHA256SUMS.sigstore.json \
+#     --certificate-identity "https://github.com/vymalo/another-adam-rs/.github/workflows/release.yml@refs/tags/vX.Y.Z" \
+#     --certificate-oidc-issuer https://token.actions.githubusercontent.com && sha256sum --check --ignore-missing SHA256SUMS
 
 on:
   push:
@@ -315,3 +332,288 @@ jobs:
             echo
             echo "helm install coder $CHART_REPO/coder --version $VERSION"
           } >> "$GITHUB_STEP_SUMMARY"
+
+  # ---------------------------------------------------------------------------------------------------------
+  # adam-agent through Homebrew (ANR-1203). Nothing below touches the image or the chart: it needs `gate` and
+  # nothing from `build` or `publish`, so a failed Homebrew job never unpublishes an image, and a failed image
+  # build never keeps a binary from a release (re-run the failed jobs).
+  # ---------------------------------------------------------------------------------------------------------
+
+  # The tag has a published GitHub release that the release App made. release-please creates the tag and the
+  # release in one call, but the push event can arrive first, so wait for it.
+  adam-agent-preflight:
+    name: adam-agent, the release is the App's and published
+    needs: gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    permissions:
+      contents: read
+    steps:
+      - name: Wait for the published release and check who made it
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          APP_SLUG: ${{ vars.RELEASE_PLEASE_APP_SLUG }}
+        run: |
+          set -eu
+          tag=${GITHUB_REF#refs/tags/}
+          case "$tag" in
+            v[0-9]*.[0-9]*.[0-9]*) ;;
+            *) echo "::error::$tag is not vX.Y.Z"; exit 1 ;;
+          esac
+          deadline=$(( $(date +%s) + 30 * 60 ))
+          until info=$(gh release view "$tag" --json author,isDraft,isPrerelease --jq '"\(.author.login) \(.isDraft) \(.isPrerelease)"' 2>/dev/null); do
+            if [ "$(date +%s)" -gt "$deadline" ]; then
+              echo "::error::no GitHub release for $tag after 30 minutes. A tag pushed by hand is not released through Homebrew."
+              exit 1
+            fi
+            sleep 30
+          done
+          read -r author draft prerelease <<EOF_INFO
+          $info
+          EOF_INFO
+          if [ "$draft" != false ] || [ "$prerelease" != false ]; then
+            echo "::error::release $tag is a draft or a prerelease"
+            exit 1
+          fi
+          case "$author" in
+            *"[bot]") ;;
+            *) echo "::error::release $tag was made by $author, not by the release App"; exit 1 ;;
+          esac
+          if [ -n "$APP_SLUG" ] && [ "$author" != "${APP_SLUG}[bot]" ]; then
+            echo "::error::release $tag was made by $author, want ${APP_SLUG}[bot]"
+            exit 1
+          fi
+          echo "release $tag by $author"
+
+  # One native build per target; nothing is cross-compiled. The Linux targets are musl, so the binary is static
+  # and runs on any distribution (ADR 0053 decision 11, the coder image's six binaries are the same). The macOS
+  # targets are built on GitHub-hosted macOS runners because there is no way to link for Apple targets from
+  # Linux without Apple's SDK; the Intel one runs natively on `macos-26-intel`, so its binary is started, not
+  # just built. The arm64 Linux target is a native build on `ubuntu-24.04-arm`.
+  adam-agent-build:
+    name: adam-agent ${{ matrix.os }} ${{ matrix.arch }}
+    needs: [gate, adam-agent-preflight]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: linux, arch: amd64, runner: ubuntu-24.04, target: x86_64-unknown-linux-musl }
+          - { os: linux, arch: arm64, runner: ubuntu-24.04-arm, target: aarch64-unknown-linux-musl }
+          - { os: darwin, arch: arm64, runner: macos-26, target: aarch64-apple-darwin }
+          - { os: darwin, arch: amd64, runner: macos-26-intel, target: x86_64-apple-darwin }
+    env:
+      VERSION: ${{ needs.gate.outputs.version }}
+      TARGET: ${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: musl C compiler (Linux)
+        if: matrix.os == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends file musl-tools
+      - name: The Rust toolchain of the workspace
+        run: |
+          rustup toolchain install 1.98 --profile minimal --target "$TARGET"
+          rustup default 1.98
+          cargo --version
+      # `musl-gcc` builds the C sources of aws-lc-sys, bundled SQLite and mimalloc, as in docker/coder/Dockerfile.
+      # ADAM_BUILD_REVISION is what the binary's card and `--version` say after the `+`.
+      - name: Build
+        env:
+          ADAM_BUILD_REVISION: ${{ github.sha }}
+        run: |
+          set -eu
+          if [ "${{ matrix.os }}" = linux ]; then
+            export "CC_$(echo "$TARGET" | tr - _)=musl-gcc"
+          fi
+          cargo build --release --locked --target "$TARGET" -p adam-agent --bin adam-agent
+      - name: The binary is static, and it starts and says its version
+        run: |
+          set -eu
+          bin="target/$TARGET/release/adam-agent"
+          if [ "${{ matrix.os }}" = linux ]; then
+            file "$bin"
+            file "$bin" | grep -Eq 'statically linked|static-pie linked'
+          else
+            otool -L "$bin"
+            # Only the system's own libraries.
+            if otool -L "$bin" | tail -n +2 | awk '{print $1}' | grep -Ev '^(/usr/lib/|/System/Library/)'; then
+              echo "::error::the binary links a library that is not part of macOS"
+              exit 1
+            fi
+          fi
+          "$bin" --version | tee version.txt
+          grep -Eq "^adam-agent $VERSION(\+|$)" version.txt
+          # No configuration is a configuration error (exit 78), not a crash.
+          code=0
+          env -i PATH="$PATH" "$bin" > /dev/null 2>&1 || code=$?
+          test "$code" -eq 78
+      - name: Archive adam-agent_${{ needs.gate.outputs.version }}_${{ matrix.os }}_${{ matrix.arch }}.tar.gz
+        run: |
+          set -eu
+          name="adam-agent_${VERSION}_${{ matrix.os }}_${{ matrix.arch }}.tar.gz"
+          mkdir out stage
+          cp "target/$TARGET/release/adam-agent" LICENSE-MIT LICENSE-APACHE stage/
+          tar -czf "out/$name" -C stage adam-agent LICENSE-MIT LICENSE-APACHE
+          tar -tzf "out/$name"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.0
+        with:
+          name: adam-agent-${{ matrix.os }}-${{ matrix.arch }}
+          path: out/*.tar.gz
+          if-no-files-found: error
+
+  # Checksum the four archives, sign the checksums, and attach everything to the release release-please made.
+  # The only other job with an OIDC token (the signing identity is this workflow at this tag, as for the image).
+  adam-agent-publish:
+    name: adam-agent, sign and attach to the release
+    needs: [gate, adam-agent-build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+      id-token: write
+    env:
+      VERSION: ${{ needs.gate.outputs.version }}
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: sigstore/cosign-installer@7e8b541eb2e61bf99390e1afd4be13a184e9ebc5 # v3.10.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.0
+        with:
+          pattern: adam-agent-*
+          merge-multiple: true
+          path: release-assets
+      - name: Checksums, signature, upload
+        run: |
+          set -eu
+          tag="v$VERSION"
+          cd release-assets
+          test "$(find . -type f | wc -l)" -eq 4
+          for os_arch in linux_amd64 linux_arm64 darwin_amd64 darwin_arm64; do
+            test -f "adam-agent_${VERSION}_${os_arch}.tar.gz"
+          done
+          sha256sum adam-agent_*.tar.gz > SHA256SUMS
+          cat SHA256SUMS
+          cosign sign-blob --yes --bundle SHA256SUMS.sigstore.json SHA256SUMS
+          # Read it back with the identity the page for people gives.
+          cosign verify-blob SHA256SUMS --bundle SHA256SUMS.sigstore.json \
+            --certificate-identity "https://github.com/${GITHUB_REPOSITORY}/.github/workflows/release.yml@refs/tags/${tag}" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com
+          gh release view "$tag" > /dev/null
+          gh release upload "$tag" --clobber adam-agent_*.tar.gz SHA256SUMS SHA256SUMS.sigstore.json
+          {
+            echo "### adam-agent $VERSION"
+            echo
+            echo '```'
+            cat SHA256SUMS
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # Install through Homebrew on the four platforms before the tap hears of the release. The formula is the
+  # one the tap gets, built from the release's own SHA256SUMS and put in a local tap, so what is tested is what
+  # is proposed. Homebrew is preinstalled on these runners (*unverified* on `ubuntu-24.04-arm`; the script says
+  # so when it is not).
+  adam-agent-smoke:
+    name: Homebrew install, ${{ matrix.name }}
+    needs: [gate, adam-agent-publish]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 25
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: Linux amd64, runner: ubuntu-24.04 }
+          - { name: Linux arm64, runner: ubuntu-24.04-arm }
+          - { name: macOS arm64, runner: macos-26 }
+          - { name: macOS amd64, runner: macos-26-intel }
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.0.0
+        with:
+          node-version: 24
+      - name: Install adam-agent with Homebrew and run it
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          VERSION: ${{ needs.gate.outputs.version }}
+        run: |
+          set -eu
+          gh release download "v$VERSION" --pattern SHA256SUMS --dir "$RUNNER_TEMP/sums"
+          sh tools/release/homebrew-smoke.sh "$VERSION" "$RUNNER_TEMP/sums/SHA256SUMS" Cargo.toml
+
+  # The tap's pull request: one open branch, `bot/adam-agent`, rebuilt from the tap's default branch, never
+  # older than what the tap has. The release App's token is scoped to this repository and the tap.
+  adam-agent-tap:
+    name: adam-agent, propose the Homebrew tap update
+    needs: [gate, adam-agent-publish, adam-agent-smoke]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    concurrency:
+      # One at a time. A newer pending run replaces an older pending one, which is right here: the branch is
+      # rebuilt from the tap's default branch with the newest version, so a release skipped while another
+      # waits is never written, and the monotonic check refuses to move the tap backwards.
+      group: homebrew-tap-adam-agent
+      cancel-in-progress: false
+    permissions:
+      contents: read
+    steps:
+      - name: Mint the release App token for this repository and the tap
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ secrets.RELEASE_PLEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_PLEASE_APP_PRIVATE_KEY }}
+          owner: vymalo
+          repositories: another-adam-rs,homebrew-tap
+          permission-contents: write
+          permission-pull-requests: write
+      - name: Discover the tap's default branch
+        id: tap
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: echo "base=$(gh api repos/vymalo/homebrew-tap --jq .default_branch)" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: vymalo/homebrew-tap
+          ref: ${{ steps.tap.outputs.base }}
+          token: ${{ steps.app-token.outputs.token }}
+          path: homebrew-tap
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: source
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.0.0
+        with:
+          node-version: 24
+      - uses: sigstore/cosign-installer@7e8b541eb2e61bf99390e1afd4be13a184e9ebc5 # v3.10.1
+      - name: The checksums are the signed ones
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          VERSION: ${{ needs.gate.outputs.version }}
+        run: |
+          set -eu
+          gh release download "v$VERSION" --pattern 'SHA256SUMS*' --dir sums
+          cosign verify-blob sums/SHA256SUMS --bundle sums/SHA256SUMS.sigstore.json \
+            --certificate-identity "https://github.com/${GITHUB_REPOSITORY}/.github/workflows/release.yml@refs/tags/v${VERSION}" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com
+      - name: Create or update the monotonic tap pull request
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          BASE: ${{ steps.tap.outputs.base }}
+          VERSION: ${{ needs.gate.outputs.version }}
+        run: |
+          node source/tools/release/update-homebrew-tap.mjs "$PWD/homebrew-tap" "$BASE" "$VERSION" \
+            "$PWD/sums/SHA256SUMS" "$PWD/source/Cargo.toml"

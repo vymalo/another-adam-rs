@@ -10,7 +10,7 @@
 use std::future::Future;
 use std::process::ExitCode;
 
-use adam_agent::{Config, exit_code};
+use adam_agent::{Config, build_version, exit_code};
 use anyhow::Context as _;
 
 /// The process-wide allocator: mimalloc in place of musl's own, which is slow under many threads
@@ -24,6 +24,14 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 /// the same logger as everything else.
 #[tokio::main]
 async fn main() -> ExitCode {
+    // `--version` and `--help` answer before anything is read or logged: they need no configuration, no
+    // database and no folder, so `brew test` and a person can run them anywhere. Any other argument is
+    // ignored, as it always was; the process is configured by its environment alone.
+    if let Some(text) = info_for(std::env::args().skip(1)) {
+        println!("{text}");
+        return ExitCode::SUCCESS;
+    }
+
     // `RUST_LOG` when set, else `info` with the MCP client library quiet (`adam_service::logging`).
     tracing_subscriber::fmt()
         .json()
@@ -43,6 +51,27 @@ async fn main() -> ExitCode {
     match adam_agent::serve(config, shutdown_signal()).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => fail(&anyhow::Error::from(e)),
+    }
+}
+
+/// The text of `--version` or `--help` when the first argument asks for it.
+fn info_for(mut args: impl Iterator<Item = String>) -> Option<String> {
+    match args.next().as_deref() {
+        Some("--version" | "-V") => Some(format!("adam-agent {}", build_version())),
+        Some("--help" | "-h") => Some(format!(
+            "adam-agent {}\n\n\
+             Serves one agent folder over A2A. It takes no arguments: it is configured by its environment.\n\n\
+             A laptop needs, at least:\n  \
+             ADAM_AGENT_DIR       the agent folder (instructions.md, card, skills, mcp.json)\n  \
+             DATABASE_URL         sqlite:///path/to/adam.db (one file, ROLE=all), or postgres:// or mongodb://\n  \
+             MODEL_BASE_URL       an OpenAI-compatible endpoint, with /v1\n  \
+             MODEL, MODEL_API_KEY the model alias and its key (the key may be empty)\n  \
+             A2A_BEARER_TOKENS    the tokens a client must present (none: no server)\n  \
+             PUBLIC_URL           where clients reach it, e.g. http://127.0.0.1:8080/\n\n\
+             Every variable: https://github.com/vymalo/another-adam-rs/blob/main/bin/adam-agent/README.md#configuration",
+            build_version()
+        )),
+        _ => None,
     }
 }
 

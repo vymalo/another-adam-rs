@@ -73,6 +73,30 @@ library's own plan is [the roadmap](docs/roadmap.md); every setting by surface i
 | **Embedded** | `adam-engine`: adam inside an application, on a desktop or a phone | ⚠️ | a chat agent on SQLite, resumed after a kill, with the host's hooks and approvals (a yes runs the call once); phones are type-checked only; a local coding agent, Windows and macOS, and adam as an ACP agent are not built ([ADR 0047](docs/decisions/0047-adam-rs-can-be-embedded-in-an-application.md), [embed in an app](docs/guides/embed-in-an-app.md)) |
 | **Bench** | adam-coder against OpenCode on the same tasks and model | ⚠️ | the dry run passed on Docker; never run against a real model ([ADR 0048](docs/decisions/0048-a-benchmark-harness-for-adam-coder-and-opencode.md), [bench](bench/README.md)) |
 
+## Install `adam-agent`
+
+`adam-agent` is one static binary that serves an agent folder over A2A. On macOS or Linux (arm64 or x86_64):
+
+```sh
+brew install vymalo/tap/adam-agent
+adam-agent --version
+```
+
+It needs, to run on a laptop: **an agent folder** (a directory with `agent/instructions.md`, nothing else is
+required: [the smallest agent](docs/guides/write-an-agent.md#the-smallest-agent)), **an OpenAI-compatible model
+endpoint** with its key, and **a bearer token** your client will present. No database server: `DATABASE_URL=sqlite://<file>`
+keeps the runs in one file. Nothing else is read from disk, and nothing is installed beside the binary.
+
+```sh
+mkdir -p my-agent/agent && printf -- '---\nname: chat\ndescription: A chat assistant.\n---\nYou are a helpful assistant.\n' > my-agent/agent/instructions.md
+ADAM_AGENT_DIR=my-agent DATABASE_URL="sqlite://$PWD/adam.db" MODEL_BASE_URL=https://your-gateway.example/v1 MODEL=your-model MODEL_API_KEY=... \
+  A2A_BEARER_TOKENS=dev-token PUBLIC_URL=http://127.0.0.1:8080/ adam-agent    # the card: curl http://127.0.0.1:8080/.well-known/agent-card.json
+```
+
+Every variable: [`adam-agent`'s README](bin/adam-agent/README.md#configuration). The archives, their signed checksums and
+how to verify them are on each [GitHub release](https://github.com/vymalo/another-adam-rs/releases) and in
+[Releases](docs/guides/releases.md#the-adam-agent-binary-and-homebrew). The macOS binaries are not notarized.
+
 ## Try it in five minutes
 
 You need Docker with Compose v2, `curl` and `jq`. The stack runs on mocks (a scripted model, a fake GitHub, a
