@@ -11,7 +11,7 @@ rest of the server looks from outside: [The A2A server](a2a-server.md). The deci
 
 ## The table
 
-Seventeen URIs, one row each. **Listed** says when the card carries the URI, for the coder (`adam-coder`) and for a
+Eighteen URIs, one row each. **Listed** says when the card carries the URI, for the coder (`adam-coder`) and for a
 folder agent (`adam-agent`). **Served** says whether anything in adam acts on it once a client activates it. **Contract**
 is the page on [the system's site](https://vymalo.github.io/another-agentic-system/api/extensions), where the
 orchestration layer writes what a client sends and reads. The system's pages were checked to exist on its `main` on
@@ -29,6 +29,7 @@ orchestration layer writes what a client sends and reads. The system's pages wer
 | Usage | `https://agents.vymalo.com/a2a/extensions/usage/v1` | always | always | yes: a report per model call, and the totals on the task | [`usage-v1`](https://vymalo.github.io/another-agentic-system/api/usage-v1) |
 | Build | `https://agents.vymalo.com/a2a/extensions/build/v1` | always | always | yes: information only, there is nothing to activate | no contract page yet; adam's side is [ADR 0028](../decisions/0028-the-card-says-which-build-answers.md) |
 | Access tier | `https://agents.vymalo.com/a2a/extensions/access-tier/v1` | always, the tiers up to `MAX_ACCESS_TIER` | never | yes, on the coder | [`access-tier-v1`](https://vymalo.github.io/another-agentic-system/api/access-tier-v1) |
+| Modes | `https://agents.vymalo.com/a2a/extensions/agent-mode/v1` | when the agent has any mode: a file in `modes/` | the same | yes: a message names the mode its run works in, and the mode narrows its tools | no contract page yet (ANR-979); adam's side is [ADR 0039](../decisions/0039-the-agent-loop-takes-opencodes-structure-and-agents-get-plugins.md) |
 | Commands | `https://agents.vymalo.com/a2a/extensions/commands/v1` | when the agent has any command: a file in `commands/`, or a prompt of one of its MCP servers | the same | yes | [`commands-v1`](https://vymalo.github.io/another-agentic-system/api/commands-v1) |
 | Child sessions | `https://agents.vymalo.com/a2a/extensions/child-sessions/v1` | when the root agent has a subagent, local or remote | the same | yes | [`child-sessions-v1`](https://vymalo.github.io/another-agentic-system/api/child-sessions-v1) |
 | Locale | `https://agents.vymalo.com/a2a/extensions/locale/v1` | when `DEFAULT_LOCALE` is set | the same | yes | [`locale-v1`](https://vymalo.github.io/another-agentic-system/api/locale-v1) |
@@ -49,9 +50,10 @@ orchestration layer writes what a client sends and reads. The system's pages wer
   it true (a locale, a profiled model, a subagent, a signed model call), and a card that already lists the URI keeps its
   own entry. A deployment that sets none of them lists none of them.
 * **The coder lists one URI the folder agent does not**: `access-tier/v1`, because only the coder works under a tier.
-* **Two URIs have no contract page on the system's site yet**: `build/v1` and `prompt-statement/v1`. Their contracts are
+* **Three URIs have no contract page on the system's site yet**: `build/v1`, `prompt-statement/v1` and `agent-mode/v1`. Their contracts are
   adam's own ADRs, linked in the table. The system's index of extensions says the orchestrator reads `build/v1` and does
-  not yet send `prompt-statement/v1` (its own words on 2026-11-26, *unverified* here: that is its code, not ours).
+  not yet send `prompt-statement/v1` (its own words on 2026-11-26, *unverified* here: that is its code, not ours); the
+  modes page and the composer's switch are ANR-979.
 * **Reasoning has no page of its own** on either side: adam's ADR 0063 is its contract and the system's `model-pick-v1`
   says how a client uses it beside the model pick.
 * **A third-party fact**: A2UI v1.0 is the A2UI project's specification, not an adam contract. What adam lists and reads

@@ -1,9 +1,10 @@
 # Extensions: the evidence
 
 For people: [Extensions](../../../docs/reference/extensions.md), which says what each card lists, what is served and
-where the contract is. This page holds, for the same seventeen rows, the code that lists the URI, the test that proves
+where the contract is. This page holds, for the same eighteen rows, the code that lists the URI, the test that proves
 it, and the check that keeps the table whole. Checked 2026-11-26 against `main` at `1f8f1a6d`; the tests were found by
-reading them, not by running them (no build ran for this page).
+reading them, not by running them (no build ran for this page). The `agent-mode/v1` row was added 2026-11-27 with the
+change that built it; its tests were run (see the pull request).
 
 ## The rows
 
@@ -30,12 +31,13 @@ card. Where two binaries list a URI the same way, one function is named; `adam-c
 | `https://agents.vymalo.com/a2a/extensions/model-pick/v1` | `adam_service::serve` and the coder's `router_with_card` (`bin/adam-coder/src/app.rs`), when `service.model_choices()` is non-empty | `crates/adam-service/tests/serve.rs` `the_card_lists_model_pick_exactly_when_the_backend_serves_it`; `bin/adam-agent/tests/agent.rs` `a_served_agent_offers_the_deployments_other_models_and_takes_a_pick`; `crates/adam-a2a-runtime/tests/model_pick.rs` `a_listed_pick_reaches_the_model_request`, `an_unlisted_pick_is_refused_and_writes_nothing` | `crates/adam-a2a-runtime/src/backend.rs` |
 | `https://agents.vymalo.com/a2a/extensions/prompt-statement/v1` | `adam_service::serve`, when `config.prompt_statement` (`MODEL_AUTH=injector` or a turn signing key; `crates/adam-service/src/config.rs`) | `crates/adam-service/tests/serve.rs` `the_card_lists_prompt_statement_exactly_behind_the_injector`; `crates/adam-a2a-runtime/tests/prompt_statement.rs` `every_model_call_of_the_run_carries_the_values_and_a_steer_replaces_them`, `without_the_activation_no_call_carries_either_header` | `crates/adam-a2a/src/prompt_statement.rs`, `crates/adam-a2a-runtime/src/prompt_statement.rs` |
 | `https://agents.vymalo.com/a2a/extensions/uploads/v1` | `adam_service::serve`, whenever a card exists and none lists it yet (`ExtensionConfig::uploads`, no `params`) | `crates/adam-service/tests/serve.rs` `the_card_lists_uploads_with_no_params`; **nothing proves a service**, because none exists | **no**: `serve.rs` computes `_inline_upload_threshold` and drops it, and no code calls `request_upload` (`rg request_upload crates bin` finds only the doc comment of the constant), parity gap 10, [#282](https://github.com/vymalo/another-adam-rs/issues/282) |
+| `https://agents.vymalo.com/a2a/extensions/agent-mode/v1` | `crates/adam-assembly/src/card.rs` (the folder's `modes/`, `ExtensionConfig::agent_mode`), so both binaries list it when their agent folder has modes; `adam_service::serve` adds it when the backend accepted modes and the card does not list it yet | `bin/adam-coder/src/app.rs` `the_card_from_the_agent_file_equals_the_golden` (the coder's card, the entry first); `crates/adam-a2a-runtime/tests/mode.rs` `a_declared_mode_reaches_the_run_as_its_context`, `the_mode_holds_until_another_message_names_another`, `a_mode_the_agent_does_not_declare_is_refused_and_writes_nothing`, `a_message_that_did_not_activate_the_extension_carries_no_mode`; `crates/adam-assembly/tests/modes.rs` `a_mode_narrows_the_tools_the_model_is_shown`, `the_tier_still_caps_what_a_mode_allows` | `crates/adam-a2a-runtime/src/mode.rs` (the check and the context key), `crates/adam-assembly/src/modes.rs` (`ModeSource`: the narrowing and the words) |
 
 Rows that say "the card tests above" are listed by the same two functions, and are proven there by the two whole-card
 tests: the folder agent's `the_card_is_the_one_the_folder_declares` (its eight URIs, in order, before `build/v1`) and the
-coder's golden `bin/adam-coder/tests/fixtures/agent/card.json`, which holds the coder's eleven (the commands entry from its
-folder, the five of the screen, `steps`, `text-stream`, `usage`, `access-tier` and `build`). The conditional URIs are in
-neither list, by design: their tests are the ones named in their rows.
+coder's golden `bin/adam-coder/tests/fixtures/agent/card.json`, which holds the coder's twelve (the modes entry from its
+folder, the commands entry from its folder, the five of the screen, `steps`, `text-stream`, `usage`, `access-tier` and
+`build`). The conditional URIs are in neither list, by design: their tests are the ones named in their rows.
 
 A claim for a row that this page does not name a test for has none: before you add "proven" to a row, find the test
 and read what it asserts.
