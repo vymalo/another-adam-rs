@@ -11,6 +11,11 @@ below), and slice T3a-2 signs the run's head at commit and checks it on decode (
 slice T3a-3 verifies each turn on re-entry and signs a carried history again (see *Amended 2026-11-27 (slice T3a-3)*
 at the end); the journal's signature is not built.
 
+*Amended 2026-11-28:* a run's **model requests** may be signed by a key a certificate authority certified for that
+run, when the host gives run keys ([ADR 0086](0086-a-run-signs-its-model-requests-with-a-certificate.md)). The
+history keeps the process `TurnKeys`; nothing else changes. See *Amended 2026-11-28 (the run's certificate)* at the
+end.
+
 It has two parts. **Part 1 is not decided here**: adam carries every opaque member a provider attaches (Gemini 3's
 `thought_signature` in a tool call's `extra_content`) byte for byte, sends it back only to the model that made it, and
 drops it when a run changes model; that is [adam-rs#322](https://github.com/vymalo/another-adam-rs/issues/322), built
@@ -594,3 +599,25 @@ The text above stands; where it says otherwise, this does.
    `crates/adam-llm-agent/tests/turn_reentry.rs`, `crates/adam-a2a-runtime/src/backend.rs` (`runtime_errors_map_by_class`).
 6. **More re-entry tests.** An appended user row (the head names one more row) and a changed head field at a resume are each
    `Corrupt` with no model call.
+
+## Amended 2026-11-28 (the run's certificate)
+
+A run's **model requests** may be signed by a key a certificate authority certified for that run, instead of the process
+turn key ([ADR 0086](0086-a-run-signs-its-model-requests-with-a-certificate.md)). This amends decision 7's "the key comes
+from the vault" for the request signature only, and leaves decisions 1 to 6, 8 and 10 to 11 as they are.
+
+1. **Two lifetimes, two keys.** A history signature must verify after the run that wrote it is gone, so its public key stays
+   in a key set (decision 8). A run certificate is renewed and dies with the run. So the run leaf signs the request, and the
+   process `TurnKeys` keeps signing the turns and the head: decision 2's "a model call never carries a turn's signature" is
+   unchanged, only *which* key signs the request changes.
+2. **`TurnKeys` gains no method.** The run's signer is a `RunKeys`, a `TurnKeys` that belongs to one run; the request path
+   holds a closed `KeySource` (`Process` or `Run`) and asks either the same three calls. A host that gives no run keys keeps
+   today's behaviour exactly, and no adapter of `TurnKeys` changes.
+3. **The port is an issuer, not a CA.** `RunCertIssuer::issue(&CertificateRequest) -> Result<CertificateChain,
+   RunCertError>` takes a bounded DER CSR and answers the `x5c` chain a request carries. No `rcgen`, `x509` or `rustls`
+   type is in it. The chain is carried, not trusted: `verify_request` still verifies by `kid`, and trusting the CA is the
+   verifier's in front of the model.
+4. **Built here:** the ports, a fake issuer, and `run_cert_issuer_conformance!` in `adam-core`; `KeySource` in
+   `adam-model::SignedRequests`, defaulting to `Process`. **Not built:** an issuer adapter, the `RUN_CERT_*` variables, and
+   the renewal clock. Until then no deployment reads a variable, and every request is signed with the process key as
+   *Amended 2026-11-25 (the request signature)* says.

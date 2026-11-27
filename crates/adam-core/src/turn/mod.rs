@@ -17,17 +17,22 @@
 //!   ([`sign_attached`]) and carried in the header [`TURN_SIGNATURE_HEADER`].
 //! * [`testkit`]: the cases every `TurnKeys` passes, [`turn_keys_conformance!`](crate::turn_keys_conformance),
 //!   and [`testkit::Certified`], a key named by a certificate chain.
+//! * [`run_cert`]: the run's certificate ([ADR 0086]): [`RunCertIssuer`] (a CSR in, a chain out),
+//!   [`RunKeys`] (a `TurnKeys` that belongs to one run), and
+//!   [`run_cert_issuer_conformance!`](crate::run_cert_issuer_conformance).
 //!
 //! Slice T1 of the ADR builds the history's form; the turns are signed by the agent loop (T3a-1)
 //! and the head by the runtime (T3a-2, [`head_payload`]); nothing verifies a turn on its own yet. Every model request is signed when the host gives keys (`adam_model::SignedRequests`).
 //!
 //! [ADR 0068]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0068-adam-signs-its-own-history.md
+//! [ADR 0086]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0086-a-run-signs-its-model-requests-with-a-certificate.md
 
 mod chain;
 mod ed25519;
 mod form;
 mod key_set;
 mod request;
+pub mod run_cert;
 pub mod testkit;
 
 use std::fmt;
@@ -53,6 +58,10 @@ pub use request::{
     ModelCall, REQUEST_MAX_AGE_SECS, REQUEST_MAX_SKEW_SECS, REQUEST_NONCE_LEN,
     TURN_SIGNATURE_HEADER, VerifiedRequest, body_sha256, request_payload, sign_request,
     sign_request_at, verify_request,
+};
+pub use run_cert::{
+    BadCertificateRequest, CertificateRequest, DynRunCertIssuer, DynRunKeys, RunCertError,
+    RunCertIssuer, RunKeys,
 };
 
 /// Signs with the turn key and gives the keys a turn signature is verified with ([ADR 0068]
