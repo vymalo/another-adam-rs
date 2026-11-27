@@ -197,8 +197,28 @@ it, so it is not under coder.runsWorkers. On when the ExternalSecret is enabled 
 property; the chart never carries the key itself.
 */}}
 {{- define "coder.turnSigning" -}}
-{{- if and .Values.externalSecrets.enabled .Values.externalSecrets.properties.turnSigningKey -}}true{{- end -}}
+{{- if include "coder.turnKeyGenerated" . -}}true
+{{- else if and .Values.externalSecrets.enabled .Values.externalSecrets.properties.turnSigningKey -}}true{{- end -}}
 {{- end -}}
+{{/* Whether the turn key is generated in the cluster and pushed, rather than pulled. */}}
+{{- define "coder.turnKeyGenerated" -}}
+{{- if and .Values.externalSecrets.enabled .Values.turnSigning.generate.enabled -}}true{{- end -}}
+{{- end -}}
+{{/* The Job and the PushSecret that generate and push the key. */}}
+{{- define "coder.turnKeyJobName" -}}{{ printf "%s-turn-key" (include "coder.fullname" .) }}{{- end -}}
+{{/* The Secret the key lives in: the generated one, or the ExternalSecret's. */}}
+{{- define "coder.turnKeySecretName" -}}
+{{- if include "coder.turnKeyGenerated" . -}}
+{{ include "coder.turnKeyJobName" . }}
+{{- else -}}
+{{ include "coder.secretName" . }}
+{{- end -}}
+{{- end -}}
+{{/* The Secret's key that holds the PEM: `private-key.pem` when generated, `TURN_SIGNING_KEY.pem` when pulled. */}}
+{{- define "coder.turnKeyItemKey" -}}
+{{- if include "coder.turnKeyGenerated" . -}}private-key.pem{{- else -}}TURN_SIGNING_KEY.pem{{- end -}}
+{{- end -}}
+
 {{/* Where the turn key's Secret is mounted. */}}
 {{- define "coder.turnSigningDir" -}}/var/run/secrets/turn-signing{{- end -}}
 {{/* The verify set, when the ExternalSecret also copies one. */}}
