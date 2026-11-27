@@ -77,8 +77,9 @@ at the same URL (`PUBLIC_URL`): the REST paths are relative to it.
 ## The document, as a file
 
 [`docs/api/a2a-server.openapi.json`](../api/a2a-server.openapi.json) is the same document, committed so a site can render it
-without a running server. It is built from one fixed default card (a bearer token required; push notifications and the
-extended card off), so it changes only when the server's code does. How it is held equal to the code, and how to rewrite
+without a running server: [A2A server API](../api/a2a-server.md) lists every operation from it. It is built from one fixed
+default card (a bearer token required; push notifications and the extended card off), so it changes only when the server's
+code does. How it is held equal to the code, and how to rewrite
 it: [the document, for agents](../../.agents/docs/reference/a2a-server.md#the-committed-document).
 
 ## Push notifications
