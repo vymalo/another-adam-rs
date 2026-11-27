@@ -485,7 +485,9 @@ round that only closes a session, for the tools and for the A2A front.
 A **round of a kept-open session** may ask the person (ADR 0045 decision 9), and only that: the person sees the
 session because their client activated `child-sessions/v1`, and answers in the round's own thread. Anything else in
 a child run is told that nobody can answer and goes on: a one-shot child, a round of a session that is not kept
-open, and a round of a session whose client does not show it (`adam_llm_agent::NOT_ASKABLE`).
+open, and a round of a session whose client does not show it (`adam_llm_agent::NOT_ASKABLE`). A hook's request to approve a
+call (ADR 0050, slice H8) follows the same rule: such a child reads it as a refusal, the call is answered with
+`adam_llm_agent::NOT_APPROVABLE` and the hook's question, and nothing waits.
 
 ```mermaid
 sequenceDiagram
