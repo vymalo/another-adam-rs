@@ -253,6 +253,10 @@ upgraded database alike; the table keeps its file (no rewrite). `load_run`, `loa
 parameter the process computes: it is a value, not a rule, and the rule, `starts_with`, is already in
 the statement. No function yet. The proofs, and the mutation that no case catches, are on the [agent
 page](../../.agents/docs/decisions/0082-the-sql-adapters-keep-their-rules-in-the-database.md#p1-built-2026-11-27).
+For the owner: the migration's connection runs with `statement_timeout = 0` and no `lock_timeout`, so the
+`ADD COLUMN` waits for its `ACCESS EXCLUSIVE` lock on the runs table for as long as a long transaction holds the
+table, and the store's other statements queue behind it meanwhile. This was already true of the earlier
+`ADD COLUMN` steps, and P1 leaves the code as it is.
 
 ## Consequences
 

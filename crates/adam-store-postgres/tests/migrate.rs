@@ -646,6 +646,23 @@ async fn a_version_7_schema_gets_the_served_column_without_a_rewrite() {
     )
     .await;
     assert_eq!(file, after, "adding a virtual column rewrote the table");
+    // The expression the server stored, as it deparses it: `ADD COLUMN IF NOT EXISTS` never
+    // changes an existing column, so a change of the expression must come with its own migration
+    // (`ALTER COLUMN served SET EXPRESSION`), and this is where a stale one shows.
+    let stored: String = support::scalar(
+        &pool,
+        "SELECT pg_get_expr(d.adbin, d.adrelid) FROM pg_attrdef d
+           JOIN pg_attribute a ON a.attrelid = d.adrelid AND a.attnum = d.adnum
+          WHERE d.adrelid = to_regclass($1) AND a.attname = 'served'",
+        &[&runs],
+    )
+    .await;
+    assert_eq!(
+        stored.split_whitespace().collect::<Vec<_>>().join(" "),
+        "CASE WHEN ((jsonb_typeof(head) = 'object'::text) AND ((head_version = version) OR \
+         (state = 'null'::jsonb))) THEN head ELSE state END",
+        "the served column's stored expression"
+    );
 
     let loaded = store.load_run(plain.id).await.unwrap().expect("the run");
     assert_eq!(loaded.state, json!({"turn": 1}), "no head: the state");

@@ -29,8 +29,9 @@ time (for example [`adam-coder`](../../bin/adam-coder/README.md)).
 * `create_run` and `commit_run` return the record with `state` set to `null`: the caller supplied the
   state, and the state is the largest column, so a `RETURNING` that echoed it would parse it back on
   every transition. `load_run`, `load_head`, the claim, `open_run_for_conversation` and the listings
-  answer the **contract document**, the virtual column `served`: the head when
-  `head_version == version`, the whole `state` otherwise (ADR 0055, the contract release). `journal_put` returns the stored payload (the loop
+  answer the **contract document**, the virtual column `served`: the head when it is a JSON object
+  and either `head_version == version` or the state is the JSON `null` tombstone, the whole `state`
+  otherwise (ADR 0055, the contract release). `journal_put` returns the stored payload (the loop
   decodes the step's outcome from it).
 * `run_header` is one statement over the primary key that selects the header columns and
   `lease_until`, never `state`: a reader that only needs the run's own bookkeeping (a cancel watch,
@@ -222,6 +223,13 @@ process of the previous release never names the column, so a mixed fleet reads a
 before; this release needs it, so it reads only after `migrate()` (as every release that adds a
 column). The column depends on `head`, `head_version`, `version` and `state`: a later migration
 that alters one of them drops and recreates it in the same transaction. P1 creates no function.
+
+**Changing the expression later.** `ADD COLUMN IF NOT EXISTS` never touches an existing column, so
+editing the expression in the code would leave every version 8 database on the old one. A change
+bumps `SCHEMA_VERSION` and adds `ALTER TABLE <prefix>runs ALTER COLUMN served SET EXPRESSION AS (..)`
+to the migration; on a virtual column that rewrites no row (*verified 2026-11-27* on 18.7: the file
+node is unchanged and the new expression is served). `tests/migrate.rs` checks that the stored
+expression (`pg_get_expr`) is the expected one after an upgrade.
 
 ## Schema version and the owner column
 

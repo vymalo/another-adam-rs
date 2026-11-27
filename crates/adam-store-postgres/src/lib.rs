@@ -174,6 +174,14 @@ fn served_columns(prefix: &str) -> String {
 /// `jsonb_typeof` and these `=` operators qualify. The column depends on `head`, `head_version`,
 /// `version` and `state`: a migration that alters one of them drops and recreates the column in
 /// the same transaction.
+///
+/// **A change to this expression is not applied by editing it.** The column is added with
+/// `ADD COLUMN IF NOT EXISTS`, which leaves an existing column as it is, so a database at
+/// version 8 would keep the old expression. A change bumps [`SCHEMA_VERSION`] and adds
+/// `ALTER TABLE <prefix>runs ALTER COLUMN served SET EXPRESSION AS (..)` to the migration; on a
+/// virtual column that rewrites no row (*verified 2026-11-27* on 18.7: the table's file node is
+/// unchanged and the new expression is served). `tests/migrate.rs` holds the stored expression
+/// (`pg_get_expr`) equal to this one after an upgrade.
 const SERVED_EXPRESSION: &str = "CASE WHEN jsonb_typeof(head) = 'object' \
                                        AND (head_version = version OR state = 'null'::jsonb) \
                                   THEN head ELSE state END";
@@ -874,7 +882,9 @@ impl Sql {
         // column is computed when it is read, so `ADD COLUMN` rewrites no row; it holds
         // `ACCESS EXCLUSIVE` on `runs` until the migration commits, as the other `ADD COLUMN`s of
         // this list do. A fresh database gets it here too, so a fresh and an upgraded table end
-        // with the same columns in the same order. `IF NOT EXISTS` keeps a re-run a no-op.
+        // with the same columns in the same order. `IF NOT EXISTS` keeps a re-run a no-op, and so
+        // never changes the expression of an existing column: a change to `SERVED_EXPRESSION` is
+        // a version bump with `ALTER COLUMN served SET EXPRESSION AS (..)` (see its doc).
         migrate.push(Arc::from(format!(
             "ALTER TABLE {runs} ADD COLUMN IF NOT EXISTS served JSONB
                  GENERATED ALWAYS AS ({SERVED_EXPRESSION}) VIRTUAL"
