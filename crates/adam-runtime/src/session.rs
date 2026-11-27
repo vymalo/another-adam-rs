@@ -982,6 +982,9 @@ impl SessionBounds {
             max_rounds: config
                 .max_rounds
                 .map(|v| v.clamp(1, self.max_rounds.max(1))),
+            // Text has no bound to clamp to: `admit` already refused one that is too long, and a
+            // later round keeps what the session was started with.
+            instructions: config.instructions.clone(),
         }
     }
 }
