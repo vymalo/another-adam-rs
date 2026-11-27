@@ -508,9 +508,9 @@ parks the run and returns.
 |---|---|---|
 | `subagent_start` | `agent` (enum), `description` (at most 80 characters), `prompt`, `keep_open` (default `false`), `config` (optional: `max_turns`, `max_tool_calls`, `max_output_tokens`, `context_window`, `max_parallel_tool_calls`, `time_limit`, `max_rounds`; [ADR 0054](../../docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md)) | `{"session", "agent", "state": "working", "keep_open"}` at once; the parent keeps working; a `config` above the subagent's bounds, or with an option that is not one of the seven, is an error result and starts nothing |
 | `subagent_send` | `session`, `message` | `{"session", "round", "state", "delivered": "new_round" \| "steered" \| "queued"}` (`queued`: the round's agent says in its state, `queues_messages: true`, that it keeps the message until its remote can take it); an error result when the session is closed |
-| `subagent_read` | `session`, `wait` (default `false`), `offset`, `limit` | a header line, `report: done` or `failed` and the report as a numbered page (the paging convention), or `report: none yet` while the round works, or `report: blocked` and the question while the round waits for the person (`SessionView::waiting`) |
+| `subagent_read` | `session`, `wait` (default `false`), `offset`, `limit` | a header line (and a `config:` line, `max_turns 20, time_limit 10`, when the session has a config), `report: done` or `failed` and the report as a numbered page (the paging convention), or `report: none yet` while the round works, or `report: blocked` and the question while the round waits for the person (`SessionView::waiting`) |
 | `subagent_close` | `session`, `cancel` (default `false`) | `{"session", "state": "closed"}` |
-| `subagent_list` | `offset`, `limit` | one line per session, working then idle then closed, paged |
+| `subagent_list` | `offset`, `limit` | one line per session, working then idle then closed, paged; a session with a config ends its line with `config: max_turns 20, time_limit 10` (`SessionSummary::config`) |
 
 * **A session** is a conversation of child runs ("rounds") of one subagent, in **the parent's own conversation** (so a later
   task of it finds the session, and no other conversation does). Its id is round 1's run id. A round carries the session's

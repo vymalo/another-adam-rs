@@ -266,3 +266,19 @@ fn every_subagents_bounds_reach_its_session_tools() {
         "the reviewer says nothing: 30 minutes, its parallelism from the deployment"
     );
 }
+
+/// The A2A front's helpers carry the very bounds the session tools hold a `config` to, so a
+/// person's `start.config` and the model's `config` cannot disagree (ADR 0054 decision 2); the
+/// definition alone, which binds no model, knows none, and its front refuses a `start.config`.
+#[cfg(feature = "sessions")]
+#[test]
+fn the_front_holds_a_start_config_to_the_bounds_of_the_tools() {
+    let assembly = assemble(family("  max_turns: 7"), SessionLimits::default(), Some(3)).unwrap();
+    let front = assembly.child_sessions().expect("the root has a helper");
+    let helper = front.agents().first().expect("a helper");
+    assert_eq!(helper.name, "reviewer");
+    assert_eq!(helper.bounds.as_ref(), Some(&bound_of(&assembly)));
+    assert_eq!(helper.bounds.as_ref().map(|b| b.max_turns), Some(7));
+    let alone = family("  max_turns: 7").child_sessions().expect("a helper");
+    assert_eq!(alone.agents()[0].bounds, None, "no model, no bounds");
+}
