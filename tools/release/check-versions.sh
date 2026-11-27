@@ -26,7 +26,7 @@ bad() { echo "check-versions: $1" >&2; fail=1; }
 want=
 if [ "$#" -eq 1 ]; then
   want=${1#v}
-  if ! printf '%s\n' "$want" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+  if [ "$(printf '%s' "$want" | wc -l)" -ne 0 ] || ! printf '%s\n' "$want" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
     echo "check-versions: '$1' is not a release tag vX.Y.Z" >&2
     exit 2
   fi

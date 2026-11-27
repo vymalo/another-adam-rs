@@ -1,0 +1,123 @@
+name: release-please
+
+# Proposes the next release as a pull request, and cuts the tag `vX.Y.Z` when that pull request
+# merges (ADR 0084). release.yml owns everything downstream of the tag. The flow is the one of
+# vaam-apps/vpay (its release-please.yml and release-please-config.json), so every repository of
+# the family releases the same way.
+#
+# One version for the whole repository. release-please rewrites the first X.Y.Z of every line marked
+# `x-release-please-version` in the files release-please-config.json lists: the workspace version, every
+# path dependency's `version` (a 0.x caret range does not cross a minor, so a requirement left behind
+# stops the workspace resolving), and deploy/coder/Chart.yaml's `version` and `appVersion`.
+# tools/release/check-versions.sh (ci.yml, job fmt) fails a pull request that adds an unmarked one.
+#
+# Two things move with a release and cannot be marked, so this job moves them on the release branch
+# (tools/release/sync.sh): every Cargo.lock (`cargo metadata`, nothing compiled) and the chart's four
+# goldens (two labels of every object carry the chart's versions, and the checksums of the ConfigMaps
+# a pod reads follow them; deploy/coder/tests/render-goldens.sh renders them again, and render-check.sh
+# on the release pull request proves them).
+#
+# Why a GitHub App token and not GITHUB_TOKEN: GitHub raises no workflow event for what GITHUB_TOKEN
+# does. release.yml runs on `push: tags: ["v*"]`, so with GITHUB_TOKEN the tag would be created and no
+# image or chart would be published, silently; the release pull request would get no CI either. There
+# is deliberately no fallback. The App needs, on this repository only, `contents: write` and
+# `pull-requests: write`. Secrets: RELEASE_PLEASE_APP_CLIENT_ID (the App's Client ID, `Iv23li...`,
+# not its numeric App ID) and RELEASE_PLEASE_APP_PRIVATE_KEY.
+#
+# The first release: `bootstrap-sha` is main at adoption, so the first release pull request lists
+# what landed after it. `.release-please-manifest.json` seeds 0.5.0, the chart's version at adoption,
+# so the chart never goes back; the crates (0.1.0 until then) join it at the first release. A
+# `Release-As: X.Y.Z` footer in a commit picks another number.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
+# Never cancel a run that may be force-pushing the release branch and then pushing onto it.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+# The App token carries every write; GITHUB_TOKEN only reads.
+permissions:
+  contents: read
+
+env:
+  HELM_VERSION: v4.3.2
+
+jobs:
+  release-please:
+    name: propose the next release
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Mint a GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          # `client-id`, not the deprecated `app-id`: the App's Client ID, a different value from its App ID.
+          client-id: ${{ secrets.RELEASE_PLEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_PLEASE_APP_PRIVATE_KEY }}
+          # Only what release-please needs (open and update the pull request, push its branch, create
+          # the tag), not everything the installation holds.
+          permission-contents: write
+          permission-pull-requests: write
+
+      - name: Open or update the release pull request
+        id: release
+        uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
+        with:
+          token: ${{ steps.app-token.outputs.token }}
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+
+      # `prs_created` is true for an updated release pull request too; release-please force-pushes its
+      # branch every run, which drops the previous run's sync commit, so the sync runs every time.
+      - name: Check out the release branch
+        if: steps.release.outputs.prs_created == 'true'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ fromJSON(steps.release.outputs.pr).headBranchName }}
+          # The App token, so the push below raises an event and the release pull request gets CI.
+          token: ${{ steps.app-token.outputs.token }}
+          # Not written into .git/config; the push passes it on the URL.
+          persist-credentials: false
+
+      - uses: azure/setup-helm@2f5e7bc67f1f9972ab16657bb795f36d8f04de0e # v5.1.0
+        if: steps.release.outputs.prs_created == 'true'
+        with:
+          version: ${{ env.HELM_VERSION }}
+
+      # No dependency cache: a restored cache in a job that commits to the release branch is a way to
+      # alter what it commits, and `cargo metadata` compiles nothing.
+      - name: Sync the lockfiles and the chart's goldens
+        if: steps.release.outputs.prs_created == 'true'
+        run: sh tools/release/sync.sh
+
+      - name: Commit the sync, if the version bump moved anything
+        if: steps.release.outputs.prs_created == 'true'
+        env:
+          TOKEN: ${{ steps.app-token.outputs.token }}
+          # `|| '{}'`: a step's `env:` is evaluated even when its `if:` skips it, and `fromJSON('')` fails the run.
+          HEAD_REF: ${{ fromJSON(steps.release.outputs.pr || '{}').headBranchName }}
+        run: |
+          set -eu
+          if git diff --quiet; then
+            echo "nothing moved: nothing to push"
+            exit 0
+          fi
+          git config user.name 'release-please[bot]'
+          git config user.email 'release-please[bot]@users.noreply.github.com'
+          git add -- '*Cargo.lock' deploy/coder/tests/golden
+          if ! git diff --quiet; then
+            echo "::error::the sync changed files it should not have:"
+            git diff --stat
+            exit 1
+          fi
+          git commit -m 'chore: sync the lockfiles and the chart goldens with the release version'
+          git push "https://x-access-token:${TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "HEAD:refs/heads/${HEAD_REF}"
+          {
+            echo "### Synced"
+            git diff --stat HEAD~1
+          } >> "$GITHUB_STEP_SUMMARY"

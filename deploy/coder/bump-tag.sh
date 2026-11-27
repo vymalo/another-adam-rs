@@ -3,6 +3,9 @@
 #
 #   bump-tag.sh <values.yaml> <tag>
 #
+# <tag> is `sha-<7 hex>`, the image of a commit of main (coder.yml's bump), or `X.Y.Z`, a release
+# (release.yml sets it in the chart it packages, never in the repository: ADR 0084).
+#
 # Prints `unchanged` (and leaves the file alone) when the tag is already
 # current, so a re-run is a no-op and the workflow never commits twice. Only the
 # `tag:` key inside the top-level `image:` block is touched; every other line is
@@ -19,7 +22,13 @@ tag=$2
 
 case "$tag" in
   sha-[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]) ;;
-  *) echo "refusing tag '$tag': expected sha-<7 hex digits>" >&2; exit 2 ;;
+  *)
+    # One line only: grep matches line by line, so a tag with a newline in it could pass.
+    if [ "$(printf '%s' "$tag" | wc -l)" -ne 0 ] || ! printf '%s\n' "$tag" | grep -Eq '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'; then
+      echo "refusing tag '$tag': expected sha-<7 hex digits> or a release X.Y.Z" >&2
+      exit 2
+    fi
+    ;;
 esac
 
 current=$(awk '

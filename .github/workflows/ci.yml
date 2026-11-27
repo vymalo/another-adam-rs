@@ -54,6 +54,9 @@ jobs:
       # one are gone. The scan is what keeps them from coming back by habit; the script says what it reads.
       - name: The dev stack and CI carry no container engine
         run: sh tools/check-dev-stack.sh
+      # ADR 0084: every version a release moves is marked for release-please, and the Cargo lines agree.
+      - name: The release's version lines are marked and agree
+        run: sh tools/release/check-versions.sh
       - run: cargo fmt --all --check
 
   # The two clippy arms: the default features, and the optional ones (or their code never runs in CI).
