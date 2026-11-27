@@ -19,6 +19,7 @@
 //!
 //! * a lesson round-trips, and one audience and root cause is one lesson, updated in place;
 //! * an audience answers only its own lessons;
+//! * the audience is a key and is never scrubbed, while a provenance label is;
 //! * two configured scopes on one store never read, overwrite or retire each other's lessons;
 //! * a lesson text is scrubbed or the write is refused, and every bound refuses the write it would
 //!   break;
@@ -43,13 +44,24 @@
 //! ```
 //!
 //! ```ignore
-//! use std::sync::Arc;
+//! use std::sync::{Arc, OnceLock};
 //!
-//! use adam_memory::{DynMemory, InProcessMemory, MemoryScope};
+//! use adam_memory::{DynMemory, InProcessLessonStore, InProcessMemory, MemoryScope};
 //! use adam_memory_testkit::LessonPlan;
 //!
+//! fn store() -> &'static InProcessLessonStore {
+//!     static STORE: OnceLock<InProcessLessonStore> = OnceLock::new();
+//!     STORE.get_or_init(InProcessLessonStore::new)
+//! }
+//!
 //! fn make(plan: &LessonPlan, scope: &MemoryScope) -> DynMemory {
-//!     Arc::new(InProcessMemory::new(plan.settings.clone(), scope.clone()))
+//!     // A database adapter here would open one database whatever the scope; this reference shares
+//!     // a store so two scopes really are two scopes on one store.
+//!     Arc::new(InProcessMemory::shared(
+//!         plan.settings.clone(),
+//!         scope.clone(),
+//!         InProcessLessonStore::clone(store()),
+//!     ))
 //! }
 //!
 //! adam_memory_testkit::memory_conformance!(crate::make);
@@ -682,11 +694,12 @@ pub mod lesson_cases {
     }
 
     /// A second record for one audience and root cause is one lesson: the update replaces its
-    /// text and keeps its creation time.
+    /// text and keeps its creation time, and the recall serves the freshest write first.
     ///
     /// # Panics
     ///
-    /// When a retried record writes a second lesson, or an update opens another.
+    /// When a retried record writes a second lesson, or an update opens another, or the recall
+    /// does not serve the freshest update first.
     pub fn a_record_lands_once_for_one_key(memory: DynMemory, _plan: LessonPlan) {
         let audience = audience("one-key");
         let draft = lesson_draft(&audience, "the worker dies on a large input");
@@ -719,6 +732,10 @@ pub mod lesson_cases {
         );
         let recalled = memory.recall(&audience).unwrap();
         assert_eq!(recalled.len(), 2);
+        assert!(
+            recalled[0].updated > recalled[1].updated,
+            "the store cannot separate two writes 5 ms apart"
+        );
         assert_eq!(
             recalled[0].root_cause, "the worker dies on a large input",
             "the freshest update is served first"
@@ -749,6 +766,40 @@ pub mod lesson_cases {
         };
         only(&a, "the first lesson");
         only(&b, "the second lesson");
+    }
+
+    /// The audience is a key and is never scrubbed, while a provenance label is scrubbed.
+    ///
+    /// An adapter that scrubs its audience stores under text the caller's `recall` never asks for,
+    /// so this case fails on the miss.
+    ///
+    /// # Panics
+    ///
+    /// When an adapter scrubs the audience, or stores a label unscrubbed.
+    pub fn an_audience_is_not_scrubbed(memory: DynMemory, _plan: LessonPlan) {
+        let audience = audience(&format!("a{TOKEN}b"));
+        let written = record(&memory, lesson_draft(&audience, "the key is the audience"));
+        assert_eq!(written.audience, audience);
+        let recalled = memory.recall(&audience).unwrap();
+        assert_eq!(
+            recalled.len(),
+            1,
+            "the audience was scrubbed, so the recall missed the lesson"
+        );
+        assert_eq!(recalled[0].root_cause, "the key is the audience");
+
+        let draft = LessonDraft::new(
+            audience.clone(),
+            "the label is scrubbed",
+            LessonProvenance::new([format!("source-{TOKEN}")], format!("reviewer-{TOKEN}")),
+        );
+        let written = record(&memory, draft);
+        assert_eq!(
+            written.provenance.sources,
+            ["source-"],
+            "a provenance label is stored scrubbed"
+        );
+        assert_eq!(written.provenance.review, "reviewer-");
     }
 
     /// Two configured scopes on one store never see each other's lessons, whether they are
@@ -1245,6 +1296,15 @@ macro_rules! memory_conformance {
                 let plan = LessonPlan::default();
                 $crate::lesson_cases::recall_answers_only_its_audience(
                     make(&plan, &$crate::memory_scope("audiences")),
+                    plan,
+                );
+            }
+
+            #[test]
+            fn an_audience_is_not_scrubbed() {
+                let plan = LessonPlan::default();
+                $crate::lesson_cases::an_audience_is_not_scrubbed(
+                    make(&plan, &$crate::memory_scope("audience-key")),
                     plan,
                 );
             }

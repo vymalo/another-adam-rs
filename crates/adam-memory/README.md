@@ -111,8 +111,9 @@ An L2 adapter is configured with one `MemoryScope`; the deployment chooses it (o
 deployments share, or one per `adam-coder`). Every key and every query carries it, so two adapters
 over one database with two scopes never see each other's lessons. Inside the scope a lesson is keyed
 by its `Audience` and its root cause; a second record for the same key updates the lesson rather
-than opening another, and a record for a retired lesson serves it again. The port keeps the audience
-opaque: the promotion pass computes it, and a lesson never widens inside an adapter.
+than opening another, and a record for a retired lesson serves it again when a free slot remains.
+The port keeps the audience opaque: the promotion pass computes it, and a lesson never widens inside
+an adapter.
 
 ## Bounds
 
@@ -144,9 +145,10 @@ a drive letter, a token with two or more slashes, and a token with a code extens
 conservative: a false positive refuses a write, which decision 12 makes the safe side.
 
 An L2 lesson's own text (its root cause, remedy, rationale and anchors) may not name any of those
-shapes **whatever its audience** (decision 5). The audience and provenance labels are keys: they
-are validated and bounded, never scrubbed, because `recall` and `retire` look a stored key up by the
-same text.
+shapes **whatever its audience** (decision 5). The audience is a key, validated and bounded, never
+scrubbed: `recall` and `retire` look it up by the same text, so a scrub would break the lookup. The
+provenance labels are scrubbed and bounded; nothing looks them up, so they may name a tool or a
+model.
 
 `adam-memory` does **not** depend on `adam-llm-agent`: `adam-llm-agent` will depend on this crate
 (the `si_recall`/`si_record` tools), and a dependency back would be a cycle. The marker is a

@@ -237,8 +237,9 @@ pub struct LessonLimits {
     /// Lessons one audience serves at most. A write that would make the audience serve more than
     /// this is refused, not evicted; a retired lesson does not count, so retirement frees a slot.
     pub lessons_per_audience: usize,
-    /// Bytes one text field (remedy, rationale, anchor) keeps at most, after scrubbing. A
-    /// provenance label is bounded by it too.
+    /// Bytes one text field (remedy, rationale, anchor) keeps at most, after scrubbing; a
+    /// provenance label is bounded by it too, and so is the audience, which is given and never
+    /// scrubbed.
     pub field_bytes: usize,
     /// Characters a root cause keeps at most, after scrubbing.
     pub root_cause_chars: usize,
@@ -298,7 +299,8 @@ impl LessonSettings {
 /// Every lesson text is scrubbed first; a text that still holds [`crate::REDACTION_MARKER`] is
 /// refused. A lesson may not name a repository, a path, a URL, a host or an e-mail address whatever
 /// its audience (ADR 0081 decision 5), so every lesson text goes through the address check too. The
-/// audience and the provenance labels are keys, validated and bounded, never scrubbed.
+/// audience is a key, validated and bounded, never scrubbed; the provenance labels are scrubbed and
+/// bounded.
 pub(crate) fn prepare(
     scope: &MemoryScope,
     draft: LessonDraft,
@@ -306,7 +308,7 @@ pub(crate) fn prepare(
     now: Timestamp,
 ) -> MemoryResult<Lesson> {
     scope.validate()?;
-    key("audience", draft.audience.as_str(), settings)?;
+    let audience = Audience::new(key("audience", draft.audience.as_str(), settings)?);
     if draft.provenance.sources.is_empty() {
         return Err(MemoryError::EmptyField {
             field: "lesson sources",
@@ -341,11 +343,11 @@ pub(crate) fn prepare(
         .provenance
         .sources
         .iter()
-        .map(|source| key("lesson source", source, settings))
+        .map(|source| label("lesson source", source, settings))
         .collect::<MemoryResult<Vec<_>>>()?;
-    let review = key("lesson review", &draft.provenance.review, settings)?;
+    let review = label("lesson review", &draft.provenance.review, settings)?;
     Ok(Lesson {
-        audience: draft.audience,
+        audience,
         root_cause,
         remedy,
         rationale,
@@ -382,14 +384,20 @@ fn text(field: &'static str, raw: &str, settings: &LessonSettings) -> MemoryResu
     bytes(field, clean, settings.limits.field_bytes)
 }
 
-/// A key or provenance label: validated and bounded, never scrubbed. A key must not be scrubbed:
-/// `recall` and `retire` look a stored key up by the same text, so a scrub would make the lookup
-/// miss.
+/// The audience: validated and bounded, never scrubbed. It must not be scrubbed, because `recall`
+/// and `retire` look the stored audience up by the same text; a scrub would make the lookup miss.
 fn key(field: &'static str, raw: &str, settings: &LessonSettings) -> MemoryResult<String> {
     if raw.trim().is_empty() {
         return Err(MemoryError::EmptyField { field });
     }
     bytes(field, raw.to_owned(), settings.limits.field_bytes)
+}
+
+/// A provenance label: scrubbed and bounded, with the marker check, and no address check (a label
+/// may name a tool or a model). Nothing looks a label up, so scrubbing it cannot break a lookup.
+fn label(field: &'static str, raw: &str, settings: &LessonSettings) -> MemoryResult<String> {
+    let clean = scrub_text(field, raw, &settings.scrubber, false)?;
+    bytes(field, clean, settings.limits.field_bytes)
 }
 
 fn bytes(field: &'static str, clean: String, limit: usize) -> MemoryResult<String> {

@@ -208,13 +208,13 @@ pub trait Memory: Send + Sync + 'static {
     /// Record a lesson the reviewer approved, or update the one its audience already holds under
     /// the same root cause.
     ///
-    /// Every lesson text is scrubbed first; the audience and the provenance labels are keys,
-    /// validated and bounded, never scrubbed. A text that still holds [`REDACTION_MARKER`], a text
-    /// over a bound, a text that names a repository, a path, a URL, a host or an e-mail address, or
-    /// a write that would make the audience *serve* more than the limit is refused, and nothing is
-    /// written. A second record for a key the audience holds updates it and keeps its creation
-    /// time, so a retried approval is one lesson; a record for a retired lesson serves it again
-    /// when a free slot remains.
+    /// Every lesson text is scrubbed first; the audience is a key, validated and bounded, never
+    /// scrubbed; the provenance labels are scrubbed and bounded. A text that still holds
+    /// [`REDACTION_MARKER`], a text over a bound, a text that names a repository, a path, a URL, a
+    /// host or an e-mail address, or a write that would make the audience *serve* more than the
+    /// limit is refused, and nothing is written. A second record for a key the audience holds
+    /// updates it and keeps its creation time, so a retried approval is one lesson; a record for a
+    /// retired lesson serves it again when a free slot remains.
     ///
     /// # Errors
     ///
@@ -233,7 +233,7 @@ pub trait Memory: Send + Sync + 'static {
     /// Retire the lesson its audience holds under `root_cause`, and return it as stored.
     ///
     /// `root_cause` is the lesson's stored root cause, as [`record`](Self::record) returned it —
-    /// the scrubbed text. An unscrubbed root cause does not find the lesson, so the adapter
+    /// the scrubbed text. A root cause the scrub changed does not find the lesson, so the adapter
     /// answers [`MemoryError::LessonNotFound`]. Retiring a retired lesson is a no-op that returns
     /// the same record, so a retried step lands once. Nothing is deleted: a retired lesson is kept
     /// (ADR 0081 decision 10).

@@ -106,6 +106,7 @@ with a remedy, a rationale and two sources.
 | `record_then_recall_round_trips` | every field of the lesson, its provenance and its state comes back as written |
 | `a_record_lands_once_for_one_key` | one audience and root cause is one lesson: a retried record is one, an update replaces the text and keeps the creation time, and the freshest update is served first |
 | `recall_answers_only_its_audience` | another audience's lessons are never served |
+| `an_audience_is_not_scrubbed` | the audience is a key: a record and a recall with the same text find the lesson, and an adapter that scrubs the audience misses; a provenance label is stored scrubbed |
 | `two_scopes_never_see_each_other` | two configured scopes on one store never read, overwrite or retire each other's lessons — the decisive case of M2 |
 | `a_text_is_scrubbed_before_the_write` | the stored text no longer holds what the scrubber removed |
 | `a_text_carrying_the_marker_is_refused` | a text the scrub marked, or one that already holds the marker, is refused and stores nothing |
@@ -133,9 +134,10 @@ exactly what it proves:
 The testkit's own tests prove them: `ScopeBlindSiMemory` fails
 `recall_answers_only_its_scope`, `DoubleWritingSiMemory` and `DoubleWritingMemory` fail
 `a_record_lands_once_for_one_key`, and `ScopeBlindMemory` fails
-`two_scopes_never_see_each_other`. The same cases pass against `InProcessSiMemory` and against two
-`InProcessMemory` adapters on one `InProcessLessonStore`. This is M1's and M2a's proof: the suites
-are not ones that any implementation passes.
+`two_scopes_never_see_each_other`. Two L1 and two L2 cases are shown able to fail, not the whole
+suite. The same cases pass against `InProcessSiMemory` and against two `InProcessMemory` adapters on
+one `InProcessLessonStore`. This is M1's and M2a's proof: the suites are not ones that any
+implementation passes.
 
 ## Tests
 

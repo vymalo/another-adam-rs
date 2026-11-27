@@ -14,12 +14,13 @@ pub enum MemoryError {
         /// The field that carried it.
         field: &'static str,
     },
-    /// A text was longer than its byte bound after scrubbing. Nothing was stored.
+    /// A text was longer than its byte bound. Nothing was stored. The length is after scrubbing, or
+    /// as given for a key, which is never scrubbed.
     #[error("{field} is {bytes} bytes, over the bound of {limit}")]
     TooManyBytes {
         /// The field that was too long.
         field: &'static str,
-        /// Its length after scrubbing.
+        /// Its length after scrubbing, or as given for a key.
         bytes: usize,
         /// The bound.
         limit: usize,
