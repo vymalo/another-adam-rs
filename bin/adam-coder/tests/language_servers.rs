@@ -568,7 +568,8 @@ async fn indexing_past_the_wait_gives_a_partial_result_and_the_next_call_finds_t
         .await;
     assert!(!first.is_error, "{}", first.content);
     assert!(
-        first.content.starts_with("[still indexing after 1 s"),
+        first.content.starts_with("[still indexing after ")
+            && first.content.contains("of at most 1 s"),
         "{}",
         first.content
     );
@@ -615,7 +616,8 @@ async fn a_server_that_reports_its_status_is_not_ready_until_it_says_it_is_quies
         .diagnostics(json!({"path": "src/lib.rs", "wait": 1}))
         .await;
     assert!(
-        first.content.starts_with("[still indexing after 1 s"),
+        first.content.starts_with("[still indexing after ")
+            && first.content.contains("of at most 1 s"),
         "{}",
         first.content
     );
