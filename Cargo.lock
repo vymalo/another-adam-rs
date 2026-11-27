@@ -590,6 +590,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "adam-hook-exec"
+version = "0.6.0"
+dependencies = [
+ "adam-core",
+ "adam-error",
+ "adam-llm-agent",
+ "adam-model",
+ "adam-plugin",
+ "adam-runtime",
+ "async-trait",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "adam-host"
 version = "0.6.0"
 dependencies = [
