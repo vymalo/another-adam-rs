@@ -2,7 +2,6 @@
 lcov.info
 __pycache__/
 node_modules/
-# The docs site's build output and the page generated from the OpenAPI document.
+# The docs site's build output.
 docs/.vitepress/dist/
 docs/.vitepress/cache/
-docs/api/a2a-server.md
