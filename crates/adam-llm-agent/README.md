@@ -954,7 +954,8 @@ ctx.emit_event("demo.published", serde_json::json!({"title": "release"}))?;
   data } }` (and without a hook set), which `adam-a2a-runtime` serves as a data part; one declared `Hooks` never leaves the
   process. A recorded name this build no longer declares is delivered to nobody.
 * **Bounds, checked at the emit** (`EmitError`, class `Invalid`; a refused event is not recorded and takes no budget): data
-  is scrubbed with the call's scrubber and then at most 4 KiB serialized, a call emits at most 16, and one **transition**
+  is scrubbed with the call's scrubber (object keys too; two keys that scrub to one form both stay, the later ones
+  suffixed `#2`, `#3`, ... in the map's iteration order) and then at most 4 KiB serialized, a call emits at most 16, and one **transition**
   at most 256 across all its calls (one counter on the loaded `Conversation`, skipped when serialized, shared by early and
   segment calls alike).
 

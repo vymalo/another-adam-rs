@@ -177,10 +177,31 @@ fn scrub_strings(value: &mut Value, scrub: &dyn Fn(&str) -> String) {
         Value::String(text) => *text = scrub(text),
         Value::Array(items) => items.iter_mut().for_each(|v| scrub_strings(v, scrub)),
         Value::Object(map) => {
-            let entries = std::mem::take(map);
+            let entries: Vec<(String, Value)> = std::mem::take(map).into_iter().collect();
+            // Every scrubbed form is reserved first, so a suffixed name can never equal the scrubbed
+            // form of a key that comes later.
+            let mut taken: std::collections::HashSet<String> =
+                entries.iter().map(|(key, _)| scrub(key)).collect();
             for (key, mut item) in entries {
                 scrub_strings(&mut item, scrub);
-                map.insert(scrub(&key), item);
+                let scrubbed = scrub(&key);
+                // Two keys that scrub to one form keep both: the first in the map's iteration order
+                // (insertion order with serde_json's `preserve_order`, which the workspace enables
+                // through feature unification; sorted order without it) keeps the name, each later one
+                // gets `#2`, `#3`, ... The order is the input's, so the result is deterministic.
+                let name = if map.contains_key(&scrubbed) {
+                    let mut n = 2_usize;
+                    loop {
+                        let candidate = format!("{scrubbed}#{n}");
+                        if taken.insert(candidate.clone()) {
+                            break candidate;
+                        }
+                        n += 1;
+                    }
+                } else {
+                    scrubbed
+                };
+                map.insert(name, item);
             }
         }
         _ => {}
@@ -268,6 +289,40 @@ mod tests {
 
     fn keep(s: &str) -> String {
         s.to_owned()
+    }
+
+    #[test]
+    fn keys_that_scrub_to_one_form_all_survive() {
+        let scope = scope(&["demo.a"], &Arc::default());
+        let scrub = |s: &str| s.replace("sk-one", "[x]").replace("sk-two", "[x]");
+        // Two secret-bearing keys scrub to `[x]`, and a plain key is already named `[x]#2`.
+        let data = json!({"sk-one": 1, "sk-two": 2, "[x]#2": 3});
+        scope.emit("demo.a", data, &scrub).unwrap();
+        let got = scope.emitted()[0].data.clone();
+        let text = got.to_string();
+        assert!(
+            !text.contains("sk-one") && !text.contains("sk-two"),
+            "{text}"
+        );
+        let obj = got.as_object().unwrap();
+        assert_eq!(obj.len(), 3, "{text}");
+        let mut values: Vec<i64> = obj.values().map(|v| v.as_i64().unwrap()).collect();
+        values.sort_unstable();
+        assert_eq!(values, [1, 2, 3]);
+        assert_eq!(obj["[x]#2"], json!(3), "an existing key keeps its name");
+        // The same input gives the same output.
+        let again = EventScope::new(
+            Arc::new([("demo.a".to_owned(), EventSpec::new("demo.a"))].into()),
+            Arc::default(),
+        );
+        again
+            .emit(
+                "demo.a",
+                json!({"sk-one": 1, "sk-two": 2, "[x]#2": 3}),
+                &scrub,
+            )
+            .unwrap();
+        assert_eq!(again.emitted()[0].data, got);
     }
 
     #[test]
