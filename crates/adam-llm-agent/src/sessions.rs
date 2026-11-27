@@ -220,7 +220,7 @@ impl SessionTools {
 
 /// The options of `config` as the model writes them (snake_case, like the other arguments), and
 /// the camelCase the wire and the header use for the same names.
-const CONFIG_OPTIONS: [(&str, &str); 7] = [
+const CONFIG_OPTIONS: [(&str, &str); 8] = [
     ("max_turns", "maxTurns"),
     ("max_tool_calls", "maxToolCalls"),
     ("max_output_tokens", "maxOutputTokens"),
@@ -228,6 +228,7 @@ const CONFIG_OPTIONS: [(&str, &str); 7] = [
     ("max_parallel_tool_calls", "maxParallelToolCalls"),
     ("time_limit", "timeLimit"),
     ("max_rounds", "maxRounds"),
+    ("report_schema", "reportSchema"),
 ];
 
 /// A session's config as a list and a read say it: `max_turns 20, time_limit 10`, the options that
@@ -238,9 +239,12 @@ fn config_words(config: &SessionConfig) -> Option<String> {
     let parts: Vec<String> = CONFIG_OPTIONS
         .iter()
         .filter_map(|(own, wire)| {
-            set.get(*wire)
-                .and_then(Value::as_u64)
-                .map(|n| format!("{own} {n}"))
+            let value = set.get(*wire)?;
+            // The schema is not a number and not worth the line: say it is set.
+            if *own == "report_schema" {
+                return Some("report_schema set".to_owned());
+            }
+            value.as_u64().map(|n| format!("{own} {n}"))
         })
         .collect();
     (!parts.is_empty()).then(|| parts.join(", "))
@@ -248,12 +252,13 @@ fn config_words(config: &SessionConfig) -> Option<String> {
 
 /// The options a remote subagent refuses: every one but `time_limit` and `max_rounds` (ADR 0054
 /// decision 4).
-const REMOTE_REFUSED: [&str; 5] = [
+const REMOTE_REFUSED: [&str; 6] = [
     "max_turns",
     "max_tool_calls",
     "max_output_tokens",
     "context_window",
     "max_parallel_tool_calls",
+    "report_schema",
 ];
 
 /// The [`SessionConfig`] a `subagent_start` call asked for, or the sentence that says what is wrong
@@ -272,6 +277,18 @@ fn config_of(value: &Value) -> Result<SessionConfig, String> {
                 options.join(", ")
             ));
         };
+        // The report schema is a JSON Schema, an object: `admit` holds it to the rest (its size, its
+        // references, that it compiles).
+        if *name == "reportSchema" {
+            if !value.is_null() && !value.is_object() {
+                return Err("config.report_schema must be a JSON Schema, an object".to_owned());
+            }
+            if value.is_null() {
+                continue;
+            }
+            wire.insert((*name).to_owned(), value.clone());
+            continue;
+        }
         // Every option is a whole number of 32 bits. Say so by name here, so the refusal is ours:
         // serde's names no option and echoes what the model wrote, without a bound. A `0` passes
         // to `admit`, which refuses it with the words of each option.
@@ -456,6 +473,90 @@ pub(crate) fn is_due(session: &SessionSummary, facts: &DueFacts) -> bool {
         && !facts.in_history.contains(&report_call_id(round.run))
         && (round.started_by == Some(facts.me)
             || (round.started_outside_a_run() && facts.since.is_none_or(|t| round.updated_at >= t)))
+}
+
+/// The corrective turns a round's final answer is given when it does not match the session's
+/// `report_schema` ([ADR 0054], slice 9): each is a model turn, counted in `max_turns`. After them
+/// the round fails with [`REPORT_MISMATCH`].
+///
+/// [ADR 0054]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md
+pub const MAX_REPORT_CORRECTIONS: u32 = 2;
+
+/// Why a round fails when its final answer still does not match its `report_schema` after
+/// [`MAX_REPORT_CORRECTIONS`] corrective turns (the problems follow it, after a colon).
+pub const REPORT_MISMATCH: &str = "report does not match report_schema";
+
+/// The problems a corrective turn tells the model.
+const REPORT_PROBLEMS_SHOWN: usize = 3;
+
+/// The most characters of one problem: a problem echoes the value it is about.
+const REPORT_PROBLEM_CHARS: usize = 300;
+
+/// What a final answer is against the `report_schema` of its session.
+pub(crate) enum ReportVerdict {
+    /// One JSON value that matches.
+    Matches,
+    /// Not one JSON value, or one that does not match: the first problems, in words.
+    Mismatch(Vec<String>),
+    /// The schema itself does not compile. Admission refuses such a schema, so this is a header
+    /// that was not admitted; no answer could match it.
+    Unusable(String),
+}
+
+/// `answer` against `schema` (draft 2020-12, nothing fetched): the answer is parsed as one JSON value
+/// first, and at most [`REPORT_PROBLEMS_SHOWN`] problems are returned, each with its place.
+pub(crate) fn check_report(schema: &Value, answer: &str) -> ReportVerdict {
+    let validator = match jsonschema::draft202012::options().offline().build(schema) {
+        Ok(validator) => validator,
+        Err(why) => return ReportVerdict::Unusable(why.to_string()),
+    };
+    let instance: Value = match serde_json::from_str(answer.trim()) {
+        Ok(instance) => instance,
+        Err(why) => {
+            return ReportVerdict::Mismatch(vec![format!(
+                "the answer is not one JSON value ({why})"
+            )]);
+        }
+    };
+    let problems: Vec<String> = validator
+        .iter_errors(&instance)
+        .take(REPORT_PROBLEMS_SHOWN)
+        .map(|e| {
+            let at = e.instance_path().to_string();
+            let problem: String = e.to_string().chars().take(REPORT_PROBLEM_CHARS).collect();
+            if at.is_empty() {
+                problem
+            } else {
+                format!("{problem} (at {at})")
+            }
+        })
+        .collect();
+    if problems.is_empty() {
+        ReportVerdict::Matches
+    } else {
+        ReportVerdict::Mismatch(problems)
+    }
+}
+
+/// The corrective turn: the problems, and what to do. The schema is told with the first one only,
+/// since the round does not otherwise see its configuration.
+pub(crate) fn report_correction(problems: &[String], schema: Option<&Value>) -> String {
+    let listed: Vec<String> = problems
+        .iter()
+        .enumerate()
+        .map(|(i, p)| format!("{}. {p}", i + 1))
+        .collect();
+    let mut text = format!(
+        "[Your answer is not a report yet: it does not match the report schema of this session. \
+         Problems: {}. Answer again with one JSON value that matches the schema, and nothing \
+         else: no words around it and no code fence.",
+        listed.join("; ")
+    );
+    if let Some(schema) = schema {
+        text = format!("{text} The schema: {schema}");
+    }
+    text.push(']');
+    text
 }
 
 fn header_json(header: &SessionHeader) -> Value {
@@ -644,6 +745,15 @@ impl Tool for Start {
                                 "description": "Minutes one round may take.",
                             },
                             "max_rounds": { "type": "integer", "minimum": 1 },
+                            "report_schema": {
+                                "type": "object",
+                                "description": "A JSON Schema (draft 2020-12, at most 16 KiB, \
+                                                with no reference outside itself) that the \
+                                                subagent's final answer must match: one JSON \
+                                                value. The subagent is not shown it unless a \
+                                                first answer fails it: describe the shape in \
+                                                `prompt` too. Not for a remote subagent.",
+                            },
                         },
                         "additionalProperties": false,
                     },

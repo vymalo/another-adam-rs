@@ -3643,6 +3643,116 @@ mod cases {
         );
     }
 
+    /// A `report_schema` is held to ADR 0054 decision 4 at the start: an outside `$ref`, one over
+    /// 16 KiB, a schema that does not compile and a value that is no object are each refused naming
+    /// the option, and nothing runs; a good one is recorded in the header, shown by a read, and
+    /// the round's report is the answer that matches it.
+    pub async fn a_report_schema_is_refused_at_start_when_it_cannot_be_enforced_and_recorded_when_it_can(
+        store: DynStore,
+    ) {
+        let rig = Rig::new();
+        rig.child_mock.push_text(r#""round one says 1""#);
+        let (parent_agent, child_agent) = (rig.parent(), rig.child());
+        let rt = rig.together(&store, &parent_agent, &child_agent);
+        let conv = conv_id();
+        let parent = rig.start(&rt, &conv).await;
+        let start = |id: &str, schema: Value| {
+            call(
+                id,
+                "subagent_start",
+                json!({"agent": "helper", "description": "look at it", "prompt": "do the work",
+                       "keep_open": true, "config": {"report_schema": schema}}),
+            )
+        };
+        let session = child_run_id(parent, "ok");
+        rig.parent_mock
+            .push_tool_calls(vec![start(
+                "outside",
+                json!({"properties": {"a": {"$ref": "https://example.com/a.json"}}}),
+            )])
+            .push_tool_calls(vec![start(
+                "big",
+                json!({"description": "x".repeat(17 * 1024)}),
+            )])
+            .push_tool_calls(vec![start("broken", json!({"type": "no-such-type"}))])
+            .push_tool_calls(vec![start("scalar", json!("a string"))])
+            .push_tool_calls(vec![start("ok", json!({"type": "string"}))])
+            .push_tool_calls(vec![read_call("r", session, true)])
+            .push_text("done");
+        let worker = spawn_worker(&rt);
+        wait_done(&rt, parent).await;
+        let view = session_until(&rt, &conv, session, |v| v.state == SessionState::Idle).await;
+        worker.stop().await;
+
+        let results = tool_results(&state_of(&rt, parent).await);
+        for (id, words) in [
+            ("outside", "refer only to itself"),
+            ("big", "at most 16384 (16 KiB)"),
+            ("broken", "draft 2020-12 that compiles"),
+            (
+                "scalar",
+                "config.report_schema must be a JSON Schema, an object",
+            ),
+        ] {
+            let (_, text, is_error) = result_of(&results, id);
+            assert!(
+                *is_error && text.contains("config.report_schema") && text.contains(words),
+                "{id}: {text}"
+            );
+        }
+        assert_eq!(
+            rig.child_mock.requests().len(),
+            1,
+            "only the admitted start ran a round"
+        );
+        let config = view.header.expect("a header").config.expect("a config");
+        assert_eq!(config.report_schema, Some(json!({"type": "string"})));
+        let (_, read, is_error) = result_of(&results, "r");
+        assert!(!*is_error, "{read}");
+        assert!(read.contains("config: report_schema set"), "{read}");
+        assert!(read.contains("report: done"), "{read}");
+        assert!(read.contains("round one says 1"), "{read}");
+    }
+
+    /// A remote subagent refuses a `report_schema` by name: its loop is another system's, and
+    /// nothing would check the answer.
+    pub async fn a_remote_subagent_refuses_a_report_schema(store: DynStore) {
+        let rig = Rig::new();
+        let far_mock = Arc::new(MockModel::new());
+        far_mock.push_text("the far answer");
+        let far_model: DynModel = far_mock.clone();
+        let far = LlmAgent::builder("far", far_model, "m").build();
+        let (parent_agent, child_agent) = (rig.parent(), rig.child());
+        let rt = rig
+            .builder(&store, "w")
+            .agent(parent_agent.clone())
+            .agent(child_agent)
+            .agent(far)
+            .build();
+        let conv = conv_id();
+        let parent = rig.start(&rt, &conv).await;
+        rig.parent_mock
+            .push_tool_calls(vec![call(
+                "schema",
+                "subagent_start",
+                json!({"agent": "far", "description": "d", "prompt": "p",
+                       "config": {"report_schema": {"type": "string"}}}),
+            )])
+            .push_text("done");
+        let worker = spawn_worker(&rt);
+        wait_done(&rt, parent).await;
+        worker.stop().await;
+        let results = tool_results(&state_of(&rt, parent).await);
+        let (_, text, is_error) = result_of(&results, "schema");
+        assert!(
+            *is_error
+                && text.contains("config.report_schema is not an option of a remote subagent"),
+            "{text}"
+        );
+        let listed = rt.list_sessions(&conv, &["far"], 0, 10).await.unwrap();
+        assert!(listed.sessions.is_empty(), "nothing was started");
+    }
+
     /// A value of the wrong type is refused naming its option and never echoing what was written.
     pub async fn a_config_value_of_the_wrong_type_is_refused_naming_the_option(store: DynStore) {
         let rig = Rig::new();
@@ -5566,6 +5676,8 @@ macro_rules! session_suite {
                 a_start_config_beyond_the_bounds_is_refused_and_one_within_is_recorded,
                 list_and_read_show_the_sessions_config_and_nothing_without_one,
                 a_remote_subagent_refuses_every_option_but_time_limit_and_max_rounds,
+                a_report_schema_is_refused_at_start_when_it_cannot_be_enforced_and_recorded_when_it_can,
+                a_remote_subagent_refuses_a_report_schema,
                 a_config_value_of_the_wrong_type_is_refused_naming_the_option,
                 round_two_carries_the_config_clamped_to_the_bounds_of_now,
                 a_sessions_time_limit_is_the_deadline_of_its_round,
