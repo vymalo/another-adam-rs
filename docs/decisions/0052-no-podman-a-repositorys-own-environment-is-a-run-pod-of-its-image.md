@@ -18,6 +18,23 @@ says: Postgres leaves the bench and each slot gets a store service with SQLite u
 and memory limits; the configuration fingerprint gains a runtime marker; gradings share one `verifier` network. B1 is cut in two
 there: 6a (this record's B1, the bench's Postgres kept) and 6b (the store service and the static coder's pin).
 
+*Amended 2026-11-27: what is built.* The status line's "Nothing is built" is the record as accepted on 2026-11-19. Checked
+against the tree on 2026-11-27, slices B1, 1, 2 and 3 of this repository are built:
+
+* **B1**: the bench runs its containers on the host's runtime (`HostContainers` in `bench/lib/containers.mjs`), and
+  `git grep -i podman bench` is empty. The dry run, the stack and the coder probe ran on the host's Docker on 2026-11-19
+  (`bench/README.md`); nothing that needs a real model has.
+* **1**: the reader of `devcontainer.json` (`crates/adam-workspace/src/devcontainer.rs`), the port's image method,
+  `use_repository_environment` (`bin/adam-coder/src/tools/environment.rs`) and the chart's `runPods.repositoryImages`, with
+  a repository image in the `run-pods` kind job (`deploy/coder/tests/kind-run-pods.sh`). **Not built in it**: the
+  configuration's lifecycle commands, `containerEnv` and `remoteEnv` (listed as ignored in the tool's result), the report
+  of the digest the node pulled, and decision 5's file-changed reset.
+* **2**: `dev/podman/` and `dev/compose.devcontainer.yaml` are gone, and `git grep -i podman dev .github` is empty.
+* **3**: `adam-devcontainer` is deleted, the `DEVCONTAINER_*` variables are ignored and `DEVCONTAINER_RUNTIME=podman` is
+  exit 78 (`bin/adam-coder/README.md`).
+
+Slices 4, 5 and 6 belong to the system, the platform and the images repositories and are not checked here.
+
 ## Context
 
 A run's commands (`run_command`, `run`, `start_command`, `run_checks`) go through the `Environment` port of `adam-workspace`
