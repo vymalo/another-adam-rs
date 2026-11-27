@@ -1,7 +1,7 @@
 # adam-plugin
 
 The vocabulary of the hooks around the agent loop ([ADR 0050](../../docs/decisions/0050-hooks-around-the-agent-loop-compiled-first-and-programs-second.md),
-slices **H1** and **H1b**): a compiled plugin may allow, rewrite or refuse a person's message before
+slices **H1**, **H1b** and **H5**): a compiled plugin may allow, rewrite or refuse a person's message before
 it reaches a model, rewrite a tool call before it runs, refuse it, ask a person, stop the run, or
 rewrite what the tool answered.
 
@@ -26,6 +26,9 @@ neither the loop nor the runtime.
 | `HookSet` | the ordered plugins and their limits; `message_received`, `before_tool` and `after_tool` run them, `catch_unwind` each call, and stop at the first decision |
 | `HookedCall`, `HookedText` | what a hook sees: the tool's name and its arguments (rewritable), and the text the model will read (rewritable) |
 | `HookedModelRequest`, `ModelCallKind`, `HookedCompaction` | what a `model.request` hook sees (the call's kind, temperature, output bound and metadata) and what a `compaction.before` hook sees (the `context` it may add to the summary request). `HookedModelRequest` gained the public field `kind` (2026-11-26), so a hand-built literal needs it |
+| `EventSpec`, `Visibility` (H5) | a custom event as it is declared: `EventSpec::new("demo.published")` is version 1, any data, `Visibility::Hooks`; `.published()` makes it `Visibility::Clients` (it also goes out as a `RunEvent::Custom`), `.with_version(n)`, `.with_schema(json)`. The name is `^[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*){1,4}$` and its first segment, the namespace, is not one of `RESERVED_NAMESPACES` (`run`, `message`, `turn`, `model`, `tool`, `permission`, `question`, `approval`, `compaction`, `child`, `session`, `usage`, `artifact`, `exec`, `hook`, `adam`; compared without regard to case). `EventSpec::validate`, `check_event_name`, `declared` (every declaration valid, two of a name equal) and `DeclarationError` (class `Invalid`) are the checks the agent's build runs. `DATA_MAX` (4 KiB), `STEP_EVENTS_MAX` (16) and `TRANSITION_EVENTS_MAX` (256) are the bounds `adam-llm-agent` holds an emit to |
+| `Subscriptions` (H5) | what `Plugin::subscriptions` says an observer wants: `core()` (the default: every core event and no custom one, which is what an observer received before custom events), `none()`, `all()` (`*`), `of(["demo.*", "tool.completed"])` (an exact name, `ns.*` or `*`; no core event unless a pattern matches it) and `.with(pattern)`. `Subscriptions::check` and `HookSet::check_events` refuse a **dead** pattern at build: a namespace that is neither core nor declared, or an exact core name that is not in the catalogue. A subscription to a core name is legal, a declaration there is not. `Plugin::events` declares custom events for the namespaces and the conflict check |
+| `HookEvent::custom`, `EventKind::Custom` (H5) | a custom event as an observer reads it: `kind` is `Custom`, `HookEvent::name()` the declared name, the fields `version` and `data` (scrubbed, held to the JSON bound). `EventKind::ALL` lists the core catalogue |
 | `HookedMessage`, `MessageFile` | what a `message.received` hook sees: the text (rewritable) and the files **by reference** (name, media type, size, the SHA-256 the image step records), never their bytes |
 
 ## The rules
@@ -45,5 +48,7 @@ denies, a transient failure is retried once then continues, one that keeps faili
 its deadline is retryable, `after_tool` runs its plugins, and `message_received` runs its plugins and a
 refusal decides. The panic case was **seen red** with `catch_unwind` removed (the panic escaped into
 the test).
+
+`events_conformance!` (`adam-plugin-testkit`, slice H5) runs against the same factory: what the set's plugins declare is valid and agrees with itself, every subscription can match something, and an observer is offered a custom event only when its subscriptions name it. `src/custom.rs` has the unit tests of the name rule (the core namespaces, the case of the first segment, a core word deeper in the name), the patterns, the default and the dead subscription. **Seen red:** with the reserved-namespace check removed, `a_core_namespace_is_refused_on_the_first_segment_without_regard_to_case` and `a_subscription_to_a_core_event_is_legal_though_a_declaration_there_is_not` fail.
 
 `Audit<W: Write + Send>` (ADR 0050, slice H6b): a plugin that writes each observed event as one JSON line (the event the loop built, already bounded and scrubbed) to `W`, once per event key, so a replay adds nothing. Off unless a deployment registers it and an agent file names it in `plugins:` (H6a); a failing writer is a counted observer failure. Tests: `tests/audit.rs` (golden `tests/golden/audit_lines.json`, written with `UPDATE_GOLDEN=1`).

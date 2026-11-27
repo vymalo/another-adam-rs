@@ -11,3 +11,8 @@ adam_plugin_testkit::plugin_conformance!(|| HookSet::new().with_limits(HookLimit
     deadline: Duration::from_millis(20),
     retries: 1,
 }));
+
+adam_plugin_testkit::events_conformance!(|| HookSet::new().with_limits(HookLimits {
+    deadline: Duration::from_millis(20),
+    retries: 1,
+}));

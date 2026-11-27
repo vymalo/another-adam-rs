@@ -568,6 +568,12 @@ pub struct Conversation {
     /// it existed, and not written while empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub removed_tools: Vec<String>,
+    /// How many custom events this transition's calls have emitted (ADR 0050, decision 6): one
+    /// counter for all of them. Not part of the record: it is skipped when serialized, new on every
+    /// load, and ignored by `==`.
+    #[serde(skip)]
+    #[doc(hidden)]
+    pub event_budget: crate::events::TransitionBudget,
     /// The loaded tools the last request carried, so a load records a growth once: the first
     /// request that carries its tools, not every request after. Not carried by a continuation
     /// (its first request has no request before it). Absent from state written before it existed,
