@@ -93,7 +93,12 @@ use uuid::Uuid;
 ///   ([`MIN_SERVER_VERSION_NUM`]). A start on a current schema runs no DDL, so a slice that adds,
 ///   changes or drops a function bumps this version again (8, 9, …); a function whose contract
 ///   changes gets a new name.
-pub const SCHEMA_VERSION: i32 = 7;
+/// * 8: the served document is a column of the runs table, `served`, a **virtual** generated
+///   column (ADR 0082, decision 12, slice P1): the head when it is a JSON object and either
+///   current (`head_version = version`) or the state is the `null` tombstone, else the state. It
+///   is computed when it is read, so adding it rewrites and stores nothing, and every read selects
+///   it instead of repeating the expression. No function yet.
+pub const SCHEMA_VERSION: i32 = 8;
 
 /// The oldest server [`Store::migrate`] accepts, as PostgreSQL's `server_version_num`: 18.0, the
 /// floor of [ADR 0082](../../docs/decisions/0082-the-sql-adapters-keep-their-rules-in-the-database.md)
@@ -136,29 +141,50 @@ pub const MAX_POOL_SIZE: u32 = 65_535;
 
 const PUSH_COLUMNS: &str = "run_id, id, agent, owner, config, cursor, state, attempts, last_error, next_attempt_at, version, created_at, updated_at";
 
-/// The record a **reader** sees in the contract release (ADR 0055): the current head when the store
-/// has one (`head_version = version`), the whole state otherwise (a v4 run, or a head a later commit
-/// did not rebuild). No read here touches a body row; `Runtime::state` joins the head with the
-/// generation it names.
+/// The record a **reader** sees in the contract release (ADR 0055): the `served` column, the
+/// current head when the store has one (`head_version = version`), the whole state otherwise (a v4
+/// run, or a head a later commit did not rebuild). No read here touches a body row;
+/// `Runtime::state` joins the head with the generation it names.
 ///
-/// A **tombstoned** run whose head is behind the version (a pre-S3 process failed a converted run
-/// with `state = null`, no head and the version bumped) serves the head: it is the only readable
-/// document, and serving it is the one-line repair. `jsonb_typeof(head) = 'object'` is the test for
-/// "a head": a JSONB `null` is not one.
+/// The rule is the column's expression ([`SERVED_EXPRESSION`]), written once beside the data
+/// (ADR 0082, decision 12), so every read, inline or in a later function, serves the same
+/// document. [`run_from_row`] decodes it into the record's `state`; no read selects the stored
+/// `state` column itself.
 ///
 /// `prefix` is the table alias a statement needs (`""` for a plain `SELECT`, `"r."` for the
 /// `UPDATE ... FROM` of a claim).
 fn served_columns(prefix: &str) -> String {
     let p = prefix;
     format!(
-        "{p}id, {p}agent, {p}conversation_id, {p}parent_id, {p}status, \
-         CASE WHEN jsonb_typeof({p}head) = 'object' \
-                   AND ({p}head_version = {p}version OR {p}state = 'null'::jsonb) \
-              THEN {p}head ELSE {p}state \
-         END AS state, \
+        "{p}id, {p}agent, {p}conversation_id, {p}parent_id, {p}status, {p}served, \
          {p}wake_at, {p}version, {p}created_at, {p}updated_at"
     )
 }
+
+/// The expression of the `served` column (schema version 8).
+///
+/// A **tombstoned** run whose head is behind the version (a pre-S3 process failed a converted run
+/// with `state = null`, no head and the version bumped) serves the head: it is the only readable
+/// document, and serving it is the one-line repair. `jsonb_typeof(head) = 'object'` is the test for
+/// "a head": a JSONB `null` is not one. A `NULL` `head_version` leaves the condition unknown, so a
+/// run with no head serves its state.
+///
+/// A virtual generated column may use only built-in, immutable functions and operators: the
+/// server refuses the `ALTER TABLE` otherwise, so a migration that succeeds is the proof that
+/// `jsonb_typeof` and these `=` operators qualify. The column depends on `head`, `head_version`,
+/// `version` and `state`: a migration that alters one of them drops and recreates the column in
+/// the same transaction.
+///
+/// **A change to this expression is not applied by editing it.** The column is added with
+/// `ADD COLUMN IF NOT EXISTS`, which leaves an existing column as it is, so a database at
+/// version 8 would keep the old expression. A change bumps [`SCHEMA_VERSION`] and adds
+/// `ALTER TABLE <prefix>runs ALTER COLUMN served SET EXPRESSION AS (..)` to the migration; on a
+/// virtual column that rewrites no row (*verified 2026-11-27* on 18.7: the table's file node is
+/// unchanged and the new expression is served). `tests/migrate.rs` holds the stored expression
+/// (`pg_get_expr`) equal to this one after an upgrade.
+const SERVED_EXPRESSION: &str = "CASE WHEN jsonb_typeof(head) = 'object' \
+                                       AND (head_version = version OR state = 'null'::jsonb) \
+                                  THEN head ELSE state END";
 
 /// What `create_run` and `commit_run` return: the record's metadata without `state`. The caller
 /// wrote the state, and a `RETURNING` that echoed it would parse the largest column back on every
@@ -851,6 +877,18 @@ impl Sql {
         .collect();
         migrate.extend(migrate_blobs.iter().cloned());
         migrate.extend(migrate_body.iter().cloned());
+        // Schema version 8 (ADR 0082, decision 12, slice P1): the served document as a virtual
+        // generated column, after the head columns it reads. A catalog change only: a virtual
+        // column is computed when it is read, so `ADD COLUMN` rewrites no row; it holds
+        // `ACCESS EXCLUSIVE` on `runs` until the migration commits, as the other `ADD COLUMN`s of
+        // this list do. A fresh database gets it here too, so a fresh and an upgraded table end
+        // with the same columns in the same order. `IF NOT EXISTS` keeps a re-run a no-op, and so
+        // never changes the expression of an existing column: a change to `SERVED_EXPRESSION` is
+        // a version bump with `ALTER COLUMN served SET EXPRESSION AS (..)` (see its doc).
+        migrate.push(Arc::from(format!(
+            "ALTER TABLE {runs} ADD COLUMN IF NOT EXISTS served JSONB
+                 GENERATED ALWAYS AS ({SERVED_EXPRESSION}) VIRTUAL"
+        )));
         // Schema version 7 and later (ADR 0082, decision 10): the store's functions, after every
         // table they name and before the version row, in the migration transaction. Rules:
         // * each is one statement, sent whole by `batch_execute` (one simple-protocol message), so
@@ -864,7 +902,7 @@ impl Sql {
         //   release later; a column a SQL-standard body reads is altered only by dropping and
         //   recreating the function in the same transaction;
         // * `tests/functions.rs` lists every function and calls it on a fresh database.
-        // Slice P0 creates none.
+        // Slices P0 and P1 create none (P1 adds the `served` column, above).
         let migrate_functions: Vec<Arc<str>> = Vec::new();
         migrate.extend(migrate_functions);
         // Record the version, and raise it from an older one. Never lower it: a process
@@ -1312,9 +1350,10 @@ fn corrupt_source(err: tokio_postgres::Error) -> StoreError {
     }
 }
 
+/// A row of [`served_columns`]: the record with the document a reader is served as its `state`.
 fn run_from_row(row: &Row) -> StoreResult<RunRecord> {
     let mut run = run_metadata_from_row(row)?;
-    run.state = decode(row, "state")?;
+    run.state = decode(row, "served")?;
     Ok(run)
 }
 
@@ -2517,24 +2556,24 @@ mod tests {
     /// fixture: a start on a current schema runs no DDL, so such a change would never reach a
     /// database (ADR 0082, decision 10).
     #[test]
-    fn the_statements_equal_the_version_7_fixture() {
-        assert_eq!(SCHEMA_VERSION, 7, "a new version gets a fixture of its own");
+    fn the_statements_equal_the_version_8_fixture() {
+        assert_eq!(SCHEMA_VERSION, 8, "a new version gets a fixture of its own");
         let sql = Sql::new("adam_");
         assert!(
             sql.migrate.len() > 4,
             "the fixture must hold the whole migration"
         );
         let mut generated = String::from(
-            "-- The schema version 7 that adam-store-postgres emits.\n\
-             -- Regenerate with ADAM_WRITE_FIXTURE=1 cargo test -p adam-store-postgres --lib the_statements_equal_the_version_7_fixture\n",
+            "-- The schema version 8 that adam-store-postgres emits.\n\
+             -- Regenerate with ADAM_WRITE_FIXTURE=1 cargo test -p adam-store-postgres --lib the_statements_equal_the_version_8_fixture\n",
         );
         generated.push_str(&sql.migrate.join(";\n\n"));
         generated.push_str(";\n");
-        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/schema-v7.sql");
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/schema-v8.sql");
         if std::env::var_os("ADAM_WRITE_FIXTURE").is_some() {
             std::fs::write(path, &generated).expect("write the fixture");
         }
-        let fixture = include_str!("../tests/fixtures/schema-v7.sql");
+        let fixture = include_str!("../tests/fixtures/schema-v8.sql");
         assert_eq!(
             normalise(&(sql.migrate.join("; ") + ";")),
             normalise(fixture)

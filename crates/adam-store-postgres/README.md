@@ -25,17 +25,18 @@ time (for example [`adam-coder`](../../bin/adam-coder/README.md)).
 * `PgStore::from_pool(pool)`: reuse your application's `deadpool_postgres::Pool`.
 * `PgStore::with_table_prefix(prefix)`: table-name prefix (default `adam_`,
   only `[a-z0-9_]`, at most 40 characters).
-* `PgStore::pool()`, `SCHEMA_VERSION` (7), `MIN_SERVER_VERSION_NUM` (`180000`: `migrate()` refuses an older server).
+* `PgStore::pool()`, `SCHEMA_VERSION` (8), `MIN_SERVER_VERSION_NUM` (`180000`: `migrate()` refuses an older server).
 * `create_run` and `commit_run` return the record with `state` set to `null`: the caller supplied the
   state, and the state is the largest column, so a `RETURNING` that echoed it would parse it back on
   every transition. `load_run`, `load_head`, the claim, `open_run_for_conversation` and the listings
-  answer the **contract document**: the head when `head_version == version`, the whole `state`
+  answer the **contract document**, the virtual column `served`: the head when it is a JSON object
+  and either `head_version == version` or the state is the JSON `null` tombstone, the whole `state`
   otherwise (ADR 0055, the contract release). `journal_put` returns the stored payload (the loop
   decodes the step's outcome from it).
 * `run_header` is one statement over the primary key that selects the header columns and
   `lease_until`, never `state`: a reader that only needs the run's own bookkeeping (a cancel watch,
   a parent check) does not pay for the largest column.
-* `load_head` is the same one-statement read as `load_run` (the `CASE`), never a body row
+* `load_head` is the same one-statement read as `load_run` (the `served` column), never a body row
   (`Runtime::view` is one `lease_until` + one `load_head`). `body_list` reads one
   generation in order; `gc_body` collects superseded generations older than its cutoff. **A `Store`
   wrapper must forward `load_head`** (as it must forward `keeps_bodies`, `body_list` and
@@ -168,8 +169,8 @@ database stamped 5 already has the blob tables but no head or body) and is metad
 nullable columns and one table.
 
 The contract release reads the same document from `load_run`, `load_head`, `claim_due`,
-`open_run_for_conversation` and `list_runs` (the `CASE` in `served_columns`): the head when it is
-current, the whole state otherwise. `commit_run` with a head, a body or blob references is **one transaction**: the run row is locked
+`open_run_for_conversation` and `list_runs` (since schema version 8 the `served` column, before it a
+`CASE` each read repeated): the head when it is current, the whole state otherwise. `commit_run` with a head, a body or blob references is **one transaction**: the run row is locked
 `FOR UPDATE`, the version is checked, the rows after the head's `len` are inserted
 (`INSERT .. SELECT unnest(..) ON CONFLICT DO NOTHING`), the slots another writer owns are read
 (an identical message is adopted; one older than the 5-minute orphan grace is collected and the
@@ -200,6 +201,35 @@ the floor, and **creates no function yet**:
 * **The refusals.** A function refuses with one of adam's own SQLSTATEs, `AD001` to `AD004`; their
   classes are the table in [`adam-postgres`](../adam-postgres/README.md#adams-own-sqlstates), and the
   store builds the `StoreError` of each (below, *Errors*). No function raises one yet.
+
+## Schema version 8: the served document is a column
+
+Slice P1 of ADR 0082 (decision 12) writes the rule of which document a read serves **once, beside
+the data**: `<prefix>runs.served` is a virtual generated column,
+
+```sql
+served JSONB GENERATED ALWAYS AS (
+  CASE WHEN jsonb_typeof(head) = 'object'
+            AND (head_version = version OR state = 'null'::jsonb)
+       THEN head ELSE state END) VIRTUAL
+```
+
+and `load_run`, `load_head`, the claim, `open_run_for_conversation` and `list_runs` select it,
+inline, as plain statements. It is computed when it is read: it stores nothing, cannot be written,
+and adding it rewrites no row (a version 7 database keeps its table file; `tests/migrate.rs` checks
+the file node). It is one `ALTER TABLE .. ADD COLUMN IF NOT EXISTS` at the end of the table
+statements, for a fresh and an upgraded database alike, so both end with the same columns. A
+process of the previous release never names the column, so a mixed fleet reads and writes as
+before; this release needs it, so it reads only after `migrate()` (as every release that adds a
+column). The column depends on `head`, `head_version`, `version` and `state`: a later migration
+that alters one of them drops and recreates it in the same transaction. P1 creates no function.
+
+**Changing the expression later.** `ADD COLUMN IF NOT EXISTS` never touches an existing column, so
+editing the expression in the code would leave every version 8 database on the old one. A change
+bumps `SCHEMA_VERSION` and adds `ALTER TABLE <prefix>runs ALTER COLUMN served SET EXPRESSION AS (..)`
+to the migration; on a virtual column that rewrites no row (*verified 2026-11-27* on 18.7: the file
+node is unchanged and the new expression is served). `tests/migrate.rs` checks that the stored
+expression (`pg_get_expr`) is the expected one after an upgrade.
 
 ## Schema version and the owner column
 
@@ -266,13 +296,13 @@ serialization failure are `Transient`, a bad statement is `Internal` (needs the
 server), and an unreachable server is `Transient` (offline).
 `tests/fixtures/schema-v5.sql` is the schema exactly as the `sqlx` build emitted it: `tests/fixture.rs`
 applies it with `batch_execute`, opens the store and takes a create/load round trip with **no
-migration**, then migrates to the current version and commits a head and a body. `tests/fixtures/schema-v7.sql` is the
-current schema; a unit test (`the_statements_equal_the_version_7_fixture`) compares the live
+migration**, then migrates to the current version and commits a head and a body. `tests/fixtures/schema-v8.sql` is the
+current schema; a unit test (`the_statements_equal_the_version_8_fixture`) compares the live
 statements with it whitespace-normalised, so they cannot drift; `ADAM_WRITE_FIXTURE=1` regenerates it.
 The fixture is named for its version: a change to a statement, a function's included, without a bump
 of `SCHEMA_VERSION` shows as an edit of a released version's file.
 `tests/functions.rs` is ADR 0082's fresh-database test: it migrates a database of its own prefix,
-compares the functions in `pg_proc` with its list `FUNCTIONS` (empty at slice P0; a slice that adds a
+compares the functions in `pg_proc` with its list `FUNCTIONS` (empty at slices P0 and P1; a slice that adds a
 function adds it there with a call) and calls each; it also checks that the comparison reports an
 unlisted and a missing function, and that a version 6 database gets the functions. A unit test
 raises the floor above the server's own version and checks that `migrate()` is refused `Invalid`
@@ -286,7 +316,9 @@ collected after the orphan grace, `Conflict`), and `tests/head_view.rs` counts t
 column, the version row, that the run survived and that pinning works on it; it also checks that an
 older release does not lower the version. A version 2 schema migrates to the current one and gets the
 push table, a version 3 schema's `runs_list` is replaced by `runs_list_status` (valid, old one
-gone), a version 4 schema gets the blob tables and keeps its runs, and a start on a current schema
+gone), a version 4 schema gets the blob tables and keeps its runs, a version 7 schema gets the
+virtual `served` column without a rewrite (the same columns as a fresh table, its runs served as
+before), and a start on a current schema
 finishes while another connection holds `ROW EXCLUSIVE` locks on `runs` and `push` (it runs no
 DDL). A unit test
 (`the_listing_index_upgrade_does_not_wait_for_live_traffic`) holds a writer's lock open and writes

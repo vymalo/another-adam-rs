@@ -1,5 +1,5 @@
--- The schema version 7 that adam-store-postgres emits.
--- Regenerate with ADAM_WRITE_FIXTURE=1 cargo test -p adam-store-postgres --lib the_statements_equal_the_version_7_fixture
+-- The schema version 8 that adam-store-postgres emits.
+-- Regenerate with ADAM_WRITE_FIXTURE=1 cargo test -p adam-store-postgres --lib the_statements_equal_the_version_8_fixture
 CREATE TABLE IF NOT EXISTS adam_meta (
                     key   TEXT PRIMARY KEY,
                     value TEXT NOT NULL
@@ -110,6 +110,9 @@ CREATE TABLE IF NOT EXISTS adam_body (
 
 CREATE INDEX IF NOT EXISTS adam_body_written ON adam_body (written_at);
 
-INSERT INTO adam_meta (key, value) VALUES ('schema_version', '7')
+ALTER TABLE adam_runs ADD COLUMN IF NOT EXISTS served JSONB
+                 GENERATED ALWAYS AS (CASE WHEN jsonb_typeof(head) = 'object' AND (head_version = version OR state = 'null'::jsonb) THEN head ELSE state END) VIRTUAL;
+
+INSERT INTO adam_meta (key, value) VALUES ('schema_version', '8')
              ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
               WHERE adam_meta.value::INT < EXCLUDED.value::INT;

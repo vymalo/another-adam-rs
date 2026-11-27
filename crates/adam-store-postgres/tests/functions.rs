@@ -17,7 +17,8 @@ use deadpool_postgres::Pool;
 
 /// Every function of the store's schema: its name without the table prefix, its identity
 /// arguments as `pg_get_function_identity_arguments` prints them, and a statement that calls it,
-/// `{p}` standing for the prefix. Empty at slice P0; P1 to P7 add theirs.
+/// `{p}` standing for the prefix. Empty at slices P0 and P1 (P1 adds a column, not a function);
+/// P2 to P7 add theirs.
 const FUNCTIONS: &[(&str, &str, &str)] = &[];
 
 /// A fresh prefix of the test's own, so no other store's functions match it.

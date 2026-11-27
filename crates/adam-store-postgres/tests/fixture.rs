@@ -1,5 +1,6 @@
 //! A database built by the previous (`sqlx`) release opens with no migration, and the upgrade to
-//! the current schema adds the head and the body (version 6) and the functions step (version 7).
+//! the current schema adds the head and the body (version 6), the functions step (version 7) and
+//! the `served` column (version 8).
 //!
 //! `tests/fixtures/schema-v5.sql` is the schema exactly as that release emitted it. This applies it
 //! with `batch_execute` into a database of its own, opens the store **without calling `migrate`**
@@ -66,7 +67,7 @@ async fn a_sqlx_migrated_database_opens_and_upgrades_to_the_head_and_body() {
     drop(client);
 
     // No `migrate`: the fixture is what the old release left behind. A run can be created (the
-    // insert names no v6 column), but a read is the contract's read and needs the head columns.
+    // insert names no v6 column), but a read is the contract's read and needs the served column.
     let store = PgStore::from_pool(PgConfig::parse(&url).expect("URL").pool(2).expect("pool"));
     let run = store
         .create_run(NewRun::new("fixture-agent", json!({"turn": 1})).conversation("c:1"))
@@ -75,7 +76,7 @@ async fn a_sqlx_migrated_database_opens_and_upgrades_to_the_head_and_body() {
     assert_eq!(run.version, 1);
     assert!(
         store.load_run(run.id).await.is_err(),
-        "a version 5 database has no head columns: migrate before reading"
+        "a version 5 database has no served column: migrate before reading"
     );
 
     // The upgrade is the migration the new build runs: metadata only, the run survives.
@@ -92,7 +93,7 @@ async fn a_sqlx_migrated_database_opens_and_upgrades_to_the_head_and_body() {
             .get(0)
     };
     assert_eq!(version, SCHEMA_VERSION.to_string());
-    assert_eq!(version, "7");
+    assert_eq!(version, "8");
 
     // The old run reads as it was written: no head, so the whole state is served.
     let loaded = store
