@@ -17,7 +17,7 @@ push = ["adam-a2a/server"]
 [dependencies]
 adam-error.workspace = true
 a2a-lf.workspace = true
-adam-a2a = { path = "../adam-a2a", version = "0.1.0", default-features = false } # x-release-please-version
+adam-a2a = { path = "../adam-a2a", version = "0.6.0", default-features = false } # x-release-please-version
 adam-agent-fs.workspace = true
 adam-core.workspace = true
 adam-runtime.workspace = true
@@ -39,7 +39,7 @@ adam-llm-agent.workspace = true
 adam-model.workspace = true
 # The client the `reasoning/v1` test drives the whole chain through (`tests/reasoning.rs`).
 adam-model-openai = { workspace = true, features = ["aws-lc"] }
-adam-store-postgres = { path = "../adam-store-postgres", version = "0.1.0" } # x-release-please-version
+adam-store-postgres = { path = "../adam-store-postgres", version = "0.6.0" } # x-release-please-version
 adam-store-testkit.workspace = true
 a2a-client-lf.workspace = true
 async-trait.workspace = true
