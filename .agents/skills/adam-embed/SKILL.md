@@ -86,8 +86,9 @@ the adam crates pinned in `orchestrator/Cargo.toml`.
      summary — the history is shortened instead. A message's files
      reach the hook by reference (name, media type, size, SHA-256), never their bytes. The verdict is
      recorded with the call (`HookedOutput`) or the message (`MessageDecision`). A hook gets no `Ctx`
-     and adds no step of its own. `EngineBuilder` takes no `HookSet` yet, and an agent file's
-     `plugins:` is a later slice, so a served folder agent installs none.
+     and adds no step of its own. An embedded host gives its hooks to `adam-engine` with
+     `EngineBuilder::hooks`/`.plugin` (below), which runs them in every agent before an agent file's
+     `plugins:`.
      https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0050-hooks-around-the-agent-loop-compiled-first-and-programs-second.md
    * **Limiting commands in your own tools** (ADR 0065): `adam_code_tools::Governor` pairs an
      `adam_budget::Admission` (`adam-admission-local`'s `LocalAdmission` over a `Budget`) with a
@@ -145,11 +146,20 @@ https://github.com/vymalo/another-adam-rs/blob/main/docs/guides/embed-in-an-app.
   a later message names another), and a folder's `model_fallback:` is the alias a run continues on, once, when
   the endpoint refuses its model as locked (ADR 0064, amended 2026-11-23). The engine reads no environment variable.
   [ADR 0065]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0065-resource-governance-admission-pools-and-os-limits.md
-* **Then** `start().await?`, `send`, `steer`, `answer`, `cancel`, `list`, `get`, `events`, `commands` (the folder's
+* **Then** `start().await?`, `send`, `steer`, `answer`, `approve`, `cancel`, `list`, `get`, `events`, `commands` (the folder's
   `/name` commands, which a message expands), `files` and `file` (what a tool handed over, by SHA-256), `firings` (the runs
   `schedules/` fired, which `get`, `events` and `cancel` reach too), `helpers`, `start_session`, `sessions` and
   `close_session` (child sessions of the local subagents, `child-sessions/v1`) and `shutdown`; decide from `EngineError`'s class
   (`adam_error::Classify`), and match `RunState` and `EngineEvent` with a `_` arm (both `#[non_exhaustive]`). `events(run)` is bounded: a slow reader gets `Behind`, then a `Snapshot` read from the store.
+* **Approvals** (ADR 0047 slice 5): install a `Plugin` whose `before_tool` returns `Verdict::Ask(question)` with
+  `EngineBuilder::plugin` (or a `HookSet` with `.hooks(..)`); it runs in every agent the engine runs. The run then
+  waits in `RunState::AwaitingApproval` (not `Waiting`), `RunInfo::approval` is the `ApprovalRequest` (`call_id`, `tool`,
+  `question`, `arguments` as the call's step shows them, through `EngineBuilder::step_io`'s redactor), and the stream
+  says `EngineEvent::ApprovalAsked`, then `ApprovalAnswered { call_id, approved }`. Answer with
+  `engine.approve(run, &call_id, Decision::Approve)` or `Decision::Refuse(Some(reason))`: the yes runs the call once,
+  in the journaled step `tool:<call id>:approved`, and neither a restart nor a replay asks again. Another call's id,
+  or a run that awaits none, is `EngineError::NotAwaitingApproval` (`Rejected`). Typed text through `answer` or `send`
+  approves only on a clear yes (`yes`, `ok`): show buttons. Approvals are not announced to A2A clients yet.
 * **Keep the embedded set**: anything else you depend on takes `adam-a2a` without `server`, `adam-a2a-runtime` without
   `push`, `adam-assembly` (and `adam`) without `remote`, and `adam-ui` without `thread-tools`, or Cargo turns them back
   on. adam-rs checks the engine's own tree with `tools/embedded-deps/check.sh`
@@ -159,7 +169,7 @@ https://github.com/vymalo/another-adam-rs/blob/main/docs/guides/embed-in-an-app.
 * **The worked example** is `crates/adam-engine/examples/chat` (`main.rs` builds the engine, `app.rs` is the loop a
   test drives): https://github.com/vymalo/another-adam-rs/tree/main/crates/adam-engine/examples/chat. The API and its
   refusals: https://github.com/vymalo/another-adam-rs/blob/main/crates/adam-engine/README.md.
-* **Not yet**: approvals, the file and command tools, MCP
+* **Not yet**: the file and command tools, MCP
   servers and remote subagents (`start` refuses an agent that names them).
 
 ## Verify

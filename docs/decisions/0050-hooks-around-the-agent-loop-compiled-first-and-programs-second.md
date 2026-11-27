@@ -560,3 +560,10 @@ for ever), and a no refuses the call with the person's words (red with every ans
 in `tests/hooks.rs` holds the two events and their keys, and `an_ask_lets_the_plugins_after_it_refuse` in
 `plugin_conformance!` holds reading 2. `tool:<call id>:approved` is a new step name: roll every worker before the build
 is used (*No mixed versions*, above).
+
+*Amended 2026-11-27 (ADR 0047 slice 5 built):* the engine's half of H8, which the note above lists as not built, is
+built. `adam_assembly::BoundDef::hooks(HookSet)` runs a host's hooks in every agent before the plugins a file names,
+and `adam-engine` takes them (`EngineBuilder::hooks`, `plugin`), shows a parked approval as
+`RunState::AwaitingApproval` with the call, and answers it with `Engine::approve`; see ADR 0047's note of the same day.
+`HookSet` is `Clone`, and the `input_required` event of an approval says its question through the agent's `StepIo`
+redactor. The A2A test that drives an approval end to end is still not built.

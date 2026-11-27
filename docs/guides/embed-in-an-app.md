@@ -5,11 +5,12 @@ network of its own ([ADR 0047](../decisions/0047-adam-rs-can-be-embedded-in-an-a
 server program that serves A2A, read [Embed adam](embed-adam.md) instead.
 
 The generated API of every library crate is on the site: [Rust API](../rust/adam/index.html){target="_self"}.
+For agents: [the evidence and the proofs](../../.agents/docs/guides/embed-in-an-app.md).
 
 ## What the engine is
 
 A typed Rust API over adam's runtime, on the host's tokio runtime: `Engine::builder(store, agent, model, alias)`,
-`start`, then `send`, `steer`, `answer`, `cancel`, `list`, `get`, `events` and `shutdown`. No A2A type is in a
+`start`, then `send`, `steer`, `answer`, `approve`, `cancel`, `list`, `get`, `events` and `shutdown`. No A2A type is in a
 signature. Inside, every call is the code the A2A server calls, so follow-ups, steering and answers behave the same.
 The calls, their refusals and their defaults: the [crate README](../../crates/adam-engine/README.md).
 
@@ -23,6 +24,7 @@ The calls, their refusals and their defaults: the [crate README](../../crates/ad
 | the deployment's model profiles | `ModelProfiles` (`EngineBuilder::models`) | none: no model has a profile, so an agent whose file sets `reasoning_effort` or `model_preset` is refused at `start` (fail closed); with them the folder's keys, the preset and the profile resolve each agent's effort and output cap per model ([ADR 0063](../decisions/0063-a-reasoning-effort-is-one-setting.md), [ADR 0064](../decisions/0064-model-profiles-reasoning-effort-and-output-cap-follow-the-model.md)) |
 | the root's reasoning level | `ReasoningEffort` (`EngineBuilder::reasoning_effort`) | none: nothing is sent unless the folder, the preset or the profile sets a level; the folder's own `reasoning_effort` wins over the builder's, and the builder's wins over the agent's `model_preset` and the profile; a level the root model's profile does not take is refused at `start` (`Agent`, `Invalid`) when it applies — when the root's file sets none (a file's own level is validated instead) |
 | its own tools | `ToolSet` (`EngineBuilder::tools`): an `FnTool`, or `#[tool]` functions with `adam = { default-features = false, features = ["macros"] }` | none: the catalog is the screen's tools (`ask_user`, `show`, `ui_catalog`, the plan tools); the files' `tools:` selects from it; a file a tool returns is read with `Engine::files` and `Engine::file` |
+| hooks around the agent loop | `HookSet` or one `Plugin` at a time (`EngineBuilder::hooks`, `plugin`), and what a step shows of a call (`EngineBuilder::step_io`) | none: no hook runs. The host's hooks run in every agent, before any its files name; a hook that asks parks the run for the person's approval ([Approvals](#approvals)) |
 | secrets the agent's files name | `SecretSource` (`EngineBuilder::secrets`) | none: `default_secrets()` refuses every name |
 | a tokio runtime | the current one at `start` | the worker runs on it |
 | the process's pools | `DynAdmission` (`EngineBuilder::admission`) | none: nothing is admitted, so every model call and tool call runs. With one ([`adam-admission-local`](../../crates/adam-admission-local/README.md), or your own), every model call takes a seat of `Pool::ModelCalls` and every tool call one of `Pool::ToolCalls` ([ADR 0065](../decisions/0065-resource-governance-admission-pools-and-os-limits.md)): a model call waits five seconds and then parks the run at the refusal's `retry_after`, a tool call waits a minute and then runs anyway with a warning |
@@ -65,8 +67,9 @@ MODEL_BASE_URL=https://gateway.example.com/v1 MODEL_API_KEY=... MODEL=my-model \
   cargo run -p adam-engine --example chat
 ```
 
-A plain line is `send` to the conversation; `/steer <text>`, `/answer <text>`, `/cancel`, `/list` and `/quit` are the
-other calls. A send while the run waits is its answer, and one while it works steers it (`Turn::delivered` says which).
+A plain line is `send` to the conversation; `/steer <text>`, `/answer <text>`, `/approve`, `/deny [reason]`, `/cancel`,
+`/list` and `/quit` are the other calls. The example's host gives a tool of its own, `save_note`, and a hook that asks
+before every call of it, so "remember to buy milk" prints an approval to answer. A send while the run waits is its answer, and one while it works steers it (`Turn::delivered` says which).
 When the input ends (`printf 'hi\n' | ...`), the example follows the run to its end or its question, then shuts down.
 
 ## How events work
@@ -108,9 +111,66 @@ sequenceDiagram
   R-->>A: EngineEvent Ended, read from the store
 ```
 
+## Approvals
+
+A tool call can wait for the person's yes ([ADR 0047](../decisions/0047-adam-rs-can-be-embedded-in-an-application.md)
+slice 5). The host installs a hook that asks, renders what it asks, and answers with a button.
+
+1. **Install the hook.** A `Plugin` whose `before_tool` answers `Verdict::Ask(question)` for the calls the person must
+   approve, given with `EngineBuilder::plugin`. It runs in every agent the engine runs.
+2. **Render the approval.** The run is `RunState::AwaitingApproval`, not `Waiting`, and its stream says
+   `EngineEvent::ApprovalAsked`. Both carry an `ApprovalRequest`: the call's id, the tool, the hook's question and the
+   arguments the call runs with. They show no more than the call's step does: with a redactor
+   (`EngineBuilder::step_io`), what it hides stays hidden.
+3. **Answer it.** `approve(run, call_id, Decision::Approve)` runs the call, once; `Decision::Refuse(reason)` does not,
+   and the model reads the person's words. The stream then says `ApprovalAnswered`. An answer for another call, or
+   for a run that awaits none, is refused (`Rejected`). Typed text reaches an approval too, through `answer` or `send`,
+   but only a clear yes (`yes`, `ok`) runs the call, which is why a host shows buttons.
+
+```rust
+let engine = Engine::builder(store, agent, model, alias).plugin(AsksBeforeWriting).start().await?;
+// ... `EngineEvent::ApprovalAsked(request)` on the run's stream:
+engine.approve(run, &request.call_id, Decision::Approve).await?;
+```
+
+```mermaid
+sequenceDiagram
+  participant A as Host
+  participant E as Engine
+  participant W as Runtime worker
+  participant H as Host's hook
+  participant S as Store
+  participant R as RunEvents
+  W->>H: before_tool
+  H-->>W: Ask
+  W->>S: journal tool step with the ask, commit the park
+  W->>R: RunEvent Status
+  R->>E: get(run)
+  R-->>A: EngineEvent ApprovalAsked
+  A->>E: approve(run, call_id, Approve)
+  E->>S: deliver the answer
+  W->>S: journal the approved step, run the call once, commit
+  R-->>A: EngineEvent ApprovalAnswered
+```
+
+```mermaid
+stateDiagram-v2
+  [*] --> Working: send
+  Working --> AwaitingApproval: a hook asks
+  AwaitingApproval --> Working: approve, yes runs the call once
+  AwaitingApproval --> Working: refuse, the call is answered with the reason
+  AwaitingApproval --> Cancelled: cancel
+  Working --> Done: the final output
+  Done --> [*]
+  Cancelled --> [*]
+```
+
+The ask is recorded in the call's step, so neither a restart of the application nor a replay asks again, and an
+approved call never runs twice. A run nobody can answer, a schedule's firing or a child run, reads the ask as a refusal.
+Approvals do not reach A2A clients yet: that is a new extension, not built.
+
 ## Not there yet
 
-* **Approvals** (slice 5): a run waits only on a question today.
 * **The person's directory** (slice 7): the file and command tools are a library now (slice 6), but the engine does not
   give them to its agent yet, which has the screen's tools only (`ask_user`, `show`, `ui_catalog`, `plan_*`).
 * **Reading a file an agent made**: `RunInfo` carries no artifacts yet, and an event withholds a file's bytes.
