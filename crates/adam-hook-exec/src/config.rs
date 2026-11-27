@@ -37,6 +37,31 @@ pub const SAFE_VARS: &[&str] = &[
     "USERPROFILE",
 ];
 
+/// The variables a program may never be given, whatever the configuration says (ADR 0050,
+/// decision 13): the safe ones are the adapter's, and the rest change how a program starts.
+const DENIED_ENV: &[&str] = &["PATH", "HOME", "LANG", "TMPDIR", "BASH_ENV", "ENV", "IFS"];
+
+/// Whether `name` is a variable a configuration may add (ADR 0050, decision 13: "a plain
+/// upper-case name, never `PATH`, `LD_*`, `BASH_ENV`, `ENV`, `IFS` or a hidden name").
+fn check_env_name(name: &str) -> Result<(), String> {
+    let plain = !name.is_empty()
+        && !name.starts_with(|c: char| c.is_ascii_digit())
+        && name
+            .chars()
+            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_');
+    if !plain {
+        return Err(format!(
+            "the variable {name:?} is not a plain upper-case name (A-Z, 0-9 and _)"
+        ));
+    }
+    if name.starts_with("LD_") || DENIED_ENV.contains(&name) {
+        return Err(format!(
+            "the variable {name:?} may not be set for a program: it changes how it starts"
+        ));
+    }
+    Ok(())
+}
+
 /// A function that replaces the secrets a deployment holds, as the loop's own scrubber does.
 pub type Scrub = dyn Fn(&str) -> String + Send + Sync;
 
@@ -164,6 +189,9 @@ pub struct Config {
     /// The agents this program applies to (`None`: all of them). The wiring decides with
     /// [`Config::applies_to`]; the adapter itself is installed per agent.
     pub agents: Option<Vec<String>>,
+    /// The empty private directory the program runs in. `None`: the adapter makes one and removes
+    /// it when it goes (ADR 0050, decision 15: never the agent's workspace).
+    pub cwd: Option<PathBuf>,
     /// Where it is asked.
     pub points: Points,
     /// How long one call may take, between 1 ms and [`MAX_DEADLINE_MS`].
@@ -181,6 +209,7 @@ impl std::fmt::Debug for Config {
             .field("args", &self.args)
             .field("env", &self.env.keys().collect::<Vec<_>>())
             .field("agents", &self.agents)
+            .field("cwd", &self.cwd)
             .field("points", &self.points)
             .field("deadline", &self.deadline)
             .finish_non_exhaustive()
@@ -199,6 +228,7 @@ impl Config {
             args: Vec::new(),
             env: BTreeMap::new(),
             agents: None,
+            cwd: None,
             points: Points::all_decide(),
             deadline: Duration::from_millis(DEFAULT_DEADLINE_MS),
             scrub: Arc::new(|text: &str| text.to_owned()),
@@ -216,6 +246,14 @@ impl Config {
     #[must_use]
     pub fn deadline(mut self, deadline: Duration) -> Self {
         self.deadline = deadline;
+        self
+    }
+
+    /// The same configuration, running the program in `cwd` (an empty private directory the
+    /// deployment owns) instead of one the adapter makes.
+    #[must_use]
+    pub fn cwd(mut self, cwd: impl Into<PathBuf>) -> Self {
+        self.cwd = Some(cwd.into());
         self
     }
 
@@ -295,6 +333,9 @@ impl Config {
                     "the deadline of {name:?} is {millis} ms; it must be 1 to {MAX_DEADLINE_MS}"
                 ),
             });
+        }
+        for name in self.env.keys() {
+            check_env_name(name).map_err(|message| Error::Config { message })?;
         }
         self.subscriptions().map(|_| ())
     }

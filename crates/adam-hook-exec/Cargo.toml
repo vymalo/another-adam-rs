@@ -2,6 +2,9 @@
 name = "adam-hook-exec"
 description = "The adam-hooks/1 adapter: a program on stdio behind the Plugin trait (ADR 0050, slice P1)"
 readme = "README.md"
+# The protocol's test program lives in `tests/program/`, which cargo would also discover as an
+# integration test: the targets are declared here instead.
+autotests = false
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -30,6 +33,14 @@ tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
 [[bin]]
 name = "adam-hook-exec-test-program"
 path = "tests/program/main.rs"
+
+[[test]]
+name = "exec"
+path = "tests/exec.rs"
+
+[[test]]
+name = "replay"
+path = "tests/replay.rs"
 
 [lints]
 workspace = true

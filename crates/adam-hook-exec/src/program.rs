@@ -1,27 +1,34 @@
-//! The child process: start it, say hello, ask one question at a time, and kill and restart it when
-//! it stops answering (ADR 0050, decision 15, "Fail closed").
+//! The child process: start it, say hello, ask it one question per call, and kill and restart it
+//! when it stops answering (ADR 0050, decision 15, "Fail closed").
 //!
 //! ```mermaid
 //! stateDiagram-v2
-//!     [*] --> Starting: spawn, write hello
+//!     [*] --> Starting: spawn in a private directory, write hello
 //!     Starting --> Ready: the program answers adam-hooks/1
 //!     Starting --> [*]: no hello, or another protocol (exit 78 in a binary)
-//!     Ready --> Asking: one event, one deadline
+//!     Ready --> Asking: one event queued to the writer, one deadline
 //!     Asking --> Ready: a reply in time
-//!     Asking --> Missed: no reply, a broken line, or a dead child
+//!     Asking --> Missed: no reply in time
 //!     Missed --> Ready: fewer than three in a row
-//!     Missed --> Down: three in a row, or the child died: killed, then restarted with backoff
+//!     Ready --> Down: a broken line, a closed output, or a dead child
+//!     Missed --> Down: three in a row
 //!     Down --> Starting: the backoff elapsed
 //!     Ready --> [*]: shutdown
 //! ```
+//!
+//! **No I/O happens under the state lock.** A writer thread owns the child's stdin and takes the
+//! lines the adapter queues; a reader thread owns its stdout and hands each reply to the request
+//! that waits for it. A program that stops reading its input fills the queue and is treated as
+//! broken, so a slow program cannot hold the loop.
 
 use std::collections::{BTreeMap, HashMap};
 use std::io::{BufRead, BufReader, Write};
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, Stdio};
-use std::sync::mpsc::{RecvTimeoutError, SyncSender, sync_channel};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TrySendError, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -32,14 +39,21 @@ use crate::config::{HELLO_DEADLINE_MS, SAFE_VARS, Scrub};
 use crate::error::Error;
 use crate::protocol::{Hello, LINE_MAX, Mode, Outgoing, PROTOCOL, Reply, VERSION};
 
-/// How many misses in a row kill the program (ADR 0050, decision 15).
+/// How many deadlines in a row kill the program (ADR 0050, decision 15).
 const MISSES_MAX: u32 = 3;
+
+/// How many lines may wait for the writer thread. A program that lets this fill is not reading,
+/// and is treated as broken instead of growing this process's memory.
+const WRITE_QUEUE: usize = 64;
 
 /// The first wait before a killed program is restarted; it doubles up to [`BACKOFF_MAX`].
 const BACKOFF_START: Duration = Duration::from_secs(1);
 
 /// The longest wait between restarts.
 const BACKOFF_MAX: Duration = Duration::from_secs(30);
+
+/// How long a killed program is given to exit on its own before its group is killed.
+const EXIT_GRACE: Duration = Duration::from_secs(1);
 
 /// What one program is: fixed for the life of the adapter.
 pub(crate) struct Spec {
@@ -69,21 +83,26 @@ enum Fault {
 /// What a waiting request receives: the answer, or why there is none.
 type Answer = Result<Incoming, Fault>;
 
-/// The state the reader thread shares with the adapter.
+/// The state the two threads share with the adapter.
 struct Shared {
     program: String,
+    scrub: Arc<Scrub>,
     /// The requests waiting for a reply, by id.
     pending: Mutex<HashMap<u64, SyncSender<Answer>>>,
     /// The hello's channel, taken once.
     hello: Mutex<Option<SyncSender<Answer>>>,
+    /// The program closed its output: nothing more will be read from it.
+    closed: AtomicBool,
 }
 
 impl Shared {
-    fn new(program: String, hello: Option<SyncSender<Answer>>) -> Self {
+    fn new(program: String, scrub: Arc<Scrub>, hello: Option<SyncSender<Answer>>) -> Self {
         Shared {
             program,
+            scrub,
             pending: Mutex::new(HashMap::new()),
             hello: Mutex::new(hello),
+            closed: AtomicBool::new(false),
         }
     }
 
@@ -133,6 +152,12 @@ impl Shared {
             let _ = tx.send(Err(fault));
         }
     }
+
+    /// Nothing more will be read: wake the waiters and remember it, so the next call restarts.
+    fn close(&self, fault: Fault) {
+        self.closed.store(true, Ordering::SeqCst);
+        self.fail_all(fault);
+    }
 }
 
 /// Read the program's lines and hand each to the request that waits for it.
@@ -141,12 +166,23 @@ fn read_lines(stdout: ChildStdout, shared: Arc<Shared>) {
     let mut line = Vec::new();
     loop {
         line.clear();
-        match reader.read_until(b'\n', &mut line) {
+        // A line longer than the protocol's bound is refused without growing this vector: the
+        // reader is capped, so a program cannot exhaust this process's memory with one line.
+        match reader
+            .by_ref()
+            .take(LINE_MAX as u64 + 1)
+            .read_until(b'\n', &mut line)
+        {
             Ok(0) | Err(_) => break,
             Ok(_) => {}
         }
-        if line.len() > LINE_MAX {
-            shared.fail_all(Fault::Malformed(format!(
+        let content = if line.last() == Some(&b'\n') {
+            line.len() - 1
+        } else {
+            line.len()
+        };
+        if content > LINE_MAX {
+            shared.close(Fault::Malformed(format!(
                 "a line longer than {LINE_MAX} bytes"
             )));
             return;
@@ -157,7 +193,7 @@ fn read_lines(stdout: ChildStdout, shared: Arc<Shared>) {
             continue;
         }
         let Ok(value) = serde_json::from_str::<Value>(text) else {
-            shared.fail_all(Fault::Malformed("a line that is not JSON".to_owned()));
+            shared.close(Fault::Malformed("a line that is not JSON".to_owned()));
             return;
         };
         // The kind is copied out first: the arms move `value` into `from_value`.
@@ -166,18 +202,22 @@ fn read_lines(stdout: ChildStdout, shared: Arc<Shared>) {
             Some("hello") => match serde_json::from_value::<Hello>(value) {
                 Ok(hello) => shared.hello(hello),
                 Err(e) => {
-                    shared.fail_all(Fault::Malformed(format!(
-                        "a hello this build cannot read: {e}"
-                    )));
+                    // The detail is logged, not carried: a serde error quotes the line, and a
+                    // hook's reason is recorded and read by the model.
+                    warn!(program = %shared.program, "{}", (shared.scrub.as_ref())(&e.to_string()));
+                    shared.close(Fault::Malformed(
+                        "a hello this build cannot read".to_owned(),
+                    ));
                     return;
                 }
             },
             Some("reply") => match serde_json::from_value::<Reply>(value) {
                 Ok(reply) => shared.reply(Box::new(reply)),
                 Err(e) => {
-                    shared.fail_all(Fault::Malformed(format!(
-                        "a reply this build cannot read: {e}"
-                    )));
+                    warn!(program = %shared.program, "{}", (shared.scrub.as_ref())(&e.to_string()));
+                    shared.close(Fault::Malformed(
+                        "a reply this build cannot read".to_owned(),
+                    ));
                     return;
                 }
             },
@@ -185,7 +225,19 @@ fn read_lines(stdout: ChildStdout, shared: Arc<Shared>) {
             _ => debug!(program = %shared.program, "a line of an unknown kind is ignored"),
         }
     }
-    shared.fail_all(Fault::Closed("the program closed its output".to_owned()));
+    shared.close(Fault::Closed("the program closed its output".to_owned()));
+}
+
+/// Write the lines the adapter queues, and close the program when its stdin refuses one.
+fn write_lines(mut stdin: ChildStdin, lines: Receiver<Vec<u8>>, shared: Arc<Shared>) {
+    for line in lines {
+        if let Err(e) = stdin.write_all(&line).and_then(|()| stdin.flush()) {
+            shared.close(Fault::Closed(format!(
+                "the program's stdin refused a line: {e}"
+            )));
+            return;
+        }
+    }
 }
 
 /// Log the program's stderr, one scrubbed line at a time.
@@ -207,12 +259,17 @@ fn read_stderr(stderr: ChildStderr, program: String, scrub: Arc<Scrub>) {
 pub(crate) struct Program {
     spec: Arc<Spec>,
     deadline: Duration,
+    /// The empty private directory the program runs in.
+    cwd: PathBuf,
+    /// Whether this adapter created `cwd` (and so removes it when it goes).
+    own_cwd: bool,
     state: Mutex<State>,
 }
 
 struct State {
     child: Option<Child>,
-    stdin: Option<ChildStdin>,
+    /// The queue the writer thread takes lines from.
+    writer: Option<SyncSender<Vec<u8>>>,
     shared: Arc<Shared>,
     next_id: u64,
     misses: u32,
@@ -221,20 +278,32 @@ struct State {
 }
 
 impl Program {
-    /// Start the program and say hello.
+    /// Start the program in `cwd` (a private directory this adapter makes when it is not given)
+    /// and say hello.
     ///
     /// # Errors
     ///
-    /// [`Error::Spawn`] when it cannot start, [`Error::Hello`] when it does not answer in time, and
-    /// [`Error::Protocol`] when it names another protocol.
-    pub(crate) fn start(spec: Arc<Spec>, deadline: Duration) -> Result<Self, Error> {
-        let (child, stdin, shared) = launch(&spec)?;
+    /// [`Error::Spawn`] when it cannot start or the directory cannot be made, [`Error::Hello`] when
+    /// it does not answer in time, and [`Error::Protocol`] when it names another protocol.
+    pub(crate) fn start(
+        spec: Arc<Spec>,
+        deadline: Duration,
+        cwd: Option<PathBuf>,
+    ) -> Result<Self, Error> {
+        let (cwd, own_cwd) = match cwd {
+            Some(dir) => (dir, false),
+            None => (private_dir(&spec.name)?, true),
+        };
+        let (child, stdin, shared) = launch(&spec, &cwd)?;
+        let writer = start_writer(stdin, &shared);
         Ok(Program {
             spec,
             deadline,
+            cwd,
+            own_cwd,
             state: Mutex::new(State {
                 child: Some(child),
-                stdin: Some(stdin),
+                writer: Some(writer),
                 shared,
                 next_id: 0,
                 misses: 0,
@@ -248,13 +317,19 @@ impl Program {
     ///
     /// # Errors
     ///
-    /// [`Error::Deadline`] when it does not answer in time, [`Error::Down`] when it is restarting,
-    /// [`Error::Malformed`] when its answer is not the protocol's.
-    pub(crate) fn request(&self, mode: Mode, point: &str, payload: Value) -> Result<Reply, Error> {
+    /// [`Error::Deadline`] when it does not answer in time, [`Error::Down`] when it is restarting or
+    /// not reading, [`Error::Malformed`] when the request or its answer is not the protocol's.
+    pub(crate) fn request(
+        &self,
+        mode: Mode,
+        key: Option<&str>,
+        point: &str,
+        payload: Value,
+    ) -> Result<Reply, Error> {
         let deadline = self.deadline;
         let (rx, id) = {
             let mut state = self.lock();
-            state.ensure(&self.spec)?;
+            state.ensure(&self.spec, &self.cwd)?;
             let id = state.next_id;
             state.next_id += 1;
             let (tx, rx) = sync_channel(1);
@@ -262,18 +337,63 @@ impl Program {
             let line = Outgoing::Event {
                 id: id.to_string(),
                 mode,
-                key: format!("{}/{}/{}", self.spec.name, point, id),
+                // An observer's key is the event's own, stable across replays; a deciding hook has
+                // no key of the loop's to carry, so it is unique to the request.
+                key: key.map_or_else(
+                    || format!("{}/{}/{}", self.spec.name, point, id),
+                    str::to_owned,
+                ),
                 point: point.to_owned(),
                 deadline_ms: u64::try_from(deadline.as_millis()).unwrap_or(u64::MAX),
                 payload,
             };
-            if let Err(message) = state.write(&line) {
+            let bytes = match serde_json::to_vec(&line) {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    Shared::guard(&state.shared.pending).remove(&id);
+                    return Err(Error::Malformed {
+                        program: self.spec.name.clone(),
+                        expected: "a request".to_owned(),
+                        what: e.to_string(),
+                    });
+                }
+            };
+            if bytes.len() > LINE_MAX {
                 Shared::guard(&state.shared.pending).remove(&id);
-                state.broken(&self.spec, &message);
-                return Err(Error::Down {
+                return Err(Error::Malformed {
                     program: self.spec.name.clone(),
-                    message,
+                    expected: format!("a request of at most {LINE_MAX} bytes"),
+                    what: format!("a request of {} bytes", bytes.len()),
                 });
+            }
+            let queued = match &state.writer {
+                Some(writer) => writer.try_send(bytes),
+                None => {
+                    Shared::guard(&state.shared.pending).remove(&id);
+                    return Err(Error::Down {
+                        program: self.spec.name.clone(),
+                        message: "the program has no writer".to_owned(),
+                    });
+                }
+            };
+            match queued {
+                Ok(()) => {}
+                Err(TrySendError::Full(_)) => {
+                    Shared::guard(&state.shared.pending).remove(&id);
+                    state.broken(&self.spec, "the program is not reading its input");
+                    return Err(Error::Down {
+                        program: self.spec.name.clone(),
+                        message: "the program is not reading its input".to_owned(),
+                    });
+                }
+                Err(TrySendError::Disconnected(_)) => {
+                    Shared::guard(&state.shared.pending).remove(&id);
+                    state.broken(&self.spec, "the writer stopped");
+                    return Err(Error::Down {
+                        program: self.spec.name.clone(),
+                        message: "the writer stopped".to_owned(),
+                    });
+                }
             }
             (rx, id)
         };
@@ -335,25 +455,32 @@ impl Program {
 
 impl Drop for Program {
     fn drop(&mut self) {
-        let mut state = self.lock();
-        if let Some(mut stdin) = state.stdin.take() {
-            if let Ok(text) = serde_json::to_string(&Outgoing::Shutdown) {
-                let _ = writeln!(stdin, "{text}");
+        // Nothing else runs by now: take the child and the queue out, and let the program go
+        // without holding the lock while it is waited for.
+        let (child, writer) = {
+            let mut state = self.lock();
+            (state.child.take(), state.writer.take())
+        };
+        if let Some(writer) = writer {
+            if let Ok(bytes) = serde_json::to_vec(&Outgoing::Shutdown) {
+                let _ = writer.try_send(bytes);
             }
-            let _ = stdin.flush();
-            // Closing stdin tells a well-behaved program to exit.
-            drop(stdin);
+            // Closing the queue tells the writer thread to finish and close stdin.
+            drop(writer);
         }
-        if let Some(mut child) = state.child.take() {
-            let deadline = Instant::now() + Duration::from_secs(1);
+        if let Some(mut child) = child {
+            let deadline = Instant::now() + EXIT_GRACE;
             while Instant::now() < deadline {
                 match child.try_wait() {
-                    Ok(Some(_)) => return,
+                    Ok(Some(_)) => break,
                     Ok(None) => std::thread::sleep(Duration::from_millis(10)),
                     Err(_) => break,
                 }
             }
             kill(&mut child);
+        }
+        if self.own_cwd {
+            let _ = std::fs::remove_dir_all(&self.cwd);
         }
     }
 }
@@ -361,7 +488,10 @@ impl Drop for Program {
 impl State {
     /// Make sure a child is running: restart it when its backoff elapsed, and fail transiently
     /// while it is down.
-    fn ensure(&mut self, spec: &Spec) -> Result<(), Error> {
+    fn ensure(&mut self, spec: &Spec, cwd: &Path) -> Result<(), Error> {
+        if self.shared.closed.load(Ordering::SeqCst) {
+            self.broken(spec, "the program closed its output");
+        }
         let exited = match &mut self.child {
             None => None,
             Some(child) => match child.try_wait() {
@@ -385,10 +515,10 @@ impl State {
                 });
             }
         }
-        match launch(spec) {
+        match launch(spec, cwd) {
             Ok((child, stdin, shared)) => {
                 self.child = Some(child);
-                self.stdin = Some(stdin);
+                self.writer = Some(start_writer(stdin, &shared));
                 self.shared = shared;
                 self.down_until = None;
                 Ok(())
@@ -405,23 +535,6 @@ impl State {
         }
     }
 
-    fn write(&mut self, line: &Outgoing) -> Result<(), String> {
-        let Some(stdin) = &mut self.stdin else {
-            return Err("the program has no stdin".to_owned());
-        };
-        let text = serde_json::to_string(line).map_err(|e| e.to_string())?;
-        let mut write = |bytes: &[u8]| {
-            stdin
-                .write_all(bytes)
-                .map_err(|e| format!("the program's stdin refused a line: {e}"))
-        };
-        write(text.as_bytes())?;
-        write(b"\n")?;
-        stdin
-            .flush()
-            .map_err(|e| format!("the program's stdin refused a line: {e}"))
-    }
-
     /// A deadline missed: the request was `Transient`, and [`MISSES_MAX`] of them in a row kill the
     /// program (ADR 0050, decision 15).
     fn miss_deadline(&mut self, spec: &Spec) {
@@ -434,8 +547,12 @@ impl State {
     }
 
     /// The program is gone or wrote what it must not: kill it, and keep it down for the backoff
-    /// (ADR 0050, decision 15). Its deciding points are `Transient` until it is back.
+    /// (ADR 0050, decision 15). Its deciding points are `Transient` until it is back. A program
+    /// already down is left alone: one kill advances the backoff once, however many calls saw it.
     fn broken(&mut self, spec: &Spec, reason: &str) {
+        if self.child.is_none() && self.down_until.is_some() {
+            return;
+        }
         warn!(program = %spec.name, reason, "the program is killed and restarted");
         self.stop();
         self.down_until = Some(Instant::now() + self.backoff);
@@ -454,16 +571,26 @@ impl State {
         if let Some(mut child) = self.child.take() {
             kill(&mut child);
         }
-        self.stdin = None;
+        // Dropping the queue ends the writer thread, which closes the child's stdin.
+        self.writer = None;
         self.shared
-            .fail_all(Fault::Closed("the program was stopped".to_owned()));
+            .close(Fault::Closed("the program was stopped".to_owned()));
     }
 }
 
+/// The writer thread: it owns the child's stdin from here on.
+fn start_writer(stdin: ChildStdin, shared: &Arc<Shared>) -> SyncSender<Vec<u8>> {
+    let (tx, rx) = sync_channel(WRITE_QUEUE);
+    let shared = Arc::clone(shared);
+    std::thread::spawn(move || write_lines(stdin, rx, shared));
+    tx
+}
+
 /// Start the program, say hello, and check the answer.
-fn launch(spec: &Spec) -> Result<(Child, ChildStdin, Arc<Shared>), Error> {
+fn launch(spec: &Spec, cwd: &Path) -> Result<(Child, ChildStdin, Arc<Shared>), Error> {
     let mut cmd = Command::new(&spec.program);
     cmd.args(&spec.args)
+        .current_dir(cwd)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -498,7 +625,11 @@ fn launch(spec: &Spec) -> Result<(Child, ChildStdin, Arc<Shared>), Error> {
         std::thread::spawn(move || read_stderr(stderr, program, scrub));
     }
     let (hello_tx, hello_rx) = sync_channel(1);
-    let shared = Arc::new(Shared::new(spec.name.clone(), Some(hello_tx)));
+    let shared = Arc::new(Shared::new(
+        spec.name.clone(),
+        Arc::clone(&spec.scrub),
+        Some(hello_tx),
+    ));
     {
         let shared = Arc::clone(&shared);
         std::thread::spawn(move || read_lines(stdout, shared));
@@ -567,6 +698,36 @@ fn launch(spec: &Spec) -> Result<(Child, ChildStdin, Arc<Shared>), Error> {
     }
 }
 
+/// An empty private directory for one program: the adapter's own when the configuration names none.
+fn private_dir(name: &str) -> Result<PathBuf, Error> {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let safe: String = name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let dir = std::env::temp_dir().join(format!(
+        "adam-hook-exec-{safe}-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::create_dir_all(&dir).map_err(|e| Error::Spawn {
+        program: name.to_owned(),
+        message: format!("no private directory for the program: {e}"),
+    })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+    }
+    Ok(dir)
+}
+
 /// SIGKILL the process group led by the child, then the child itself.
 ///
 /// The child was started with `process_group(0)`, so its group id is its pid and a grandchild it
@@ -576,13 +737,19 @@ fn kill(child: &mut Child) {
     #[cfg(unix)]
     {
         let pid = child.id();
-        let _ = Command::new("sh")
+        let killed = Command::new("sh")
             .arg("-c")
             .arg(format!("kill -s KILL -- -{pid}"))
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status();
+        if !matches!(killed, Ok(status) if status.success()) {
+            warn!(
+                pid,
+                "could not kill the process group; killing the child only"
+            );
+        }
     }
     let _ = child.kill();
     let _ = child.wait();

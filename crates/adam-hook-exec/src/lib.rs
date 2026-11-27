@@ -1,5 +1,5 @@
-//! The `adam-hooks/1` adapter (ADR 0050, slice **P1**): a program on stdio, behind the [`Plugin`]
-//! trait.
+//! The `adam-hooks/1` adapter (ADR 0050, slice **P1**): a program on stdio, behind the
+//! [`Plugin`](adam_plugin::Plugin) trait.
 //!
 //! A **program** is a long-lived child process that speaks one JSON object per line: the adapter
 //! says hello, asks one `event` per hook call, reads a `reply` with a verdict, and says `shutdown`
@@ -26,8 +26,8 @@
 //! 2. **It is killed and restarted.** Three misses in a row kill the program's process group, and
 //!    its deciding points are `Transient` until the backoff elapsed.
 //! 3. **It sees only what it should.** Payloads go through the deployment's scrubber, a rewrite over
-//!    a scrubbed span is refused, and the child gets an empty environment plus [`SAFE_VARS`] and the
-//!    variables the configuration adds.
+//!    a scrubbed span is refused, and the child gets an empty environment, then [`SAFE_VARS`], then
+//!    the variables the configuration adds (a plain upper-case name, never `PATH` or `LD_*`).
 //! 4. **Nothing is read from a repository.** The configuration is a value the embedder passes; the
 //!    file and the switch that read it from a deployment are slice P2.
 //!
@@ -46,6 +46,7 @@
 //! # }
 //! ```
 
+#![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
 mod config;

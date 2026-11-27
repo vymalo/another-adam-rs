@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use adam_error::{Classify, ErrorClass};
-use adam_hook_exec::{Config, DecidePoint, Error, HookExec, Points};
+use adam_hook_exec::{Config, DecidePoint, Error, HookExec, Points, SAFE_VARS};
 use adam_plugin::{
     EventHeader, EventKind, HookEvent, HookSet, HookedCall, HookedCompaction, HookedEnd,
     HookedMessage, HookedModelRequest, HookedText, MessageFile, ModelCallKind, Plugin, Verdict,
@@ -30,6 +30,15 @@ fn only(point: DecidePoint) -> Points {
         decide: vec![point],
         observe: Vec::new(),
     }
+}
+
+/// How many requests the program logged.
+fn requests(log: &std::path::Path) -> usize {
+    std::fs::read_to_string(log)
+        .unwrap_or_default()
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .count()
 }
 
 fn header() -> EventHeader {
@@ -182,9 +191,15 @@ fn garbage_denies() {
 
 #[test]
 fn a_dead_program_is_transient_and_the_set_gives_up() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("requests.log");
     // The program answers the hello, then exits on its first event.
-    let exec =
-        HookExec::start(config("die-after:0").points(only(DecidePoint::ToolBefore))).unwrap();
+    let exec = HookExec::start(
+        config("die-after:0")
+            .points(only(DecidePoint::ToolBefore))
+            .env("ADAM_HOOK_TEST_LOG", log.to_string_lossy()),
+    )
+    .unwrap();
     let mut arguments = json!({});
     let error = exec
         .before_tool(&mut HookedCall {
@@ -198,7 +213,8 @@ fn a_dead_program_is_transient_and_the_set_gives_up() {
         "a dead program is transient, never a continue: {error}"
     );
 
-    // The set retries it once (its default), then refuses the call.
+    // The set retries it once (its default) and then refuses the call. The retry finds the
+    // program down, so the program itself was asked exactly once.
     let set = HookSet::new().with(Arc::new(exec));
     let mut arguments = json!({});
     let refused = set
@@ -207,9 +223,15 @@ fn a_dead_program_is_transient_and_the_set_gives_up() {
             arguments: &mut arguments,
         })
         .unwrap_err();
-    assert!(
-        refused.class.is_retryable(),
+    assert_eq!(
+        refused.class,
+        ErrorClass::Transient,
         "the set reports the program's class: {refused}"
+    );
+    assert_eq!(
+        requests(&log),
+        1,
+        "the dead program was asked once, and the retry found it down"
     );
 }
 
@@ -397,6 +419,55 @@ fn an_observer_that_decides_is_refused() {
     }))
     .unwrap();
     quiet.observe(&event).unwrap();
+}
+
+#[test]
+fn a_configuration_may_not_override_a_safe_variable_or_add_a_dangerous_one() {
+    for (name, value) in [
+        ("PATH", "/tmp"),
+        ("HOME", "/tmp"),
+        ("LD_PRELOAD", "/tmp/evil.so"),
+        ("BASH_ENV", "/tmp/evil.sh"),
+        ("lower_case", "x"),
+        ("1NUMBER", "x"),
+    ] {
+        let error = HookExec::start(config("continue").env(name, value))
+            .err()
+            .unwrap_or_else(|| panic!("{name} must be refused"));
+        assert!(
+            matches!(error, Error::Config { .. }),
+            "{name} is a configuration error: {error}"
+        );
+    }
+}
+
+#[test]
+fn sixteen_calls_at_once_each_get_their_own_reply() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("requests.log");
+    let exec = Arc::new(
+        HookExec::start(
+            config("continue")
+                .points(only(DecidePoint::ToolBefore))
+                .env("ADAM_HOOK_TEST_LOG", log.to_string_lossy()),
+        )
+        .unwrap(),
+    );
+    let mut handles = Vec::new();
+    for n in 0..16 {
+        let exec = Arc::clone(&exec);
+        handles.push(std::thread::spawn(move || {
+            let mut arguments = json!({"n": n});
+            exec.before_tool(&mut HookedCall {
+                tool: "read",
+                arguments: &mut arguments,
+            })
+        }));
+    }
+    for handle in handles {
+        assert_eq!(handle.join().unwrap().unwrap(), Verdict::Continue);
+    }
+    assert_eq!(requests(&log), 16, "each call was its own request");
 }
 
 #[test]

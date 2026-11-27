@@ -50,7 +50,7 @@ impl HookExec {
             points: config.points.wire(),
             scrub: Arc::clone(&config.scrub),
         });
-        let program = Program::start(spec, config.deadline)?;
+        let program = Program::start(spec, config.deadline, config.cwd.clone())?;
         Ok(HookExec {
             name: config.name,
             points: config.points,
@@ -60,23 +60,36 @@ impl HookExec {
         })
     }
 
-    /// Ask the program one question, and turn its failure into the hook's.
+    /// Ask the program one question, and turn its failure into the hook's. The payload is
+    /// scrubbed whole, and a reply that asks for an action this build cannot perform is refused.
     fn ask(&self, point: DecidePoint, payload: Value) -> Result<Reply, HookError> {
+        let payload = self.scrub_value(&payload);
         let reply = self
             .program
-            .request(Mode::Decide, point.as_str(), payload)
+            .request(Mode::Decide, None, point.as_str(), payload)
             .map_err(|e| HookError::new(self.name.clone(), e.class(), e.to_string()))?;
-        if !reply.actions.is_empty() {
-            let error = Error::Action {
-                program: self.name.clone(),
-            };
-            return Err(HookError::new(
-                self.name.clone(),
-                error.class(),
-                error.to_string(),
-            ));
-        }
+        self.check(&reply)?;
         Ok(reply)
+    }
+
+    /// Refuse a reply this build cannot honour: an action is slice H1d, which is not built.
+    fn check(&self, reply: &Reply) -> Result<(), HookError> {
+        if reply.actions.is_empty() {
+            return Ok(());
+        }
+        let error = Error::Action {
+            program: self.name.clone(),
+        };
+        Err(HookError::new(
+            self.name.clone(),
+            error.class(),
+            error.to_string(),
+        ))
+    }
+
+    /// The reason a verdict carries, scrubbed: it is recorded and read by the model.
+    fn reason(&self, reply: &Reply) -> String {
+        self.scrub(&reply.reason())
     }
 
     /// A failure of this adapter's own making: an answer the point does not allow.
@@ -139,7 +152,7 @@ impl Plugin for HookExec {
         )?;
         match reply.verdict {
             Word::Continue => Ok(Verdict::Continue),
-            Word::Deny => Ok(Verdict::Deny(reply.reason())),
+            Word::Deny => Ok(Verdict::Deny(self.reason(&reply))),
             Word::Ask => Err(self
                 .refuse("ask at message.received, where only allow, rewrite and deny are allowed")),
             Word::Stop => Err(self.refuse(
@@ -170,8 +183,8 @@ impl Plugin for HookExec {
         )?;
         match reply.verdict {
             Word::Continue => Ok(Verdict::Continue),
-            Word::Deny => Ok(Verdict::Deny(reply.reason())),
-            Word::Stop => Ok(Verdict::Stop(reply.reason())),
+            Word::Deny => Ok(Verdict::Deny(self.reason(&reply))),
+            Word::Stop => Ok(Verdict::Stop(self.reason(&reply))),
             Word::Ask => Err(self.refuse(
                 "ask at run.ending, where only allow, deny (keep going) and stop are allowed",
             )),
@@ -212,7 +225,7 @@ impl Plugin for HookExec {
         )?;
         match reply.verdict {
             Word::Continue => Ok(Verdict::Continue),
-            Word::Stop => Ok(Verdict::Stop(reply.reason())),
+            Word::Stop => Ok(Verdict::Stop(self.reason(&reply))),
             Word::Deny | Word::Ask => Err(self.refuse(
                 "deny or ask at model.request, where only allow, rewrite and stop are allowed",
             )),
@@ -257,8 +270,8 @@ impl Plugin for HookExec {
         let reply = self.ask(DecidePoint::CompactionBefore, json!({"context": clean}))?;
         match reply.verdict {
             Word::Continue => Ok(Verdict::Continue),
-            Word::Deny => Ok(Verdict::Deny(reply.reason())),
-            Word::Stop => Ok(Verdict::Stop(reply.reason())),
+            Word::Deny => Ok(Verdict::Deny(self.reason(&reply))),
+            Word::Stop => Ok(Verdict::Stop(self.reason(&reply))),
             Word::Ask => Err(self.refuse(
                 "ask at compaction.before, where only allow, rewrite, deny and stop are allowed",
             )),
@@ -288,9 +301,9 @@ impl Plugin for HookExec {
         )?;
         match reply.verdict {
             Word::Continue => Ok(Verdict::Continue),
-            Word::Deny => Ok(Verdict::Deny(reply.reason())),
-            Word::Ask => Ok(Verdict::Ask(reply.reason())),
-            Word::Stop => Ok(Verdict::Stop(reply.reason())),
+            Word::Deny => Ok(Verdict::Deny(self.reason(&reply))),
+            Word::Ask => Ok(Verdict::Ask(self.reason(&reply))),
+            Word::Stop => Ok(Verdict::Stop(self.reason(&reply))),
             Word::Rewrite => {
                 let Some(arguments) = reply.arguments else {
                     return Err(self.refuse("a rewrite without `arguments`"));
@@ -317,8 +330,8 @@ impl Plugin for HookExec {
         )?;
         match reply.verdict {
             Word::Continue => Ok(Verdict::Continue),
-            Word::Deny => Ok(Verdict::Deny(reply.reason())),
-            Word::Stop => Ok(Verdict::Stop(reply.reason())),
+            Word::Deny => Ok(Verdict::Deny(self.reason(&reply))),
+            Word::Stop => Ok(Verdict::Stop(self.reason(&reply))),
             Word::Ask => Err(self
                 .refuse("ask at tool.after, where only allow, rewrite, deny and stop are allowed")),
             Word::Rewrite => {
@@ -355,8 +368,14 @@ impl Plugin for HookExec {
         });
         let reply = self
             .program
-            .request(Mode::Observe, event.name(), payload)
+            .request(
+                Mode::Observe,
+                Some(event.header.key.as_str()),
+                event.name(),
+                payload,
+            )
             .map_err(|e| HookError::new(self.name.clone(), e.class(), e.to_string()))?;
+        self.check(&reply)?;
         if reply.verdict == Word::Continue {
             Ok(())
         } else {

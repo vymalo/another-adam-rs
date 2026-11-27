@@ -29,8 +29,12 @@ sequenceDiagram
    at most 30. Replies may come in any order; each names the `id` it answers.
 4. At the end, adam writes `shutdown`. A program that does not exit is killed.
 
-One JSON object per line, at most **256 KiB**. A member adam does not know is ignored, so a program
-may add its own; a line that is not JSON is a broken program (see *When it fails*).
+One JSON object per line, at most **256 KiB** each way. A member adam does not know is ignored, so a program may
+add its own; a line that is not JSON is a broken program (see *When it fails*).
+
+**The host's own deadline is separate.** `adam-hook-exec` gives a call 2 s, but the `HookSet` it is installed in
+has its own deadline (1 s by default) and measures it after the hook returns: a host that wants the protocol's
+2 s must build the set with `HookSet::with_limits` and a deadline at least as long.
 
 ## The messages
 
@@ -55,9 +59,10 @@ may add its own; a line that is not JSON is a broken program (see *When it fails
  "payload":{"tool":"run_command","arguments":{"command":"git push"}}}
 ```
 
-`mode` is `decide` (your answer is the verdict) or `observe` (you may only say `continue`). `key` is
-`<plugin>/<point>/<id>`: unique for the life of the process, and **not** the journal's key — a replay
-sends no request at all, so a program has nothing to deduplicate on.
+`mode` is `decide` (your answer is the verdict) or `observe` (you may only say `continue`). For a deciding
+point, `key` is `<plugin>/<point>/<id>`: unique for the life of the process, and **not** the journal's key — a
+replay sends no request at all, so there is nothing to deduplicate on. For an observer, `key` is the event's own
+key, which is stable across replays: deduplicate on it if you write elsewhere.
 
 **reply**, from the program:
 
@@ -75,12 +80,12 @@ A `rewrite` carries the member its point rewrites: `arguments` for `tool.before`
 
 | Point | Payload | Your verdicts | A `rewrite` carries |
 |---|---|---|---|
-| `message.received` | `text`, `files` (name, media type, size, reference — never the bytes) | allow, deny, rewrite | `text` |
-| `tool.before` | `tool`, `arguments` | allow, deny, ask, stop, rewrite | `arguments` |
-| `tool.after` | `tool`, `text` | allow, deny, stop, rewrite | `text` |
-| `model.request` | `kind` (`turn` or `compaction`), `temperature`, `top_p`, `max_output_tokens`, `metadata`, `headers`, `extra_body` | allow, stop, rewrite | the member to change |
-| `compaction.before` | `context` | allow, deny, stop, rewrite | `context` |
-| `run.ending` | `text`, `continuations` | allow, deny (keep going), stop | nothing |
+| `message.received` | `text`, `files` (name, media type, size, reference — never the bytes) | `continue`, `deny`, `rewrite` | `text` |
+| `tool.before` | `tool`, `arguments` | `continue`, `deny`, `ask`, `stop`, `rewrite` | `arguments` |
+| `tool.after` | `tool`, `text` | `continue`, `deny`, `stop`, `rewrite` | `text` |
+| `model.request` | `kind` (`turn` or `compaction`), `temperature`, `top_p`, `max_output_tokens`, `metadata`, `headers`, `extra_body` | `continue`, `stop`, `rewrite` | the member to change |
+| `compaction.before` | `context` | `continue`, `deny`, `stop`, `rewrite` | `context` |
+| `run.ending` | `text`, `continuations` | `continue`, `deny` (keep going), `stop` | nothing |
 
 `deny` refuses the action and the run goes on with your reason. `ask` parks the run for a person's
 approval (`tool.before` only). `stop` fails the run with your reason. `deny` at `run.ending` keeps
@@ -100,8 +105,10 @@ answers anything but `continue` is refused and counted as a failure.
   span is refused, so a program cannot put a redaction marker back into a real call.
 - **stderr is logged**, scrubbed, at debug level.
 - **No run context**: no store, no history, no model, no secret.
-- **Actions are not built yet.** A reply with a non-empty `actions` is refused (`Unsupported`)
-  rather than silently ignored ([ADR 0050](../decisions/0050-hooks-around-the-agent-loop-compiled-first-and-programs-second.md),
+- **An empty private directory** is its working directory — the adapter makes one (mode 0700, removed when the
+  program goes) unless the deployment names one.
+- **Actions are not built yet.** A reply with a non-empty `actions` — deciding or observing — is refused
+  (`Unsupported`) rather than silently ignored ([ADR 0050](../decisions/0050-hooks-around-the-agent-loop-compiled-first-and-programs-second.md),
   slice H1d).
 
 ## When it fails
@@ -129,7 +136,9 @@ for line in sys.stdin:
     if message.get("type") == "hello":
         print(json.dumps({"type": "hello", "protocol": "adam-hooks/1", "name": "no-push"}), flush=True)
     elif message.get("type") == "event":
-        command = message["payload"].get("arguments", {}).get("command", "")
+        arguments = message["payload"].get("arguments")
+        command = arguments.get("command", "") if isinstance(arguments, dict) else ""
+        command = command if isinstance(command, str) else ""
         verdict = {"verdict": "deny", "reason": "pushing is not allowed here"} if "git push" in command \
             else {"verdict": "continue"}
         print(json.dumps({"type": "reply", "id": message["id"], **verdict}), flush=True)
@@ -140,3 +149,6 @@ for line in sys.stdin:
 It is started with `Config` in an embedding host. The deployment's file and switch that read a
 program from a configuration file are the next slice, P2; nothing is read from an agent's folder or a
 repository.
+
+The invariants to check, the test behind each claim and what is not built yet:
+[hook programs, for agents](../../.agents/docs/reference/hooks-protocol.md).

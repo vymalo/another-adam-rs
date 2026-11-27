@@ -69,15 +69,6 @@ pub enum Error {
         millis: u64,
     },
 
-    /// The program answered something the point does not allow.
-    #[error("the program {program} answered {what}")]
-    Reply {
-        /// The program, as the configuration named it.
-        program: String,
-        /// What it answered, as a person reads it.
-        what: String,
-    },
-
     /// The program asked for an action this build cannot perform.
     #[error(
         "the program {program} asked for an action, and no action is built yet (ADR 0050, slice H1d)"
@@ -104,7 +95,6 @@ impl Classify for Error {
             | Error::Hello { .. }
             | Error::Protocol { .. }
             | Error::Malformed { .. }
-            | Error::Reply { .. }
             | Error::Config { .. } => ErrorClass::Invalid,
             // A dead program stops calls until it is back, and a missed deadline is retried.
             Error::Down { .. } | Error::Deadline { .. } => ErrorClass::Transient,

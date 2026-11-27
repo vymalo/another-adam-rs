@@ -16,7 +16,7 @@ use adam_core::{DynStore, MemoryStore, RunId, RunStatus};
 use adam_hook_exec::{Config, DecidePoint, HookExec, Points};
 use adam_llm_agent::{HookSet, LlmAgent, Tool, ToolCtx, ToolError, ToolOutput, user_message};
 use adam_model::{MockModel, ToolCall, ToolSpec};
-use adam_runtime::Runtime;
+use adam_runtime::{RetryPolicy, Runtime};
 use async_trait::async_trait;
 use serde_json::{Value, json};
 use tokio::sync::Notify;
@@ -55,16 +55,16 @@ fn spawn_worker(rt: &Runtime) -> Worker {
     Worker { stop, handle }
 }
 
-async fn wait_done(rt: &Runtime, run: RunId) {
+async fn wait_status(rt: &Runtime, run: RunId, wanted: RunStatus) {
     let deadline = std::time::Instant::now() + Duration::from_secs(20);
     loop {
         let view = rt.view(run).await.expect("view").expect("run exists");
-        if view.status == RunStatus::Done {
+        if view.status == wanted {
             return;
         }
         assert!(
             std::time::Instant::now() < deadline,
-            "timed out waiting for the run; last view: {view:#?}"
+            "timed out waiting for {wanted:?}; last view: {view:#?}"
         );
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
@@ -193,7 +193,7 @@ async fn a_replay_sends_no_request_for_the_recorded_step() {
     assert_eq!(a_calls.load(SeqCst), 1, "the first call ran once");
 
     let survivor = spawn_worker(&rt_b);
-    wait_done(&rt_b, run).await;
+    wait_status(&rt_b, run, RunStatus::Done).await;
     let _ = survivor.stop.send(());
     tokio::time::timeout(Duration::from_secs(10), survivor.handle)
         .await
@@ -216,5 +216,54 @@ async fn a_replay_sends_no_request_for_the_recorded_step() {
         requests_for(&log, "b"),
         2,
         "the step that was never recorded was asked again"
+    );
+}
+
+/// A program that dies on its first event makes the transition transient; after the runtime's
+/// tries the run fails, and the tool never ran.
+#[tokio::test]
+async fn a_run_fails_when_its_program_never_answers() {
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let log = dir.path().join("requests.log");
+    let exec = HookExec::start(program("die-after:0", &log)).expect("the program starts");
+
+    let store: DynStore = Arc::new(MemoryStore::new());
+    let mock = Arc::new(MockModel::new());
+    let (a, a_calls) = Echo::new("a");
+    let agent = LlmAgent::builder("llm", mock.clone(), "test-model")
+        .tool(a)
+        .hooks(HookSet::new().with(Arc::new(exec)))
+        .build();
+    mock.push_tool_calls(vec![call("c1", "a", json!({}))])
+        .push_text("done");
+
+    let rt = Runtime::builder(store.clone())
+        .agent(agent.clone())
+        .worker_id("dead-program")
+        .poll_interval(Duration::from_millis(20))
+        .lease_ttl(Duration::from_millis(300))
+        .retry(RetryPolicy::new(2).with_backoff(Duration::ZERO, Duration::ZERO))
+        .build();
+    let run = rt
+        .start("llm", user_message("go"), None)
+        .await
+        .expect("start");
+    let worker = spawn_worker(&rt);
+    wait_status(&rt, run, RunStatus::Failed).await;
+    let _ = worker.stop.send(());
+    tokio::time::timeout(Duration::from_secs(10), worker.handle)
+        .await
+        .expect("the worker stops")
+        .expect("the worker task")
+        .expect("the worker result");
+
+    assert_eq!(
+        a_calls.load(SeqCst),
+        0,
+        "a hook that cannot decide never lets the call through"
+    );
+    assert!(
+        requests_for(&log, "a") >= 1,
+        "the program was asked, and never answered"
     );
 }

@@ -46,14 +46,13 @@ fn main() {
     let mut garbage = mode == "garbage";
     for line in stdin.lock().lines() {
         let Ok(line) = line else { return };
-        if let Some(path) = &log {
-            if let Ok(mut file) = std::fs::OpenOptions::new()
+        if let Some(path) = &log
+            && let Ok(mut file) = std::fs::OpenOptions::new()
                 .create(true)
                 .append(true)
                 .open(path)
-            {
-                let _ = writeln!(file, "{line}");
-            }
+        {
+            let _ = writeln!(file, "{line}");
         }
         let value: Value = serde_json::from_str(&line).unwrap_or(Value::Null);
         match value.get("type").and_then(Value::as_str) {
@@ -71,10 +70,10 @@ fn main() {
             Some("shutdown") => return,
             Some("event") => {
                 events += 1;
-                if let Some(limit) = die_after {
-                    if events > limit {
-                        std::process::exit(4);
-                    }
+                if let Some(limit) = die_after
+                    && events > limit
+                {
+                    std::process::exit(4);
                 }
                 if garbage {
                     // One broken line: the adapter must refuse, never continue.
