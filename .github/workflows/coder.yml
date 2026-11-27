@@ -190,6 +190,15 @@ jobs:
           helm template coder deploy/coder --namespace another-agentic-system --set image.tag=sha-abc1234 \
             --set cache.create=true --set cache.storageClass=rwx --set runPods.enabled=true \
             --set topology=split --set front.replicas=2 > "$RUNNER_TEMP/rendered-cache-run-pods.yaml"
+          # GET /internal/activity on a port of its own (activity.*, ADR 0083): the container port, its Service
+          # port, the tokens from a Secret and the policy's second rule, in the combined pod and on the split front.
+          helm template coder deploy/coder --namespace another-agentic-system --set image.tag=sha-abc1234 \
+            --set activity.enabled=true --set activity.tokensSecret.name=coder-activity \
+            --set activity.allowedNamespace=agent-platform > "$RUNNER_TEMP/rendered-activity.yaml"
+          helm template coder deploy/coder --namespace another-agentic-system --set image.tag=sha-abc1234 \
+            --set activity.enabled=true --set activity.tokensSecret.name=coder-activity \
+            --set activity.allowedNamespace=agent-platform --set topology=split \
+            > "$RUNNER_TEMP/rendered-activity-split.yaml"
           for attempt in 1 2 3; do
             status=0
             "$RUNNER_TEMP/kubeconform" -strict -summary -kubernetes-version "$KUBERNETES_VERSION" \
@@ -205,6 +214,7 @@ jobs:
                 "$RUNNER_TEMP/rendered-model-url.yaml" "$RUNNER_TEMP/rendered-model-url-split.yaml" \
                 "$RUNNER_TEMP/rendered-run-pods.yaml" "$RUNNER_TEMP/rendered-run-pods-shared.yaml" \
                 "$RUNNER_TEMP/rendered-cache.yaml" "$RUNNER_TEMP/rendered-cache-run-pods.yaml" \
+                "$RUNNER_TEMP/rendered-activity.yaml" "$RUNNER_TEMP/rendered-activity-split.yaml" \
                 > "$RUNNER_TEMP/kubeconform.out" 2>&1 || status=$?
             cat "$RUNNER_TEMP/kubeconform.out"
             if [ "$status" -eq 0 ]; then exit 0; fi

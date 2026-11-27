@@ -231,6 +231,23 @@ impl Running {
         Self { stop, handle }
     }
 
+    /// Serve on `listener`, and the activity route on `activity`, until `finish`.
+    fn start_with_activity(
+        listener: TcpListener,
+        activity: TcpListener,
+        config: ServiceConfig,
+        agents: Agents,
+    ) -> Self {
+        let (stop, rx) = tokio::sync::oneshot::channel::<()>();
+        let handle = tokio::spawn(async move {
+            adam_service::serve_on_with_activity(&config, agents, listener, activity, async {
+                let _ = rx.await;
+            })
+            .await
+        });
+        Self { stop, handle }
+    }
+
     /// Ask it to stop and wait for it: a clean stop is `Ok`.
     async fn finish(self) {
         let _ = self.stop.send(());
@@ -429,8 +446,9 @@ async fn serve_runs_the_whole_agent_on_a_sqlite_file() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// `GET /internal/activity` needs the bearer, and on an idle store answers `busy: 0` with no
-/// `nextDueAt` and nothing of any run.
+/// Without `ACTIVITY_LISTEN_ADDR` (the compatible form, deprecated by ADR 0083), `GET
+/// /internal/activity` is on the A2A listener: it needs the A2A bearer, and on an idle store answers
+/// `busy: 0` with no `nextDueAt` and nothing of any run.
 #[tokio::test]
 async fn the_activity_route_needs_the_bearer_and_reports_an_idle_store() {
     let name = unique("serve-activity");
@@ -461,6 +479,186 @@ async fn the_activity_route_needs_the_bearer_and_reports_an_idle_store() {
     assert_eq!(body.trim(), r#"{"busy":0}"#);
     running.finish().await;
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+const ACTIVITY_TOKEN: &str = "serve-activity-only-token";
+
+/// The variables of an activity listener of its own: its address is not read by
+/// `serve_on_with_activity`, which takes the bound listener.
+fn activity_vars() -> [(&'static str, String); 2] {
+    [
+        ("ACTIVITY_LISTEN_ADDR", "127.0.0.1:0".to_owned()),
+        ("ACTIVITY_BEARER_TOKENS", ACTIVITY_TOKEN.to_owned()),
+    ]
+}
+
+/// With `ACTIVITY_LISTEN_ADDR` (ADR 0083): the activity listener answers its own token only and
+/// serves `GET /internal/activity` only (every other path is a 404, `/healthz` and the card
+/// included); the A2A listener refuses the activity token, and no longer serves the route even to
+/// an A2A token.
+#[tokio::test]
+async fn the_activity_listener_answers_its_own_token_and_that_route_only() {
+    let name = unique("serve-activity-own");
+    let dir = std::env::temp_dir().join(format!(
+        "adam-serve-activity-own-{}",
+        RunId::new().0.simple()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let url = format!("sqlite://{}", dir.join("adam.sqlite").display());
+    let (listener, port) = listen().await;
+    let (activity, activity_port) = listen().await;
+    let addr: SocketAddr = ([127, 0, 0, 1], port).into();
+    let own: SocketAddr = ([127, 0, 0, 1], activity_port).into();
+    let cfg = config_with(&url, "all", port, &activity_vars());
+    let running =
+        Running::start_with_activity(listener, activity, cfg.clone(), agents(&name, &cfg));
+    until_ok(addr, "/healthz", &running.handle).await;
+
+    // Its own token, and nothing else.
+    let (status, body) = get_with(own, "/internal/activity", Some(ACTIVITY_TOKEN))
+        .await
+        .expect("an answer");
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body.trim(), r#"{"busy":0}"#);
+    for token in [None, Some("wrong"), Some("serve-test-token")] {
+        assert_eq!(
+            get_with(own, "/internal/activity", token)
+                .await
+                .map(|r| r.0),
+            Some(401),
+            "{token:?} on the activity listener"
+        );
+    }
+    // That route only: nothing of A2A, no probe, with its token or without.
+    for path in [
+        "/healthz",
+        "/.well-known/agent-card.json",
+        "/",
+        "/tasks",
+        "/openapi.json",
+    ] {
+        for token in [None, Some(ACTIVITY_TOKEN), Some("serve-test-token")] {
+            assert_eq!(
+                get_with(own, path, token).await.map(|r| r.0),
+                Some(404),
+                "{path} {token:?} on the activity listener"
+            );
+        }
+    }
+
+    // The A2A listener: the activity token is no A2A token, and the route is gone from it.
+    assert_eq!(
+        get_with(addr, "/internal/activity", Some(ACTIVITY_TOKEN))
+            .await
+            .map(|r| r.0),
+        Some(401)
+    );
+    assert_eq!(
+        get_with(addr, "/tasks", Some(ACTIVITY_TOKEN))
+            .await
+            .map(|r| r.0),
+        Some(401),
+        "the activity token reads nothing of A2A"
+    );
+    assert_eq!(
+        get_with(addr, "/internal/activity", Some("serve-test-token"))
+            .await
+            .map(|r| r.0),
+        Some(404),
+        "with a listener of its own, the route is not on the A2A port"
+    );
+    assert_eq!(
+        status_of(addr, "/.well-known/agent-card.json").await,
+        Some(200)
+    );
+    running.finish().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// An activity listener handed over with no `ACTIVITY_LISTEN_ADDR`, so no tokens of its own, is
+/// never served (exit 78), and nothing connects first.
+#[tokio::test]
+async fn an_activity_listener_without_its_own_tokens_is_78() {
+    let cfg = config("postgres://nobody:nothing@127.0.0.1:1/none", "all", 0);
+    let (listener, _) = listen().await;
+    let (activity, _) = listen().await;
+    let error = adam_service::serve_on_with_activity(
+        &cfg,
+        agents("serve-activity-none", &cfg),
+        listener,
+        activity,
+        std::future::pending(),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(error, ServeError::ActivityWithoutTokens),
+        "{error}"
+    );
+    assert_eq!(exit_code(&error), 78);
+}
+
+/// `ACTIVITY_LISTEN_ADDR` without `ACTIVITY_BEARER_TOKENS` is a configuration problem: exit 78.
+#[test]
+fn an_activity_address_without_tokens_is_exit_78() {
+    let vars = [
+        ("DATABASE_URL", "postgres://u:p@127.0.0.1:1/x"),
+        ("A2A_BEARER_TOKENS", "serve-test-token"),
+        ("PUBLIC_URL", "http://agent.test:8080/"),
+        ("ACTIVITY_LISTEN_ADDR", "127.0.0.1:0"),
+    ];
+    let mut problems = Vec::new();
+    let _ = ServiceConfig::parse(
+        &|name: &str| {
+            vars.iter()
+                .find(|(k, _)| *k == name)
+                .map(|(_, v)| (*v).to_owned())
+        },
+        &mut problems,
+    );
+    let error = ConfigError::check(problems).unwrap_err();
+    assert!(
+        error
+            .problems
+            .iter()
+            .any(|p| p.starts_with("ACTIVITY_BEARER_TOKENS is required")),
+        "{error}"
+    );
+    assert_eq!(exit_code(&error), 78);
+}
+
+/// A worker with an activity listener of its own: the route is there, behind its token, and its
+/// probe listener is `/healthz` alone.
+#[tokio::test]
+async fn a_worker_serves_activity_on_its_own_listener() {
+    let Some(url) = database() else { return };
+
+    let name = unique("serve-worker-activity");
+    let (listener, port) = listen().await;
+    let (activity, activity_port) = listen().await;
+    let addr: SocketAddr = ([127, 0, 0, 1], port).into();
+    let own: SocketAddr = ([127, 0, 0, 1], activity_port).into();
+    let cfg = config_with(&url, "worker", port, &activity_vars());
+    let running =
+        Running::start_with_activity(listener, activity, cfg.clone(), agents(&name, &cfg));
+    until_ok(addr, "/healthz", &running.handle).await;
+    let (status, body) = get_with(own, "/internal/activity", Some(ACTIVITY_TOKEN))
+        .await
+        .expect("an answer");
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        get_with(own, "/internal/activity", None).await.map(|r| r.0),
+        Some(401)
+    );
+    assert_eq!(status_of(own, "/healthz").await, Some(404));
+    assert_eq!(
+        get_with(addr, "/internal/activity", Some(ACTIVITY_TOKEN))
+            .await
+            .map(|r| r.0),
+        Some(404),
+        "the probe listener no longer has the route"
+    );
+    running.finish().await;
 }
 
 /// A worker serves `/healthz` and nothing else; a control plane serves A2A and steps nothing.

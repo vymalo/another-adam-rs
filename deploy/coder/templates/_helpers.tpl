@@ -226,6 +226,39 @@ a control plane signs and verifies too (ADR 0068 decision 9).
 {{- end -}}
 
 {{/*
+GET /internal/activity on a port of its own (values `activity`, adam ADR 0083): on the pods that serve
+A2A, so on the Service's pods. Off by default, and then nothing of it is rendered.
+*/}}
+{{- define "coder.activity" -}}
+{{- if .Values.activity.enabled -}}true{{- end -}}
+{{- end -}}
+
+{{/*
+The environment of the activity listener, as list items for a container's `env`: the address, and the
+tokens from the Secret that was named (never a value of the chart).
+*/}}
+{{- define "coder.activityEnv" -}}
+{{- if include "coder.activity" . }}
+- name: ACTIVITY_LISTEN_ADDR
+  value: {{ printf "0.0.0.0:%d" (int64 .Values.activity.port) | quote }}
+- name: ACTIVITY_BEARER_TOKENS
+  valueFrom:
+    secretKeyRef:
+      name: {{ .Values.activity.tokensSecret.name | toString | trim }}
+      key: {{ .Values.activity.tokensSecret.key }}
+{{- end }}
+{{- end -}}
+
+{{/* The container port of the activity listener, as a list item for a container's `ports`. */}}
+{{- define "coder.activityPort" -}}
+{{- if include "coder.activity" . }}
+- name: activity
+  containerPort: {{ int64 .Values.activity.port }}
+  protocol: TCP
+{{- end }}
+{{- end -}}
+
+{{/*
 The environment of the optional A2A features, as list items for a container's `env`. Include it only in
 a pod that serves A2A (the combined StatefulSet, the split front).
 */}}

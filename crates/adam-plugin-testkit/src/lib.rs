@@ -404,7 +404,7 @@ macro_rules! plugin_conformance {
 
         #[test]
         fn a_hook_past_its_deadline_is_transient_and_denies() {
-            let set = ($make)().with(std::sync::Arc::new($crate::Sleeps(std::time::Duration::from_millis(40))));
+            let set = ($make)().with(std::sync::Arc::new($crate::Sleeps(std::time::Duration::from_secs(2))));
             let mut arguments = a_call();
             let mut call = adam_plugin::HookedCall {
                 tool: "ls",

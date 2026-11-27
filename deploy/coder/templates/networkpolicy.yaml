@@ -33,4 +33,14 @@ spec:
       ports:
         - protocol: TCP
           port: 8080
+    {{- if include "coder.activity" . }}
+    {{- /* activity.*: its caller reaches the activity port only, never the A2A port (ADR 0083). */}}
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.activity.allowedNamespace | toString | trim }}
+      ports:
+        - protocol: TCP
+          port: {{ int64 .Values.activity.port }}
+    {{- end }}
 {{- end }}

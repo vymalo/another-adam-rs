@@ -171,6 +171,12 @@ spec:
             - name: http
               containerPort: 8080
               protocol: TCP
+            {{- if not $split }}
+            {{- /* activity.*: GET /internal/activity on a port of its own, on the pods the Service selects (ADR 0083). */}}
+            {{- with (include "coder.activityPort" . | trim) }}
+            {{- . | nindent 12 }}
+            {{- end }}
+            {{- end }}
           env:
             - name: LISTEN_ADDR
               value: "0.0.0.0:8080"
@@ -426,6 +432,10 @@ spec:
             {{- if not $split }}
             {{- /* a2a.*: the optional A2A features, off by default; the split worker serves no A2A. */}}
             {{- with (include "coder.a2aEnv" . | trim) }}
+            {{- . | nindent 12 }}
+            {{- end }}
+            {{- /* activity.*: its listener and its own tokens, from the Secret that was named. */}}
+            {{- with (include "coder.activityEnv" . | trim) }}
             {{- . | nindent 12 }}
             {{- end }}
             {{- end }}

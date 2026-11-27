@@ -786,6 +786,24 @@ control plane that runs for as long as a task does: delivery is a loop in the po
 leases. `extraEnv` may not set `A2A_PUSH_ALLOWED_URLS` or `A2A_CARD_SIGNING_KEY_FILE` while the value that sets it is on. The
 extended agent card needs no value: it is `card.extended` in the agent's folder.
 
+## The activity port (`activity.*`)
+
+`GET /internal/activity` says how busy the coder is (`{"busy": N, "nextDueAt": "..."}`, no run content), for a caller
+that scales the service. **Off by default**, and then nothing of it is rendered (the goldens do not move): the route is on
+the A2A port behind the A2A tokens, a form that is **deprecated**. On, the route has a port of its own and tokens of its own,
+so its caller holds no A2A token and gets no path to the A2A port
+([ADR 0083](../../docs/decisions/0083-the-activity-route-has-a-listener-and-tokens-of-its-own.md)).
+
+| Value | Renders | Effect |
+|---|---|---|
+| `activity.enabled` | `ACTIVITY_LISTEN_ADDR`, `ACTIVITY_BEARER_TOKENS`, a container port and a Service port `activity` | **turns it on**: the pods the Service selects (the StatefulSet, or the front with `topology: split`) serve the route alone on `activity.port`; the A2A port stops serving it |
+| `activity.port` (8081) | `ACTIVITY_LISTEN_ADDR=0.0.0.0:<port>` | not 8080 (A2A) nor `githubMcp.port` |
+| `activity.tokensSecret.name`, `.key` (`ACTIVITY_BEARER_TOKENS`) | a `secretKeyRef` | **required**: a Secret you (or another ExternalSecret) manage, comma-separated tokens under `key`. The chart never takes a token as a value, and refuses `ACTIVITY_*` in `config.extraEnv`. A token that is also an A2A token makes the process exit 78 |
+| `activity.allowedNamespace` | a second ingress rule of the NetworkPolicy | **required** with `networkPolicy.enabled`: that namespace reaches `activity.port`, and only it |
+
+**The render is a contract**: another-agentic-platform renders its parity goldens from this chart, so a change to what it
+renders for these values is said in the pull request.
+
 ## Swagger UI
 
 Every A2A server serves Swagger UI at `/docs` and its OpenAPI document at `/openapi.json`, both public, both bindings

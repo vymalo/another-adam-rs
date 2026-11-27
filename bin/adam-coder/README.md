@@ -2175,6 +2175,7 @@ way; every problem is reported at once at startup):
 | `A2A_BEARER_TOKENS` | comma-separated accepted tokens (fail closed: none = no server) | required by `all` and `control-plane` |
 | `PUBLIC_URL` | where clients reach the JSON-RPC endpoint (agent card) | required by `all` and `control-plane` |
 | `LISTEN_ADDR` | bind address: the A2A server, or a worker's `/healthz` listener | `0.0.0.0:8080` |
+| `ACTIVITY_LISTEN_ADDR`, `ACTIVITY_BEARER_TOKENS` | `GET /internal/activity` alone on a listener of its own, behind tokens of its own (none an A2A token; the address without tokens is exit 78), and gone from `LISTEN_ADDR` ([ADR 0083](../../docs/decisions/0083-the-activity-route-has-a-listener-and-tokens-of-its-own.md), `adam-service`) | unset: the route stays on `LISTEN_ADDR` behind the A2A tokens (deprecated) |
 | `A2A_PUSH_ALLOWED_URLS` | turns A2A push notifications **on** and names the webhooks they may reach: comma-separated URL prefixes or hosts ([`adam-service`](../../crates/adam-service/README.md#environment)); a client's webhook that matches none, is not `https` or is a private address is refused | unset: off, the card says so |
 | `A2A_PUSH_ALLOW_PRIVATE` | also allow loopback, private and link-local webhooks and `http` to loopback: development only | `false` |
 | `A2A_PUSH_GIVE_UP_AFTER_SECS`, `A2A_PUSH_REQUEST_TIMEOUT_SECS` | how long a notification may keep failing before delivery to that webhook is abandoned (1 to 604800), and how long one request may take (1 to 120) | `3600`, `15` |

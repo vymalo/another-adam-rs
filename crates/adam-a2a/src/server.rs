@@ -162,6 +162,17 @@ impl A2aServer {
         Self::health_router().merge(protected)
     }
 
+    /// `routes` alone, behind the bearer `auth` asks for: no `/healthz`, no card, nothing of A2A,
+    /// and any other path a plain 404. For a listener of its own that serves one internal route
+    /// with tokens of its own (the service's `GET /internal/activity` on `ACTIVITY_LISTEN_ADDR`),
+    /// so a credential for that route is never one for A2A, nor the reverse.
+    pub fn protected_router(auth: AuthConfig, routes: Router) -> Router {
+        routes.route_layer(middleware::from_fn_with_state(
+            Arc::new(Authenticator::new(auth)),
+            auth::authenticate,
+        ))
+    }
+
     /// [`router`](Self::router) with [`ServerOptions`].
     pub fn router_with_options(
         card: AgentCardConfig,
