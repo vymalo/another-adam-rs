@@ -535,7 +535,7 @@ forwards stdin, held open for minutes, to it (proved in both environments — th
 **What a call waits for.** `wait` (1 to 120 s, 30 by default) is how long a call waits for a server that is still indexing:
 a `$/progress` that has begun and not ended, `experimental/serverStatus` that is not `quiescent` (when the server says it
 reports it: rust-analyzer's), or less than 300 ms of quiet since the last. Past it the model gets what the server has said under
-a first line, `[still indexing after 30 s (server up 34 s): the result may be incomplete; call again, the server is kept]`,
+a first line, `[still indexing after 30 s of at most 30 s (server up 34 s): the result may be incomplete; call again, the server is kept]` (the time spent, then the `wait` bound),
 and the server stays: the next call finds it warm. That is never an error. Diagnostics are pulled
 (`textDocument/diagnostic`) when the server offers it, else the last `publishDiagnostics` of the file, waited for after a change
 (a first one within 3 s from a server that is not indexing, then 300 ms without another). A file is found under whatever
