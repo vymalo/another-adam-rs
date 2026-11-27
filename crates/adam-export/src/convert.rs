@@ -241,6 +241,8 @@ pub(crate) fn head_of(
             .conversation_id
             .as_deref()
             .map(|conversation| pseudonyms.of("conversation", conversation)),
+        // The exporter sets it from the source's label: the conversion does not know the source.
+        source: None,
         agent: run.agent.clone(),
         status: run.status.as_str().to_owned(),
         created_at: run.created_at.to_string(),
@@ -592,4 +594,23 @@ mod tests {
             Some("push refused for [gone]")
         );
     }
+
+    /// The bytes of a record as the exporter wrote them before records could name their source
+    /// (`Record::source`): a record with no source is the same line, so one unnamed source's export
+    /// is byte-identical to the one before the ports (ADR 0085, *Amended*: ports and adapters).
+    #[test]
+    fn a_record_without_a_source_is_the_line_it_was() {
+        let id = |text: &str| -> RunId { serde_json::from_value(json!(text)).expect("a run id") };
+        let run = RunMeta {
+            id: id("0195f0aa-0000-7000-8000-000000000001"),
+            parent_id: Some(id("0195f0aa-0000-7000-8000-000000000002")),
+            ..meta(RunStatus::Done)
+        };
+        let line = serde_json::to_string(&record_of(&run, &conversation(), &options()))
+            .expect("a record serializes");
+        assert_eq!(line, GOLDEN_LINE);
+    }
+
+    /// Written by the exporter before `Record::source` existed (captured on 2026-11-27).
+    const GOLDEN_LINE: &str = r##"{"schema":"adam.export/v1","id":"a65751c74b4df58489a4976ad73d8de1","parent":"8b2f43d9e12814ecd296fafc9672f138","conversation":"425258b40f480f116276830a75727003","agent":"coder","status":"done","created_at":"2027-01-15T08:00:00Z","updated_at":"2027-01-15T08:00:00Z","turns":2,"tool_calls":2,"usage":{"input_tokens":10,"output_tokens":5},"models":["big","small"],"compacted":false,"facets":{"dep":["axum"],"lang":["toml"]},"outcome":{"status":"done","artifacts":[{"name":"pull_request","mime_type":"application/json"}]},"tools_source":"none","train_on":"assistant","messages":[{"role":"user","content":"look at this[image]"},{"role":"assistant","content":"","tool_calls":[{"id":"c1","type":"function","function":{"name":"read_file","arguments":"{\"path\":\"Cargo.toml\"}"}},{"id":"c2","type":"function","function":{"name":"run","arguments":"{not json"}}]},{"role":"tool","tool_call_id":"c1","content":"[dependencies]\naxum = \"0.8\"\n[image]"},{"role":"tool","tool_call_id":"c2","content":"arguments were not valid JSON"},{"role":"assistant","content":"done"}]}"##;
 }

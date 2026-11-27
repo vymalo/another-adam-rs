@@ -4,23 +4,23 @@ For people: [Export runs for training](../../../docs/guides/export-runs-for-trai
 the invariants to check on a change to the exporter, the commands to run and where each claim stands in the code. The
 decision is [ADR 0085](../../../docs/decisions/0085-runs-are-exported-as-training-records.md); the crate is
 [`adam-export`](../../../crates/adam-export/README.md). Written on 2026-11-27 against the working tree on `f69e6ea` plus
-the slice E1 and E2 change, and updated the same day for slice E5 (per-turn samples) on `3bc7997`; line numbers move, so
-the function names are the anchors.
+the slice E1 and E2 change, and updated the same day for slice E5 (per-turn samples) on `3bc7997` and for the ports
+and adapters on `6a859c0`; line numbers move, so the function names are the anchors.
 
 ## Invariants to check on a change
 
 1. **No secret and no person's data beyond the messages.** `record_with` (`crates/adam-export/src/convert.rs:174`,
    through `head_of` at `:228`) reads only these fields of a `Conversation`: `messages` (`:182-192`, and `facets_of` at
-   `:253`), `turns`, `tool_calls`, `usage` (`:248-250`), `artifacts` by `name` and `mime_type` (`:257-264`), and
-   through `is_compacted` (`:275`) `compactions`, `shortenings`, `omitted_turns`, `summary`, and through `models_of`
-   (`:283`) each assistant message's `provider.model` and `model_switch` (`:295`). `samples_of`
+   `:255`), `turns`, `tool_calls`, `usage` (`:250-252`), `artifacts` by `name` and `mime_type` (`:259-266`), and
+   through `is_compacted` (`:277`) `compactions`, `shortenings`, `omitted_turns`, `summary`, and through `models_of`
+   (`:285`) each assistant message's `provider.model` and `model_switch` (`:297`). `samples_of`
    (`crates/adam-export/src/sample.rs:204`) also reads `compactions`, `continued_from`, `omitted_turns`, `request`, `limit` and
    `shortenings` to place and mark the samples, and `context` **only** through `interface_language` (`:228`), to mark a
    sample not exact: no value of `context` is written. It never reads `context` otherwise
    (`crates/adam-llm-agent/src/conversation.rs:821`; the caller is the `vymalo.caller` key in it, `CALLER_CONTEXT_KEY`
-   at `:167`), `prompt_statement` (`:851`) or `session` (`:867`). The driver reads `messages` only to skip an empty
-   state (`crates/adam-export/src/export.rs:232`), and `request` and `requests` to load their blobs
-   (`recorded_requests`, `export.rs:247`). A change that reads another field must say why in the pull request
+   at `:167`), `prompt_statement` (`:851`) or `session` (`:867`). `RuntimeSource` reads `messages` only to skip an empty
+   state (`crates/adam-export/src/runtime_source.rs:146`), and `request` and `requests` to load their blobs
+   (`recorded_requests`, `runtime_source.rs:165`). A change that reads another field must say why in the pull request
    and update both pages.
 2. **Every string is cleaned.** Each `String` a record carries from the run passes `ExportOptions::clean`
    (`convert.rs:104`): the deployment's `Scrub`, then `scrub_known_shapes` (`crates/adam-export/src/scrub.rs:62`;
@@ -32,23 +32,23 @@ the function names are the anchors.
    (`convert.rs:236-243`; `crates/adam-export/src/pseudonym.rs:50`), HMAC-SHA256 checked against RFC 4231. No
    `RunId` or conversation id is written anywhere else in a record. `Pseudonyms`' `Debug` hides the key
    (`pseudonym.rs:73`), and so does `ExportOptions`' (`convert.rs:113`).
-4. **Images stay out.** An image part becomes `IMAGE_PLACEHOLDER` (`convert.rs:20`, `:342`, `:358`); no image bytes or
+4. **Images stay out.** An image part becomes `IMAGE_PLACEHOLDER` (`convert.rs:20`, `:344`, `:360`); no image bytes or
    image references are written.
-5. **Reasoning only when asked.** `reasoning_content` is set only under `include_reasoning` (`convert.rs:330`).
+5. **Reasoning only when asked.** `reasoning_content` is set only under `include_reasoning` (`convert.rs:332`).
 6. **Facets never read what a person wrote**: `facets_of` skips `Message::User`
    (`crates/adam-export/src/facets.rs:147`), and a facet is a name, never a value from the text.
-7. **An export is a command.** `export_runs` is called only by the `export` subcommand of `adam-agent` and `adam-coder`;
-   no worker component, route or schedule calls it. Check with
-   `grep -rn "export_runs" crates bin --include=*.rs`.
-8. **Which runs are reached.** `export_agent` lists with `ConversationScope::Prefix(String::new())`
-   (`export.rs:138`), and `ConversationScope::contains` is `false` for a run with no conversation id
+7. **An export is a command.** An `Exporter` is run (directly, or through `export_runs`) only by the `export`
+   subcommand of `adam-agent` and `adam-coder` (`crates/adam-service/src/export.rs:419-424`); no worker component,
+   route or schedule runs one. Check with `grep -rn "Exporter::new\|export_runs" crates bin --include=*.rs`.
+8. **Which runs are reached.** `RuntimeSource::page` lists with `ConversationScope::Prefix(String::new())`
+   (`crates/adam-export/src/runtime_source.rs:85`), and `ConversationScope::contains` is `false` for a run with no conversation id
    (`crates/adam-core/src/store/query.rs:23-29`). Since ADR 0087 slice C1 a subagent's own tool starts its child as a
    one-shot session (`SubagentTool::call` → `ToolCtx::start_one_shot_session`), so every subagent run has a session's
    conversation id and is exported, linked by `parent`
    (`crates/adam-export/tests/export.rs` `a_subagents_run_is_a_record_of_its_own_linked_to_its_parent`). Still not
    reached: a child a host starts with `Runtime::start_child` (no conversation) and a subagent run from before C1;
    listing those needs a query by parent, which `RunQuery` does not have: a `Store` change (Rule 2), not an exporter
-   change. `export_runs` lists per agent name, and the `export` subcommand defaults to every registered agent
+   change. A source lists per agent name (`RunSource::agents`), and the `export` subcommand defaults to every registered agent
    (`agents_to_export`, `crates/adam-service/src/export.rs`), the subagents included.
 9. **The schema is stable.** `SCHEMA` is `adam.export/v1` (`crates/adam-export/src/record.rs:11`). A new optional field
    is fine; a changed meaning is a new schema and an *Amended* note on ADR 0085. Slice E5 added `train_on` (default
@@ -72,10 +72,30 @@ the function names are the anchors.
     `(system, tools)` ids differ from the last entry's, keeping the newest `MAX_RECORDED_REQUESTS` (64, `:998`); the
     turn calls it with the journaled answer's request (`agent.rs:3431`), so a replay writes the same list, and the
     blobs were referenced by the commits that added them. A run-mode record keeps E3's rule: the last call's request,
-    none when that call recorded none (`export.rs:168`).
+    none when that call recorded none (`export.rs:189`).
 13. **The budget never cuts.** `max_tokens` drops a whole record whose `estimated_tokens` (`sample.rs:72`, characters
     of messages and tools / 4, rounded up, the rule of `adam-llm-agent`'s `compaction::estimate`) is over it, and
-    counts it (`export.rs:186`). In turn mode the filter keeps compacted runs (`export.rs:130-137`).
+    counts it (`over_budget`, `export.rs:209`, `:223`). In turn mode the filter keeps compacted runs (`record_filter`,
+    `export.rs:98-104`).
+14. **Ports and adapters** (ADR 0085, *Amended* 2026-11-27). The pipeline (`Exporter`, `crates/adam-export/src/export.rs:88`)
+    names no store and no file: it reads `&dyn RunSource` (`crates/adam-export/src/source.rs:34`) and writes
+    `&mut dyn RecordSink` (`crates/adam-export/src/sink.rs:27`), both `#[async_trait]` like `Store`. Neither error names a
+    backend type (Rule 2): `SourceError::Backend` and `SinkError::Backend` box it with a class; a runtime's error keeps its
+    class (`source.rs:245`), a write is `Transient` and a put after `finish` `Internal` (`sink.rs:89`), a foreign cursor
+    `Invalid` (`source.rs:251`). A source counts what it lists and cannot yield in `Skipped` (`source.rs:195`; outside the
+    query, not a conversation, unreadable), and the pipeline adds them to the `Summary` (`count_listed`, `export.rs:45`),
+    so the counts are those of the driver before the ports. `RuntimeSource::page` (`runtime_source.rs:78`) is the old
+    listing, unchanged: one `list_runs` of `SourceQuery::limit` (100, `export.rs:17`), statuses and `since` pushed, `until`
+    checked (`runtime_source.rs:105`), the cursor the last run's `(updated_at, id)` (`:122`). A new port method breaks
+    every adapter: say so in the pull request and in both READMEs.
+15. **One unnamed source writes the lines of before.** `Record::source` (`crates/adam-export/src/record.rs:30`) is
+    skipped when `None`; `head_of` leaves it `None` (`convert.rs:245`) and the pipeline sets it from the source's label
+    only (`export.rs:215`). The `export` subcommand runs one unnamed `RuntimeSource` (`crates/adam-service/src/export.rs:419`),
+    so its output is byte-identical (`convert.rs` `a_record_without_a_source_is_the_line_it_was`, a line captured before
+    the change; `tests/export.rs` `export_runs_is_the_exporter_over_one_unnamed_runtime_source`). Several sources must
+    each have a label of their own, or nothing is read (`check_labels`, `export.rs:231`). The pseudonym key is the
+    export's, so ids link across sources. A label is the operator's word and is not scrubbed: never put a host or a URL
+    in one.
 
 ## The gates
 
@@ -83,6 +103,7 @@ the function names are the anchors.
 cargo fmt --all --check
 cargo clippy -p adam-export --all-targets --locked -- -D warnings
 cargo test -p adam-export --locked
+cargo test -p adam-export-testkit --locked                           # the port suites against RuntimeSource and JsonLines
 cargo test -p adam-llm-agent --test recorded_request --locked        # the per-change request list (slice E5)
 cargo test -p adam-service --features export --lib export --locked   # --samples, --max-tokens
 cargo clippy --workspace --all-targets --locked -- -D warnings      # the binaries' subcommand
@@ -116,6 +137,13 @@ blocks are not doc-tested.
 | turn mode end to end: two calls are two samples, recorded tools, `train_on: "last"`; run mode says `assistant`; a budget keeps the first | `tests/export.rs` `a_turn_export_writes_one_sample_per_answer` |
 | `requests` gets one entry per change, the same list after a replayed commit, one entry when nothing changes; an older state keeps its bytes | `adam-llm-agent` `tests/recorded_request.rs` `tools_that_change_mid_run_record_one_request_per_change`, `the_last_call_names_its_prompt_and_tools_stored_once`, `a_replayed_call_names_the_same_request_without_the_model`, `a_state_from_before_decodes_and_writes_the_same_bytes`; the rule and the cap: `conversation.rs` `a_request_is_listed_once_per_change_and_the_list_is_bounded` |
 | `--samples run\|turn` and `--max-tokens N` parse strictly (64 otherwise) | `adam-service` `src/export.rs` `samples_and_a_token_budget_read`, `no_flag_exports_every_agent_s_finished_runs_to_standard_output` |
+| several stores into one sink: labels in `source`, the summary of both, the same id alone and together, an unnamed source among several refused | `tests/export.rs` `two_stores_export_into_one_sink_with_their_labels_and_linked_ids` |
+| `export_runs` is the `Exporter` over one unnamed `RuntimeSource` into `JsonLines`, byte for byte | `tests/export.rs` `export_runs_is_the_exporter_over_one_unnamed_runtime_source` |
+| a record without a source is the line the exporter wrote before the ports | `convert.rs` `a_record_without_a_source_is_the_line_it_was` |
+| several sources need labels of their own, not blank | `export.rs` `several_sources_need_labels_of_their_own` |
+| `JsonLines`: one line per record, in order; `finish` twice is fine; a put after it is `Internal`; a refused write `Transient` | `sink.rs` `each_record_is_one_line_of_json_in_order`, `a_refused_write_is_transient` |
+| `RuntimeSource` passes the source suite (disjoint pages, the cursor, skips counted, the query, the bookkeeping) | `adam-export-testkit` `tests/runtime_source.rs` (`source_conformance!`), and `a_cursor_it_did_not_make_is_invalid` |
+| `JsonLines` over a `BufWriter` passes the sink suite (order, `finish` flushes and is idempotent, a put after it refused, a whole record) | `adam-export-testkit` `tests/json_lines.rs` (`sink_conformance!`) |
 | `lang` from paths and commands, not from a URL | `facets.rs` `a_path_and_a_command_say_the_language` |
 | `dep` from a `Cargo.toml`, with a line-number prefix, target tables and `[dependencies.<name>]` | `facets.rs` `a_cargo_manifest_names_its_dependencies` |
 | `dep` from `use` and `extern crate`, `_` read as `-` | `facets.rs` `a_use_line_names_its_crate` |
@@ -129,7 +157,7 @@ blocks are not doc-tested.
 | ordinary text is not copied; a closure is a `Scrub` | `scrub.rs` `ordinary_text_is_borrowed`, `a_closure_is_a_scrub` |
 
 The crate's integration tests (`crates/adam-export/tests/export.rs`, among them
-`a_stack_filter_keeps_the_run_that_read_the_manifest`) drive `export_runs` over a runtime end to end; the binaries'
+`a_stack_filter_keeps_the_run_that_read_the_manifest`) drive `export_runs` and the `Exporter` over a runtime end to end; the binaries'
 tests cover the subcommand. Add each new one to this table by name.
 
 ## Known limits of per-turn samples

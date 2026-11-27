@@ -2,8 +2,11 @@
 
 Turns adam-rs runs into training records: one JSON Lines record per run, in the chat shape most
 trainers read, with the facets a stack filter needs, the outcome the store holds, every string
-scrubbed and every id a pseudonym. The conversion is pure: no store driver and no I/O beyond the
-`std::io::Write` sink it is given. The driver reads runs through a `Runtime`.
+scrubbed and every id a pseudonym. The conversion is pure: no store driver and no I/O. Where runs
+come from and where records go are two ports, `RunSource` and `RecordSink`, with an adapter each
+here (`RuntimeSource` over any `Store`, `JsonLines` over any `std::io::Write`) and their
+conformance suites in [`adam-export-testkit`](../adam-export-testkit/README.md). The `Exporter`
+reads one or several sources into one sink.
 
 The decision is
 [ADR 0085](https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0085-runs-are-exported-as-training-records.md),
@@ -26,12 +29,17 @@ the training pipeline around it is the guide
 | `RunMeta`, `RunMeta::of(&RunRecord, error)` | A run's bookkeeping without its state: id, agent, conversation id, parent, status, times, error. |
 | `ExportOptions` | `new(Pseudonyms)`, then `.scrub(..)` (the deployment's secrets), `.include_reasoning(bool)`, `.current(agent, RequestShape)` (the agent's current prompt and tools), `.samples(Samples)` and `.max_tokens(Option<u32>)` (the driver leaves out a record over it, whole). |
 | `RequestShape` | A system prompt and a list of `ToolSpec`, as the export passes them. |
-| `export_runs(&Runtime, agents, &Filter, &ExportOptions, &mut impl Write) -> Result<Summary, ExportError>` | The driver: lists each agent's runs, joins each one, writes the records the filter accepts: one per run, or its samples with `Samples::Turn`, each under `max_tokens`. |
-| `write_record(&mut impl Write, &Record)` | One record as one line of JSON. |
-| `Summary` | `seen`, `written` (records: runs, or samples), `filtered` (runs), `not_a_conversation`, `unreadable`, `over_budget` (records left out by `max_tokens`), `turns_lost_to_compaction` and `inexact` (samples written with `exact: false`). **Breaking** for a `Summary { .. }` literal outside the crate: it needs the three new fields or `..Summary::default()`. |
-| `ExportError` | `Runtime` (a listing failed; its class), `Write` (`Transient`), `Json` (`Internal`). Implements `Classify`. |
+| `Exporter::new(Filter, ExportOptions)`, `.run(&[&dyn RunSource], &mut dyn RecordSink) -> Result<Summary, ExportError>` | The pipeline: for each source, for each of its agents, reads the runs page by page and puts the records the filter accepts into the sink: one per run, or its samples with `Samples::Turn`, each under `max_tokens`; then finishes the sink. *Ports and adapters*, below. |
+| `RunSource` (port), `SourceQuery`, `SourcePage`, `SourceRun`, `Skipped`, `Cursor`, `SourceError` | Where runs come from. |
+| `RuntimeSource::new(Runtime)`, `.only(agents)`, `.named(label)` | The source over a runtime, so over every `Store` adapter. |
+| `RecordSink` (port), `SinkError` | Where records go. |
+| `JsonLines::new(W: Write + Send)`, `.into_inner()`, `.get_ref()` | The sink of one JSON object per line, flushed on `finish`. |
+| `export_runs(&Runtime, agents, &Filter, &ExportOptions, &mut (impl Write + Send)) -> Result<Summary, ExportError>` | The convenience path: an `Exporter` over one unnamed `RuntimeSource` into `JsonLines` (`export_runs_is_the_exporter_over_one_unnamed_runtime_source`). The writer must now be `Send`. |
+| `write_record(&mut impl Write, &Record)` | One record as one line of JSON, as `JsonLines` writes it. |
+| `Summary` | `seen`, `written` (records: runs, or samples), `filtered` (runs), `not_a_conversation`, `unreadable`, `over_budget` (records left out by `max_tokens`), `turns_lost_to_compaction` and `inexact` (samples written with `exact: false`), summed over every source. **Breaking** for a `Summary { .. }` literal outside the crate: it needs the three new fields or `..Summary::default()`. |
+| `ExportError` | `Source` (a page failed; its class), `Sink` (its class: a write is `Transient`, a put after `finish` `Internal`), `Labels` (several sources and one has no label of its own: `Invalid`, nothing read). `#[non_exhaustive]`. Implements `Classify`. **Breaking**: it was `Runtime`, `Write`, `Json`. |
 | `Filter` | Which records are written; `Filter::parse_requirement("lang=rust")`. See *Filters*. |
-| `Record`, `ChatMessage`, `ChatToolCall`, `FunctionCall`, `ToolDef`, `FunctionDef`, `Outcome`, `OutcomeArtifact`, `Facets`, `ToolsSource`, `TrainOn`, `Sample`, `SCHEMA` | The record (below). `Serialize` and `Deserialize`. `Record` gained `train_on` and `sample`: **breaking** for a `Record { .. }` literal outside the crate. |
+| `Record`, `ChatMessage`, `ChatToolCall`, `FunctionCall`, `ToolDef`, `FunctionDef`, `Outcome`, `OutcomeArtifact`, `Facets`, `ToolsSource`, `TrainOn`, `Sample`, `SCHEMA` | The record (below). `Serialize` and `Deserialize`. `Record` gained `train_on`, `sample` and `source`: **breaking** for a `Record { .. }` literal outside the crate. |
 | `facets` (module) | `facets_of(&[Message]) -> Facets`, the kinds `LANG` and `DEP`. |
 | `Scrub`, `NoSecrets`, `scrub_known_shapes` | What removes secrets. A closure `Fn(&str) -> String` is a `Scrub`. |
 | `Pseudonyms`, `NoRandomness` | HMAC-SHA256 pseudonyms; `Pseudonyms::new(key)` or `Pseudonyms::random()`. |
@@ -56,6 +64,7 @@ One line per run (wrapped here):
 |---|---|
 | `schema` | always `adam.export/v1`. A new field is not a new schema; a changed meaning is |
 | `id`, `parent`, `conversation` | pseudonyms of the run, the run it works for (a child) and its conversation; never the store's ids |
+| `source` | the label of the source the run was read from (`RunSource::label`), as the operator named it; absent when the export reads one unnamed source, which is what the binaries' `export` does, so their lines are the ones they wrote before |
 | `agent`, `status` | the agent's name; `runnable`, `parked`, `done` or `failed` |
 | `created_at`, `updated_at` | RFC 3339 |
 | `turns`, `tool_calls`, `usage` | the run's model calls, tool calls and tokens (`adam_model::Usage`) |
@@ -63,7 +72,7 @@ One line per run (wrapped here):
 | `compacted` | a compaction, a shortening, omitted turns or a summary replaced history: `messages` are not what the model saw at every turn |
 | `facets` | `{kind: [values]}`, derived from the transcript (*Facets*) |
 | `outcome` | `status`, the scrubbed `error` of a failed run, and the run's `artifacts` by `name` and `mime_type` |
-| `tools_source` | `none` (no system message, no tools), `current` (the agent's current ones, passed by the export) or `recorded` (the system prompt and tools the run's last model call was sent, `Conversation::request`, read with `RecordedRequest::load`; `export_runs` uses them when their blobs are still in the store). A per-turn sample's are those recorded for its call |
+| `tools_source` | `none` (no system message, no tools), `current` (the agent's current ones, passed by the export) or `recorded` (the system prompt and tools the run's last model call was sent, `Conversation::request`, read with `RecordedRequest::load`; `RuntimeSource` reads them when their blobs are still in the store). A per-turn sample's are those recorded for its call |
 | `train_on` | which messages carry the loss: `assistant` (a whole run: every assistant message) or `last` (a per-turn sample: its last message). A record written before the field reads as `assistant` |
 | `sample` | a per-turn sample only: `{turn, index, of, exact}`, the model call (from 0), its place among the run's samples (from 0) and their number, and whether the messages and tools are what that call was sent (*Per-turn samples*) |
 | `messages` | an optional `system`, then `user`, `assistant` (`content`, `tool_calls` as `{id, type: "function", function: {name, arguments}}` with `arguments` a JSON text, optional `reasoning_content`) and `tool` (`tool_call_id`, `content`) |
@@ -165,10 +174,61 @@ the filter's other fields decide on the run before its samples are made.
 The messages a person wrote are exported: which threads a deployment may train on is the
 operator's call.
 
-## The driver and its limits
+## Ports and adapters
 
-`export_runs` lists runs with `Store::list_runs` per agent, newest first, by pages of 100, with the
-filter's statuses and `since` pushed into the query (`until` and the rest are checked here). Each
+The pipeline knows two ports and nothing of a store or a file. A deployment may keep runs in
+several stores (one per region, an old database and a new one), and a dataset may go to a file, a
+bucket or a dataset hub: each is an adapter, and the `Exporter` reads **several sources into one
+sink**. The pseudonym key is the export's, not the source's, so ids link across sources and across
+exports.
+
+```mermaid
+flowchart LR
+    pg[("PostgreSQL store")] --> rsA["RuntimeSource 'eu'"]
+    mongo[("MongoDB store")] --> rsB["RuntimeSource 'us'"]
+    other["another source (a dump, an archive)"] --> exporter
+    rsA --> exporter["Exporter: Filter, ExportOptions"]
+    rsB --> exporter
+    exporter --> sink["RecordSink"]
+    sink --> jl["JsonLines: a file, standard output"]
+    sink -.-> more["object storage, a dataset hub, a table"]
+```
+
+| Port | Methods | Contract (checked by the testkit) |
+|---|---|---|
+| `RunSource: Send + Sync` | `label() -> Option<&str>`, `agents() -> &[String]`, `async page(&SourceQuery, Option<&Cursor>) -> Result<SourcePage, SourceError>` | the pages of a query are disjoint and cover every run once; a page lists at most `SourceQuery::limit` runs; a run outside the query, not a conversation, or unreadable is **counted** in `Skipped`, never yielded; a `Cursor` is opaque and read only by its source, and the same cursor answers the same page; `next: None` ends the listing |
+| `RecordSink: Send` | `async put(&mut self, &Record) -> Result<(), SinkError>`, `async finish(&mut self) -> Result<(), SinkError>` | records are kept in order, each once; after `finish` every record is durable and visible; `finish` is idempotent; a `put` after it is `SinkError::Finished` (`Internal`) and writes nothing |
+
+Both are `#[async_trait]`, as `Store` and `Notifier` are. A sink takes `&mut self`: an export owns
+its sink, so order needs no lock (a `Store` takes `&self` because many workers share it). Neither
+error names a backend type: an adapter boxes its error into `SourceError::Backend` or
+`SinkError::Backend` with the class it chose (`SourceError::backend(class, e)`); a runtime's error
+keeps its class (`From<RuntimeError>`), a write's `std::io::Error` is `Transient`, a cursor the
+source did not make `Invalid`.
+
+A label is the operator's name for a source (`eu`, `archive-2025`), written as each record's
+`source`: never a host, a URL or a credential. One source may be unnamed; several must each have a
+label of their own, or the export is `ExportError::Labels` before anything is read.
+
+### Write an adapter
+
+1. Implement the port in your own crate: a source over another store or a dump (it fills a
+   `SourceRun::new(RunMeta, Conversation, requests)` per run and counts what it cannot yield in
+   `Skipped`), or a sink to object storage, a Hugging Face dataset or a database table (it buffers
+   in `put`, makes the records visible in `finish`, and refuses a `put` after it).
+2. Add `adam-export-testkit` as a dev-dependency and run the suite from an integration test:
+   `source_conformance!(make_source)` with an `async fn(Vec<SeedRun>) -> Option<Box<dyn RunSource>>`
+   that writes the seeds where a fresh source reads them, or `sink_conformance!(make_sink)` with an
+   `async fn() -> Option<SinkFixture>`: a fresh sink and a `Readback` of its destination. `None`
+   skips (and fails under `ADAM_TEST_REQUIRE_DB=1`).
+3. Pass it to an `Exporter` beside the others. A backend reached only through a `Store` needs no
+   source of its own: `RuntimeSource` reads it once its store passes `store_conformance!`.
+
+## `RuntimeSource` and its limits
+
+A page is one `Store::list_runs`, newest first, `SourceQuery::limit` runs (the `Exporter` asks for
+100), with the query's statuses and `since` pushed into it; `until` is checked here and counted as
+`outside_query` (the summary's `filtered`). Its cursor is the last run's `(updated_at, id)`. Each
 run is joined with `Runtime::state`, so **each agent must be registered on the runtime** (its
 `join` reads a run's transcript). A state that does not decode as a `Conversation` with messages
 counts as `not_a_conversation` (another kind of agent, or a run that never started). A run whose
@@ -183,7 +243,7 @@ so it is a record of its own, its `parent` the pseudonym of the parent's record
 (`a_subagents_run_is_a_record_of_its_own_linked_to_its_parent` in `tests/export.rs`). Child sessions
 and a session's timer runs have one too. Still not reached: a child a host starts itself with
 `Runtime::start_child` (it has none), and a subagent's run from before C1. Export the subagents' agent
-names too (`coder/reviewer`): `export_runs` lists by agent, and the `export` subcommand takes every
+names too (`coder/reviewer`): a source lists by agent, and the `export` subcommand takes every
 registered agent by default.
 
 ## Environment
@@ -207,16 +267,26 @@ None: the crate reads no variable. The binaries read `EXPORT_PSEUDONYM_KEY` for 
 * pseudonyms: `the_mac_is_hmac_sha256` and `a_long_key_is_hashed_first` (RFC 4231 cases 2 and 6),
   `a_pseudonym_depends_on_the_key_and_the_kind`;
 * scrub: `every_known_shape_is_removed`, `a_url_keeps_everything_but_its_password`,
-  `ordinary_text_is_borrowed`, `a_closure_is_a_scrub`.
+  `ordinary_text_is_borrowed`, `a_closure_is_a_scrub`;
+* convert: `a_record_without_a_source_is_the_line_it_was` (the bytes of a record with no `source` are the
+  line the exporter wrote before the ports, captured before the change);
+* sink: `each_record_is_one_line_of_json_in_order`, `a_refused_write_is_transient`;
+* the pipeline: `several_sources_need_labels_of_their_own`.
 
-The integration tests in `tests/export.rs` cover the conversion and the driver end to end:
-`a_stack_filter_keeps_the_run_that_read_the_manifest` and `a_turn_export_writes_one_sample_per_answer` (two calls,
-two samples with the recorded tools, `train_on: "last"`, and a budget that keeps the first). No test needs a
-database.
+The integration tests in `tests/export.rs` cover the conversion and the pipeline end to end:
+`a_stack_filter_keeps_the_run_that_read_the_manifest`, `a_turn_export_writes_one_sample_per_answer` (two calls,
+two samples with the recorded tools, `train_on: "last"`, and a budget that keeps the first),
+`a_subagents_run_is_a_record_of_its_own_linked_to_its_parent`,
+`two_stores_export_into_one_sink_with_their_labels_and_linked_ids` (two memory stores, labels, the same id alone and
+together, an unnamed source among several refused) and `export_runs_is_the_exporter_over_one_unnamed_runtime_source`
+(byte for byte). The conformance suites run against `RuntimeSource` (memory store) and `JsonLines` in
+[`adam-export-testkit`](../adam-export-testkit/README.md)'s own tests, as `adam-store-testkit` runs the memory store's:
+a dev-dependency on the testkit would be a cycle. No test needs a database.
 
 ## See also
 
 * [ADR 0085](../../docs/decisions/0085-runs-are-exported-as-training-records.md): the decision and
   its slices.
+* [`adam-export-testkit`](../adam-export-testkit/README.md): the conformance suites of the two ports.
 * [Export runs for training](../../docs/guides/export-runs-for-training.md): the pipeline, from
   collecting runs to evaluating a tuned model.

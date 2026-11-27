@@ -23,6 +23,11 @@ pub struct Record {
     /// The pseudonym of the run's conversation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub conversation: Option<String>,
+    /// The label of the [`RunSource`](crate::RunSource) the run was read from, as the operator
+    /// named it; absent when the export reads one unnamed source, so such an export writes the
+    /// lines it wrote before sources had labels.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
     /// The agent's name.
     pub agent: String,
     /// `runnable`, `parked`, `done` or `failed`.

@@ -41,7 +41,7 @@ events, streamed text, a lease.
 
 An arrow means "depends on". Solid arrows are `[dependencies]`; dotted arrows are optional features.
 The picture is a selection: nearly every crate also depends on `adam-error`, and the test kits
-(`adam-store-testkit`, `adam-notify-testkit`, `adam-mcp-testkit`, `adam-code-tools-testkit`, `adam-agent-fixture`) are left out.
+(`adam-store-testkit`, `adam-notify-testkit`, `adam-mcp-testkit`, `adam-code-tools-testkit`, `adam-export-testkit`, `adam-agent-fixture`) are left out.
 
 ```mermaid
 flowchart TB
@@ -145,7 +145,7 @@ flowchart TB
 |---|---|---|
 | Contracts | [`adam-error`](../crates/adam-error/README.md), [`adam-core`](../crates/adam-core/README.md), [`adam-model`](../crates/adam-model/README.md), [`adam-a2a`](../crates/adam-a2a/README.md), [`adam-host`](../crates/adam-host/README.md) | Error classes, the `Store` port and run types, the `ModelClient` port, the `TaskBackend` port with the A2A 1.0 server, the process `Role` and `Placement` with a supervisor. |
 | Implementations | `adam-store-postgres`, `adam-store-mongodb`, `adam-store-sqlite`, `adam-model-openai`, [`adam-model-oauth`](../crates/adam-model-oauth/README.md), [`adam-workspace`](../crates/adam-workspace/README.md), [`adam-code-tools`](../crates/adam-code-tools/README.md) (the file and command tools as a library, ADR 0047; moving out of the coder in steps), [`adam-git-sandbox`](../crates/adam-git-sandbox/README.md), [`adam-env-kubernetes`](../crates/adam-env-kubernetes/README.md), [`adam-acp`](../crates/adam-acp/README.md), `adam-notify-postgres` | Each in a crate of its own, so a binary links only what it uses. |
-| Runtime | [`adam-runtime`](../crates/adam-runtime/README.md), [`adam-a2a-runtime`](../crates/adam-a2a-runtime/README.md), [`adam-service`](../crates/adam-service/README.md), [`adam-schedule`](../crates/adam-schedule/README.md) (a folder's schedules, [ADR 0060](decisions/0060-schedules-are-parked-runs.md): when they are due, the ids of their firings, each agent's scheduler `<agent>/adam.schedule` and `reconcile`; `adam-agent` and the coder run them with a `schedules` worker component, `reconcile_until_stopped`, and `adam-engine` with one `reconcile` at `start`), [`adam-export`](../crates/adam-export/README.md) (runs as training records, [ADR 0085](decisions/0085-runs-are-exported-as-training-records.md): one JSON Lines record per run in the chat shape, read through the runtime by the binaries' `export` subcommand; see [Export runs for training](guides/export-runs-for-training.md)) | The run state machine, journal, workers and retry policy; the A2A backend over it; the composition every agent binary shares; the export of runs. |
+| Runtime | [`adam-runtime`](../crates/adam-runtime/README.md), [`adam-a2a-runtime`](../crates/adam-a2a-runtime/README.md), [`adam-service`](../crates/adam-service/README.md), [`adam-schedule`](../crates/adam-schedule/README.md) (a folder's schedules, [ADR 0060](decisions/0060-schedules-are-parked-runs.md): when they are due, the ids of their firings, each agent's scheduler `<agent>/adam.schedule` and `reconcile`; `adam-agent` and the coder run them with a `schedules` worker component, `reconcile_until_stopped`, and `adam-engine` with one `reconcile` at `start`), [`adam-export`](../crates/adam-export/README.md) (runs as training records, [ADR 0085](decisions/0085-runs-are-exported-as-training-records.md): one JSON Lines record per run in the chat shape, from one or several sources into one sink (both ports, with [`adam-export-testkit`](../crates/adam-export-testkit/README.md)), read through the runtime by the binaries' `export` subcommand; see [Export runs for training](guides/export-runs-for-training.md)) | The run state machine, journal, workers and retry policy; the A2A backend over it; the composition every agent binary shares; the export of runs. |
 | Agents and authoring | [`adam-llm-agent`](../crates/adam-llm-agent/README.md), [`adam-ui`](../crates/adam-ui/README.md), [`adam-mcp`](../crates/adam-mcp/README.md), [`adam-agent-fs`](../crates/adam-agent-fs/README.md), [`adam-assembly`](../crates/adam-assembly/README.md), [`adam-macros`](../crates/adam-macros/README.md), [`adam`](../crates/adam/README.md) | The model-and-tools loop; the screen's tools; MCP tools; the agent-folder parser; binding a folder to agents; `#[tool]`; the facade. See [Write an agent](guides/write-an-agent.md). |
 | Embedded | [`adam-engine`](../crates/adam-engine/README.md) | adam-rs in an application with no server and nothing on the network of its own ([ADR 0047](decisions/0047-adam-rs-can-be-embedded-in-an-application.md)): the embedded set, the runtime and its agent crates with `adam-a2a`'s `server`, `adam-a2a-runtime`'s `push` and `adam-ui`'s `thread-tools` off, checked by `tools/embedded-deps/check.sh`. Its API (slice 4: send, steer, answer, cancel, list, over `RuntimeTaskBackend` and a store and a model the host gives) is built; its stream of events is not yet. |
 | Binaries | [`adam-coder`](../bin/adam-coder/README.md), [`adam-agent`](../bin/adam-agent/README.md), [`adam-egress`](../bin/adam-egress/README.md) | The two agents you can run, library and binary each, over `adam-service`; and the HTTPS-only egress proxy for run pods, which uses only `adam-error` and is in the same image; the chart deploys it with the run pods, whose network policy allows nothing else out ([ADR 0042](decisions/0042-run-pods-reach-the-internet-through-an-egress-proxy.md)). |
@@ -206,6 +206,10 @@ classDiagram
     Tool <|.. FnTool
     class Admission { <<interface>> }
     Admission <|.. LocalAdmission
+    class RunSource { <<interface>> }
+    RunSource <|.. RuntimeSource
+    class RecordSink { <<interface>> }
+    RecordSink <|.. JsonLines
     class Confine { <<interface>> }
     Confine <|.. NoConfine
     Confine <|.. Rlimits
@@ -231,6 +235,8 @@ classDiagram
 | `Admission` | `adam-budget` | `LocalAdmission` (`adam-admission-local`): semaphores per pool and per conversation, one token bucket | the conformance suite `admission_conformance!` is the reference |
 | `Confine` | `adam-workspace` | `Rlimits`, `SystemdScope` (`adam-confine`, Unix); `best_effort()` picks | `NoConfine`; the suite `confine_conformance!` (`adam-confine-testkit`) is the reference |
 | `DeviceState` | `adam-device-state` | none yet: the host pushes its readings, and `adam_budget::Throttled` lowers the admission by them ([ADR 0065](decisions/0065-resource-governance-admission-pools-and-os-limits.md) decision 8) | `FakeDevice`, the reference of `device_state_conformance!` |
+| `RunSource` | `adam-export` | `RuntimeSource` (any `Store` through a `Runtime`) | the suite `source_conformance!` (`adam-export-testkit`); `RuntimeSource` over `MemoryStore` is the reference |
+| `RecordSink` | `adam-export` | `JsonLines` (any `std::io::Write`: a file, standard output) | the suite `sink_conformance!` (`adam-export-testkit`); `JsonLines` is the reference |
 | `PermissionPrompt` | `adam-acp` | none (the default policy needs no prompt) | `StaticPrompt` |
 
 `AgentStarter` is the start-only half of `Agent` (`name`, `init`, `init_continuing`): a process that

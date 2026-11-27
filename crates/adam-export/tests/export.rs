@@ -1,4 +1,4 @@
-//! `export_runs` end to end: an `LlmAgent` on a scripted `MockModel` and the in-memory store, its
+//! `export_runs` and the `Exporter` end to end: an `LlmAgent` on a scripted `MockModel` and the in-memory store, its
 //! runs exported as JSON Lines through a filter.
 #![allow(clippy::unwrap_used, clippy::expect_used)] // integration tests assert by unwrapping
 
@@ -6,7 +6,11 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use adam_core::{DynStore, MemoryStore, RunId, RunStatus};
-use adam_export::{ExportOptions, Filter, Pseudonyms, Samples, Summary, export_runs};
+use adam_error::{Classify, ErrorClass};
+use adam_export::{
+    ExportError, ExportOptions, Exporter, Filter, JsonLines, Pseudonyms, RuntimeSource, Samples,
+    Summary, export_runs,
+};
 use adam_llm_agent::{
     LlmAgent, LlmAgentBuilder, Tool, ToolCtx, ToolError, ToolOutput, user_message,
 };
@@ -430,5 +434,100 @@ async fn a_subagents_run_is_a_record_of_its_own_linked_to_its_parent() {
     assert_eq!(roles, ["system", "user", "assistant"]);
     assert_eq!(helper["messages"][1]["content"], "summarise the manifest");
     assert_eq!(helper["messages"][2]["content"], "it uses axum");
+    h.stop().await;
+}
+
+fn lines(out: Vec<u8>) -> Vec<Value> {
+    String::from_utf8(out)
+        .expect("utf-8")
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("a JSON object"))
+        .collect()
+}
+
+/// Two stores into one dataset (ADR 0085, *Amended*: ports and adapters): each record names its
+/// source by label, the summary adds both up, and the ids are pseudonyms under the one key, so a
+/// run's id is the same whether its store is exported alone or with the other.
+#[tokio::test]
+async fn two_stores_export_into_one_sink_with_their_labels_and_linked_ids() {
+    let (alpha, beta) = (Harness::new(), Harness::new());
+    alpha.mock.push_text("hello from alpha");
+    let alpha_run = alpha.run_to_done("hi", "conv-a").await;
+    beta.mock.push_text("hello from beta");
+    let beta_run = beta.run_to_done("hi", "conv-b").await;
+
+    let exporter = Exporter::new(Filter::default(), options());
+    let a = RuntimeSource::new(alpha.runtime.clone())
+        .only(["coder"])
+        .named("alpha");
+    let b = RuntimeSource::new(beta.runtime.clone())
+        .only(["coder"])
+        .named("beta");
+    let mut sink = JsonLines::new(Vec::new());
+    let summary = exporter.run(&[&a, &b], &mut sink).await.expect("export");
+    assert_eq!((summary.seen, summary.written), (2, 2), "{summary:?}");
+    let records = lines(sink.into_inner());
+    let pseudonym = |run: RunId| Pseudonyms::new(b"export key").of("run", &run.to_string());
+    let [first, second] = records.as_slice() else {
+        panic!("two records: {records:#?}");
+    };
+    assert_eq!(first["source"], "alpha");
+    assert_eq!(first["id"], pseudonym(alpha_run));
+    assert_eq!(second["source"], "beta");
+    assert_eq!(second["id"], pseudonym(beta_run));
+
+    // One unnamed source: no `source` field, the same id.
+    let alone = RuntimeSource::new(alpha.runtime.clone()).only(["coder"]);
+    let mut sink = JsonLines::new(Vec::new());
+    exporter.run(&[&alone], &mut sink).await.expect("export");
+    let records = lines(sink.into_inner());
+    let [record] = records.as_slice() else {
+        panic!("one record: {records:#?}");
+    };
+    assert!(record.get("source").is_none(), "{record}");
+    assert_eq!(record["id"], first["id"], "the ids link across exports");
+
+    // Several sources must each be named: nothing is read otherwise.
+    let mut sink = JsonLines::new(Vec::new());
+    let e = exporter
+        .run(&[&a, &alone], &mut sink)
+        .await
+        .expect_err("an unnamed source among several");
+    assert!(matches!(e, ExportError::Labels(_)), "{e:?}");
+    assert_eq!(e.class(), ErrorClass::Invalid);
+    assert!(sink.into_inner().is_empty());
+
+    alpha.stop().await;
+    beta.stop().await;
+}
+
+/// The convenience path writes what the `Exporter` writes from one unnamed `RuntimeSource` into
+/// `JsonLines`, byte for byte.
+#[tokio::test]
+async fn export_runs_is_the_exporter_over_one_unnamed_runtime_source() {
+    let h = Harness::new();
+    h.mock.push_text("hello");
+    h.run_to_done("hi", "conv-chat").await;
+    let agents = ["coder".to_owned()];
+
+    let mut convenience = Vec::new();
+    let summary = export_runs(
+        &h.runtime,
+        &agents,
+        &Filter::default(),
+        &options(),
+        &mut convenience,
+    )
+    .await
+    .expect("export");
+    let mut sink = JsonLines::new(Vec::new());
+    let source = RuntimeSource::new(h.runtime.clone()).only(agents);
+    let piped = Exporter::new(Filter::default(), options())
+        .run(&[&source], &mut sink)
+        .await
+        .expect("export");
+    assert_eq!(summary, piped);
+    assert_eq!(summary.written, 1);
+    assert_eq!(convenience, sink.into_inner());
     h.stop().await;
 }

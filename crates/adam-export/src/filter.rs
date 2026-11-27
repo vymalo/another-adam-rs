@@ -67,9 +67,7 @@ impl Filter {
 
     /// Whether the run's status and time pass, before its state is read.
     pub fn admits(&self, status: RunStatus, updated_at: Timestamp) -> bool {
-        (self.statuses.is_empty() || self.statuses.contains(&status))
-            && self.since.is_none_or(|since| updated_at >= since)
-            && self.until.is_none_or(|until| updated_at < until)
+        within(&self.statuses, self.since, self.until, status, updated_at)
     }
 
     /// Whether `record` is written.
@@ -86,6 +84,20 @@ impl Filter {
                 .iter()
                 .all(|(kind, value)| record.facets.has(kind, value))
     }
+}
+
+/// Whether `status` is one of `statuses` (any, when empty) and `updated_at` is in `[since, until)`:
+/// the part of a [`Filter`] a [`SourceQuery`](crate::SourceQuery) carries.
+pub(crate) fn within(
+    statuses: &[RunStatus],
+    since: Option<Timestamp>,
+    until: Option<Timestamp>,
+    status: RunStatus,
+    updated_at: Timestamp,
+) -> bool {
+    (statuses.is_empty() || statuses.contains(&status))
+        && since.is_none_or(|since| updated_at >= since)
+        && until.is_none_or(|until| updated_at < until)
 }
 
 #[cfg(test)]

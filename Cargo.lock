@@ -594,6 +594,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "adam-export-testkit"
+version = "0.6.0"
+dependencies = [
+ "adam-core",
+ "adam-error",
+ "adam-export",
+ "adam-llm-agent",
+ "adam-model",
+ "adam-runtime",
+ "async-trait",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "adam-git-sandbox"
 version = "0.6.0"
 dependencies = [

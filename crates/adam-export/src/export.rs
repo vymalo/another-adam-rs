@@ -1,18 +1,19 @@
-//! The driver: list an agent's runs, join each one, write the records that pass.
+//! The pipeline: read the runs of each source, turn each into its records, put the ones that pass
+//! into one sink.
 
+use std::collections::BTreeSet;
 use std::io::Write;
 
-use adam_core::store::{ConversationScope, RunQuery, RunRecord};
 use adam_error::{Classify, ErrorClass};
-use adam_llm_agent::Conversation;
-use adam_runtime::{Runtime, RuntimeError, view_from_record};
+use adam_runtime::Runtime;
 
 use crate::{
-    ExportOptions, Filter, Record, RequestShape, RunMeta, Samples, TurnRequest, estimated_tokens,
-    record_with, samples_of, turns_lost_to_compaction,
+    ExportOptions, Filter, JsonLines, Record, RecordSink, RunSource, RuntimeSource, Samples,
+    SinkError, SourceError, SourcePage, SourceQuery, SourceRun, estimated_tokens, record_with,
+    samples_of, turns_lost_to_compaction,
 };
 
-/// Runs read per listing.
+/// Runs a source lists per page.
 const PAGE: usize = 100;
 
 /// What an export did.
@@ -40,65 +41,237 @@ pub struct Summary {
 }
 
 impl Summary {
-    fn add(&mut self, other: Summary) {
-        self.seen += other.seen;
-        self.written += other.written;
-        self.filtered += other.filtered;
-        self.over_budget += other.over_budget;
-        self.turns_lost_to_compaction += other.turns_lost_to_compaction;
-        self.inexact += other.inexact;
-        self.not_a_conversation += other.not_a_conversation;
-        self.unreadable += other.unreadable;
+    /// Count what a page listed and did not yield.
+    fn count_listed(&mut self, page: &SourcePage) {
+        self.seen += page.listed();
+        self.filtered += page.skipped.outside_query;
+        self.not_a_conversation += page.skipped.not_a_conversation;
+        self.unreadable += page.skipped.unreadable;
     }
 }
 
 /// Why an export stopped.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum ExportError {
-    /// The store refused a listing.
+    /// A source could not answer a page.
     #[error("listing the runs failed")]
-    Runtime(#[from] RuntimeError),
-    /// The sink refused a record.
+    Source(#[from] SourceError),
+    /// The sink refused a record, or could not finish.
     #[error("writing a record failed")]
-    Write(#[from] std::io::Error),
-    /// A record did not serialize (it cannot: a record is plain data).
-    #[error("serializing a record failed")]
-    Json(#[from] serde_json::Error),
+    Sink(#[from] SinkError),
+    /// The sources cannot be told apart in the records: with several, each needs a label of its
+    /// own. Nothing was read.
+    #[error("{0}")]
+    Labels(String),
 }
 
 impl Classify for ExportError {
     fn class(&self) -> ErrorClass {
         match self {
-            Self::Runtime(e) => e.class(),
-            Self::Write(_) => ErrorClass::Transient,
-            Self::Json(_) => ErrorClass::Internal,
+            Self::Source(e) => e.class(),
+            Self::Sink(e) => e.class(),
+            Self::Labels(_) => ErrorClass::Invalid,
         }
     }
 }
 
-/// Write `record` as one line of JSON.
+/// Exports runs from sources into a sink: the records a [`Filter`] accepts, made with
+/// [`ExportOptions`].
+///
+/// One record per run, or one per assistant turn with [`ExportOptions::samples`]
+/// ([`samples_of`]; the samples of a run oldest first). A record over
+/// [`ExportOptions::max_tokens`] is left out and counted. With [`Samples::Turn`] a compacted run
+/// is kept whatever [`Filter::include_compacted`] says: its samples start at its last compaction,
+/// so they are what the model was sent.
+#[derive(Debug, Clone)]
+pub struct Exporter {
+    filter: Filter,
+    /// What a record must pass: `filter`, keeping compacted runs in turn mode.
+    record_filter: Filter,
+    options: ExportOptions,
+}
+
+impl Exporter {
+    /// An export of what `filter` accepts, made with `options`.
+    pub fn new(filter: Filter, options: ExportOptions) -> Self {
+        let record_filter = match options.samples {
+            Samples::Run => filter.clone(),
+            Samples::Turn => Filter {
+                include_compacted: true,
+                ..filter.clone()
+            },
+        };
+        Self {
+            filter,
+            record_filter,
+            options,
+        }
+    }
+
+    /// The filter.
+    pub fn filter(&self) -> &Filter {
+        &self.filter
+    }
+
+    /// The options.
+    pub fn options(&self) -> &ExportOptions {
+        &self.options
+    }
+
+    /// Export the runs of every agent of each of `sources`, in order, into `sink`, and finish it.
+    ///
+    /// Every record of a labelled source names it in `source`. One source may be unnamed (its
+    /// records have no `source`); several must each have a label of their own. The pseudonyms
+    /// are the same for every source ([`ExportOptions`]' key), so ids link across them.
+    ///
+    /// A run a source cannot read is counted and the export goes on; a page a source cannot
+    /// answer, or a record the sink refuses, stops it.
+    ///
+    /// # Errors
+    ///
+    /// [`ExportError`].
+    pub async fn run(
+        &self,
+        sources: &[&dyn RunSource],
+        sink: &mut dyn RecordSink,
+    ) -> Result<Summary, ExportError> {
+        check_labels(sources)?;
+        let mut summary = Summary::default();
+        for source in sources {
+            for agent in source.agents() {
+                self.export_agent(*source, agent, sink, &mut summary)
+                    .await?;
+            }
+        }
+        sink.finish().await?;
+        Ok(summary)
+    }
+
+    /// Export the runs of `agent` from `source`, page after page.
+    async fn export_agent(
+        &self,
+        source: &dyn RunSource,
+        agent: &str,
+        sink: &mut dyn RecordSink,
+        summary: &mut Summary,
+    ) -> Result<(), ExportError> {
+        let query = SourceQuery::of(agent, &self.filter, PAGE);
+        let mut after = None;
+        loop {
+            let page = source.page(&query, after.as_ref()).await?;
+            summary.count_listed(&page);
+            for run in &page.runs {
+                self.export_run(run, source.label(), sink, summary).await?;
+            }
+            match page.next {
+                Some(next) => after = Some(next),
+                None => return Ok(()),
+            }
+        }
+    }
+
+    /// Put the records of `run` that pass into `sink`.
+    async fn export_run(
+        &self,
+        run: &SourceRun,
+        label: Option<&str>,
+        sink: &mut dyn RecordSink,
+        summary: &mut Summary,
+    ) -> Result<(), ExportError> {
+        let SourceRun {
+            meta,
+            conversation,
+            requests,
+        } = run;
+        // The last call's, as `Conversation::request` names it: none when that call recorded
+        // nothing, never an earlier call's.
+        let last_request = conversation
+            .request
+            .as_ref()
+            .and(requests.last())
+            .map(|entry| &entry.shape);
+        let exported = record_with(meta, conversation, last_request, &self.options);
+        if !self.record_filter.accepts(&exported) {
+            summary.filtered += 1;
+            return Ok(());
+        }
+        let records = match self.options.samples {
+            Samples::Run => vec![exported],
+            Samples::Turn => {
+                summary.turns_lost_to_compaction +=
+                    u64::from(turns_lost_to_compaction(conversation));
+                samples_of(meta, conversation, requests, &self.options)
+            }
+        };
+        for mut record in records {
+            if self.over_budget(&record) {
+                summary.over_budget += 1;
+                continue;
+            }
+            if record.sample.is_some_and(|sample| !sample.exact) {
+                summary.inexact += 1;
+            }
+            record.source = label.map(str::to_owned);
+            sink.put(&record).await?;
+            summary.written += 1;
+        }
+        Ok(())
+    }
+
+    /// Whether `record`'s estimated tokens are over [`ExportOptions::max_tokens`].
+    fn over_budget(&self, record: &Record) -> bool {
+        self.options
+            .max_tokens
+            .is_some_and(|max| estimated_tokens(record) > u64::from(max))
+    }
+}
+
+/// One source may be unnamed; several must each have a label of their own, not blank.
+fn check_labels(sources: &[&dyn RunSource]) -> Result<(), ExportError> {
+    if let [only] = sources {
+        return match only.label() {
+            Some(label) if label.trim().is_empty() => {
+                Err(ExportError::Labels("a source's label is blank".into()))
+            }
+            _ => Ok(()),
+        };
+    }
+    let mut seen = BTreeSet::new();
+    for source in sources {
+        match source.label() {
+            None => {
+                return Err(ExportError::Labels(
+                    "several sources are exported and one has no label".into(),
+                ));
+            }
+            Some(label) if label.trim().is_empty() => {
+                return Err(ExportError::Labels("a source's label is blank".into()));
+            }
+            Some(label) if !seen.insert(label) => {
+                return Err(ExportError::Labels(format!(
+                    "two sources are labelled {label:?}"
+                )));
+            }
+            Some(_) => {}
+        }
+    }
+    Ok(())
+}
+
+/// Write `record` as one line of JSON, as [`JsonLines`] does.
 ///
 /// # Errors
 ///
 /// The sink's.
 pub fn write_record(out: &mut impl Write, record: &Record) -> Result<(), ExportError> {
-    serde_json::to_writer(&mut *out, record)?;
-    out.write_all(b"\n")?;
-    Ok(())
+    Ok(crate::sink::write_line(out, record)?)
 }
 
-/// Export the runs of each of `agents` that have a conversation, newest first, as JSON Lines to
-/// `out`: one record per run, or one per assistant turn with [`ExportOptions::samples`]
-/// ([`samples_of`]; the samples of a run oldest first). A record over
-/// [`ExportOptions::max_tokens`] is left out and counted.
-///
-/// With [`Samples::Turn`] a compacted run is kept whatever [`Filter::include_compacted`] says:
-/// its samples start at its last compaction, so they are what the model was sent.
-///
-/// The runs are listed with [`Store::list_runs`](adam_core::Store::list_runs) and joined with
-/// [`Runtime::state`], so each agent must be registered on `runtime` (its `join` reads a v5
-/// run's transcript). A run whose state cannot be read is counted and logged, and the export
-/// goes on; a listing or a write that fails stops it.
+/// Export the runs of each of `agents` from `runtime`'s store as JSON Lines to `out`, and flush
+/// it: the convenience path, an [`Exporter`] over one unnamed [`RuntimeSource`] into
+/// [`JsonLines`]. What `Exporter::run` and `RuntimeSource` say holds; each agent must be
+/// registered on `runtime`.
 ///
 /// # Errors
 ///
@@ -108,168 +281,63 @@ pub async fn export_runs(
     agents: &[String],
     filter: &Filter,
     options: &ExportOptions,
-    out: &mut impl Write,
+    out: &mut (impl Write + Send),
 ) -> Result<Summary, ExportError> {
-    let mut summary = Summary::default();
-    for agent in agents {
-        summary.add(export_agent(runtime, agent, filter, options, out).await?);
-    }
-    out.flush()?;
-    Ok(summary)
+    let source = RuntimeSource::new(runtime.clone()).only(agents.iter().cloned());
+    let mut sink = JsonLines::new(out);
+    Exporter::new(filter.clone(), options.clone())
+        .run(&[&source], &mut sink)
+        .await
 }
 
-async fn export_agent(
-    runtime: &Runtime,
-    agent: &str,
-    filter: &Filter,
-    options: &ExportOptions,
-    out: &mut impl Write,
-) -> Result<Summary, ExportError> {
-    let mut summary = Summary::default();
-    // Per turn, a compacted run is kept: its samples start at its last compaction.
-    let turn_filter = Filter {
-        include_compacted: true,
-        ..filter.clone()
-    };
-    let filter_of_record = match options.samples {
-        Samples::Run => filter,
-        Samples::Turn => &turn_filter,
-    };
-    let mut query = RunQuery::new(agent, ConversationScope::Prefix(String::new()), PAGE);
-    query.statuses = (!filter.statuses.is_empty()).then(|| filter.statuses.clone());
-    query.updated_since = filter.since;
-    loop {
-        let page = runtime
-            .store()
-            .list_runs(&query)
-            .await
-            .map_err(RuntimeError::from)?;
-        let Some(last) = page.last() else {
-            break;
-        };
-        query.after = Some((last.updated_at, last.id));
-        let full = page.len() == PAGE;
-        for record in page {
-            summary.seen += 1;
-            if !filter.admits(record.status, record.updated_at) {
-                summary.filtered += 1;
-                continue;
-            }
-            match read(runtime, record).await {
-                Ok(Some((meta, conversation, recorded))) => {
-                    let exported = record_with(
-                        &meta,
-                        &conversation,
-                        // The last call's, as `Conversation::request` names it: none when that
-                        // call recorded nothing, never an earlier call's.
-                        conversation
-                            .request
-                            .as_ref()
-                            .and(recorded.last())
-                            .map(|entry| &entry.shape),
-                        options,
-                    );
-                    if !filter_of_record.accepts(&exported) {
-                        summary.filtered += 1;
-                        continue;
-                    }
-                    let records = match options.samples {
-                        Samples::Run => vec![exported],
-                        Samples::Turn => {
-                            summary.turns_lost_to_compaction +=
-                                u64::from(turns_lost_to_compaction(&conversation));
-                            samples_of(&meta, &conversation, &recorded, options)
-                        }
-                    };
-                    for record in records {
-                        if options
-                            .max_tokens
-                            .is_some_and(|max| estimated_tokens(&record) > u64::from(max))
-                        {
-                            summary.over_budget += 1;
-                            continue;
-                        }
-                        if record.sample.is_some_and(|sample| !sample.exact) {
-                            summary.inexact += 1;
-                        }
-                        write_record(out, &record)?;
-                        summary.written += 1;
-                    }
-                }
-                Ok(None) => summary.not_a_conversation += 1,
-                Err((run, e)) => {
-                    tracing::warn!(%run, error = %adam_error::report(&e), "a run's state could not be read; it is not exported");
-                    summary.unreadable += 1;
-                }
-            }
+#[cfg(test)]
+mod tests {
+    use async_trait::async_trait;
+
+    use super::*;
+    use crate::Cursor;
+
+    struct Named(Option<&'static str>);
+
+    #[async_trait]
+    impl RunSource for Named {
+        fn label(&self) -> Option<&str> {
+            self.0
         }
-        if !full {
-            break;
+
+        fn agents(&self) -> &[String] {
+            &[]
+        }
+
+        async fn page(
+            &self,
+            _: &SourceQuery,
+            _: Option<&Cursor>,
+        ) -> Result<SourcePage, SourceError> {
+            Ok(SourcePage::default())
         }
     }
-    Ok(summary)
-}
 
-/// What [`read`] answers: the run's bookkeeping, its conversation, and the prompts and tools its
-/// model calls were sent, as the run recorded them (empty when it recorded none, or a blob is
-/// gone); the last entry is the last call's.
-type Read = (RunMeta, Conversation, Vec<TurnRequest>);
-
-/// The bookkeeping, the conversation and the recorded request of `record`, or `None` when its
-/// state is not a conversation with messages.
-async fn read(
-    runtime: &Runtime,
-    record: RunRecord,
-) -> Result<Option<Read>, (adam_core::RunId, RuntimeError)> {
-    let run = record.id;
-    let state = runtime.state(run).await.map_err(|e| (run, e))?;
-    let Some(state) = state else {
-        return Ok(None);
-    };
-    // Every field of a `Conversation` has a default, so any object decodes: a state with no
-    // messages is not one.
-    let conversation = match serde_json::from_value::<Conversation>(state) {
-        Ok(conversation) if !conversation.messages.is_empty() => conversation,
-        _ => return Ok(None),
-    };
-    let error = view_from_record(record.clone(), false)
-        .map_err(|e| (run, e))?
-        .error;
-    let recorded = recorded_requests(runtime, run, &conversation).await;
-    Ok(Some((RunMeta::of(&record, error), conversation, recorded)))
-}
-
-/// The requests `conversation` recorded, read from the store: its distinct requests
-/// (`Conversation::requests`), or, for a run recorded before the list existed, its last call's
-/// (`Conversation::request`). All or none: a request whose bytes were collected, or that does not
-/// read, would stand for the calls of another, so then none is used, and the records fall back to
-/// the current shape or to none and say so in `tools_source`.
-async fn recorded_requests(
-    runtime: &Runtime,
-    run: adam_core::RunId,
-    conversation: &Conversation,
-) -> Vec<TurnRequest> {
-    let entries: Vec<_> = if conversation.requests.is_empty() {
-        conversation.request.iter().collect()
-    } else {
-        conversation.requests.iter().collect()
-    };
-    let mut recorded = Vec::with_capacity(entries.len());
-    for entry in entries {
-        match entry.load(runtime.store().as_ref()).await {
-            Ok(Some(content)) => recorded.push(TurnRequest {
-                turn: entry.turn,
-                shape: RequestShape {
-                    system: content.system,
-                    tools: content.tools,
-                },
-            }),
-            Ok(None) => return Vec::new(),
-            Err(e) => {
-                tracing::warn!(%run, error = %adam_error::report(&e), "a run's recorded request could not be read; its records have no recorded tools");
-                return Vec::new();
-            }
+    #[test]
+    fn several_sources_need_labels_of_their_own() {
+        let (a, b, none, blank) = (
+            Named(Some("a")),
+            Named(Some("b")),
+            Named(None),
+            Named(Some(" ")),
+        );
+        assert!(check_labels(&[]).is_ok());
+        assert!(check_labels(&[&none]).is_ok());
+        assert!(check_labels(&[&a]).is_ok());
+        assert!(check_labels(&[&a, &b]).is_ok());
+        for refused in [
+            &[&blank as &dyn RunSource][..],
+            &[&a, &none],
+            &[&a, &a],
+            &[&a, &blank],
+        ] {
+            let e = check_labels(refused).expect_err("refused");
+            assert_eq!(e.class(), ErrorClass::Invalid, "{e}");
         }
     }
-    recorded
 }

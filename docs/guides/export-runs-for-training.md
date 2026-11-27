@@ -37,6 +37,14 @@ each export gets a random key ([environment variables](../reference/environment.
 
 The record, every field and the facets are described in [the crate's README](../../crates/adam-export/README.md).
 
+**Several stores into one dataset.** Where runs come from and where records go are adapters: a source (the store
+behind a runtime, so PostgreSQL, MongoDB, SQLite or memory) and a sink (JSON Lines to a file or standard output). The
+`export` subcommand reads its own store into one file. A Rust program can give the library's `Exporter` several
+sources, each with a label of its own, and get one dataset: each record names its source in `source`, and the ids link
+across stores because the pseudonym key is the export's. A new source or sink (object storage, a dataset hub, a
+table) is an adapter that passes the conformance suites of
+[`adam-export-testkit`](../../crates/adam-export-testkit/README.md).
+
 ## One sample per turn, for a small GPU
 
 A whole run is often far longer than a small card trains on (a 12 GB card fits about 8,000 to 16,000 tokens). With

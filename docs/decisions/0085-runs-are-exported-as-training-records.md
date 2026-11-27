@@ -24,6 +24,19 @@ shortening, without a recorded entry, with a possible closing answer, from a run
 language, or from a run whose answers do not add up to its calls, is `exact: false`. `--max-tokens N` leaves out a
 record over `N` tokens estimated as characters / 4, whole: a sample is never cut.
 
+*Amended 2026-11-27:* the exporter is **ports and adapters**, like the rest of adam-rs. The owner asked for it: *"don't
+break the repository's patterns — ports and adapters even for the exporter, since there may be several data stores."*
+Decision 1's driver over `&Runtime` becomes an adapter. Where runs come from is the port `RunSource` (`label`, `agents`,
+`page(&SourceQuery, Option<&Cursor>)`: pages of `SourceRun`s, with what a page lists and cannot yield counted in
+`Skipped`), with the adapter `RuntimeSource` over any `Store` through a `Runtime`. Where records go is the port
+`RecordSink` (`put`, `finish`), with the adapter `JsonLines` over any `std::io::Write`. The pipeline, `Exporter`, reads
+**several sources into one sink** with one pseudonym key, so ids link across stores; a record gains an optional `source`,
+the label the operator gave its source (several sources must each have one), absent for one unnamed source, so the
+`export` subcommand writes the same bytes as before. A new field, not a new schema. The conformance suites
+`source_conformance!` and `sink_conformance!` are in a new crate, `adam-export-testkit` (Rule 2). The conversion
+(`record_of`, `record_with`, `samples_of`) is unchanged; `export_runs` stays as the convenience path over the three.
+No `Store` method changes.
+
 ## Context
 
 adam-rs had no exporter (*verified 2026-11-27*: no export code in `crates/`, `bin/` or `bench/`). The thread exports of

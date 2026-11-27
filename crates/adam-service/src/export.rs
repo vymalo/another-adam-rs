@@ -3,9 +3,9 @@
 //!
 //! A binary reads its own files, builds its scrub from the secrets it knows and registers its
 //! agents' starters; [`run`] opens the store ([`open_store`](crate::open_store)), builds a runtime
-//! with those registrations and nothing else (no server, no worker, no schedule), and writes the
-//! records of [`adam_export::export_runs`] as JSON Lines to standard output or a file. The summary
-//! is one log line, never on standard output.
+//! with those registrations and nothing else (no server, no worker, no schedule), and runs an
+//! [`Exporter`] from one unnamed [`RuntimeSource`] over it into [`JsonLines`] on standard output
+//! or a file. The summary is one log line, never on standard output.
 //!
 //! ```text
 //! <binary> export [--agent NAME]... [--status done|failed|all] [--require KIND=VALUE]...
@@ -20,7 +20,10 @@ use std::path::{Path, PathBuf};
 use adam_core::store::RunStatus;
 use adam_core::time::Timestamp;
 use adam_error::{Classify, ErrorClass};
-use adam_export::{ExportError, ExportOptions, Filter, NoRandomness, Pseudonyms, Samples, Summary};
+use adam_export::{
+    ExportError, ExportOptions, Exporter, Filter, JsonLines, NoRandomness, Pseudonyms,
+    RuntimeSource, Samples, Summary,
+};
 use adam_runtime::Runtime;
 use secrecy::SecretString;
 
@@ -412,8 +415,11 @@ pub async fn run(
         .clone()
         .samples(args.samples)
         .max_tokens(args.max_tokens);
-    let mut out = open_out(args.out.as_deref())?;
-    let summary = adam_export::export_runs(&runtime, &agents, &args.filter, &options, &mut out)
+    // One unnamed source, so the records carry no `source`: the lines are the ones before sources.
+    let source = RuntimeSource::new(runtime).only(agents);
+    let mut sink = JsonLines::new(open_out(args.out.as_deref())?);
+    let summary = Exporter::new(args.filter.clone(), options)
+        .run(&[&source], &mut sink)
         .await
         .map_err(ExportCommandError::Export)?;
     tracing::info!(
