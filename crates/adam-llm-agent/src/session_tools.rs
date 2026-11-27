@@ -321,6 +321,7 @@ mod tests {
                 keep_open: false,
                 closed: false,
                 closing: false,
+                deleted: false,
                 round: 1,
                 root: None,
                 workspace: None,
