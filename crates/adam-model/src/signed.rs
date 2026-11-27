@@ -5,8 +5,12 @@
 //! [ADR 0068]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0068-adam-signs-its-own-history.md
 
 use std::fmt;
+use std::sync::Arc;
 
-use adam_core::turn::{DynTurnKeys, ModelCall, TurnKeyError, sign_request};
+use adam_core::turn::{
+    CurrentKey, DynRunKeys, DynTurnKeys, KeyId, KeySet, ModelCall, Signature, TurnKeyError,
+    TurnKeys, sign_request,
+};
 use async_trait::async_trait;
 use secrecy::SecretString;
 
@@ -25,11 +29,11 @@ use crate::{
 /// |---|---|
 /// | `X-Run-Id` | the call's root run ([`CredentialRequest::run`]) |
 /// | `Prompt-Statement`, `Prompt-User-Signature` | the run's values, when it has them, byte for byte ([`PromptStatement`](crate::PromptStatement)) |
-/// | `Turn-Signature` | adam's signature of this request: its run, method, request target, the SHA-256 of its exact body, the prompt's id, the time and a nonce, signed by `keys` ([`adam_core::turn::sign_request`]) |
+/// | `Turn-Signature` | adam's signature of this request: its run, method, request target, the SHA-256 of its exact body, the prompt's id, the time and a nonce, signed by the [`KeySource`] ([`adam_core::turn::sign_request`]) |
 ///
 /// Each call and each attempt is signed anew, so a retry after a `401` carries a new signature. The
-/// key is named as `keys` names it: by `kid`, or by a certificate chain, which the header then
-/// carries as `x5c`.
+/// key is named as the source names it: by `kid`, or by a certificate chain, which the header then
+/// carries as `x5c` ([`KeySource`]).
 ///
 /// **It fails closed**: a call it cannot sign is not sent. A call that names no run, a URL with no
 /// request target, a prompt statement whose id cannot be read ([`PromptStatement::prompt_jti`](crate::PromptStatement::prompt_jti))
@@ -37,24 +41,81 @@ use crate::{
 /// retried as a model outage is); keys that refuse are [`ModelError::Auth`]. A run with no prompt
 /// statement is signed with `prompt_jti` `null`.
 ///
-/// Refusals and parks are `inner`'s. Its `Debug` names the keys' kind, nothing else.
+/// Refusals and parks are `inner`'s. Its `Debug` names the source and the keys' kind, nothing else.
 pub struct SignedRequests {
     inner: DynCredentials,
-    keys: DynTurnKeys,
+    source: KeySource,
+}
+
+/// Which key signs a model request ([ADR 0086] decision 4).
+///
+/// Closed on purpose: the request path handles each source, and a new one must fail to compile.
+/// [`new`](SignedRequests::new) takes [`Process`](Self::Process), the process's turn keys, so a
+/// host that gives none signs exactly as it did before a run had a certificate.
+///
+/// [ADR 0086]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0086-a-run-signs-its-model-requests-with-a-certificate.md
+#[derive(Clone, Debug)]
+pub enum KeySource {
+    /// The process's turn keys ([ADR 0068]): one key for every run the process steps.
+    ///
+    /// [ADR 0068]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0068-adam-signs-its-own-history.md
+    Process(DynTurnKeys),
+    /// The run's own key, named by a certificate a CA issued for it ([ADR 0086]).
+    ///
+    /// [ADR 0086]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0086-a-run-signs-its-model-requests-with-a-certificate.md
+    Run(DynRunKeys),
+}
+
+#[async_trait]
+impl TurnKeys for KeySource {
+    async fn current(&self) -> Result<CurrentKey, TurnKeyError> {
+        match self {
+            Self::Process(keys) => keys.current().await,
+            Self::Run(keys) => keys.current().await,
+        }
+    }
+
+    async fn sign(&self, kid: &KeyId, input: &[u8]) -> Result<Signature, TurnKeyError> {
+        match self {
+            Self::Process(keys) => keys.sign(kid, input).await,
+            Self::Run(keys) => keys.sign(kid, input).await,
+        }
+    }
+
+    async fn key_set(&self) -> Result<Arc<KeySet>, TurnKeyError> {
+        match self {
+            Self::Process(keys) => keys.key_set().await,
+            Self::Run(keys) => keys.key_set().await,
+        }
+    }
+
+    fn kind(&self) -> &'static str {
+        match self {
+            Self::Process(keys) => keys.kind(),
+            Self::Run(keys) => keys.kind(),
+        }
+    }
 }
 
 impl SignedRequests {
-    /// The credentials of `inner`, each call signed with `keys`.
+    /// The credentials of `inner`, each call signed with the process's turn keys `keys`.
     #[must_use]
     pub fn new(inner: DynCredentials, keys: DynTurnKeys) -> Self {
-        Self { inner, keys }
+        Self::with_key_source(inner, KeySource::Process(keys))
+    }
+
+    /// The credentials of `inner`, each call signed by `source`: the process's turn keys, or the
+    /// run's certified key ([`KeySource`]).
+    #[must_use]
+    pub fn with_key_source(inner: DynCredentials, source: KeySource) -> Self {
+        Self { inner, source }
     }
 }
 
 impl fmt::Debug for SignedRequests {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("SignedRequests")
-            .field("keys", &self.keys)
+            .field("source", &self.source)
             .finish_non_exhaustive()
     }
 }
@@ -95,9 +156,9 @@ impl ModelCredentials for SignedRequests {
             body: call.body,
             prompt_jti: prompt_jti.as_deref(),
         };
-        let signature = match sign_request(&*self.keys, &request).await {
+        let signature = match sign_request(&self.source, &request).await {
             // The key was renewed between naming it and signing: name the current one again, once.
-            Err(TurnKeyError::NotSigning { .. }) => sign_request(&*self.keys, &request).await,
+            Err(TurnKeyError::NotSigning { .. }) => sign_request(&self.source, &request).await,
             signed => signed,
         }
         .map_err(key_error)?;
@@ -374,7 +435,54 @@ mod tests {
         assert!(matches!(err, ModelError::Auth(_)), "{err:?}");
         assert_eq!(
             format!("{locked:?}"),
-            "SignedRequests { keys: TurnKeys(host), .. }"
+            "SignedRequests { source: Process(TurnKeys(host)), .. }"
+        );
+    }
+
+    /// A run's key: the signature carries the certificate chain, and it verifies with the run's
+    /// key set. The process source is the default; a run source is chosen by name.
+    #[tokio::test]
+    async fn a_run_key_signs_with_its_certificate_chain() {
+        use adam_core::turn::run_cert::testkit::FakeRunCertIssuer;
+        use adam_core::turn::testkit::Certified;
+        use adam_core::turn::{CertificateRequest, Ed25519TurnKeys, RunCertIssuer};
+        use base64::Engine as _;
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+
+        let issuer = FakeRunCertIssuer::new();
+        let request = CertificateRequest::new(b"run-root-1/csr".to_vec()).unwrap();
+        let chain = issuer.issue(&request).await.unwrap();
+        let run = Certified::new(Ed25519TurnKeys::ephemeral().unwrap(), chain);
+        let set = run.key_set().await.unwrap();
+        let signed = SignedRequests::with_key_source(
+            Arc::new(StaticBearer::new(SecretString::from(""))),
+            KeySource::Run(Arc::new(run)),
+        );
+        let headers = signed.headers(call(None, b"{}")).await.unwrap();
+        let jws = header(&headers, TURN_SIGNATURE_HEADER).unwrap();
+        verify_request(
+            &set,
+            &jws,
+            &ModelCall {
+                run: "run-root-1",
+                method: "POST",
+                path: "/v1/chat/completions",
+                body: b"{}",
+                prompt_jti: None,
+            },
+            now(),
+        )
+        .unwrap();
+        let protected = jws.split('.').next().unwrap();
+        let header_json: serde_json::Value =
+            serde_json::from_slice(&URL_SAFE_NO_PAD.decode(protected).unwrap()).unwrap();
+        assert!(
+            header_json.get("x5c").is_some(),
+            "the run key's signature carries no certificate chain: {header_json}"
+        );
+        assert_eq!(
+            format!("{signed:?}"),
+            "SignedRequests { source: Run(RunKeys(certificate)), .. }"
         );
     }
 }
