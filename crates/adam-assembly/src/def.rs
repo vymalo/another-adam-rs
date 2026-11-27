@@ -14,7 +14,7 @@ use adam_agent_fs::{
 use adam_core::{DynSecretSource, ProcessEnv};
 use adam_llm_agent::{DynTool, DynToolSource, Limits, LlmStarter, SESSION_TOOLS, ToolSet};
 use adam_model::ReasoningEffort;
-use adam_runtime::{RuntimeBuilder, SessionLimits};
+use adam_runtime::{RuntimeBuilder, SessionLimits, glob};
 use secrecy::SecretString;
 
 use crate::assembly::{BoundDef, Rounds};
@@ -482,6 +482,7 @@ impl AgentDef {
                     &target,
                     self.max_parallel,
                     max_rounds,
+                    None,
                 );
                 (target.name, bounds)
             })
@@ -1754,26 +1755,6 @@ fn retry_policies(
     Ok(policies)
 }
 
-/// Whether `name` matches `pattern`, where `*` stands for any run of characters.
-fn glob(pattern: &str, name: &str) -> bool {
-    let parts: Vec<&str> = pattern.split('*').collect();
-    // `split` yields at least one piece; without a `*` there is exactly one.
-    let (first, rest) = (parts[0], &parts[1..]);
-    let Some((last, middles)) = rest.split_last() else {
-        return pattern == name;
-    };
-    let Some(mut tail) = name.strip_prefix(first) else {
-        return false;
-    };
-    for middle in middles {
-        let Some(at) = tail.find(middle) else {
-            return false;
-        };
-        tail = &tail[at + middle.len()..];
-    }
-    tail.ends_with(last)
-}
-
 /// Render the prompt of one agent: `instructions.md` and each `instructions/*.md`, then joined
 /// the way [`Instructions::prompt`] joins them.
 fn render_prompt(
@@ -1874,24 +1855,6 @@ fn render_prompt(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn a_star_matches_any_run() {
-        assert!(glob("linear__*", "linear__list_issues"));
-        assert!(glob("linear__*", "linear__"));
-        assert!(!glob("linear__*", "github__list"));
-        assert!(!glob("linear__*", "linear_"));
-        assert!(glob("*_issues", "linear__list_issues"));
-        assert!(glob("*", "anything"));
-        assert!(glob("a*b*c", "aXbYc"));
-        assert!(glob("a*b*c", "abc"));
-        assert!(!glob("a*b*c", "acb"));
-        assert!(!glob("a*b*c", "aXbY"));
-        assert!(glob("exact", "exact"));
-        assert!(!glob("exact", "exactly"));
-        // The pieces of a pattern cannot overlap: `ab*ba` needs four characters.
-        assert!(!glob("ab*ba", "aba"));
-    }
 
     #[test]
     fn a_subagents_run_limit_is_30_minutes_unless_its_file_says_otherwise() {

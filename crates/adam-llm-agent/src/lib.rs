@@ -156,6 +156,7 @@ mod redact;
 mod schedule;
 #[cfg(feature = "schema")]
 mod schema;
+mod session_tools;
 mod sessions;
 mod signing;
 mod source;
@@ -204,8 +205,8 @@ pub use conversation::{
     MAX_REPORTED_ROUNDS, MESSAGE_KIND, MODE_CONTEXT_KEY, MODEL_CONTEXT_KEY, ModelSwitch,
     OMITTED_MARKER_PREFIX, PER_MESSAGE_CONTEXT_KEYS, PROMPT_STATEMENT_KEY, PROTECTED_CONTEXT_KEYS,
     PendingQuestion, PendingRemote, PendingRun, PendingSession, PendingWait,
-    REASONING_EFFORT_CONTEXT_KEY, RENDERER_OFFER_CONTEXT_KEY, Repeats, STOPPED_BY_THE_PERSON,
-    loaded_note, user_message,
+    REASONING_EFFORT_CONTEXT_KEY, RENDERER_OFFER_CONTEXT_KEY, Repeats, SESSION_TOOLS_CONTEXT_KEY,
+    STOPPED_BY_THE_PERSON, loaded_note, user_message,
 };
 pub use events::{EmitError, RecordedEvent};
 pub use fn_tool::FnTool;
@@ -236,6 +237,7 @@ pub use plan::{MAX_PLAN_ITEMS, Plan, PlanItem, PlanStatus};
 pub use redact::{REDACTED_MARKER, is_ordinary_word, is_value_position};
 #[cfg(feature = "schema")]
 pub use schema::{ToolSpecExt, spec_for};
+pub use session_tools::SessionToolFilter;
 pub use sessions::{
     MAX_DESCRIPTION_CHARS, MAX_OPEN_SESSIONS, MAX_SESSION_ROUNDS, MAX_TEXT_CHARS,
     MAX_WORKING_ROUNDS, SESSION_TOOL_TIME_LIMIT, SESSION_TOOLS, SUBAGENT_CLOSE, SUBAGENT_LIST,

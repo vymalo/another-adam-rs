@@ -72,6 +72,10 @@ fn is_local(manifest: &AgentManifest, target: &SessionTarget) -> bool {
 ///   option (decision 2); a *folder* above the deployment's is clamped (decision 3).
 /// * `time_limit` is the round's own limit (`limits.max_minutes`, or the remote's wait), and
 ///   `max_rounds` the root's effective `max_session_rounds`.
+/// * `tools` is what the caller passes: the names the subagent is bound with, when the caller knows
+///   them exactly (a worker, which binds the agent), else `None` (the control plane, which binds
+///   none, and cannot list an MCP server's tools without calling it). It is `None` for a remote
+///   target whatever is passed: a remote's tools are another system's, and the option is refused.
 ///
 /// A remote subagent's rounds are runs of an agent of its own, and the ADR refuses every option
 /// but `time_limit`, `max_rounds` and `instructions` on one: the loop's defaults stand for the
@@ -81,6 +85,7 @@ pub(crate) fn bounds_of(
     target: &SessionTarget,
     deployment_parallel: Option<usize>,
     max_rounds: u32,
+    tools: Option<Vec<String>>,
 ) -> SessionBounds {
     let (max_turns, max_tool_calls, max_output_tokens, parallel) = if is_local(manifest, target) {
         let file = folder_limits(manifest, target);
@@ -117,5 +122,6 @@ pub(crate) fn bounds_of(
             u32::try_from(within.as_secs() / 60).unwrap_or(u32::MAX)
         }),
         max_rounds,
+        tools: tools.filter(|_| !target.remote),
     }
 }

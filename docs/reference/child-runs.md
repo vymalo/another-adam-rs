@@ -302,6 +302,13 @@ admitted is kept in the session's header, and the round reads its limits from it
 deployment that lowered a limit is obeyed and nothing is raised back. `max_output_tokens` is never `0` (that would leave the cap
 to the model) and a `context_window` is never so small that no history fits: it is held to the least that leaves room.
 
+`config` also takes `tools` and `deny_tools` (ADR 0054, slice 3): lists of tool names, in the folder's own syntax (an exact name or
+a `*` pattern; `github__*` selects an MCP server). The session is offered only the tools `tools` matches, less the ones `deny_tools`
+matches (the deny-list is applied after the allow-list); `read_output` always stays. A hidden tool is not in the model's request,
+and a call to it anyway is refused without running. A name or pattern that matches none of the subagent's tools is refused with
+the list of its tools, where the starter knows them. At most 32 entries, each at most 200 characters. A remote subagent takes
+neither. They apply from the next model call; a later round carries them on.
+
 ```mermaid
 sequenceDiagram
     autonumber

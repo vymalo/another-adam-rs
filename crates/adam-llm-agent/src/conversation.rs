@@ -160,6 +160,18 @@ pub const MODEL_CONTEXT_KEY: &str = "vymalo.model";
 /// list are withheld, and the access tier still caps every one it does.
 pub const MODE_CONTEXT_KEY: &str = "vymalo.mode";
 
+/// The context key under which a session's round carries the tools its `config` narrows (ADR 0054
+/// slice 3): `{"tools": [..], "denyTools": [..]}`, only the members the config sets, and an empty
+/// object when it sets neither, so a round never inherits another round's value. Written by
+/// `subagent_start` and `subagent_send` (and the A2A front) from the header's clamped config, and
+/// read by [`SessionToolFilter`](crate::SessionToolFilter), which withholds every tool the lists leave out.
+/// `read_output` is never withheld.
+///
+/// **Not one of [`PROTECTED_CONTEXT_KEYS`]**: a child of the session must not inherit its parent's
+/// narrowing, so the key is not copied into a child run
+/// ([`ToolCtx::start_child`](crate::ToolCtx::start_child)); it speaks for the round that carries it.
+pub const SESSION_TOOLS_CONTEXT_KEY: &str = "vymalo.session.tools";
+
 /// The context key under which a message says **who it was sent for** (`thread-tools/v1`): the
 /// thread's addressed agent, `{"caller": "main"}`, or an agent another agent asked, `{"caller":
 /// "ask:<n>", ..}`, read from the claims of the grant's token. A run of an asked agent has no person

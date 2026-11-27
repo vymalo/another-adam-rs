@@ -61,6 +61,23 @@ fn bound_of(assembly: &Assembly) -> SessionBounds {
     all[0].1.clone()
 }
 
+/// The bounds with the one fact only a worker has taken out: the names of the tools the subagent is
+/// bound with (`tools`, ADR 0054 slice 3), which a control plane that binds no agent does not know.
+fn without_tools(bounds: Vec<(String, SessionBounds)>) -> Vec<(String, SessionBounds)> {
+    bounds
+        .into_iter()
+        .map(|(name, bound)| {
+            (
+                name,
+                SessionBounds {
+                    tools: None,
+                    ..bound
+                },
+            )
+        })
+        .collect()
+}
+
 /// Every field, in the order of `SessionBounds`: turns, tool calls, output tokens, window, calls
 /// at once, minutes and rounds.
 fn fields(bound: &SessionBounds) -> (u32, u32, u32, Option<u32>, u32, u32, u32) {
@@ -313,7 +330,7 @@ fn a_definition_computes_the_bounds_a_worker_binds_without_binding() {
             let control_plane = control_plane.session_bounds();
             assert_eq!(
                 control_plane,
-                worker.session_bounds(),
+                without_tools(worker.session_bounds()),
                 "folder {folder:?}, {limits:?}, MAX_PARALLEL_TOOL_CALLS {parallel:?}"
             );
         }
@@ -350,7 +367,10 @@ fn the_roster_of_the_bounds_is_the_workers() {
         .model(Arc::new(MockModel::new()), "m")
         .unwrap();
     let root = root.session_max_parallel(6);
-    assert_eq!(root.session_bounds(), worker.session_bounds());
+    assert_eq!(
+        root.session_bounds(),
+        without_tools(worker.session_bounds())
+    );
     assert_eq!(root.session_bounds().len(), 2);
 
     let alone = def(&[(
@@ -405,7 +425,10 @@ fn the_definitions_parallel_limit_is_the_workers_unless_it_says_another() {
         .model(Arc::new(MockModel::new()), "m")
         .unwrap();
     assert_eq!(bound_of(&worker).max_parallel_tool_calls, 4);
-    assert_eq!(definition.session_bounds(), worker.session_bounds());
+    assert_eq!(
+        definition.session_bounds(),
+        without_tools(worker.session_bounds())
+    );
     let override_ = definition
         .bind(tools(&[]))
         .unwrap()
@@ -413,4 +436,56 @@ fn the_definitions_parallel_limit_is_the_workers_unless_it_says_another() {
         .model(Arc::new(MockModel::new()), "m")
         .unwrap();
     assert_eq!(bound_of(&override_).max_parallel_tool_calls, 7);
+}
+
+/// ADR 0054 slice 3: a worker knows the names of the tools its subagent is bound with, and
+/// `admit` holds `tools` and `deny_tools` to them; a control plane, which binds no agent, knows
+/// none and checks the shape alone.
+#[test]
+fn a_worker_bounds_hold_the_names_of_the_subagents_tools_and_a_definitions_do_not() {
+    let definition = def(&[
+        (
+            "agent/instructions.md",
+            &instructions("name: coder", "You are the root."),
+        ),
+        (
+            "agent/subagents/reviewer.md",
+            &instructions(
+                "description: Reviews a change.\ntools: [read_file, write_file]",
+                "You review.",
+            ),
+        ),
+    ]);
+    let worker = definition
+        .clone()
+        .bind(tools(&["read_file", "write_file", "delete_repository"]))
+        .unwrap()
+        .model(Arc::new(MockModel::new()), "m")
+        .unwrap();
+    let bound = bound_of(&worker);
+    assert_eq!(
+        bound.tools,
+        Some(vec!["read_file".to_owned(), "write_file".to_owned()]),
+        "only the subagent's own tools, not the root's"
+    );
+    let asked = |value| SessionConfig::from_value(value).expect("a config");
+    assert!(bound.admit(asked(json!({"tools": ["read_*"]}))).is_ok());
+    let why = bound
+        .admit(asked(json!({"denyTools": ["delete_repository"]})))
+        .expect_err("a tool the subagent has not got");
+    assert_eq!(why.option(), Some("deny_tools"));
+    assert!(
+        why.message()
+            .contains("matches none of its tools: read_file, write_file"),
+        "{why}"
+    );
+
+    let control_plane = definition.session_bounds().remove(0).1;
+    assert_eq!(control_plane.tools, None);
+    assert!(
+        control_plane
+            .admit(asked(json!({"denyTools": ["delete_repository"]})))
+            .is_ok(),
+        "a control plane checks the shape only"
+    );
 }

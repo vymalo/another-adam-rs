@@ -60,6 +60,22 @@
             "max_rounds": {
               "type": "integer",
               "minimum": 1
+            },
+            "tools": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "maxItems": 32,
+              "description": "Only these tools: names or * patterns (github__* is one MCP server)."
+            },
+            "deny_tools": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "maxItems": 32,
+              "description": "Hide these tools, same syntax; applied after tools."
             }
           },
           "additionalProperties": false

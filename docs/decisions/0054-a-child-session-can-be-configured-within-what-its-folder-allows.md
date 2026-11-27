@@ -305,6 +305,28 @@ where a store is involved (`crates/adam-llm-agent/tests/sessions.rs` holds the s
 * Files: `agent.rs` (the session withhold, both points), `sessions.rs`, `def.rs` (the bound tool names).
 * Accepted when: a hidden tool is not in the request and a call to it is refused without running; a pattern matching no tool is
   refused with the list; an MCP server is selected by `server__*`; `read_output` stays.
+* *2026-11-27 (ANR-210, slice 3):* **`tools` and `deny_tools`** are built. `subagent_start`'s `config` takes both as lists of strings, and a
+  person's `start.config` takes `tools` and `denyTools`; entries are the folder's own syntax (exact names and `*` patterns, so
+  `github__*` selects an MCP server), and **both fronts admit them with the same `SessionBounds::admit`**: at most 32 entries of at
+  most 200 characters each, none blank. `SessionBounds` gains `tools`, the names the subagent is bound with. A worker knows them (the
+  node of the subagent in `Assembly`) and `admit` then refuses an entry that matches none, in words that list them (cut at 50 with
+  `and N more`: `config.tools has "red_file", which matches none of its tools: read_file, write_file`). **A role that does not know
+  them checks the shape alone**: the control plane (`AgentDef::session_bounds`) binds no agent and cannot list an MCP server's tools
+  without calling it, and a worker whose agent has tools a *source* adds at run time (an `mcp.json` server with a `when`, or a source
+  the deployment gave, as the coder does) cannot list them either. There an entry that matches nothing is not refused: it hides what
+  it does not select, which is the safe side. **The mechanism** is a context key, not a field of the run: every round's message
+  carries `vymalo.session.tools` (`SESSION_TOOLS_CONTEXT_KEY`: `{"tools": [..], "denyTools": [..]}`, only the members set, `{}` when
+  the config sets neither), written from the header's config by `round_message` for `subagent_start` and `subagent_send` (a send's is
+  the clamped copy) and by `put_header` for the A2A front, which writes it **over** whatever a person's message said. It is **not** a
+  protected context key, so a child of the session does not inherit it. `SessionToolFilter`, a `ToolSource` that `adam-assembly`
+  gives every agent beside the mode source, offers no tool and says nothing; its `withhold` holds back every tool `tools` leaves out
+  and every tool `deny_tools` matches (the deny-list is applied after the allow-list), **except `read_output`**. The loop already
+  applies a source's holds at both points of ADR 0036 decision 6, so a hidden tool is not in the request and a call to it is refused
+  without running. The words tell the model to say in plain words what it did not do and not to look for another way. A value of
+  the wrong shape in the key fails closed. The `subagent_start` schema grew by two properties (**the prompt prefix, and the prompt
+  cache, of every agent that has subagents change once**; the coder's tool table row is 2,520 to 2,808 bytes). `list` and `read` print
+  them (`tools read_file, *, deny_tools write_file`); a remote subagent takes neither. *Not in this slice:* the card's
+  `agents[].config` listing the bound tool names (slice 10), and an edit of a running session's tools (slice 4).
 
 **4. `subagent_edit`** (decision 11). Depends on 1 and 3.
 * Files: `sessions.rs`, `crates/adam-runtime/src/session.rs` (`adam.session.edit`, `edits`), `agent.rs` (read at the next step).
