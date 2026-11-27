@@ -42,6 +42,7 @@ const sidebar = [
           "egress-and-run-pod-network.md",
           "read-a-stuck-run.md",
           "troubleshoot-by-error-class.md",
+          "export-runs-for-training.md",
         ]),
       },
       { text: "Extend", items: pages("guides", [], ["embed-adam.md", "embed-in-an-app.md"]) },

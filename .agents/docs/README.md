@@ -19,6 +19,7 @@ A page here that has a page for people sits at the same relative path, and the t
 | [Read a stuck run: queries](guides/read-a-stuck-run.md) | [Read a run's state when it is stuck](../../docs/guides/read-a-stuck-run.md) | the read-only queries on the run store and the code each claim stands on |
 | [Embed adam in an application: the evidence](guides/embed-in-an-app.md) | [Embed adam in an application](../../docs/guides/embed-in-an-app.md) | where the engine's approvals are in the code, the invariants to check, and each proof with the change it was seen failing against |
 | [Troubleshoot by error class: evidence](guides/troubleshoot-by-error-class.md) | [Troubleshoot by error class](../../docs/guides/troubleshoot-by-error-class.md) | where each class's retry, A2A code and exit code is decided |
+| [Export runs for training: invariants and evidence](guides/export-runs-for-training.md) | [Export runs for training](../../docs/guides/export-runs-for-training.md) | which fields of a run the exporter reads, what is cleaned and pseudonymised, which runs it reaches, the gates and the tests |
 | [Errors: rules to check](reference/errors.md) | [Errors](../../docs/reference/errors.md) | the rules every error enum keeps |
 | [Agent files: the decisions to keep](reference/agent-files.md) | [Agent files](../../docs/reference/agent-files.md) | the owner's decisions behind the folder format |
 | [Child runs: the tests](reference/child-runs.md) | [Child runs](../../docs/reference/child-runs.md) | the test of every failure interleaving, and how the tests make each happen |
