@@ -134,10 +134,11 @@ helm_reasoning --set config.maxParallelToolCalls=6 > "$out"
 check "... and from --set" envval MAX_PARALLEL_TOOL_CALLS 6
 check "... once" count 'name: MAX_PARALLEL_TOOL_CALLS' 1
 helm_reasoning --set config.maxParallelToolCalls=6 --set config.role=control-plane > "$out"
-check "a control plane runs no tools: no MAX_PARALLEL_TOOL_CALLS" lacks 'MAX_PARALLEL_TOOL_CALLS'
+check "a control plane reads it too: the session bounds a start.config is held to (ADR 0054)" \
+  dhas StatefulSet 'name: MAX_PARALLEL_TOOL_CALLS'
 helm_reasoning --set config.maxParallelToolCalls=6 --set topology=split > "$out"
 check "split: the worker StatefulSet has it" envval MAX_PARALLEL_TOOL_CALLS 6
-check "split: the front has not" dlacks Deployment 'MAX_PARALLEL_TOOL_CALLS'
+check "split: the front has it too, for the same bounds" dhas Deployment 'name: MAX_PARALLEL_TOOL_CALLS'
 for bad in 0 -1 33 2.5 lots true; do
   printf 'config:\n  maxParallelToolCalls: %s\n' "$bad" > "$vals"
   check "maxParallelToolCalls $bad is refused" fails helm_reasoning -f "$vals"
