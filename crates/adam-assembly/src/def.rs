@@ -1500,7 +1500,6 @@ fn limits(file: Option<&FileLimits>) -> Limits {
     }
 }
 
-/// The tools an agent gets, by name, in the order its `tools:` lists them.
 /// The root's modes, resolved against the tools the agent ends up with (ADR 0039, decision 3): a
 /// pattern is expanded (one that matches nothing is an error), a plain name the agent does not have
 /// is dropped with a warning (a deployment's environment decides some tools, and a folder's `tools:`
@@ -1577,6 +1576,7 @@ fn resolve_modes(
     Ok(Modes::new(resolved, default).map(std::sync::Arc::new))
 }
 
+/// The tools an agent gets, by name, in the order its `tools:` lists them.
 fn resolve_tools(
     origin: &Origin,
     list: Option<&ToolList>,
