@@ -1605,7 +1605,6 @@ mod tests {
             keep_open: true,
             closed: false,
             closing: false,
-            deleted: false,
             idle_expired: false,
             started_by: by.or(Some(me)),
             report: ReportRound {
