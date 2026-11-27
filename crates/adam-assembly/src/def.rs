@@ -1582,7 +1582,8 @@ fn resolve_tools(
     list: Option<&ToolList>,
     is_root: bool,
     catalog: &Catalog,
-) -> Result<Vec<(String, DynTool)>, Error> {    let names = match list {
+) -> Result<Vec<(String, DynTool)>, Error> {
+    let names = match list {
         // A root agent with no `tools:` gets everything registered; a subagent gets nothing.
         None if is_root => return Ok(catalog.entries.clone()),
         None => return Ok(Vec::new()),

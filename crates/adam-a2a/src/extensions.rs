@@ -551,8 +551,7 @@ impl ExtensionConfig {
     /// contract (`docs/api/agent-mode-v1.md`, ANR-979).
     pub fn agent_mode(modes: &crate::AgentModes) -> Self {
         let mut extension = Self::new(AGENT_MODE_EXTENSION);
-        extension.description =
-            Some("Works in the mode the person picks for each message.".into());
+        extension.description = Some("Works in the mode the person picks for each message.".into());
         extension
             .params
             .insert("modes".into(), json!(modes.entries()));
@@ -1102,7 +1101,8 @@ mod tests {
     }
 
     #[test]
-    fn a_model_that_takes_no_level_lists_no_reasoning_extension() {        // No entry at all, an entry with no level, and another agent's levels: none is the root's.
+    fn a_model_that_takes_no_level_lists_no_reasoning_extension() {
+        // No entry at all, an entry with no level, and another agent's levels: none is the root's.
         assert!(ExtensionConfig::reasoning(&ReasoningEfforts::new(), "coder").is_none());
         let empty = ReasoningEfforts::new().with_agent("coder", [], Some(ReasoningEffort::Low));
         assert!(ExtensionConfig::reasoning(&empty, "coder").is_none());

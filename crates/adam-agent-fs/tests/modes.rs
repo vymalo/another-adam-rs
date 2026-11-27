@@ -142,7 +142,9 @@ fn exactly_one_mode_says_default() {
     let none_default = errors(&report);
     assert_eq!(none_default.len(), 1, "{:#?}", report.diagnostics);
     assert!(
-        none_default[0].message.contains("one mode says `default: true`"),
+        none_default[0]
+            .message
+            .contains("one mode says `default: true`"),
         "{none_default:?}"
     );
 
@@ -218,7 +220,10 @@ fn more_than_16_modes_are_refused() {
         .map(|n| {
             (
                 format!("agent/modes/m{n:02}.md"),
-                format!("---\ndescription: d\n{}---\n", if n == 0 { "default: true\n" } else { "" }),
+                format!(
+                    "---\ndescription: d\n{}---\n",
+                    if n == 0 { "default: true\n" } else { "" }
+                ),
             )
         })
         .collect();
@@ -292,10 +297,7 @@ fn digest_unchanged_without_modes() {
     let json = serde_json::to_string(&report.package.agents[0]).unwrap();
     assert!(!json.contains("modes"), "{json}");
     // An empty `modes/` changes nothing either.
-    let dir = write(&[
-        ("agent/instructions.md", ROOT),
-        ("agent/modes/.keep", ""),
-    ]);
+    let dir = write(&[("agent/instructions.md", ROOT), ("agent/modes/.keep", "")]);
     assert_eq!(digest_of(dir.path()), without);
     // A mode changes it, and so does a change to a mode's prompt.
     let with = write(&[

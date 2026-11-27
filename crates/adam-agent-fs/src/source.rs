@@ -437,7 +437,12 @@ impl Loader<'_> {
                 (entry.name.as_str(), entry.kind),
                 ("instructions.md" | "mcp.json", EntryKind::File)
                     | (
-                        "instructions" | "skills" | "subagents" | "schedules" | "commands" | "modes",
+                        "instructions"
+                            | "skills"
+                            | "subagents"
+                            | "schedules"
+                            | "commands"
+                            | "modes",
                         EntryKind::Dir
                     )
             );
@@ -812,7 +817,8 @@ impl Loader<'_> {
                 &rel,
                 None,
                 if named.is_empty() {
-                    "one mode says `default: true`: a message that names none works in it".to_owned()
+                    "one mode says `default: true`: a message that names none works in it"
+                        .to_owned()
                 } else {
                     format!(
                         "{} modes say `default: true` ({}): exactly one may",

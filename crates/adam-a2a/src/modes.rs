@@ -213,10 +213,7 @@ mod tests {
         );
         assert_eq!(set.default_mode(), "build");
         assert!(set.offers("plan") && !set.offers("Build"));
-        assert_eq!(
-            AgentModes::new([], "build"),
-            Err(AgentModesError::Empty)
-        );
+        assert_eq!(AgentModes::new([], "build"), Err(AgentModesError::Empty));
         assert_eq!(
             AgentModes::new([info("plan")], "build"),
             Err(AgentModesError::DefaultNotDeclared("build".into()))

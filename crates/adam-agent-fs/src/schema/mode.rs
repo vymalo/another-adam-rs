@@ -24,8 +24,9 @@ pub struct ModeFrontmatter {
     /// client shows beside the name.
     pub description: Option<String>,
     /// The tools the model is shown while the mode is in force: a list or a comma-separated
-    /// string, as an agent's `tools:`. Absent: the agent's own list, unchanged. A name the agent
-    /// does not have is a bind error (fail closed).
+    /// string, as an agent's `tools:`. Absent: the agent's own list, unchanged. A plain name the
+    /// agent does not have is left out with a warning (a deployment's setting decides some tools);
+    /// a pattern that matches nothing is a bind error.
     pub tools: Option<ToolList>,
     /// `true` on the one mode the agent works in when a message names none. Exactly one mode of a
     /// folder says it.

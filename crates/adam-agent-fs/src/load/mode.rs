@@ -3,11 +3,11 @@
 use std::path::Path;
 
 use super::read_front;
+use crate::Diagnostic;
 use crate::diagnostic::Sink;
 use crate::frontmatter::{clean_body, key_line};
 use crate::manifest::{MODE_DESCRIPTION_MAX, MODE_TITLE_MAX, Mode};
 use crate::schema::{ModeFrontmatter, is_agent_name};
-use crate::Diagnostic;
 
 /// Read one mode from its text, with `diagnostics` collecting what is wrong (the embedded path:
 /// the file was read at build time and is parsed again here, by this same parser).
@@ -25,12 +25,7 @@ pub(crate) fn parse_mode_text(
 }
 
 /// Read one mode. `name` is the file stem. `None` (with an error) when it is unusable.
-pub(crate) fn parse_mode(
-    sink: &mut Sink<'_>,
-    path: &Path,
-    text: &str,
-    name: &str,
-) -> Option<Mode> {
+pub(crate) fn parse_mode(sink: &mut Sink<'_>, path: &Path, text: &str, name: &str) -> Option<Mode> {
     let front = read_front::<ModeFrontmatter>(sink, text)?;
     let (fm, split) = (front.value, front.split);
     for key in fm.extra.keys() {
@@ -79,7 +74,9 @@ pub(crate) fn parse_mode(
     if title_chars > MODE_TITLE_MAX {
         sink.error(
             key_line(&split, "title"),
-            format!("the title has {title_chars} characters; a mode takes at most {MODE_TITLE_MAX}"),
+            format!(
+                "the title has {title_chars} characters; a mode takes at most {MODE_TITLE_MAX}"
+            ),
         );
         ok = false;
     }
@@ -95,10 +92,7 @@ pub(crate) fn parse_mode(
         ok = false;
     }
     let prompt = clean_body(split.body);
-    {
-        let mut sink = sink;
-        super::agent::check_prompt_length(&mut sink, &prompt);
-    }
+    super::agent::check_prompt_length(sink, &prompt);
     ok.then(|| Mode {
         name: name.to_owned(),
         title: title.to_owned(),

@@ -12,9 +12,9 @@
 //! * A mode only narrows. The access tier still caps every tool the mode allows, and a mode can
 //!   neither raise the tier nor grant a tool the agent does not have.
 
+use a2a::Message;
 use adam_a2a::{AGENT_MODE_EXTENSION, AgentModes, Caller};
 use adam_runtime::Inbound;
-use a2a::Message;
 use serde_json::{Value, json};
 
 /// The context key under which the mode the **latest message that named one** picked is kept:
@@ -61,14 +61,17 @@ pub(crate) fn put(inbound: &mut Inbound, mode: &str) -> Result<(), String> {
     if let Value::String(text) = &inbound.payload {
         inbound.payload = json!({ "text": text });
     }
-    let payload = inbound.payload.as_object_mut().ok_or_else(|| {
-        "the message cannot carry a mode: its payload is not text".to_owned()
-    })?;
+    let payload = inbound
+        .payload
+        .as_object_mut()
+        .ok_or_else(|| "the message cannot carry a mode: its payload is not text".to_owned())?;
     let context = payload
         .entry("context")
         .or_insert_with(|| Value::Object(Default::default()))
         .as_object_mut()
-        .ok_or_else(|| "the message cannot carry a mode: its context is not an object".to_owned())?;
+        .ok_or_else(|| {
+            "the message cannot carry a mode: its context is not an object".to_owned()
+        })?;
     context.insert(CONTEXT_MODE.to_owned(), json!({ "mode": mode }));
     Ok(())
 }

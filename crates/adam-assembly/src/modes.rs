@@ -47,10 +47,7 @@ pub(crate) struct Modes {
 
 impl Modes {
     /// `modes` (each name once) with `default` among them. `None` for an empty set.
-    pub(crate) fn new(
-        modes: Vec<ResolvedMode>,
-        default: impl Into<String>,
-    ) -> Option<Self> {
+    pub(crate) fn new(modes: Vec<ResolvedMode>, default: impl Into<String>) -> Option<Self> {
         if modes.is_empty() {
             return None;
         }
@@ -67,11 +64,13 @@ impl Modes {
     }
 
     /// Every mode, in the order the files gave (sorted by name).
+    #[cfg(test)]
     pub(crate) fn modes(&self) -> &[ResolvedMode] {
         &self.modes
     }
 
     /// The default mode's name.
+    #[cfg(test)]
     pub(crate) fn default_mode(&self) -> &str {
         &self.default
     }
@@ -90,10 +89,7 @@ impl Modes {
             .and_then(|entry| entry.get("mode"))
             .and_then(Value::as_str)
             .and_then(|name| self.get(name))
-            .unwrap_or_else(|| {
-                self.get(&self.default)
-                    .unwrap_or_else(|| &self.modes[0])
-            })
+            .unwrap_or_else(|| self.get(&self.default).unwrap_or_else(|| &self.modes[0]))
     }
 }
 
@@ -218,7 +214,11 @@ mod tests {
         Modes::new(
             vec![
                 mode("build", None, ""),
-                mode("plan", Some(&["read_file", "list_files"]), "Change nothing."),
+                mode(
+                    "plan",
+                    Some(&["read_file", "list_files"]),
+                    "Change nothing.",
+                ),
             ],
             "build",
         )
@@ -227,9 +227,7 @@ mod tests {
 
     fn context(entry: Option<Value>) -> serde_json::Map<String, Value> {
         entry
-            .map(|entry| {
-                serde_json::Map::from_iter([(MODE_CONTEXT_KEY.to_owned(), entry)])
-            })
+            .map(|entry| serde_json::Map::from_iter([(MODE_CONTEXT_KEY.to_owned(), entry)]))
             .unwrap_or_default()
     }
 
@@ -269,7 +267,6 @@ mod tests {
         let tools = ["read_file", "list_files", "write_file", "delete_repository"];
         let held = |entry: Option<Value>| {
             let source = source.clone();
-            let tools = tools;
             async move {
                 let ctx = SourceCtx::detached(context(entry));
                 source
@@ -282,7 +279,10 @@ mod tests {
         };
         // The default mode narrows nothing.
         assert!(held(None).await.is_empty());
-        assert_eq!(held(Some(json!({"mode": "plan"}))).await, ["write_file", "delete_repository"]);
+        assert_eq!(
+            held(Some(json!({"mode": "plan"}))).await,
+            ["write_file", "delete_repository"]
+        );
         // A tool the mode lists but the agent does not have is not invented: the list is an
         // allowlist, and only what the agent offers can be shown.
         let ctx = SourceCtx::detached(context(Some(json!({"mode": "plan"}))));
@@ -315,7 +315,11 @@ mod tests {
         let ctx = SourceCtx::detached(context(Some(json!({"mode": "plan"}))));
         let held = source.withhold(&ctx, &["write_file"]).await;
         assert_eq!(held.len(), 1);
-        assert!(held[0].reason.contains("`write_file`"), "{}", held[0].reason);
+        assert!(
+            held[0].reason.contains("`write_file`"),
+            "{}",
+            held[0].reason
+        );
         assert!(held[0].reason.contains("plan mode"), "{}", held[0].reason);
     }
 }

@@ -184,13 +184,13 @@ pub use groups::{
     GROUP_LOADER_PREFIX, Group, Groups, MAX_GROUP_NAME_CHARS, MAX_KEYWORD_CHARS, MAX_KEYWORDS,
     keywords_fit, name_fits,
 };
+#[cfg(feature = "sessions")]
+pub use modes::agent_modes_of;
 #[cfg(feature = "remote")]
 pub use remote_session::{RemoteRoundAgent, RemoteRoundStarter};
 pub use skills::{
     LOAD_SKILL, READ_SKILL_FILE, RunSkills, SkillError, SkillFiles, run_skills_conformance,
 };
-#[cfg(feature = "sessions")]
-pub use modes::agent_modes_of;
 pub use subagent::{DEFAULT_SUBAGENT_MINUTES, SubagentTool};
 pub use template::TemplateProblem;
 

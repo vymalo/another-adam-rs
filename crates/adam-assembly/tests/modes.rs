@@ -29,7 +29,10 @@ fn files() -> Vec<(&'static str, String)> {
     vec![
         (
             INSTRUCTIONS,
-            instructions("name: helper\ntools: [read_file, list_files, write_file]", "You help."),
+            instructions(
+                "name: helper\ntools: [read_file, list_files, write_file]",
+                "You help.",
+            ),
         ),
         (
             "agent/modes/build.md",
@@ -132,7 +135,10 @@ fn naming(mode: &str) -> Value {
 
 #[tokio::test]
 async fn the_default_mode_narrows_nothing() {
-    assert_eq!(shown(json!({})).await, ["read_file", "list_files", "write_file"]);
+    assert_eq!(
+        shown(json!({})).await,
+        ["read_file", "list_files", "write_file"]
+    );
     // `build` is the default and says nothing: naming it changes nothing either.
     assert_eq!(
         shown(naming("build")).await,
@@ -188,10 +194,7 @@ async fn the_modes_words_reach_the_prompt_only_when_a_mode_says_them() {
     let run = rt
         .start(
             "helper",
-            Inbound::new(
-                "message",
-                json!({"text": "go", "context": naming("plan")}),
-            ),
+            Inbound::new("message", json!({"text": "go", "context": naming("plan")})),
             None,
         )
         .await
@@ -210,7 +213,11 @@ async fn the_modes_words_reach_the_prompt_only_when_a_mode_says_them() {
     let rt = runtime(&built);
     let worker = spawn_worker(&rt);
     let run = rt
-        .start("helper", Inbound::new("message", json!({"text": "go"})), None)
+        .start(
+            "helper",
+            Inbound::new("message", json!({"text": "go"})),
+            None,
+        )
         .await
         .unwrap();
     wait_done(&rt, run).await;

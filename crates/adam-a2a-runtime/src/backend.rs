@@ -5,9 +5,9 @@ use std::time::Duration;
 
 use a2a::{Message, Task, TaskState};
 use adam_a2a::{
-    ACCESS_TIER_EXTENSION, AGENT_MODE_EXTENSION, AccessTiers, AgentModes, BackendError,
-    COMMANDS_EXTENSION, Caller, MODEL_PICK_EXTENSION, ModelChoices, REASONING_EXTENSION,
-    ReasoningEfforts, STEER_EXTENSION, TaskBackend, TaskEvent, TaskPage, TaskQuery,
+    ACCESS_TIER_EXTENSION, AccessTiers, AgentModes, BackendError, COMMANDS_EXTENSION, Caller,
+    MODEL_PICK_EXTENSION, ModelChoices, REASONING_EXTENSION, ReasoningEfforts, STEER_EXTENSION,
+    TaskBackend, TaskEvent, TaskPage, TaskQuery,
 };
 use adam_core::{RunId, StoreError};
 use adam_error::ErrorClass;
@@ -195,7 +195,7 @@ pub const MAX_REFERENCES: usize = 8;
 /// # The mode a message picks (`agent-mode/v1`)
 ///
 /// With [`with_agent_modes`](Self::with_agent_modes), a message whose request **activated**
-/// [`AGENT_MODE_EXTENSION`] must name one of the modes the card declares in its metadata under that
+/// [`AGENT_MODE_EXTENSION`](adam_a2a::AGENT_MODE_EXTENSION) must name one of the modes the card declares in its metadata under that
 /// URI, or it is refused (`InvalidParams`, whose sentence begins `mode_not_offered`, before
 /// anything is written). The mode reaches the run as the context key [`CONTEXT_MODE`](crate::CONTEXT_MODE),
 /// which the agent's mode source reads on every model turn and every call: it withholds the tools
