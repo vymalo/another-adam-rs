@@ -803,6 +803,7 @@ mod tests {
             keep_open: true,
             closed: false,
             closing: false,
+            deleted: false,
             round: 1,
             root: None,
             workspace: None,
