@@ -60,7 +60,7 @@ use adam_core::{
     RunUpdate, Store, StoreActivity, StoreError, StoreResult,
 };
 use adam_error::ErrorClass;
-use adam_postgres::{PgConfig, classify, classify_pool};
+use adam_postgres::{AdamSqlState, PgConfig, classify, classify_pool};
 use async_trait::async_trait;
 use deadpool_postgres::{ClientWrapper, Object, Pool};
 use serde_json::Value;
@@ -86,7 +86,20 @@ use uuid::Uuid;
 ///   is stale and is not served, unless the state is the tombstone: then the head is the only
 ///   readable document and it is served); `adam_body` holds one row per transcript message, keyed
 ///   `(run_id, generation, idx)`, `ON DELETE CASCADE`. The upgrade is metadata-only.
-pub const SCHEMA_VERSION: i32 = 6;
+/// * 7: the first version that carries the store's database functions
+///   ([ADR 0082](../../docs/decisions/0082-the-sql-adapters-keep-their-rules-in-the-database.md),
+///   decision 10), created in the migration transaction after the tables they name. Slice P0
+///   creates none: it is the step the later slices add functions to, and the server floor
+///   ([`MIN_SERVER_VERSION_NUM`]). A start on a current schema runs no DDL, so a slice that adds,
+///   changes or drops a function bumps this version again (8, 9, …); a function whose contract
+///   changes gets a new name.
+pub const SCHEMA_VERSION: i32 = 7;
+
+/// The oldest server [`Store::migrate`] accepts, as PostgreSQL's `server_version_num`: 18.0, the
+/// floor of [ADR 0082](../../docs/decisions/0082-the-sql-adapters-keep-their-rules-in-the-database.md)
+/// (decision 11). An older server is refused with [`StoreError::InvalidInput`] (class `Invalid`,
+/// exit 78 in a binary) before any lock or DDL, so it is never half-migrated.
+pub const MIN_SERVER_VERSION_NUM: i32 = 180_000;
 
 /// How old a foreign attempt's body row must be before a commit may collect it: the insert→CAS gap
 /// is milliseconds, and the runtime's default lease is 30 s, so five minutes separates a dead
@@ -156,7 +169,7 @@ const RUN_METADATA_COLUMNS: &str =
 /// What [`Store::run_header`] reads: the record's metadata and the lease, never `state`.
 const RUN_HEADER_COLUMNS: &str = "id, agent, conversation_id, parent_id, status, wake_at, version, created_at, updated_at, lease_until";
 
-/// A [`Store`] backed by PostgreSQL (12+).
+/// A [`Store`] backed by PostgreSQL ([18 or later](MIN_SERVER_VERSION_NUM)).
 #[derive(Clone, Debug)]
 pub struct PgStore {
     pool: Pool,
@@ -460,6 +473,83 @@ impl PgStore {
     }
 }
 
+/// What a call knows when one of the store's functions refuses with an `AD` SQLSTATE: the run it
+/// names, the version a commit expected, and the journal step a `journal_put` asked for.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "P4 and P5 of ADR 0082 raise the codes; P0 builds the mapping"
+    )
+)]
+#[derive(Clone, Copy, Debug)]
+struct Call<'a> {
+    run: RunId,
+    /// The version a commit expected; `0` for a call that expects none.
+    expected: u64,
+    /// The step a journal append asked for: its sequence number and its name.
+    step: Option<(u64, &'a str)>,
+}
+
+/// The [`StoreError`] one of adam's own SQLSTATEs stands for (ADR 0082, decision 4; the codes and
+/// their classes are `adam_postgres::AdamSqlState`), or the driver's error back when it carries
+/// none of them, for the caller's own mapping.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "P4 and P5 of ADR 0082 raise the codes; P0 builds the mapping"
+    )
+)]
+fn refused(
+    err: tokio_postgres::Error,
+    call: Call<'_>,
+) -> Result<StoreError, tokio_postgres::Error> {
+    let built = match (AdamSqlState::of(&err), err.as_db_error()) {
+        (Some(state), Some(db)) => refusal(state, db.message(), db.detail(), call),
+        _ => return Err(err),
+    };
+    // An `AD002` outside a journal append has no step to name: its class is still the table's.
+    Ok(built.unwrap_or_else(|| classify(err)))
+}
+
+/// [`refused`]'s table, apart from the driver: the variant each code is, built from the error's
+/// message and `DETAIL`. `None` for a non-determinism the call cannot describe (no step).
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "P4 and P5 of ADR 0082 raise the codes; P0 builds the mapping"
+    )
+)]
+fn refusal(
+    state: AdamSqlState,
+    message: &str,
+    detail: Option<&str>,
+    call: Call<'_>,
+) -> Option<StoreError> {
+    Some(match state {
+        AdamSqlState::InvalidInput => StoreError::InvalidInput(message.to_owned()),
+        AdamSqlState::NonDeterminism => {
+            let (seq, requested) = call.step?;
+            StoreError::NonDeterminism {
+                run: call.run,
+                seq,
+                recorded: detail.unwrap_or_default().to_owned(),
+                requested: requested.to_owned(),
+            }
+        }
+        AdamSqlState::Corrupt => StoreError::Corrupt(message.to_owned()),
+        // A live attempt's differing body row: the version did not move, as the Rust body write
+        // reports it today.
+        AdamSqlState::Conflict => StoreError::Conflict {
+            run: call.run,
+            expected: call.expected,
+            actual: call.expected,
+        },
+    })
+}
+
 /// `ADAM_PG_POOL_SIZE`: the connections one process's pool may open, [`MIN_POOL_SIZE`] to
 /// [`MAX_POOL_SIZE`].
 ///
@@ -761,6 +851,22 @@ impl Sql {
         .collect();
         migrate.extend(migrate_blobs.iter().cloned());
         migrate.extend(migrate_body.iter().cloned());
+        // Schema version 7 and later (ADR 0082, decision 10): the store's functions, after every
+        // table they name and before the version row, in the migration transaction. Rules:
+        // * each is one statement, sent whole by `batch_execute` (one simple-protocol message), so
+        //   the server parses a `BEGIN ATOMIC` body itself; never split this list on `;`;
+        // * `CREATE OR REPLACE FUNCTION {p}<name>`, the table prefix in the name; `LANGUAGE sql`
+        //   with a `BEGIN ATOMIC` or `RETURN` body for plain SQL, PL/pgSQL with
+        //   `SET search_path FROM CURRENT` for control flow, a fresh snapshot or a `RAISE`;
+        //   `SECURITY INVOKER` (the default); a refusal raises one of `adam_postgres::AdamSqlState`;
+        // * a start on a current schema runs none of this, so adding, changing or dropping one
+        //   bumps `SCHEMA_VERSION`; a changed contract is a new name, the old one dropped a
+        //   release later; a column a SQL-standard body reads is altered only by dropping and
+        //   recreating the function in the same transaction;
+        // * `tests/functions.rs` lists every function and calls it on a fresh database.
+        // Slice P0 creates none.
+        let migrate_functions: Vec<Arc<str>> = Vec::new();
+        migrate.extend(migrate_functions);
         // Record the version, and raise it from an older one. Never lower it: a process
         // running an older release must not undo a newer one's migration.
         migrate.push(Arc::from(format!(
@@ -1296,9 +1402,38 @@ fn entry_from_row(row: &Row) -> StoreResult<JournalEntry> {
     })
 }
 
-#[async_trait]
-impl Store for PgStore {
-    async fn migrate(&self) -> StoreResult<()> {
+/// The server's `server_version_num` (for example `180007` for 18.7).
+async fn server_version_num(client: &ClientWrapper) -> StoreResult<i32> {
+    let stmt = client
+        .prepare_cached("SELECT current_setting('server_version_num')::integer")
+        .await
+        .map_err(classify)?;
+    client
+        .query_one(&stmt, &[])
+        .await
+        .map_err(classify)
+        .and_then(|row| decode_at(&row, 0))
+}
+
+/// Refuse a server older than `floor` (a `server_version_num`): [`StoreError::InvalidInput`], so a
+/// binary exits 78 and a supervisor does not restart it into the same refusal.
+fn check_server_version(num: i32, floor: i32) -> StoreResult<()> {
+    if num >= floor {
+        return Ok(());
+    }
+    Err(StoreError::InvalidInput(format!(
+        "PostgreSQL {}.{} is older than {}, the oldest server adam-store-postgres supports (ADR \
+         0082): upgrade the server before this release; nothing was changed",
+        num / 10_000,
+        num % 10_000,
+        floor / 10_000,
+    )))
+}
+
+impl PgStore {
+    /// [`Store::migrate`] against a floor of the caller's: the tests raise it above the server's
+    /// own version to see a refusal on the one server CI runs.
+    async fn migrate_with_floor(&self, floor: i32) -> StoreResult<()> {
         // One connection for the whole migration: the listing-index upgrade must run outside a
         // transaction, so the migration takes a session-level advisory lock on this connection and
         // opens its transaction on it too. The transaction's own `pg_advisory_xact_lock` is
@@ -1310,6 +1445,8 @@ impl Store for PgStore {
         // connection another task would reuse; dropping it closes the connection and releases the
         // lock.
         let mut client = Object::take(object);
+        // The floor first: an older server is refused before any lock is taken or DDL sent.
+        check_server_version(server_version_num(&client).await?, floor)?;
         // A migration may legitimately run past `ADAM_PG_STATEMENT_TIMEOUT_MS` (a concurrent index
         // build): it is exempt, on this connection only, which is closed when it ends.
         client
@@ -1325,6 +1462,15 @@ impl Store for PgStore {
             .await
             .map_err(classify)?;
         self.migrate_locked(&mut client).await
+    }
+}
+
+#[async_trait]
+impl Store for PgStore {
+    /// Create or upgrade the schema. Refuses a server older than PostgreSQL 18
+    /// ([`MIN_SERVER_VERSION_NUM`]) with [`StoreError::InvalidInput`] before any lock or DDL.
+    async fn migrate(&self) -> StoreResult<()> {
+        self.migrate_with_floor(MIN_SERVER_VERSION_NUM).await
     }
 
     async fn create_run(&self, new: NewRun) -> StoreResult<RunRecord> {
@@ -2365,28 +2511,103 @@ mod tests {
     /// `ADAM_WRITE_FIXTURE=1` rewrites the fixture instead of comparing (the migration is the
     /// source of truth; the fixture is what a database built by this release already has).
     /// `tests/fixtures/schema-v5.sql` stays: it is the pre-#361 schema the upgrade test applies.
+    ///
+    /// The fixture is named for its version, so a change to the statements, a function's included,
+    /// that does not bump [`SCHEMA_VERSION`] shows in review as an edit of a released version's
+    /// fixture: a start on a current schema runs no DDL, so such a change would never reach a
+    /// database (ADR 0082, decision 10).
     #[test]
-    fn the_statements_equal_the_version_6_fixture() {
+    fn the_statements_equal_the_version_7_fixture() {
+        assert_eq!(SCHEMA_VERSION, 7, "a new version gets a fixture of its own");
         let sql = Sql::new("adam_");
         assert!(
             sql.migrate.len() > 4,
             "the fixture must hold the whole migration"
         );
         let mut generated = String::from(
-            "-- The schema version 6 that adam-store-postgres emits.\n\
-             -- Regenerate with ADAM_WRITE_FIXTURE=1 cargo test -p adam-store-postgres --lib the_statements_equal_the_version_6_fixture\n",
+            "-- The schema version 7 that adam-store-postgres emits.\n\
+             -- Regenerate with ADAM_WRITE_FIXTURE=1 cargo test -p adam-store-postgres --lib the_statements_equal_the_version_7_fixture\n",
         );
         generated.push_str(&sql.migrate.join(";\n\n"));
         generated.push_str(";\n");
-        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/schema-v6.sql");
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/schema-v7.sql");
         if std::env::var_os("ADAM_WRITE_FIXTURE").is_some() {
             std::fs::write(path, &generated).expect("write the fixture");
         }
-        let fixture = include_str!("../tests/fixtures/schema-v6.sql");
+        let fixture = include_str!("../tests/fixtures/schema-v7.sql");
         assert_eq!(
             normalise(&(sql.migrate.join("; ") + ";")),
             normalise(fixture)
         );
+    }
+
+    /// ADR 0082, decision 11: 18.0 and later pass, anything older is `Invalid` (exit 78).
+    #[test]
+    fn the_floor_is_postgresql_18() {
+        assert_eq!(MIN_SERVER_VERSION_NUM, 180_000);
+        for ok in [180_000, 180_007, 190_000, 200_001] {
+            check_server_version(ok, MIN_SERVER_VERSION_NUM)
+                .unwrap_or_else(|e| panic!("{ok}: {e}"));
+        }
+        for old in [179_999, 170_006, 160_013, 120_022] {
+            let err = check_server_version(old, MIN_SERVER_VERSION_NUM).unwrap_err();
+            assert!(matches!(err, StoreError::InvalidInput(_)), "{old}: {err:?}");
+            assert_eq!(err.class(), ErrorClass::Invalid, "{old}");
+        }
+        let message = check_server_version(170_006, MIN_SERVER_VERSION_NUM)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            message.contains("PostgreSQL 17.6 is older than 18"),
+            "{message}"
+        );
+        assert!(message.contains("nothing was changed"), "{message}");
+    }
+
+    /// The store's half of ADR 0082 decision 4: each `AD` code becomes the variant of its row, and
+    /// that variant's class is the class `adam_postgres::AdamSqlState` gives the code.
+    #[test]
+    fn each_refusal_is_the_variant_of_its_code_with_its_class() {
+        let run = RunId(Uuid::new_v4());
+        let call = Call {
+            run,
+            expected: 4,
+            step: Some((7, "fetch")),
+        };
+        for state in AdamSqlState::ALL {
+            let built = refusal(state, "the message", Some("search"), call).expect("built");
+            assert_eq!(built.class(), state.class(), "{state}");
+            match (state, built) {
+                (AdamSqlState::InvalidInput, StoreError::InvalidInput(m))
+                | (AdamSqlState::Corrupt, StoreError::Corrupt(m)) => assert_eq!(m, "the message"),
+                (
+                    AdamSqlState::NonDeterminism,
+                    StoreError::NonDeterminism {
+                        run: r,
+                        seq,
+                        recorded,
+                        requested,
+                    },
+                ) => {
+                    assert_eq!((r, seq), (run, 7));
+                    assert_eq!(recorded, "search", "the recorded name is the DETAIL");
+                    assert_eq!(requested, "fetch");
+                }
+                (
+                    AdamSqlState::Conflict,
+                    StoreError::Conflict {
+                        run: r,
+                        expected,
+                        actual,
+                    },
+                ) => assert_eq!((r, expected, actual), (run, 4, 4)),
+                (state, other) => panic!("{state} became {other:?}"),
+            }
+        }
+        // A non-determinism the call cannot describe is left to `classify`, which gives it the
+        // table's class.
+        let no_step = Call { step: None, ..call };
+        assert!(refusal(AdamSqlState::NonDeterminism, "m", None, no_step).is_none());
     }
 
     /// Whitespace runs collapse to one space; comment lines are dropped.
@@ -2418,6 +2639,11 @@ mod tests {
             ("57P01", ErrorClass::Transient), // admin shutdown
             ("42601", ErrorClass::Internal),  // syntax error
             ("23514", ErrorClass::Internal),  // check violation
+            ("AD001", ErrorClass::Invalid),   // adam's own (ADR 0082 decision 4)
+            ("AD002", ErrorClass::Corrupt),
+            ("AD003", ErrorClass::Corrupt),
+            ("AD004", ErrorClass::Conflict),
+            ("AD005", ErrorClass::Internal), // an `AD` code this release does not know
         ] {
             let stmt =
                 format!("DO $$ BEGIN RAISE EXCEPTION 'boom' USING ERRCODE = '{state}'; END $$");
@@ -2430,6 +2656,83 @@ mod tests {
             .await
             .expect_err("syntax error");
         assert_eq!(classify(err).class(), ErrorClass::Internal);
+
+        // The store builds each `AD` code's variant from what the server sent: the message, and
+        // for a non-determinism the recorded step's name in `DETAIL`.
+        let run = RunId(Uuid::new_v4());
+        let call = Call {
+            run,
+            expected: 3,
+            step: Some((5, "fetch")),
+        };
+        for state in AdamSqlState::ALL {
+            let stmt = format!(
+                "DO $$ BEGIN RAISE EXCEPTION 'refused by the database' \
+                 USING ERRCODE = '{state}', DETAIL = 'search'; END $$"
+            );
+            let err = client.batch_execute(&stmt).await.expect_err("it raises");
+            let built = refused(err, call).expect("one of adam's codes");
+            assert_eq!(built.class(), state.class(), "{state}");
+            match built {
+                StoreError::InvalidInput(m) | StoreError::Corrupt(m) => {
+                    assert_eq!(m, "refused by the database", "{state}");
+                }
+                StoreError::NonDeterminism { recorded, .. } => assert_eq!(recorded, "search"),
+                StoreError::Conflict { run: r, .. } => assert_eq!(r, run),
+                other => panic!("{state} became {other:?}"),
+            }
+        }
+        // PostgreSQL's own codes come back to the caller's mapping untouched.
+        let err = client
+            .batch_execute("DO $$ BEGIN RAISE EXCEPTION 'x' USING ERRCODE = '23505'; END $$")
+            .await
+            .expect_err("it raises");
+        let back = refused(err, call).expect_err("not one of adam's");
+        assert_eq!(back.code().map(|c| c.code()), Some("23505"));
+    }
+
+    /// ADR 0082, decision 11, on the one server CI runs: with the floor raised above the server's
+    /// own version the migration is refused as an older server is, `Invalid`, and the database
+    /// holds no object of the prefix afterwards (no table, no index, no function). The real thing,
+    /// an older server, is `tests/functions.rs`'s `a_server_below_18_is_refused_before_any_ddl`.
+    #[tokio::test]
+    async fn a_server_below_the_floor_is_refused_before_any_ddl() {
+        let Some(url) = adam_core::testing::test_env("ADAM_TEST_POSTGRES_URL") else {
+            return;
+        };
+        let pool = PgConfig::parse(&url).expect("url").pool(2).expect("pool");
+        let p = format!("adam_floor_{}_", &Uuid::new_v4().simple().to_string()[..12]);
+        let store = PgStore::from_pool(pool.clone())
+            .with_table_prefix(&p)
+            .unwrap();
+        let client = pool.get().await.unwrap();
+        let actual: i32 = client
+            .query_one("SELECT current_setting('server_version_num')::integer", &[])
+            .await
+            .unwrap()
+            .get(0);
+        let err = store.migrate_with_floor(actual + 1).await.unwrap_err();
+        assert!(matches!(err, StoreError::InvalidInput(_)), "{err:?}");
+        assert_eq!(err.class(), ErrorClass::Invalid);
+        let objects: i64 = client
+            .query_one(
+                "SELECT (SELECT count(*) FROM pg_class WHERE starts_with(relname::text, $1))
+                      + (SELECT count(*) FROM pg_proc WHERE starts_with(proname::text, $1))",
+                &[&p],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(objects, 0, "a refused migration created something");
+        // The same store on the real floor migrates: the refusal was the floor and nothing else.
+        store.migrate().await.unwrap();
+        for table in [
+            "body", "run_blob", "blob", "push", "journal", "runs", "meta",
+        ] {
+            let _ = client
+                .batch_execute(&format!("DROP TABLE IF EXISTS {p}{table} CASCADE"))
+                .await;
+        }
     }
 
     /// The version 3 -> 4 listing index is rebuilt without taking `runs` from live traffic: a

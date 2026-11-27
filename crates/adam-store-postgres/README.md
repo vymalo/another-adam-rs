@@ -1,6 +1,6 @@
 # adam-store-postgres
 
-`adam_core::Store` on PostgreSQL 12+ through `tokio-postgres`, pooled by `deadpool-postgres`
+`adam_core::Store` on PostgreSQL 18 or later through `tokio-postgres`, pooled by `deadpool-postgres`
 ([ADR 0053](../../docs/decisions/0053-sqlite-a-store-service-a-database-per-agent-and-a-static-coder.md),
 decision 1: the driver changed, the schema and the statements did not).
 
@@ -25,7 +25,7 @@ time (for example [`adam-coder`](../../bin/adam-coder/README.md)).
 * `PgStore::from_pool(pool)`: reuse your application's `deadpool_postgres::Pool`.
 * `PgStore::with_table_prefix(prefix)`: table-name prefix (default `adam_`,
   only `[a-z0-9_]`, at most 40 characters).
-* `PgStore::pool()`, `SCHEMA_VERSION` (6).
+* `PgStore::pool()`, `SCHEMA_VERSION` (7), `MIN_SERVER_VERSION_NUM` (`180000`: `migrate()` refuses an older server).
 * `create_run` and `commit_run` return the record with `state` set to `null`: the caller supplied the
   state, and the state is the largest column, so a `RETURNING` that echoed it would parse it back on
   every transition. `load_run`, `load_head`, the claim, `open_run_for_conversation` and the listings
@@ -180,6 +180,27 @@ nothing (the transaction rolls back), so a loser cannot poison the next append. 
 is served when it is the v4 envelope a v4 commit wrote (and the next split rewrites the head), and
 the head is served when the state is the tombstone (a run a pre-S3 process failed).
 
+## Schema version 7: the functions, and PostgreSQL 18
+
+[ADR 0082](../../docs/decisions/0082-the-sql-adapters-keep-their-rules-in-the-database.md) moves the
+store's rules into database functions, slice by slice. Slice P0 built the step they arrive in and
+the floor, and **creates no function yet**:
+
+* **The floor.** `migrate()` reads `server_version_num` first and refuses a server older than 18.0
+  (`MIN_SERVER_VERSION_NUM`) with `StoreError::InvalidInput`, class `Invalid`, so a binary exits 78.
+  The check runs before the advisory lock and before any DDL: a refused database holds nothing new.
+  PostgreSQL 12 to 17, supported until this release, must be upgraded before it.
+* **The step.** The functions are statements of the migration transaction, after every table they
+  name and before the version row, each sent whole by `batch_execute` (one simple-protocol message,
+  so a `BEGIN ATOMIC` body is parsed by the server and never split on `;`). Each is
+  `CREATE OR REPLACE FUNCTION <prefix><name>`. A start on a current schema still runs no DDL, so a
+  slice that adds, changes or drops a function **bumps `SCHEMA_VERSION`** (P0 is 7, the next is 8),
+  and a function whose contract changes gets a new name, the old one dropped a release later.
+  A version 6 database gets version 7 from the same migration transaction; nothing is rewritten.
+* **The refusals.** A function refuses with one of adam's own SQLSTATEs, `AD001` to `AD004`; their
+  classes are the table in [`adam-postgres`](../adam-postgres/README.md#adams-own-sqlstates), and the
+  store builds the `StoreError` of each (below, *Errors*). No function raises one yet.
+
 ## Schema version and the owner column
 
 The owner column is schema version 2. Version 2 adds `<prefix>runs.owner TEXT`, the worker a pinned claim
@@ -205,8 +226,19 @@ and this adapter's choice of class ([`adam-postgres`](../adam-postgres/README.md
 | I/O, TLS, a closed connection, a pool wait timeout or a closed pool | `Transient` |
 | database error with SQLSTATE class `08` or `53`, or `40001`, `40P01`, `57P01`, `57P02`, `57P03` | `Transient` |
 | a value or column that cannot be decoded, a missing column | `Corrupt` |
-| a bad connection string, a missing certificate file | `Invalid` |
+| a bad connection string, a missing certificate file, a server older than PostgreSQL 18 (at `migrate()`) | `Invalid` |
 | any other database error (a rejected statement) and anything else | `Internal` |
+
+adam's own SQLSTATEs (ADR 0082, decision 4; the table is `adam_postgres::AdamSqlState`), raised by
+the store's functions, become these variants; a code that reaches `classify` without its call's
+context keeps the class of the table:
+
+| SQLSTATE | `StoreError` | Class |
+|---|---|---|
+| `AD001` | `InvalidInput` (the error's message) | `Invalid` |
+| `AD002` | `NonDeterminism`, the recorded step's name from the error's `DETAIL` | `Corrupt` |
+| `AD003` | `Corrupt` (the error's message) | `Corrupt` |
+| `AD004` | `Conflict`, the version unchanged | `Conflict` |
 
 One documented change from the `sqlx` mapping: `sqlx`'s `Protocol` and `WorkerCrashed` were
 `Transient`; `tokio-postgres` has no equivalent, so what is not a database error, a closed
@@ -234,9 +266,19 @@ serialization failure are `Transient`, a bad statement is `Internal` (needs the
 server), and an unreachable server is `Transient` (offline).
 `tests/fixtures/schema-v5.sql` is the schema exactly as the `sqlx` build emitted it: `tests/fixture.rs`
 applies it with `batch_execute`, opens the store and takes a create/load round trip with **no
-migration**, then migrates to 6 and commits a head and a body. `tests/fixtures/schema-v6.sql` is the
-current schema; a unit test (`the_statements_equal_the_version_6_fixture`) compares the live
+migration**, then migrates to the current version and commits a head and a body. `tests/fixtures/schema-v7.sql` is the
+current schema; a unit test (`the_statements_equal_the_version_7_fixture`) compares the live
 statements with it whitespace-normalised, so they cannot drift; `ADAM_WRITE_FIXTURE=1` regenerates it.
+The fixture is named for its version: a change to a statement, a function's included, without a bump
+of `SCHEMA_VERSION` shows as an edit of a released version's file.
+`tests/functions.rs` is ADR 0082's fresh-database test: it migrates a database of its own prefix,
+compares the functions in `pg_proc` with its list `FUNCTIONS` (empty at slice P0; a slice that adds a
+function adds it there with a call) and calls each; it also checks that the comparison reports an
+unlisted and a missing function, and that a version 6 database gets the functions. A unit test
+raises the floor above the server's own version and checks that `migrate()` is refused `Invalid`
+with no object of the prefix left behind; `a_server_below_18_is_refused_before_any_ddl` does the same
+against a real older server when `ADAM_TEST_POSTGRES_BELOW_FLOOR_URL` names one (CI runs none, so
+it skips there).
 `tests/body_writers.rs` writes a foreign body row directly and proves the three resolutions (adopted,
 collected after the orphan grace, `Conflict`), and `tests/head_view.rs` counts the calls
 `Runtime::view` makes (one lease, one head, no body) and `Runtime::state`'s (one head, one body).
@@ -251,14 +293,16 @@ DDL). A unit test
 beside the upgrade, which fails if the rebuild ever queues for `AccessExclusiveLock` again.
 `tests/time.rs` proves the wire: a `TIMESTAMPTZ` is microseconds since 2000 (read as PostgreSQL's
 own `i64`), a `NULL` stays `NULL`, an out-of-range value is `Corrupt`, and a sub-millisecond cutoff
-keeps its microseconds. Unit tests in `src/lib.rs` cover the pool-size rule and provoke real
-SQLSTATEs when the server variable is set.
+keeps its microseconds. Unit tests in `src/lib.rs` cover the pool-size rule, the floor and the
+variant of each `AD` code, and provoke real SQLSTATEs (PostgreSQL's and adam's) when the server
+variable is set.
 
 | Variable | Meaning |
 |---|---|
 | `ADAM_TEST_POSTGRES_URL` | server to test against; unset means the suite is skipped |
 | `ADAM_TEST_TABLE_PREFIX` | table prefix of the test store (default `adam_test_`) |
 | `ADAM_TEST_REQUIRE_DB` | `1`: an unset URL fails instead of skipping (CI sets it) |
+| `ADAM_TEST_POSTGRES_BELOW_FLOOR_URL` | a server older than 18, for the refusal test; unset skips it, even under `ADAM_TEST_REQUIRE_DB` |
 
 ```sh
 docker compose up -d   # from the repository root
@@ -266,8 +310,8 @@ ADAM_TEST_POSTGRES_URL=postgres://postgres:postgres@localhost:5432/adam_test \
   cargo test -p adam-store-postgres
 ```
 
-CI runs it against PostgreSQL 12 and 17 (`conformance` job in
-`.github/workflows/ci.yml`).
+CI runs it against PostgreSQL 18, the floor, with MongoDB 5.0 and with 8.0 (`conformance` job in
+`.github/workflows/ci.yml`; the image is pinned by tag and digest there).
 
 ## See also
 

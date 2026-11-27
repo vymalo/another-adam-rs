@@ -33,10 +33,18 @@
 //! [`PgConfig::pool`] builds a `deadpool-postgres` pool with explicit timeouts (deadpool has none
 //! by default) and [`PgConfig::connect`] opens one standalone connection, which is what
 //! `LISTEN`/`NOTIFY` needs: a pooled client can never receive a notification.
+//!
+//! # adam's own SQLSTATEs
+//!
+//! The store's database functions refuse with SQLSTATEs of the class `AD` ([`AdamSqlState`],
+//! [ADR 0082](../../docs/decisions/0082-the-sql-adapters-keep-their-rules-in-the-database.md),
+//! decision 4). That table and the mapping of PostgreSQL's own codes in [`classify`] are the one
+//! place a SQLSTATE gets its class.
 
 #![warn(missing_docs)]
 
 mod config;
+mod sqlstate;
 
 use std::task::{Context, Poll};
 
@@ -49,6 +57,7 @@ use tokio_postgres::{AsyncMessage, Connection};
 pub use crate::config::{
     DEFAULT_CREATE_TIMEOUT, DEFAULT_RECYCLE_TIMEOUT, DEFAULT_WAIT_TIMEOUT, PgConfig,
 };
+pub use crate::sqlstate::{ADAM_SQLSTATE_CLASS, AdamSqlState};
 
 /// Drives one standalone connection, the way a `LISTEN`/`NOTIFY` listener must.
 ///
@@ -85,6 +94,9 @@ where
 ///
 /// * Connection loss, a shutdown or restart, pool exhaustion, a serialization failure and a
 ///   deadlock may succeed later: `Transient` (a retry by the runtime).
+/// * One of adam's own SQLSTATEs ([`AdamSqlState`], class `AD`) has the class of its row of that
+///   table. The store builds a more precise `StoreError` from the code where it knows the call's
+///   context; this is the class of one that reaches here unbuilt.
 /// * Any other database error is a rejected statement or a violated invariant that repeating
 ///   cannot cure: `Internal`.
 /// * A row that cannot be decoded is handled at the `try_get` call site (`Corrupt`), because only
@@ -100,7 +112,9 @@ where
 pub fn classify(err: tokio_postgres::Error) -> StoreError {
     let class = if let Some(db) = err.as_db_error() {
         let code = db.code().code();
-        if code.starts_with("08")
+        if let Some(state) = AdamSqlState::from_code(code) {
+            state.class()
+        } else if code.starts_with("08")
             || code.starts_with("53")
             || matches!(
                 code,

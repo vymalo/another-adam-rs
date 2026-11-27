@@ -228,7 +228,11 @@ ADAM_TEST_POSTGRES_URL=postgres://postgres:postgres@localhost:5432/adam_test \
   notifications sent during the reconnect are lost.
 * *Unverified:* behaviour behind transaction-mode poolers and on managed
   Postgres offerings (from general knowledge of `LISTEN`, not tested here).
-  The CI matrix runs PostgreSQL 12 and 17.
+  CI runs PostgreSQL 18 alone, the store's floor
+  ([ADR 0082](../../docs/decisions/0082-the-sql-adapters-keep-their-rules-in-the-database.md),
+  decision 11). The notifier itself needs nothing newer than `LISTEN` and `pg_notify`, and refuses
+  no server; the process's store does. *Verified 2026-11-27:* the whole suite passed against a
+  PostgreSQL 18.7 server (`postgres:18.7-alpine`).
 
 ## See also
 
