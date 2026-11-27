@@ -34,6 +34,7 @@ use crate::retry::{
     Decision, RUNTIME_RETRY_KEY, RetryRecord, StepRetry, Verdict, class_name, decide,
 };
 use crate::runtime::{Inner, MAX_COMMIT_RETRIES, Runtime, RuntimeError};
+use crate::seal::{Seal, Sealer, attach, chain_over};
 
 type InFlight = Arc<Mutex<HashSet<RunId>>>;
 
@@ -584,6 +585,13 @@ async fn transition(
     }
     let (mut env, base_head, base_rows) = match claimed {
         Ok(claimed) => (claimed.env, claimed.head, claimed.rows),
+        // The keys, not the run, are the trouble: a key set that cannot be read now says nothing of
+        // the run's state, so the run is left as it is (lease kept, found again when it expires)
+        // and never failed for it. A forged head is `Corrupt` and takes the path below.
+        Err(e @ RuntimeError::TurnKeys(_)) => {
+            tracing::warn!(run = %run, error = %report(&e), "the turn keys could not check the run's head; leaving the run for its next claim");
+            return false;
+        }
         Err(e) => {
             tracing::error!(run = %run, error = %e, "failing run with unreadable state");
             // The document is unreadable, so it is stored as it is — except a head, which stays
@@ -684,6 +692,7 @@ async fn transition(
     let plan = plan(
         inner,
         run,
+        &rec.agent,
         &env,
         rec.state.get("agent"),
         base_head.is_some(),
@@ -944,9 +953,11 @@ fn panic_message(panic: &Box<dyn std::any::Any + Send>) -> String {
 ///
 /// `base_agent` is the agent state the run had before the step: the step took `base.agent` by
 /// move, so the paths that commit the state untouched read it from the record instead.
+#[allow(clippy::too_many_arguments)] // one transition, described by its parts
 fn plan(
     inner: &Inner,
     run: RunId,
+    agent: &str,
     base: &Envelope,
     base_agent: Option<&Value>,
     v5: bool,
@@ -1094,6 +1105,7 @@ fn plan(
         }
     };
 
+    let stepped = result.is_ok();
     let next = match result {
         Ok(Stepped {
             transition: Transition::Continue(s),
@@ -1175,6 +1187,27 @@ fn plan(
             }
         },
     };
+    // A runtime with keys needs an agent that signs its turns: a step whose rows hold an unsigned
+    // assistant or tool row ends the run here, with its state untouched, before anything is
+    // signed or written (ADR 0068). Retrying would call the model again for the same refusal.
+    if stepped && inner.sealer.is_some() {
+        let transcript;
+        let rows: &[Value] = match &next.split {
+            Some((_, rows)) => rows,
+            None => {
+                transcript = inner
+                    .transcript_of(run, agent, &next.agent)
+                    .ok()
+                    .flatten()
+                    .unwrap_or_default();
+                &transcript
+            }
+        };
+        if let Err(e) = Sealer::require_signed_turns(run, rows) {
+            tracing::error!(run = %run, error = %report(&e), "the agent did not sign its turns under a runtime with turn keys; failing the run");
+            return Plan::Commit(Box::new(failed(e.to_string())));
+        }
+    }
     Plan::Commit(Box::new(next))
 }
 
@@ -1297,6 +1330,7 @@ fn build_update(
         remaining_secs: next.remaining_secs,
         agent_wake,
         hb: heartbeat,
+        signature: None,
     };
     let mut update = RunUpdate::new(status, Value::Null);
     update.wake_at = wake_at;
@@ -1360,6 +1394,151 @@ fn build_update(
         (_, None) | (Some(_), _) => update.state = env.encode()?,
     }
     Ok(update)
+}
+
+/// Sign the document `update` writes as the run's state ([ADR 0068] decision 4): the v5 head, or
+/// the v4 state of a run that is not split. With no turn keys the document is left as built, which
+/// carries no signature.
+///
+/// A head whose transcript this commit writes is chained over the rows it writes (`next.split`).
+/// One that carries its rows is signed again with the `{len, chain}` it read, and a head that had
+/// none (an unsigned run, adopted by decision 11) stays unsigned until a commit that writes rows. A
+/// v4 state is chained over the agent's own transcript, the one a reader takes from it.
+///
+/// A key that cannot sign is the commit's failure, with the keys' class: the run keeps its lease
+/// and is tried again, and nothing is written unsigned by a runtime that has keys.
+///
+/// [ADR 0068]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0068-adam-signs-its-own-history.md
+async fn seal_update(
+    inner: &Inner,
+    rec: &RunRecord,
+    next: &Next,
+    base: Option<&HeadParts>,
+    update: &mut RunUpdate,
+) -> StoreResult<()> {
+    let Some(sealer) = &inner.sealer else {
+        return Ok(());
+    };
+    let refuse = refuse_commit;
+    let conversation = rec.conversation_id.as_deref();
+    let doc = match update.head.as_mut() {
+        Some(head) => head,
+        None if update.state.is_object() => &mut update.state,
+        None => return Ok(()),
+    };
+    let is_head = doc.get("v").and_then(Value::as_u64) == Some(u64::from(crate::head::VERSION));
+    let (len, chain, seal) = if is_head {
+        match &next.split {
+            Some((_, rows)) if !next.split_refused => {
+                // Before anything is signed: never a head the next decode would refuse.
+                Sealer::require_signed_turns(rec.id, rows).map_err(refuse)?;
+                let (seal, chain) = Seal::over(rec.id, conversation, rows).map_err(refuse)?;
+                (seal.len, chain, Some(seal))
+            }
+            _ => {
+                let seal = base.and_then(|base| base.seal.clone());
+                match seal.as_ref().and_then(Seal::parts) {
+                    Some((len, chain)) => (len, chain, seal),
+                    // A signed head with no usable seal cannot be signed again without its rows,
+                    // and is not signed over: it is the commit's failure, as `reseal`'s strict
+                    // path is a delivery's.
+                    None if rec.state.get("signature").is_some() => {
+                        return Err(refuse(unusable_seal(rec.id)));
+                    }
+                    // An unsigned head (adopted, decision 11) stays unsigned.
+                    None => return Ok(()),
+                }
+            }
+        }
+    } else {
+        let rows = inner
+            .transcript_of(rec.id, &rec.agent, &next.agent)
+            .map_err(refuse)?
+            .ok_or_else(|| RuntimeError::Corrupt {
+                run: rec.id,
+                reason: "the agent that stepped the run is not registered".into(),
+                source: None,
+            })
+            .map_err(refuse)?;
+        if let Err(e) = Sealer::require_signed_turns(rec.id, &rows) {
+            // A run that ends over a history that was never signed (an adopted run, decision 11)
+            // is written as it was read, unsigned, so it can still be failed. Anything else
+            // would be signed over unsigned turns: refused.
+            if next.status == RunStatus::Failed && rec.state.get("signature").is_none() {
+                return Ok(());
+            }
+            return Err(refuse(e));
+        }
+        let (len, chain) = chain_over(rec.id, conversation, &rows).map_err(refuse)?;
+        (len, chain, None)
+    };
+    let signature = sealer
+        .sign(rec.id, conversation, len, &chain, doc)
+        .await
+        .map_err(|e| refuse(e.into()))?;
+    attach(doc, signature, seal.as_ref());
+    Ok(())
+}
+
+/// The error of a head that is signed and carries no usable `seal`.
+fn unusable_seal(run: RunId) -> RuntimeError {
+    RuntimeError::Corrupt {
+        run,
+        reason: "the run's head is refused (ADR 0068): it is signed and carries no usable seal"
+            .into(),
+        source: None,
+    }
+}
+
+/// A runtime error of the signing path as the commit's: the keys' own class for a key that
+/// cannot be reached or refuses, `Corrupt` for a document that does not verify, and invalid input
+/// otherwise.
+fn refuse_commit(e: RuntimeError) -> StoreError {
+    match e {
+        RuntimeError::TurnKeys(e) => StoreError::Backend {
+            class: e.class(),
+            source: Box::new(e),
+        },
+        RuntimeError::Corrupt { .. } => StoreError::Corrupt(e.to_string()),
+        other => StoreError::InvalidInput(other.to_string()),
+    }
+}
+
+/// Check the record a commit reloaded after losing its CAS to a delivery, before the retry signs
+/// over what it takes from it (the inbox, the artifacts): a signature is never put over a
+/// document that did not verify. A signed head is checked against its own `seal`, a signed v4
+/// state against the agent's transcript; an unsigned one is left unsigned, as a first commit would
+/// find it.
+async fn verify_reloaded(
+    inner: &Inner,
+    rec: &RunRecord,
+    env: &Envelope,
+    head: Option<&HeadParts>,
+) -> StoreResult<()> {
+    let Some(sealer) = &inner.sealer else {
+        return Ok(());
+    };
+    if rec.state.get("signature").is_none() {
+        return Ok(());
+    }
+    let conversation = rec.conversation_id.as_deref();
+    let checked = match head {
+        Some(parts) => {
+            sealer
+                .check_sealed(rec.id, conversation, parts.seal.as_ref(), &rec.state)
+                .await
+        }
+        None => match inner.transcript_of(rec.id, &rec.agent, &env.agent) {
+            Ok(Some(rows)) => {
+                sealer
+                    .check_read(rec.id, conversation, &rows, &rec.state)
+                    .await
+            }
+            Ok(None) => Ok(()),
+            Err(e) => Err(e),
+        },
+    };
+    checked.map_err(refuse_commit)
 }
 
 /// Inline the bytes of every file a v5 head names into `artifacts`, so a demoted v4 state carries
@@ -1478,6 +1657,7 @@ async fn commit(
             {
                 return Ok(None);
             }
+            verify_reloaded(inner, &rec, &env, head.as_ref()).await?;
             retried = Some((rec, env, head));
         }
         let (cur_rec, cur_env, cur_head) = match &retried {
@@ -1531,6 +1711,7 @@ async fn commit(
             body_writer,
             keeps_bodies,
         )?;
+        seal_update(inner, cur_rec, next, cur_head, &mut update).await?;
         update.blobs = blobs;
         match inner.store.commit_run(run, cur_rec.version, update).await {
             Ok(rec) => {
@@ -1781,5 +1962,187 @@ mod claim_tests {
         let after = store.load_run(run).await.expect("load").expect("run");
         assert_eq!(after.status, RunStatus::Failed);
         assert_eq!(after.version, cancelled.version, "nothing was committed");
+    }
+
+    /// Parks at every step; splits its transcript, so the run is a signed v5 head.
+    struct Splitting;
+
+    #[async_trait]
+    impl Agent for Splitting {
+        type State = Value;
+
+        fn name(&self) -> &str {
+            "splitting"
+        }
+
+        fn init(&self, input: Inbound) -> Result<Value, AgentError> {
+            Ok(json!({"messages": [input.payload], "n": 0}))
+        }
+
+        fn split(&self, state: &Value) -> Option<(Value, Vec<Value>)> {
+            let mut head = state.clone();
+            let rows = head["messages"].as_array().cloned().unwrap_or_default();
+            head["messages"] = json!([]);
+            Some((head, rows))
+        }
+
+        fn join(&self, mut head: Value, rows: Vec<Value>) -> Result<Value, AgentError> {
+            head["messages"] = Value::Array(rows);
+            Ok(head)
+        }
+
+        async fn step(
+            &self,
+            _ctx: &mut Ctx,
+            state: Value,
+        ) -> Result<Transition<Value>, AgentError> {
+            Ok(Transition::Park {
+                state,
+                wake_at: None,
+            })
+        }
+    }
+
+    /// A signed, parked run of `agent` on a runtime with keys.
+    async fn signed_parked(agent: impl Agent<State = Value>, name: &str) -> (Runtime, RunRecord) {
+        let store: DynStore = Arc::new(MemoryStore::new());
+        let rt = Runtime::builder(store.clone())
+            .agent(agent)
+            .turn_keys(<dyn adam_core::turn::TurnKeys>::ephemeral().expect("keys"))
+            .poll_interval(std::time::Duration::from_millis(10))
+            .build();
+        let run = rt
+            .start(name, Inbound::new("start", json!({"text": "hi"})), None)
+            .await
+            .expect("start");
+        let (stop, rx) = tokio::sync::oneshot::channel::<()>();
+        let worker = {
+            let rt = rt.clone();
+            tokio::spawn(async move {
+                let _ = rt
+                    .run_worker(async {
+                        let _ = rx.await;
+                    })
+                    .await;
+            })
+        };
+        loop {
+            let rec = store.load_run(run).await.expect("load").expect("run");
+            if rec.status == RunStatus::Parked && rec.state.get("signature").is_some() {
+                let _ = stop.send(());
+                worker.await.expect("worker");
+                return (rt, rec);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    }
+
+    fn bare_next() -> Next {
+        Next {
+            status: RunStatus::Parked,
+            wake_at: None,
+            agent: Value::Null,
+            output: Value::Null,
+            error: None,
+            attempt: 0,
+            retry: None,
+            seq: 0,
+            consumed: 0,
+            artifacts: Vec::new(),
+            retry_detail: None,
+            reopen: false,
+            read: Vec::new(),
+            split: None,
+            generation: None,
+            split_refused: false,
+            head_artifacts: None,
+            shadow_blobs: Vec::new(),
+            shadow_files: Vec::new(),
+            deadline: None,
+            remaining_secs: None,
+        }
+    }
+
+    /// The CAS retry reloads the record a delivery changed and signs over what it takes from it:
+    /// it must check that record first, v4 and v5 alike. A forged inbox (v4) or a forged member of
+    /// a head (v5) fails the commit `Corrupt`; the intact record passes.
+    #[tokio::test]
+    async fn a_reloaded_record_that_does_not_verify_fails_the_commit() {
+        let (rt, rec) = signed_parked(Counting(Arc::new(AtomicU32::new(0))), "counting").await;
+        let Ok(Stored::Full(env)) = Stored::decode(rec.id, &rec.state) else {
+            panic!("a v4 state");
+        };
+        verify_reloaded(&rt.inner, &rec, &env, None)
+            .await
+            .expect("the intact record verifies");
+        let mut forged = rec.clone();
+        forged.state["inbox"] =
+            json!([{"kind": "message", "id": "x", "payload": {"text": "forged"}}]);
+        let err = verify_reloaded(&rt.inner, &forged, &env, None)
+            .await
+            .expect_err("a forged inbox is refused");
+        assert_eq!(err.class(), adam_error::ErrorClass::Corrupt, "{err}");
+
+        let (rt, rec) = signed_parked(Splitting, "splitting").await;
+        assert_eq!(rec.state["v"], 5);
+        let Ok(Stored::Head(head)) = Stored::decode(rec.id, &rec.state) else {
+            panic!("a head");
+        };
+        let (env, parts) = head.into_parts(Value::Null);
+        verify_reloaded(&rt.inner, &rec, &env, Some(&parts))
+            .await
+            .expect("the intact head verifies");
+        let mut forged = rec.clone();
+        forged.state["error"] = json!("forged");
+        let err = verify_reloaded(&rt.inner, &forged, &env, Some(&parts))
+            .await
+            .expect_err("a forged head is refused");
+        assert_eq!(err.class(), adam_error::ErrorClass::Corrupt, "{err}");
+    }
+
+    /// A signed head whose seal is missing or unusable is not signed over: `seal_update` fails the
+    /// commit `Corrupt`. An unsigned head stays unsigned, and an intact one is signed again.
+    #[tokio::test]
+    async fn a_signed_head_with_a_forged_seal_is_not_signed_over() {
+        let (rt, rec) = signed_parked(Splitting, "splitting").await;
+        let next = bare_next();
+        let sign = |rec: RunRecord| {
+            let inner = rt.inner.clone();
+            let next = &next;
+            async move {
+                let Ok(Stored::Head(head)) = Stored::decode(rec.id, &rec.state) else {
+                    panic!("a head");
+                };
+                let (_, parts) = head.into_parts(Value::Null);
+                let mut update =
+                    RunUpdate::new(RunStatus::Parked, Value::Null).head(rec.state.clone());
+                let out = seal_update(&inner, &rec, next, Some(&parts), &mut update).await;
+                (out, update)
+            }
+        };
+
+        let (out, update) = sign(rec.clone()).await;
+        out.expect("an intact head is signed again");
+        assert!(update.head.expect("head")["signature"].is_string());
+
+        let mut forged = rec.clone();
+        forged.state["seal"] = json!({"len": 1, "chain": "not-a-chain"});
+        let (out, _) = sign(forged).await;
+        let err = out.expect_err("an unparsable seal");
+        assert_eq!(err.class(), adam_error::ErrorClass::Corrupt, "{err}");
+
+        let mut forged = rec.clone();
+        forged.state.as_object_mut().unwrap().remove("seal");
+        let (out, _) = sign(forged).await;
+        let err = out.expect_err("a missing seal");
+        assert_eq!(err.class(), adam_error::ErrorClass::Corrupt, "{err}");
+
+        let mut unsigned = rec.clone();
+        let doc = unsigned.state.as_object_mut().unwrap();
+        doc.remove("seal");
+        doc.remove("signature");
+        let (out, update) = sign(unsigned).await;
+        out.expect("an unsigned head is adopted");
+        assert!(update.head.expect("head").get("signature").is_none());
     }
 }

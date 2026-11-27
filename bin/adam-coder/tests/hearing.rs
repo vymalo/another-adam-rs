@@ -594,6 +594,7 @@ async fn a_yes_to_a_question_asked_beside_the_tool_grants_nothing() {
                 );
                 let mut response = ModelResponse::tool_calls(vec![ask.clone()]);
                 response.message = Message::Assistant {
+                    extra_content: None,
                     content: vec![ContentPart::text(
                         "Shall I also fix the typo in the README? Reply yes or no.",
                     )],

@@ -2593,6 +2593,7 @@ mod tests {
 
     fn calls(ids: &[&str]) -> Message {
         Message::Assistant {
+            extra_content: None,
             content: vec![],
             tool_calls: ids.iter().map(|id| call(id)).collect(),
             reasoning: None,

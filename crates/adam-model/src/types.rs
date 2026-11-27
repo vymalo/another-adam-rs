@@ -29,6 +29,17 @@ pub struct ModelRequest {
     /// Sampling temperature.
     #[serde(default)]
     pub temperature: Option<f32>,
+    /// Nucleus sampling mass; absent leaves the model's own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top_p: Option<f32>,
+    /// Headers for this call alone, beside the client's own. A name that looks like a credential
+    /// is refused ([`is_credential_header`]): the model's key is the deployment's.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub headers: BTreeMap<String, String>,
+    /// Members merged over this call's body at its top level, after the client's own extra body.
+    /// The members the client owns ([`RESERVED_BODY_KEYS`]) are refused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extra_body: Option<serde_json::Map<String, Value>>,
     /// How much the model should reason for this call (ADR 0063), when the caller sets a level.
     /// Absent sends nothing and leaves the model's own default, which may reason. The client sends
     /// it through the wire of the request's model profile; a level that profile does not declare is
@@ -60,6 +71,29 @@ pub struct ModelRequest {
     /// image. A reference with no entry here is sent as its stand-in text.
     #[serde(skip)]
     pub image_data: ImageData,
+}
+
+/// The body members a client owns: no extra body may set them.
+pub const RESERVED_BODY_KEYS: [&str; 5] = ["model", "messages", "tools", "tool_choice", "stream"];
+
+/// Whether a header name looks like it carries a credential (`authorization`, an API key, a cookie,
+/// a token, a secret, a password, a signature and the like), so a hook can never set the model's key.
+/// Case and `_` against `-` do not matter.
+pub fn is_credential_header(name: &str) -> bool {
+    let name = name.trim().to_ascii_lowercase().replace('_', "-");
+    const PARTS: [&str; 10] = [
+        "authorization",
+        "authentication",
+        "api-key",
+        "apikey",
+        "cookie",
+        "token",
+        "secret",
+        "password",
+        "credential",
+        "signature",
+    ];
+    name == "auth" || name.starts_with("x-auth") || PARTS.iter().any(|part| name.contains(part))
 }
 
 /// The bytes of the images of one [`ModelRequest`], by SHA-256. Its `Debug` says how many and how
@@ -205,6 +239,13 @@ pub enum Message {
         /// journal decodes.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         provider: Option<ProviderTurn>,
+        /// Members of the message object itself, namespaced by maker (`{"adam": {…}}` beside
+        /// `{"google": {…}}`), the shape of a provider's `extra_content`. `None` when there are
+        /// none, so a message without them is the same bytes as before and an older journal
+        /// decodes. The `adam` maker is adam's own and is never sent to a model nor kept from
+        /// one ([`ADAM_MAKER`]).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        extra_content: Option<BTreeMap<String, Value>>,
     },
     /// The result of running a tool the model asked for.
     Tool {
@@ -221,7 +262,26 @@ pub enum Message {
         /// image is the same bytes as before and an older journal decodes.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         images: Vec<ImageRef>,
+        /// The same carrier as [`Message::Assistant::extra_content`].
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        extra_content: Option<BTreeMap<String, Value>>,
     },
+}
+
+/// The maker name of adam's own members in a message's `extra_content`. It is adam's alone: a
+/// request never carries it and a model's reply never keeps it ([`strip_adam_member`]).
+pub const ADAM_MAKER: &str = "adam";
+
+/// Remove adam's maker from the `extra_content` member of a provider's members map (a reply's
+/// message members, or a tool call's), dropping the member only if adam's maker was in it and
+/// nothing else is. Everything else stays as the provider sent it, an empty object included.
+pub fn strip_adam_member(members: &mut BTreeMap<String, Value>) {
+    if let Some(Value::Object(makers)) = members.get_mut("extra_content")
+        && makers.remove(ADAM_MAKER).is_some()
+        && makers.is_empty()
+    {
+        members.remove("extra_content");
+    }
 }
 
 impl Message {
@@ -239,6 +299,7 @@ impl Message {
             tool_calls: Vec::new(),
             reasoning: None,
             provider: None,
+            extra_content: None,
         }
     }
 
@@ -249,6 +310,7 @@ impl Message {
             content: content.into(),
             is_error: false,
             images: Vec::new(),
+            extra_content: None,
         }
     }
 
@@ -259,6 +321,7 @@ impl Message {
             content: content.into(),
             is_error: true,
             images: Vec::new(),
+            extra_content: None,
         }
     }
 
@@ -269,6 +332,7 @@ impl Message {
         images: Vec<ImageRef>,
     ) -> Self {
         Self::Tool {
+            extra_content: None,
             call_id: call_id.into(),
             content: content.into(),
             is_error: false,
@@ -580,6 +644,7 @@ impl ModelResponse {
     pub fn tool_calls(tool_calls: Vec<ToolCall>) -> Self {
         Self {
             message: Message::Assistant {
+                extra_content: None,
                 content: Vec::new(),
                 tool_calls,
                 reasoning: None,
@@ -808,6 +873,7 @@ mod tests {
     fn response() -> ModelResponse {
         ModelResponse {
             message: Message::Assistant {
+                extra_content: None,
                 content: vec![ContentPart::text("checking")],
                 tool_calls: vec![tool_call()],
                 reasoning: None,
@@ -863,12 +929,14 @@ mod tests {
         roundtrip(Message::user_text("hi"));
         roundtrip(Message::assistant_text("hi"));
         roundtrip(Message::Assistant {
+            extra_content: None,
             content: vec![],
             tool_calls: vec![tool_call()],
             reasoning: None,
             provider: None,
         });
         roundtrip(Message::Assistant {
+            extra_content: None,
             content: vec![],
             tool_calls: vec![tool_call()],
             reasoning: Some("thinking".into()),
@@ -876,6 +944,103 @@ mod tests {
         });
         roundtrip(Message::tool_result("c", "out"));
         roundtrip(Message::tool_error("c", "boom"));
+    }
+
+    fn makers() -> BTreeMap<String, Value> {
+        BTreeMap::from([
+            ("adam".to_owned(), json!({"turn_signature": "SIG"})),
+            ("google".to_owned(), json!({"thought_signature": "G"})),
+        ])
+    }
+
+    #[test]
+    fn the_extra_content_member_roundtrips_with_and_without_a_value() {
+        let signed = Message::Assistant {
+            content: vec![ContentPart::text("yo")],
+            tool_calls: Vec::new(),
+            reasoning: None,
+            provider: None,
+            extra_content: Some(makers()),
+        };
+        roundtrip(signed.clone());
+        assert_eq!(
+            serde_json::to_value(&signed).unwrap()["extra_content"],
+            json!({"adam": {"turn_signature": "SIG"}, "google": {"thought_signature": "G"}})
+        );
+        let tool = Message::Tool {
+            call_id: "c".into(),
+            content: "out".into(),
+            is_error: false,
+            images: Vec::new(),
+            extra_content: Some(makers()),
+        };
+        roundtrip(tool.clone());
+        assert_eq!(
+            serde_json::to_value(&tool).unwrap()["extra_content"]["adam"],
+            json!({"turn_signature": "SIG"})
+        );
+        // Without a value the member is not written: an unsigned history is the same bytes.
+        for unsigned in [
+            Message::assistant_text("yo"),
+            Message::tool_result("c", "o"),
+        ] {
+            roundtrip(unsigned.clone());
+            assert!(
+                serde_json::to_value(&unsigned)
+                    .unwrap()
+                    .get("extra_content")
+                    .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn an_older_history_decodes_with_the_member_absent() {
+        let assistant: Message = serde_json::from_value(
+            json!({"role": "assistant", "content": [{"type": "text", "text": "x"}]}),
+        )
+        .unwrap();
+        let tool: Message = serde_json::from_value(
+            json!({"role": "tool", "call_id": "c", "content": "o", "is_error": false}),
+        )
+        .unwrap();
+        assert!(matches!(
+            assistant,
+            Message::Assistant {
+                extra_content: None,
+                ..
+            }
+        ));
+        assert!(matches!(
+            tool,
+            Message::Tool {
+                extra_content: None,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn adams_maker_is_stripped_from_a_members_map_and_the_rest_kept() {
+        let mut members = BTreeMap::from([(
+            "extra_content".to_owned(),
+            json!({"adam": {"turn_signature": "X"}, "google": {"thought_signature": "G"}}),
+        )]);
+        strip_adam_member(&mut members);
+        assert_eq!(
+            members["extra_content"],
+            json!({"google": {"thought_signature": "G"}})
+        );
+        let mut only = BTreeMap::from([(
+            "extra_content".to_owned(),
+            json!({"adam": {"turn_signature": "X"}}),
+        )]);
+        strip_adam_member(&mut only);
+        assert!(only.is_empty());
+        // Nothing of adam's in it: the provider's member, even an empty object, is left as sent.
+        let mut empty = BTreeMap::from([("extra_content".to_owned(), json!({}))]);
+        strip_adam_member(&mut empty);
+        assert_eq!(empty["extra_content"], json!({}));
     }
 
     #[test]
@@ -897,6 +1062,7 @@ mod tests {
         assert_eq!(
             serde_json::to_value(Message::assistant_text("yo")).unwrap(),
             serde_json::to_value(Message::Assistant {
+                extra_content: None,
                 content: vec![ContentPart::text("yo")],
                 tool_calls: Vec::new(),
                 reasoning: None,
@@ -906,6 +1072,7 @@ mod tests {
         );
         assert_eq!(
             serde_json::to_value(Message::Assistant {
+                extra_content: None,
                 content: vec![],
                 tool_calls: Vec::new(),
                 reasoning: Some("r".into()),
@@ -936,6 +1103,7 @@ mod tests {
         )]);
         provider.reasoning = Some(json!({"blocks": [{"text": "thought"}]}));
         let message = Message::Assistant {
+            extra_content: None,
             content: vec![],
             tool_calls: vec![call.clone()],
             reasoning: None,
@@ -965,6 +1133,7 @@ mod tests {
         assert_eq!(
             old,
             Message::Assistant {
+                extra_content: None,
                 content: vec![],
                 tool_calls: vec![ToolCall::new("c", "w", json!({}))],
                 reasoning: None,
@@ -1138,6 +1307,7 @@ mod tests {
     #[test]
     fn helpers() {
         let m = Message::Assistant {
+            extra_content: None,
             content: vec![ContentPart::text("a"), ContentPart::text("b")],
             tool_calls: vec![tool_call()],
             reasoning: Some("why".into()),
@@ -1231,5 +1401,35 @@ mod tests {
     fn the_label_names_the_image_by_what_the_model_may_say() {
         assert_eq!(shot().label(), "shot.png (png, 120.0 KiB, 800\u{d7}600)");
         assert_eq!(human_bytes(1_468_006), "1.4 MiB");
+    }
+}
+
+#[cfg(test)]
+mod credential_header_tests {
+    use super::is_credential_header;
+
+    #[test]
+    fn names_that_look_like_credentials_are_found_and_plain_ones_are_not() {
+        for name in [
+            "Authorization",
+            "proxy-authorization",
+            "x-api-key",
+            "X_API_KEY",
+            "Cookie",
+            "x-auth-token",
+            "x-amz-security-token",
+            "client-secret",
+            "Prompt-User-Signature",
+        ] {
+            assert!(is_credential_header(name), "{name}");
+        }
+        for name in [
+            "x-tenant",
+            "x-request-id",
+            "openai-organization",
+            "user-agent",
+        ] {
+            assert!(!is_credential_header(name), "{name}");
+        }
     }
 }

@@ -80,6 +80,12 @@ pub(crate) struct Envelope {
     /// that is not the agent's own wake only looks at the parent and the deadline, and parks again.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub hb: bool,
+    /// The runtime's signature of this document ([ADR 0068] decision 4, `crate::seal`): present
+    /// only when the runtime has turn keys. It is not a member of what it signs.
+    ///
+    /// [ADR 0068]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0068-adam-signs-its-own-history.md
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<String>,
 }
 
 impl Envelope {
@@ -100,6 +106,7 @@ impl Envelope {
             remaining_secs: None,
             agent_wake: None,
             hb: false,
+            signature: None,
         }
     }
 

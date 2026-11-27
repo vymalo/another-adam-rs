@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use adam_budget::{Admission, Ask, ConversationId, DynAdmission, Permit, Pool, Refused};
 use adam_core::time::Timestamp;
+use adam_core::turn::DynTurnKeys;
 use adam_core::{RunId, RunStatus};
 use adam_error::report;
 use adam_model::{
@@ -14,8 +15,8 @@ use adam_model::{
     PromptStatement, ReasoningEffort, ToolCall, ToolChoice, ToolSpec,
 };
 use adam_plugin::{
-    HookSet, HookedCall, HookedEnd, HookedMessage, HookedModelRequest, HookedText, MessageFile,
-    Plugin, Verdict,
+    HookSet, HookedCall, HookedCompaction, HookedEnd, HookedMessage, HookedModelRequest,
+    HookedText, MessageFile, ModelCallKind, Plugin, Verdict,
 };
 use adam_runtime::{
     AGENT_TEXT_KIND, Agent, AgentError, AgentStarter, CHILD_PARKED_KIND, CHILD_REPORTED_KIND,
@@ -44,7 +45,7 @@ use crate::conversation::{
     parse_model_run, parse_prompt_statement, parse_root_run, parse_root_step, parse_session,
     parse_user_text,
 };
-use crate::history::{RunChars, record_shortenings};
+use crate::history::{RunChars, record_shortenings_from};
 use crate::images::{
     ImageCache, ImageGate, ImageStore, InboundImage, Item, KeptImage,
     MAX_RUN_JOURNALED_IMAGE_BYTES, admit_inbound, answer_with, described, for_sending, image_data,
@@ -178,6 +179,10 @@ struct Summarised {
     cut: usize,
     usage: adam_model::Usage,
     call: String,
+    /// Why a `compaction.before` hook refused the summary (ADR 0050, slice H9): the history is
+    /// shortened instead, and the reason is what the step says.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    vetoed: Option<String>,
 }
 
 /// The id of the summary call `n` of `run` in its usage report: made inside the journaled step, like
@@ -208,6 +213,7 @@ fn shortened_for_overflow(messages: &[Message]) -> Vec<Message> {
                 content,
                 is_error,
                 images,
+                extra_content,
             } => {
                 let len = content.chars().count();
                 let short = (len > OVERFLOW_OUTPUT_CHARS)
@@ -216,6 +222,7 @@ fn shortened_for_overflow(messages: &[Message]) -> Vec<Message> {
                     })
                     .flatten();
                 Message::Tool {
+                    extra_content: extra_content.clone(),
                     call_id: call_id.clone(),
                     content: short.unwrap_or_else(|| content.clone()),
                     is_error: *is_error,
@@ -1158,12 +1165,14 @@ fn report_messages(reports: &[RoundReport], paged: bool) -> Vec<Message> {
         })
         .collect();
     let mut messages = vec![Message::Assistant {
+        extra_content: None,
         content: Vec::new(),
         tool_calls: calls.clone(),
         reasoning: None,
         provider: None,
     }];
     messages.extend(reports.iter().zip(&calls).map(|(r, call)| Message::Tool {
+        extra_content: None,
         call_id: call.id.clone(),
         content: backstop(&r.output.content, SUBAGENT_READ, paged).into_owned(),
         is_error: false,
@@ -1335,6 +1344,7 @@ pub struct LlmAgentBuilder {
     admission: Option<DynAdmission>,
     hooks: HookSet,
     max_run_continuations: u32,
+    turn_keys: Option<DynTurnKeys>,
 }
 
 /// How long a run waiting for a child run sleeps before it looks at the child itself, unless
@@ -1571,6 +1581,20 @@ impl LlmAgentBuilder {
         self
     }
 
+    /// The keys that sign every assistant and tool turn this agent commits ([ADR 0068], slice
+    /// T3a-1): each carries `extra_content.adam.turn_signature`, bound to its run, conversation,
+    /// position and the chain of every message before it. A person's message is chained, never
+    /// signed. Without keys (the default) nothing is signed and a run commits as it always did.
+    /// Nothing is verified here (re-entry is slice T3a-3), and the signature is never sent to a
+    /// model.
+    ///
+    /// [ADR 0068]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0068-adam-signs-its-own-history.md
+    #[must_use]
+    pub fn turn_keys(mut self, keys: DynTurnKeys) -> Self {
+        self.turn_keys = Some(keys);
+        self
+    }
+
     /// Append one plugin to the hook set ([`LlmAgentBuilder::hooks`]); the order plugins are added in
     /// is the order their hooks run in.
     #[must_use]
@@ -1763,6 +1787,7 @@ impl LlmAgentBuilder {
             admission: self.admission,
             hooks: Arc::new(self.hooks),
             max_run_continuations: self.max_run_continuations.min(MAX_RUN_CONTINUATIONS),
+            turn_keys: self.turn_keys,
         }
     }
 }
@@ -1998,6 +2023,8 @@ pub struct LlmAgent {
     hooks: Arc<HookSet>,
     /// The most times `run.ending` hooks may keep one run going (ADR 0050, decision 10).
     max_run_continuations: u32,
+    /// The keys that sign each assistant and tool turn at commit ([`LlmAgentBuilder::turn_keys`]).
+    turn_keys: Option<DynTurnKeys>,
 }
 
 impl std::fmt::Debug for LlmAgent {
@@ -2109,6 +2136,7 @@ impl LlmAgent {
             admission: None,
             hooks: HookSet::new(),
             max_run_continuations: DEFAULT_RUN_CONTINUATIONS,
+            turn_keys: None,
         }
     }
 
@@ -2495,7 +2523,7 @@ impl LlmAgent {
             context_model(&state.context)
                 .and_then(|alias| self.choices.iter().find(|b| b.alias == alias))
         };
-        match bound {
+        let mut live = match bound {
             Some(b) => LiveModel {
                 alias: &b.alias,
                 max_output_tokens: b.max_output_tokens,
@@ -2506,6 +2534,58 @@ impl LlmAgent {
                 max_output_tokens: self.limits.max_output_tokens,
                 reasoning_effort: self.reasoning_effort,
             },
+        };
+        // A session's own cap narrows the model's, never widens it (ADR 0054): with the model's cap
+        // left to the model (`0`) the session's is the cap, and it is never `0`.
+        if let Some(cap) = self
+            .session_config(state)
+            .and_then(|c| c.max_output_tokens)
+            .filter(|cap| *cap > 0)
+        {
+            live.max_output_tokens = match live.max_output_tokens {
+                0 => cap,
+                own => own.min(cap),
+            };
+        }
+        live
+    }
+
+    /// What this run's session asked for ([ADR 0054]): the `config` of the header of the round, an
+    /// empty one for a run that is no round of a session.
+    ///
+    /// [ADR 0054]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md
+    fn session_config<'a>(
+        &self,
+        state: &'a Conversation,
+    ) -> Option<&'a adam_runtime::SessionConfig> {
+        state.session.as_ref().and_then(|h| h.config.as_ref())
+    }
+
+    /// The agent's [`Limits`] narrowed by its session's `max_turns` and `max_tool_calls`: read at
+    /// every step, so the next model call obeys them. A value of `0` is no narrowing (a header is
+    /// never trusted to widen), and nothing here is ever raised.
+    fn limits_of(&self, state: &Conversation) -> Limits {
+        let mut limits = self.limits;
+        if let Some(config) = self.session_config(state) {
+            if let Some(n) = config.max_turns.filter(|n| *n > 0) {
+                limits.max_turns = limits.max_turns.min(n);
+            }
+            if let Some(n) = config.max_tool_calls.filter(|n| *n > 0) {
+                limits.max_tool_calls = limits.max_tool_calls.min(n);
+            }
+        }
+        limits
+    }
+
+    /// The most tool calls of a turn that run at the same time in this run: the agent's, narrowed
+    /// by its session's `max_parallel_tool_calls` (never below 1, never above the agent's).
+    fn parallel_of(&self, state: &Conversation) -> usize {
+        match self
+            .session_config(state)
+            .and_then(|c| c.max_parallel_tool_calls)
+        {
+            Some(n) => self.max_parallel.min((n as usize).max(1)),
+            None => self.max_parallel,
         }
     }
 
@@ -2778,7 +2858,7 @@ impl LlmAgent {
             hit.answered = false;
             hit.answer = None;
         }
-        if state.limit.is_none() && state.turns >= self.limits.max_turns {
+        if state.limit.is_none() && state.turns >= self.limits_of(state).max_turns {
             state.limit = Some(LimitHit {
                 limit: LimitKind::MaxTurns,
                 answered: false,
@@ -2902,11 +2982,11 @@ impl LlmAgent {
             loaded: Arc::from(state.loaded.clone()),
             removed_tools: Arc::from(state.removed_tools.clone()),
             turn: crate::early::Turn {
-                limit: self.max_parallel,
+                limit: self.parallel_of(state),
                 closing,
                 cancelled: false,
                 tool_calls: state.tool_calls,
-                max_tool_calls: self.limits.max_tool_calls,
+                max_tool_calls: self.limits_of(state).max_tool_calls,
             },
             repeats: state.repeats.clone(),
         };
@@ -2975,21 +3055,34 @@ impl LlmAgent {
                 };
                 // The `model.request` hooks (ADR 0050, slice H3) run here, inside the step, on the
                 // final request: a replay of a recorded turn asks none. They may rewrite only the
-                // temperature, the bound on output tokens and the metadata.
+                // temperature and top-p, the bound on output tokens, the metadata, the headers and an extra body.
                 if !agent.hooks.is_empty() {
                     let mut temperature = request.temperature;
+                    let mut top_p = request.top_p;
+                    let mut headers = request.headers.clone();
+                    let mut extra_body = request.extra_body.clone();
                     let mut max_output_tokens = request.max_output_tokens;
                     let mut metadata = request.metadata.clone();
                     let verdict = agent.hooks.model_request(&mut HookedModelRequest {
+                        kind: ModelCallKind::Turn,
                         temperature: &mut temperature,
+                        top_p: &mut top_p,
+                        headers: &mut headers,
+                        extra_body: &mut extra_body,
                         max_output_tokens: &mut max_output_tokens,
                         metadata: &mut metadata,
                     });
                     match verdict {
                         Ok(Verdict::Continue) => {
-                            request.temperature = temperature;
-                            request.max_output_tokens = max_output_tokens;
-                            request.metadata = metadata;
+                            apply_hooked(
+                                &mut request,
+                                temperature,
+                                top_p,
+                                headers,
+                                extra_body,
+                                max_output_tokens,
+                                metadata,
+                            )?;
                         }
                         Ok(Verdict::Stop(reason)) => {
                             return Err(ModelFailure::by_hook(
@@ -3275,7 +3368,7 @@ impl LlmAgent {
         if calls.is_empty()
             && !unread
             && state.limit.is_none()
-            && state.tool_calls < self.limits.max_tool_calls
+            && state.tool_calls < self.limits_of(state).max_tool_calls
             && let Some(session) = self.session_to_wait_for(ctx, state, turn).await?
         {
             let wait = ToolCall::new(
@@ -3381,7 +3474,7 @@ impl LlmAgent {
                     state.messages.pop();
                 }
                 // The next turn is the closing turn, which has its own instruction.
-                if state.turns < self.limits.max_turns {
+                if state.turns < self.limits_of(state).max_turns {
                     state.messages.push(Message::user_text(THINKING_CUT_TURN));
                 }
                 return Ok((Flow::Next, early));
@@ -3405,13 +3498,14 @@ impl LlmAgent {
         }
 
         let requested = u32::try_from(calls.len()).unwrap_or(u32::MAX);
-        if state.tool_calls.saturating_add(requested) > self.limits.max_tool_calls {
+        let max_tool_calls = self.limits_of(state).max_tool_calls;
+        if state.tool_calls.saturating_add(requested) > max_tool_calls {
             // None of the turn's calls runs, and each is answered, so the history has no call without
             // a result; the next model call is the closing turn.
             let said = format!(
                 "not run: {} tool calls were already made and this turn asked for {} more \
                  (max_tool_calls = {})",
-                state.tool_calls, requested, self.limits.max_tool_calls
+                state.tool_calls, requested, max_tool_calls
             );
             state.messages.extend(
                 calls
@@ -3436,7 +3530,11 @@ impl LlmAgent {
     fn history_budget(&self, state: &Conversation) -> Option<usize> {
         let live = self.live_model(state);
         compaction::budget(
-            self.model.context_window(live.alias),
+            compaction::effective_window(
+                self.model.context_window(live.alias),
+                self.session_config(state).and_then(|c| c.context_window),
+                live.max_output_tokens,
+            ),
             live.max_output_tokens,
             self.limits.max_history_tokens,
         )
@@ -3640,6 +3738,7 @@ impl LlmAgent {
         );
         let images_state = Arc::clone(&state.images);
         let images_cache = Arc::clone(&self.images_cache);
+        let hooks = &self.hooks;
         let recorded: Result<Summarised, ModelFailure> = ctx
             .step(&id, move || async move {
                 if !named.is_empty() {
@@ -3653,6 +3752,96 @@ impl LlmAgent {
                     .await;
                 }
                 apply_sources(&sources, source_ctx.as_ref(), &mut request, ordered).await;
+                // The compaction hooks (ADR 0050, slice H9) run here, inside the journaled step:
+                // a replay of a recorded summary asks none. A hook may add context to the request
+                // or veto the summary, and the history is shortened instead; it never writes the
+                // summary itself.
+                if !hooks.is_empty() {
+                    let mut context = String::new();
+                    match hooks.compaction_before(&mut HookedCompaction {
+                        context: &mut context,
+                    }) {
+                        Ok(Verdict::Continue) => {}
+                        Ok(Verdict::Deny(reason)) => {
+                            return Ok(Summarised {
+                                summary: None,
+                                cut: at,
+                                usage: adam_model::Usage::default(),
+                                call: compaction_call_id(run, n),
+                                vetoed: Some(reason),
+                            });
+                        }
+                        Ok(Verdict::Stop(reason)) => {
+                            return Err(ModelFailure::by_hook(
+                                format!("stopped by a plugin: {reason}"),
+                                false,
+                            ));
+                        }
+                        Ok(Verdict::Ask(_)) => {
+                            return Err(ModelFailure::by_hook(
+                                "a hook may only continue, deny or stop at compaction.before"
+                                    .to_owned(),
+                                false,
+                            ));
+                        }
+                        Err(error) => {
+                            return Err(ModelFailure::by_hook(
+                                format!("the hook `{}` failed: {}", error.plugin, error.reason),
+                                error.is_retryable(),
+                            ));
+                        }
+                    }
+                    if !context.is_empty() {
+                        request.messages.push(Message::user_text(context));
+                    }
+                    // The summary is a model call too: `model.request` sees it, and knows which
+                    // kind it is (ADR 0050, slice H9).
+                    let mut temperature = request.temperature;
+                    let mut top_p = request.top_p;
+                    let mut headers = request.headers.clone();
+                    let mut extra_body = request.extra_body.clone();
+                    let mut max_output_tokens = request.max_output_tokens;
+                    let mut metadata = request.metadata.clone();
+                    match hooks.model_request(&mut HookedModelRequest {
+                        kind: ModelCallKind::Compaction,
+                        temperature: &mut temperature,
+                        top_p: &mut top_p,
+                        headers: &mut headers,
+                        extra_body: &mut extra_body,
+                        max_output_tokens: &mut max_output_tokens,
+                        metadata: &mut metadata,
+                    }) {
+                        Ok(Verdict::Continue) => {
+                            apply_hooked(
+                                &mut request,
+                                temperature,
+                                top_p,
+                                headers,
+                                extra_body,
+                                max_output_tokens,
+                                metadata,
+                            )?;
+                        }
+                        Ok(Verdict::Stop(reason)) => {
+                            return Err(ModelFailure::by_hook(
+                                format!("stopped by a plugin: {reason}"),
+                                false,
+                            ));
+                        }
+                        Ok(Verdict::Deny(_) | Verdict::Ask(_)) => {
+                            return Err(ModelFailure::by_hook(
+                                "a hook may only continue or stop at model.request".to_owned(),
+                                false,
+                            ));
+                        }
+                        Err(error) => {
+                            return Err(ModelFailure::by_hook(
+                                format!("the hook `{}` failed: {}", error.plugin, error.reason),
+                                error.is_retryable(),
+                            ));
+                        }
+                    }
+                }
                 let answer = tokio::select! {
                     biased;
                     () = cancel.cancelled() => return Err(ModelFailure::cancelled()),
@@ -3664,6 +3853,7 @@ impl LlmAgent {
                     cut: at,
                     usage: answer.usage.accounted(),
                     call: compaction_call_id(run, n),
+                    vetoed: None,
                 })
             })
             .await?;
@@ -3707,6 +3897,20 @@ impl LlmAgent {
             state.model_wait = None;
         }
         let (summary, cut_at, rejected) = match recorded {
+            // A compaction hook vetoed the summary: the history is shortened instead (ADR 0050,
+            // slice H9), as when no summary can be made, and the reason is what the step says.
+            Ok(Summarised {
+                vetoed: Some(reason),
+                ..
+            }) => {
+                tracing::warn!(run = %run, "a compaction hook vetoed the summary: the history is shortened instead");
+                state.compact_failed = Some(state.turns);
+                ctx.emit(RunEvent::Step(step(StepState::Failed).with_detail(format!(
+                    "no summary could be made (vetoed by a plugin: {reason}); the history is shortened instead"
+                ))))
+                .await;
+                return Ok(Compacted::No);
+            }
             Ok(done) => {
                 // The call was made and counts, whatever its summary is worth.
                 self.report_usage(ctx, state, done.call.clone(), &live_alias, done.usage, None)
@@ -4501,7 +4705,8 @@ impl LlmAgent {
     /// runs by itself (the common case: a tool that declares nothing runs alone).
     fn together(&self, state: &Conversation) -> usize {
         let calls = &state.pending_calls;
-        if self.max_parallel <= 1 || calls.len() < 2 {
+        let parallel = self.parallel_of(state);
+        if parallel <= 1 || calls.len() < 2 {
             return 1;
         }
         let mut before = state.repeats.as_ref().map(|r| r.key.clone());
@@ -4519,7 +4724,7 @@ impl LlmAgent {
                 }
             })
             .collect();
-        match schedule::segments(&entries, self.max_parallel).first() {
+        match schedule::segments(&entries, parallel).first() {
             Some(Segment::Together(range)) if range.start == 0 => range.end,
             _ => 1,
         }
@@ -4618,7 +4823,7 @@ impl LlmAgent {
 
         let emitter = ctx.emitter();
         let cancel = ctx.cancel_token();
-        let mut queue = Queue::new(&accesses, self.max_parallel);
+        let mut queue = Queue::new(&accesses, self.parallel_of(state));
         let mut running = FuturesUnordered::new();
         let mut finished: Ordered<Finished> = Ordered::new(n);
         let mut failure: Option<AgentError> = None;
@@ -5887,11 +6092,13 @@ impl LlmAgent {
         match limit {
             LimitKind::MaxToolCalls => format!(
                 "tool call limit exceeded: {} calls already made (max_tool_calls = {})",
-                state.tool_calls, self.limits.max_tool_calls
+                state.tool_calls,
+                self.limits_of(state).max_tool_calls
             ),
             LimitKind::MaxTurns => format!(
                 "turn limit exceeded: the model was called {} times (max_turns = {})",
-                state.turns, self.limits.max_turns
+                state.turns,
+                self.limits_of(state).max_turns
             ),
             LimitKind::RepeatedCall => "the same tool call was repeated with the same result \
                  and the run was stopped (doom_loop)"
@@ -6194,6 +6401,7 @@ async fn output_message(
         )
     };
     let message = Message::Tool {
+        extra_content: None,
         call_id: call_id.to_owned(),
         // After the journal: the journal holds the whole output, and the cut (which the history, the
         // model and the step event carry) is a pure function of it.
@@ -6515,17 +6723,24 @@ fn continue_conversation(
             .rev()
             .find(|m| matches!(m, Message::Assistant { .. }))
             .cloned();
-        return Ok(Conversation {
+        let mut conversation = Conversation {
             messages: last.into_iter().collect(),
             continued_from: Some(prior_run),
             context: prior.context.clone(),
             plan: prior.plan.clone(),
             session: parse_session(&input.payload).or_else(|| prior.session.clone()),
             ..Conversation::default()
-        });
+        };
+        // The carried answer was signed under the run it came from; this run signs it again.
+        crate::signing::unsign_from(&mut conversation.messages, 0);
+        return Ok(conversation);
     }
     let text = start_text(input)?;
     let mut conversation = prior.continued(text, prior_run);
+    // A carried row was signed under the run it came from, at its place in that run's chain. The
+    // runtime verified it there before handing it over (`prior_state`); this run signs every row
+    // again at its first commit, under its own id (ADR 0068 decision 5).
+    crate::signing::unsign_from(&mut conversation.messages, 0);
     conversation.pending_images = parse_inbound_images(&input.payload);
     // A round of a session works for the run that started it, as the first one did, and says what
     // the session is.
@@ -7056,6 +7271,52 @@ fn tool_transient(
     }
 }
 
+/// Checks what a `model.request` hook left in a request and, if it is allowed, writes it back:
+/// no header that looks like a credential, no body member the client owns, a finite top-p.
+fn apply_hooked(
+    request: &mut ModelRequest,
+    temperature: Option<f32>,
+    top_p: Option<f32>,
+    headers: std::collections::BTreeMap<String, String>,
+    extra_body: Option<serde_json::Map<String, serde_json::Value>>,
+    max_output_tokens: Option<u32>,
+    metadata: std::collections::BTreeMap<String, String>,
+) -> Result<(), ModelFailure> {
+    if let Some(name) = headers
+        .keys()
+        .find(|name| adam_model::is_credential_header(name))
+    {
+        return Err(ModelFailure::by_hook(
+            format!(
+                "a hook set the header `{name}`, which looks like a credential: the model's key is the deployment's"
+            ),
+            false,
+        ));
+    }
+    if let Some(key) = adam_model::RESERVED_BODY_KEYS
+        .iter()
+        .find(|key| extra_body.as_ref().is_some_and(|b| b.contains_key(**key)))
+    {
+        return Err(ModelFailure::by_hook(
+            format!("a hook set the body member `{key}`, which the client owns"),
+            false,
+        ));
+    }
+    if top_p.is_some_and(|p| !p.is_finite()) {
+        return Err(ModelFailure::by_hook(
+            "a hook set a top_p that is not finite".to_owned(),
+            false,
+        ));
+    }
+    request.top_p = top_p;
+    request.headers = headers;
+    request.extra_body = extra_body;
+    request.temperature = temperature;
+    request.max_output_tokens = max_output_tokens;
+    request.metadata = metadata;
+    Ok(())
+}
+
 /// Whether `doom_loop` would refuse a call of `key` now, from the committed state alone: the third
 /// call in a row with the same tool, the same arguments and the same result does not run.
 fn doom_loop_would_refuse(repeats: Option<&Repeats>, key: &str) -> bool {
@@ -7225,43 +7486,34 @@ pub(crate) fn render_output(output: Option<&Value>) -> String {
     }
 }
 
-#[async_trait]
-impl Agent for LlmAgent {
-    type State = Conversation;
-
-    fn name(&self) -> &str {
-        &self.name
-    }
-
-    /// The input is the first user message: payload `{"text": "..."}` or a bare
-    /// JSON string (see [`user_message`](crate::user_message)); its `kind` is
-    /// not inspected. The same as [`LlmStarter::init`].
-    fn init(&self, input: Inbound) -> Result<Conversation, AgentError> {
-        start_conversation(input)
-    }
-
-    /// The prior run's conversation with the input as its newest user message, see
-    /// [`Conversation::continued`] for what is carried, dropped and reset. The same as
-    /// [`LlmStarter::init_continuing`].
-    fn init_continuing(
+impl LlmAgent {
+    /// `transition` with every assistant and tool message of its state signed
+    /// (`signing::sign_messages`); unchanged when the agent has no [`turn_keys`](LlmAgentBuilder::turn_keys).
+    async fn sign_transition(
         &self,
-        input: Inbound,
-        prior: &Conversation,
-        prior_run: RunId,
-    ) -> Result<Conversation, AgentError> {
-        continue_conversation(&input, prior, prior_run)
+        ctx: &Ctx,
+        mut transition: Transition<Conversation>,
+    ) -> Result<Transition<Conversation>, AgentError> {
+        let Some(keys) = &self.turn_keys else {
+            return Ok(transition);
+        };
+        let (Transition::Continue(state)
+        | Transition::Park { state, .. }
+        | Transition::Done { state, .. }
+        | Transition::Fail { state, .. }) = &mut transition;
+        crate::signing::sign_messages(
+            keys,
+            ctx.run_id(),
+            ctx.conversation_id(),
+            &mut state.messages,
+        )
+        .await
+        .map_err(|e| AgentError::from_classified("signing the turns of a step failed", e))?;
+        Ok(transition)
     }
 
-    fn split(&self, state: &Conversation) -> Option<(Conversation, Vec<Value>)> {
-        Some(state.split())
-    }
-
-    fn join(&self, head: Conversation, rows: Vec<Value>) -> Result<Conversation, AgentError> {
-        Conversation::join(head, rows)
-    }
-
-    #[tracing::instrument(skip_all, fields(run = %ctx.run_id(), agent = %self.name))]
-    async fn step(
+    /// The transition of one step, before its turns are signed ([`LlmAgent::sign_transition`]).
+    async fn step_unsigned(
         &self,
         ctx: &mut Ctx,
         mut state: Conversation,
@@ -7440,12 +7692,15 @@ impl Agent for LlmAgent {
                 state.compactions.len(),
             )
         };
-        if record_shortenings(
+        if let Some(first) = record_shortenings_from(
             &mut state.messages,
             self.limits.max_history_tokens,
             &output_id_of,
             &mut counted,
         ) {
+            // A shortened row's bytes changed, and every later row's `prv` with it: their turn
+            // signatures no longer hold, and the commit signs them again (ADR 0068).
+            crate::signing::unsign_from(&mut state.messages, first);
             state.shortenings.push(state.turns);
             state.last_prompt = None;
             // The images of a result that was shortened left the history with it.
@@ -7747,6 +8002,52 @@ impl Agent for LlmAgent {
     }
 }
 
+#[async_trait]
+impl Agent for LlmAgent {
+    type State = Conversation;
+
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// The input is the first user message: payload `{"text": "..."}` or a bare
+    /// JSON string (see [`user_message`](crate::user_message)); its `kind` is
+    /// not inspected. The same as [`LlmStarter::init`].
+    fn init(&self, input: Inbound) -> Result<Conversation, AgentError> {
+        start_conversation(input)
+    }
+
+    /// The prior run's conversation with the input as its newest user message, see
+    /// [`Conversation::continued`] for what is carried, dropped and reset. The same as
+    /// [`LlmStarter::init_continuing`].
+    fn init_continuing(
+        &self,
+        input: Inbound,
+        prior: &Conversation,
+        prior_run: RunId,
+    ) -> Result<Conversation, AgentError> {
+        continue_conversation(&input, prior, prior_run)
+    }
+
+    fn split(&self, state: &Conversation) -> Option<(Conversation, Vec<Value>)> {
+        Some(state.split())
+    }
+
+    fn join(&self, head: Conversation, rows: Vec<Value>) -> Result<Conversation, AgentError> {
+        Conversation::join(head, rows)
+    }
+
+    #[tracing::instrument(skip_all, fields(run = %ctx.run_id(), agent = %self.name))]
+    async fn step(
+        &self,
+        ctx: &mut Ctx,
+        state: Conversation,
+    ) -> Result<Transition<Conversation>, AgentError> {
+        let transition = self.step_unsigned(ctx, state).await?;
+        self.sign_transition(ctx, transition).await
+    }
+}
+
 #[cfg(test)]
 mod thinking_cut_tests {
     use super::*;
@@ -7777,6 +8078,7 @@ mod thinking_cut_tests {
     #[test]
     fn a_cut_turn_with_a_reasoning_block_or_a_carrier_stays() {
         let mut block = Message::Assistant {
+            extra_content: None,
             content: vec![],
             tool_calls: vec![],
             reasoning: None,
@@ -7808,6 +8110,7 @@ mod thinking_cut_tests {
         assert!(!LlmAgent::cut_turn_has_nothing_to_send(&block));
 
         let empty = Message::Assistant {
+            extra_content: None,
             content: vec![],
             tool_calls: vec![],
             reasoning: None,
@@ -7815,6 +8118,7 @@ mod thinking_cut_tests {
         };
         assert!(LlmAgent::cut_turn_has_nothing_to_send(&empty));
         let echoed = Message::Assistant {
+            extra_content: None,
             content: vec![],
             tool_calls: vec![],
             reasoning: Some("r".into()),
@@ -8384,6 +8688,7 @@ mod compaction_gate_tests {
         let mut state = Conversation::new("task");
         for n in 0..turns {
             state.messages.push(Message::Assistant {
+                extra_content: None,
                 content: vec![],
                 tool_calls: vec![adam_model::ToolCall {
                     id: format!("c{n}"),

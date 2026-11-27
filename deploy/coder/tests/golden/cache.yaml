@@ -17,6 +17,7 @@ value: 0
 preemptionPolicy: Never
 globalDefault: false
 description: "Run pods of coder (adam-coder): scoped by a ResourceQuota, ranks nothing."
+
 ---
 # Source: coder/templates/networkpolicy.yaml
 # Ingress only from the orchestrator's namespace. Egress is not restricted: the
@@ -46,6 +47,7 @@ spec:
       ports:
         - protocol: TCP
           port: 8080
+
 ---
 # Source: coder/templates/run-pods-egress-networkpolicy.yaml
 # runPods.enabled: what the egress proxy may reach (ADR 0042). Ingress only from the run pods, on the proxy's port: no
@@ -111,6 +113,7 @@ spec:
       ports:
         - protocol: TCP
           port: 443
+
 ---
 # Source: coder/templates/run-pods-networkpolicy.yaml
 # runPods.enabled: what a run pod may reach, deny by default (ADR 0042). No ingress at all (nothing connects to a run pod:
@@ -163,6 +166,7 @@ spec:
       ports:
         - protocol: TCP
           port: 3128
+
 ---
 # Source: coder/templates/run-pods-quota.yaml
 # What the run pods may use in all. A pod beyond it is refused with 403 "exceeded quota", which the coder waits out.
@@ -186,6 +190,7 @@ spec:
         operator: In
         values:
           - coder-run
+
 ---
 # Source: coder/templates/run-pods-egress-proxy.yaml
 # Keeps one proxy pod up through node drains. Not rendered for one replica: minAvailable 1 of 1 would block every drain.
@@ -207,6 +212,7 @@ spec:
       app.kubernetes.io/name: coder-egress
       app.kubernetes.io/instance: coder
       app.kubernetes.io/component: egress-proxy
+
 ---
 # Source: coder/templates/run-pods-egress-proxy.yaml
 # runPods.enabled: the egress proxy (ADR 0042), the one way out of a run pod to the internet: `adam-egress`, from the
@@ -226,6 +232,7 @@ metadata:
     app.kubernetes.io/managed-by: Helm
     helm.sh/chart: coder-0.5.0
 automountServiceAccountToken: false
+
 ---
 # Source: coder/templates/run-pods-rbac.yaml
 # runPods.enabled: the coder pod's ServiceAccount. Its token is mounted in the coder pod alone (the front Deployment
@@ -241,6 +248,7 @@ metadata:
     app.kubernetes.io/managed-by: Helm
     helm.sh/chart: coder-0.5.0
 automountServiceAccountToken: false
+
 ---
 # Source: coder/templates/run-pods-configmap.yaml
 # runPods.enabled: the pod every run pod is made from (ADR 0019). The coder reads it at startup
@@ -356,6 +364,7 @@ data:
             claimName: coder-cache
         - name: tools
           emptyDir: {}
+
 ---
 # Source: coder/templates/run-pods-egress-allow.yaml
 # runPods.enabled: the hosts the egress proxy allows (ADR 0042): runPods.egressProxy.allow, then extraAllow. The proxy
@@ -387,6 +396,7 @@ data:
     objects.githubusercontent.com
     release-assets.githubusercontent.com
     pub.dev
+
 ---
 # Source: coder/templates/cache-pvc.yaml
 # cache.create: the claim behind /cache (ADR 0040), for this release alone. A cache, not state: it goes with the
@@ -408,6 +418,7 @@ spec:
   resources:
     requests:
       storage: "20Gi"
+
 ---
 # Source: coder/templates/run-pods-rbac.yaml
 # What the coder does with run pods: make, find, watch and delete them, and exec in them. Nothing else: no Secret,
@@ -430,6 +441,7 @@ rules:
   - apiGroups: [""]
     resources: ["pods/exec"]
     verbs: ["create", "get"]
+
 ---
 # Source: coder/templates/run-pods-rbac.yaml
 apiVersion: rbac.authorization.k8s.io/v1
@@ -450,6 +462,7 @@ subjects:
   - kind: ServiceAccount
     name: coder
     namespace: coder-ns
+
 ---
 # Source: coder/templates/run-pods-egress-proxy.yaml
 # The run pods' HTTPS_PROXY names this Service (<name>.<namespace>.svc:3128). ClusterIP only: nothing outside the
@@ -476,6 +489,7 @@ spec:
       port: 3128
       targetPort: proxy
       protocol: TCP
+
 ---
 # Source: coder/templates/service.yaml
 # ClusterIP only, never exposed: the orchestrator reaches it in-cluster over A2A
@@ -500,6 +514,7 @@ spec:
       port: 8080
       targetPort: http
       protocol: TCP
+
 ---
 # Source: coder/templates/run-pods-egress-proxy.yaml
 apiVersion: apps/v1
@@ -600,6 +615,7 @@ spec:
         - name: allow
           configMap:
             name: coder-egress-allow
+
 ---
 # Source: coder/templates/statefulset.yaml
 apiVersion: apps/v1
@@ -894,6 +910,7 @@ spec:
         resources:
           requests:
             storage: "20Gi"
+
 ---
 # Source: coder/templates/cnpg-cluster.yaml
 # The coder's own Postgres. CloudNativePG creates the database, its owner and
@@ -917,6 +934,7 @@ spec:
     initdb:
       database: adam
       owner: adam
+
 ---
 # Source: coder/templates/externalsecret.yaml
 # Secret values live in AWS Secrets Manager (`prod/meta/test-app`)
@@ -952,6 +970,7 @@ spec:
       remoteRef:
         key: prod/meta/test-app
         property: adam_coder_a2a_bearer_tokens
+
 ---
 # Source: coder/templates/run-pods-admission.yaml
 # runPods.enabled: the guard that lets the coder make pods without being able to read the namespace's other Secrets,
@@ -1006,6 +1025,7 @@ spec:
       message: "a run pod uses its own network, PID and IPC namespaces"
     - expression: "has(object.spec.automountServiceAccountToken) && object.spec.automountServiceAccountToken == false"
       message: "a run pod sets automountServiceAccountToken: false: it holds no credential for the cluster"
+
 ---
 # Source: coder/templates/run-pods-admission.yaml
 apiVersion: admissionregistration.k8s.io/v1

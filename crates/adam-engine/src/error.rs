@@ -90,6 +90,14 @@ pub enum EngineError {
     /// 0060): a schedule that does not parse, or a store that failed while it was read or written.
     #[error("the agent's schedules cannot be set up")]
     Schedules(#[source] adam_schedule::ReconcileError),
+    /// `start` on a store that outlives the process, with no turn key (ADR 0068 decision 9): the
+    /// host gives one with [`EngineBuilder::turn_keys`](crate::EngineBuilder::turn_keys), and adam
+    /// does not fall back to a key that would die with the process.
+    #[error(
+        "a store that outlives the process needs a turn key: give one with \
+         EngineBuilder::turn_keys (ADR 0068)"
+    )]
+    NoTurnKeys,
     /// A bug, or a failure nothing above describes.
     #[error("internal error: {message}")]
     Internal {
@@ -105,7 +113,7 @@ impl Classify for EngineError {
     fn class(&self) -> ErrorClass {
         match self {
             Self::Agent(source) => source.class(),
-            Self::NoRuntime | Self::Invalid(_) => ErrorClass::Invalid,
+            Self::NoRuntime | Self::Invalid(_) | Self::NoTurnKeys => ErrorClass::Invalid,
             Self::NotFound(_) => ErrorClass::NotFound,
             Self::NotWaiting { .. }
             | Self::Finished { .. }
@@ -233,7 +241,9 @@ mod tests {
     fn expected(e: &EngineError) -> ErrorClass {
         match e {
             EngineError::Agent(source) => source.class(),
-            EngineError::NoRuntime | EngineError::Invalid(_) => ErrorClass::Invalid,
+            EngineError::NoRuntime | EngineError::Invalid(_) | EngineError::NoTurnKeys => {
+                ErrorClass::Invalid
+            }
             EngineError::NotFound(_) => ErrorClass::NotFound,
             EngineError::NotWaiting { .. }
             | EngineError::Finished { .. }

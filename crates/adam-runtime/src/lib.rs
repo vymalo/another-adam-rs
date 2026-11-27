@@ -97,6 +97,7 @@ mod lines;
 mod notify;
 mod retry;
 mod runtime;
+mod seal;
 mod session;
 mod starter;
 mod step;

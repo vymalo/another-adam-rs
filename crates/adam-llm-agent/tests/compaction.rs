@@ -9,9 +9,9 @@ use std::time::{Duration, Instant};
 
 use adam_core::{DynStore, MemoryStore, RunId, RunStatus, Store};
 use adam_llm_agent::{
-    COMPACTION_TURN, CompactionReason, Conversation, Limits, LlmAgent, LlmAgentBuilder, Plan,
-    PlanItem, PlanStatus, ReadOutput, SessionAgent, SessionTools, Tool, ToolCtx, ToolError,
-    ToolOutput, user_message,
+    COMPACTION_TURN, CompactionReason, Conversation, HookResult, HookedCompaction, Limits,
+    LlmAgent, LlmAgentBuilder, Plan, PlanItem, PlanStatus, Plugin, ReadOutput, SessionAgent,
+    SessionTools, Tool, ToolCtx, ToolError, ToolOutput, Verdict, user_message,
 };
 use adam_model::{
     DynModel, Message, MockModel, ModelClient, ModelDelta, ModelError, ModelRequest, ModelResponse,
@@ -1374,6 +1374,145 @@ async fn with_a_window_the_reported_tokens_trigger_it() {
     assert!(state.compactions.is_empty());
 }
 
+/// A round of a session with `config` in its header (ADR 0054): the first message the A2A front
+/// writes.
+fn session_message(config: Value) -> (adam_runtime::Inbound, RunId) {
+    let session = RunId::new();
+    let mut first = user_message("go");
+    first.payload["session"] = json!({
+        "id": session,
+        "agent": "llm",
+        "description": "a round",
+        "keep_open": false,
+        "round": 1,
+        "config": config,
+    });
+    (first, session)
+}
+
+impl Rig {
+    async fn start_session(&self, config: Value) -> RunId {
+        let (first, session) = session_message(config);
+        self.rt
+            .start_child_continuing(
+                session,
+                session,
+                "llm",
+                first,
+                &adam_runtime::session_conversation_id("conversation", session),
+                None,
+            )
+            .await
+            .expect("start");
+        *self.arm.run.lock().unwrap() = Some(session);
+        session
+    }
+}
+
+/// Ten turns that report a prompt of `input` tokens, and a summary when `summary`.
+fn script_reports(mock: &MockModel, input: u64, summary: bool) {
+    for n in 0..10 {
+        mock.push_response(reported(
+            ModelResponse::tool_calls(vec![big(&format!("c{n}"), 20)]),
+            input,
+        ));
+    }
+    if summary {
+        mock.push_text("SUMMARY");
+    }
+    mock.push_response(reported(ModelResponse::text("done"), input));
+}
+
+fn with_cap(b: LlmAgentBuilder) -> LlmAgentBuilder {
+    b.limits(Limits {
+        max_output_tokens: 4096,
+        max_history_tokens: 0,
+        ..Limits::default()
+    })
+}
+
+#[tokio::test]
+async fn a_sessions_context_window_starts_compaction_sooner() {
+    // The model's window is 100,000: a budget of 75,904, and 9,000 reported tokens are far under
+    // it. The session asks for 32,096, which leaves 8,000, so the same run compacts.
+    let plain = Rig::with(
+        MockModel::new().with_context_window("test-model", 100_000),
+        0,
+        with_cap,
+    );
+    script_reports(&plain.mock, 9_000, false);
+    let run = plain.start().await;
+    let (_, state) = plain.finish(run).await;
+    assert!(
+        state.compactions.is_empty(),
+        "no session: the model's window"
+    );
+
+    let sooner = Rig::with(
+        MockModel::new().with_context_window("test-model", 100_000),
+        0,
+        with_cap,
+    );
+    script_reports(&sooner.mock, 9_000, true);
+    let run = sooner.start_session(json!({"contextWindow": 32_096})).await;
+    let (_, state) = sooner.finish(run).await;
+    assert_eq!(state.compactions.len(), 1, "{:?}", state.compactions);
+}
+
+#[tokio::test]
+async fn a_sessions_context_window_is_the_minimum_with_the_models_never_instead_of_it() {
+    // The model's window leaves a budget of 2,000. A session that asks for more does not widen it.
+    let rig = Rig::with(
+        MockModel::new().with_context_window("test-model", 26_096),
+        0,
+        with_cap,
+    );
+    script_reports(&rig.mock, 2_500, true);
+    let run = rig.start_session(json!({"contextWindow": 200_000})).await;
+    let (_, state) = rig.finish(run).await;
+    assert_eq!(state.compactions.len(), 1, "the model's window still holds");
+
+    // With no window known, the session's alone is the window.
+    let none = Rig::with(MockModel::new(), 0, with_cap);
+    script_reports(&none.mock, 9_000, true);
+    let run = none.start_session(json!({"contextWindow": 32_096})).await;
+    let (_, state) = none.finish(run).await;
+    assert_eq!(state.compactions.len(), 1);
+}
+
+#[tokio::test]
+async fn a_sessions_window_that_leaves_no_budget_does_not_turn_compaction_into_a_loop_or_off() {
+    // 1,000 is below 20,000 + 4,096 + 8,000: the window is held to that floor, a budget of 8,000.
+    // A prompt of 300 tokens is under it and is not compacted (a budget of one token would
+    // compact every turn); one of 9,000 is over it and is.
+    let small = Rig::with(MockModel::new(), 0, with_cap);
+    script_reports(&small.mock, 300, false);
+    let run = small.start_session(json!({"contextWindow": 1_000})).await;
+    let (_, state) = small.finish(run).await;
+    assert!(state.compactions.is_empty(), "{:?}", state.compactions);
+
+    let big_prompt = Rig::with(MockModel::new(), 0, with_cap);
+    script_reports(&big_prompt.mock, 9_000, true);
+    let run = big_prompt
+        .start_session(json!({"contextWindow": 1_000}))
+        .await;
+    let (_, state) = big_prompt.finish(run).await;
+    assert_eq!(state.compactions.len(), 1, "compaction is not off");
+}
+
+#[tokio::test]
+async fn a_sessions_floor_follows_its_narrower_output_cap() {
+    // With a 512-token cap the floor is 28,512 and the budget 8,000 again: a window of 28,512
+    // compacts a prompt of 9,000.
+    let rig = Rig::with(MockModel::new(), 0, with_cap);
+    script_reports(&rig.mock, 9_000, true);
+    let run = rig
+        .start_session(json!({"contextWindow": 28_512, "maxOutputTokens": 512}))
+        .await;
+    let (_, state) = rig.finish(run).await;
+    assert_eq!(state.compactions.len(), 1);
+}
+
 #[tokio::test]
 async fn a_failed_summary_call_falls_back_to_recorded_shortenings() {
     let rig = Rig::new(BUDGET);
@@ -1959,6 +2098,53 @@ async fn a_shortening_leaves_the_estimate_to_start_again() {
     assert_eq!(state.last_prompt, None);
 }
 
+/// ADR 0068, slice T3a-3: a shortening changes the bytes of an old result and with them every later
+/// `prv`; the rows from the first one it changed are signed again at the commit, and the transcript
+/// the run ends with verifies at every assistant and tool row, at the position it is stored at.
+#[tokio::test]
+async fn a_shortened_transcript_is_signed_again_and_verifies() {
+    use adam_core::turn::{
+        ChainHash, ConversationHash, TurnKeys, TurnPosition, turn_signature, verify_turn,
+    };
+    let keys = <dyn TurnKeys>::ephemeral().unwrap();
+    let set = keys.key_set().await.unwrap();
+    let rig = Rig::with(MockModel::new(), BUDGET, |b| b.turn_keys(keys.clone()));
+    rig.mock
+        .push_response(reported(
+            ModelResponse::tool_calls(vec![big("c0", 3000)]),
+            100,
+        ))
+        .push_response(reported(
+            ModelResponse::tool_calls(vec![big("c1", 3000)]),
+            100,
+        ))
+        .push_text("done");
+    let run = rig.start().await;
+    let view = rig.work(run).await;
+    assert_eq!(view.status, RunStatus::Done, "{view:#?}");
+    let state = conversation(&rig.rt, &view).await;
+    assert_eq!(state.shortenings.len(), 1, "the history was shortened");
+    let stored = rig.rt.state(run).await.unwrap().unwrap();
+    let rows = stored["messages"].as_array().unwrap();
+    let cnv = ConversationHash::of(None, run);
+    let mut signed_rows = 0;
+    for (idx, row) in rows.iter().enumerate() {
+        if row["role"] == "user" {
+            assert!(turn_signature(row).is_none());
+            continue;
+        }
+        let at = TurnPosition {
+            run,
+            cnv,
+            idx: u32::try_from(idx).unwrap(),
+            prv: ChainHash::over(run, &cnv, &rows[..idx]),
+        };
+        verify_turn(&set, &at, row).unwrap_or_else(|e| panic!("row {idx} ({}): {e}", row["role"]));
+        signed_rows += 1;
+    }
+    assert!(signed_rows >= 5, "{signed_rows} assistant and tool rows");
+}
+
 // ---------------------------------------------------------------------------
 // Sessions and subagents
 // ---------------------------------------------------------------------------
@@ -2294,4 +2480,162 @@ async fn a_childs_summary_call_names_the_top_run() {
     for request in &requests {
         assert_eq!(request.run, Some(top.to_string()), "not the child {child}");
     }
+}
+
+// ---------------------------------------------------------------------------
+// compaction.before (ADR 0050, slice H9)
+// ---------------------------------------------------------------------------
+
+/// Adds a line to the summary request, and counts its calls.
+struct CompactionContext {
+    asked: Arc<AtomicUsize>,
+}
+
+impl Plugin for CompactionContext {
+    fn name(&self) -> &str {
+        "compaction-context"
+    }
+
+    fn compaction_before(&self, compaction: &mut HookedCompaction<'_>) -> HookResult {
+        self.asked.fetch_add(1, SeqCst);
+        compaction.context.push_str("THE HOOK ADDED THIS");
+        Ok(Verdict::Continue)
+    }
+}
+
+/// The summary request carries what a `compaction.before` hook adds, and the hook is asked once.
+#[tokio::test]
+async fn the_summary_request_carries_the_context_a_hook_adds() {
+    let asked = Arc::new(AtomicUsize::new(0));
+    let rig = Rig::with(MockModel::new(), BUDGET, |b| {
+        b.plugin(CompactionContext {
+            asked: asked.clone(),
+        })
+    });
+    script_one_compaction(&rig.mock, "SUMMARY: four results of x");
+    let run = rig.start().await;
+    let (requests, state) = rig.finish(run).await;
+
+    let summaries: Vec<_> = requests
+        .iter()
+        .filter(|r| r.tool_choice == ToolChoice::None)
+        .collect();
+    assert_eq!(summaries.len(), 1, "one summary");
+    assert!(
+        summaries[0]
+            .messages
+            .iter()
+            .any(|m| m.text().contains("THE HOOK ADDED THIS")),
+        "the summary request carries the added context: {:?}",
+        summaries[0].messages
+    );
+    assert_eq!(asked.load(SeqCst), 1);
+    assert_eq!(state.compactions.len(), 1);
+    assert!(
+        state
+            .summary
+            .as_deref()
+            .is_some_and(|s| s.contains("SUMMARY: four")),
+        "{:?}",
+        state.summary
+    );
+}
+
+/// A veto asks for no summary: the history is shortened instead, and the run goes on.
+struct VetoesCompaction;
+
+impl Plugin for VetoesCompaction {
+    fn name(&self) -> &str {
+        "vetoes-compaction"
+    }
+
+    fn compaction_before(&self, _compaction: &mut HookedCompaction<'_>) -> HookResult {
+        Ok(Verdict::Deny("not this history".into()))
+    }
+}
+
+#[tokio::test]
+async fn a_vetoed_compaction_shortens_the_history_instead() {
+    let rig = Rig::with(MockModel::new(), BUDGET, |b| b.plugin(VetoesCompaction));
+    rig.mock
+        .push_tool_calls(vec![big("c0", 1200)])
+        .push_tool_calls(vec![big("c1", 1200)])
+        .push_tool_calls(vec![big("c2", 1200)])
+        .push_tool_calls(vec![big("c3", 1200)])
+        .push_text("answered without a summary");
+    let run = rig.start().await;
+    let (requests, state) = rig.finish(run).await;
+
+    assert_eq!(state.compactions.len(), 0, "the summary was vetoed");
+    assert!(
+        requests.iter().all(|r| r.tool_choice != ToolChoice::None),
+        "no summary request was made"
+    );
+    assert!(state.summary.is_none());
+    assert!(
+        !state.shortenings.is_empty(),
+        "the history is shortened instead: {state:#?}"
+    );
+}
+
+/// A replay of the recorded summary asks the hook no second time.
+#[tokio::test]
+async fn a_replay_of_the_summary_asks_no_compaction_hook() {
+    let asked = Arc::new(AtomicUsize::new(0));
+    let rig = Rig::with(MockModel::new(), BUDGET, |b| {
+        b.plugin(CompactionContext {
+            asked: asked.clone(),
+        })
+    });
+    script_one_compaction(&rig.mock, "S");
+    // Calls 0 to 3 are the turns and call 4 is the summary: its step's commit is the one lost.
+    rig.lose_the_commit_after_call(4, false);
+    let run = rig.start().await;
+    let (requests, state) = rig.finish(run).await;
+
+    let summaries = requests
+        .iter()
+        .filter(|r| r.tool_choice == ToolChoice::None)
+        .count();
+    assert_eq!(summaries, 1, "the summary is not asked again");
+    assert_eq!(asked.load(SeqCst), 1, "the replay asks no hook");
+    assert_eq!(state.compactions.len(), 1);
+}
+
+/// ADR 0068, slice T3a-1: a compaction moves the kept tail to other positions behind other bytes,
+/// so its old turn signatures cannot hold; the commit signs those rows again, and the transcript
+/// the run ends with verifies at every assistant and tool row, at the position it is stored at.
+#[tokio::test]
+async fn a_compacted_transcript_is_signed_again_and_verifies_at_its_new_positions() {
+    use adam_core::turn::{
+        ChainHash, ConversationHash, TurnKeys, TurnPosition, turn_signature, verify_turn,
+    };
+    let keys = <dyn TurnKeys>::ephemeral().unwrap();
+    let set = keys.key_set().await.unwrap();
+    let rig = Rig::with(MockModel::new(), BUDGET, |b| b.turn_keys(keys.clone()));
+    script_one_compaction(&rig.mock, "SUMMARY: four results of x");
+    let run = rig.start().await;
+    let (_, state) = rig.finish(run).await;
+    assert_eq!(state.compactions.len(), 1, "the run was compacted");
+    let stored = rig.rt.state(run).await.unwrap().unwrap();
+    let rows = stored["messages"].as_array().unwrap();
+    assert_eq!(rows[0]["role"], "user", "the summary row leads");
+    assert!(rows.len() > 3);
+    let cnv = ConversationHash::of(None, run);
+    let mut signed_rows = 0;
+    for (idx, row) in rows.iter().enumerate() {
+        if row["role"] == "user" {
+            assert!(turn_signature(row).is_none());
+            continue;
+        }
+        let at = TurnPosition {
+            run,
+            cnv,
+            idx: u32::try_from(idx).unwrap(),
+            prv: ChainHash::over(run, &cnv, &rows[..idx]),
+        };
+        verify_turn(&set, &at, row).unwrap_or_else(|e| panic!("row {idx} ({}): {e}", row["role"]));
+        signed_rows += 1;
+    }
+    assert!(signed_rows >= 4, "{signed_rows} assistant and tool rows");
 }

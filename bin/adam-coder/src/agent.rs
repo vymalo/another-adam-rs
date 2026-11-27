@@ -1996,6 +1996,7 @@ mod tests {
 
     fn assistant(text: &str, calls: Vec<ToolCall>) -> Message {
         Message::Assistant {
+            extra_content: None,
             content: vec![adam_model::ContentPart::text(text)],
             tool_calls: calls,
             reasoning: None,

@@ -4,6 +4,8 @@
 network of its own ([ADR 0047](../decisions/0047-adam-rs-can-be-embedded-in-an-application.md)). To host agents in a
 server program that serves A2A, read [Embed adam](embed-adam.md) instead.
 
+The generated API of every library crate is on the site: [Rust API](../rust/adam/index.html){target="_self"}.
+
 ## What the engine is
 
 A typed Rust API over adam's runtime, on the host's tokio runtime: `Engine::builder(store, agent, model, alias)`,

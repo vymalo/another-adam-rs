@@ -101,8 +101,8 @@ pub const ACCESS_TIER_EXTENSION: &str = "https://agents.vymalo.com/a2a/extension
 /// "description", "argumentHint"?}]}`, sorted by name, and a message that activates the extension
 /// may carry `{"command": "<name>", "arguments": "<text>"}` in its metadata under this URI. The agent
 /// expands the template before the message is stored (ADR 0044, decision 9); the contract is the
-/// orchestration layer's (`docs/api/commands-v1.md` of `vymalo/another-agentic-system`, not written
-/// yet).
+/// orchestration layer's (`docs/api/commands-v1.md` of `vymalo/another-agentic-system`, published
+/// at <https://vymalo.github.io/another-agentic-system/api/commands-v1>).
 pub const COMMANDS_EXTENSION: &str = "https://agents.vymalo.com/a2a/extensions/commands/v1";
 
 /// The URI of the `child-sessions/v1` extension: the card lists the helpers a person may start a

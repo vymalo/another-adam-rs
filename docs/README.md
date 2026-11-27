@@ -12,6 +12,7 @@ These pages are for people. The procedures and evidence that coding agents use l
 
 | Page | When |
 |---|---|
+| [Get started](getting-started.md) | you want one success in minutes: the stack up and a folder agent answering over A2A |
 | [Try the agents](guides/try-the-agents.md) | you want to chat with the Assistant, give Adam a task and write your own agent, all on mocks, then on a real model |
 | [Run it locally](guides/run-locally.md) | you want the coder and the general agent running on your machine in minutes |
 
@@ -21,7 +22,11 @@ These pages are for people. The procedures and evidence that coding agents use l
 |---|---|---|
 | Use | [Write an agent](guides/write-an-agent.md) | you want an agent that is a folder of Markdown, or one with `#[tool]` functions |
 | Deploy | [Deploy the coder](guides/deploy-the-coder.md) | you are installing the image and the Helm chart on Kubernetes |
-| Operate | [Troubleshooting a local run](guides/run-locally.md#troubleshooting), [errors by class](reference/errors.md#what-each-class-decides), [the chart's known risks](guides/deploy-the-coder.md#known-risks) | something does not work, or you want to know what can go wrong |
+| Operate | [Upgrade an adam deployment](guides/upgrade-an-adam-deployment.md) | you move a running coder to a newer image: what to read, what needs your hand, what the database does |
+| Operate | [The egress proxy and the network of run pods](guides/egress-and-run-pod-network.md) | a build in a run pod cannot reach a host, or you want to let it |
+| Operate | [Read a run's state when it is stuck](guides/read-a-stuck-run.md) | a task does not finish: is it waiting, or is it stuck, and where to look in the store |
+| Operate | [Troubleshoot by error class](guides/troubleshoot-by-error-class.md) | a pod exited or a task failed: from the class of the error to what to do |
+| Operate | [Troubleshooting a local run](guides/run-locally.md#troubleshooting), [the chart's known risks](guides/deploy-the-coder.md#known-risks) | something does not work on your machine, or you want to know what can go wrong in a cluster |
 | Extend | [Embed adam](guides/embed-adam.md) | you host adam agents inside your own Rust program, a server |
 | Extend | [Embed adam in an application](guides/embed-in-an-app.md) | adam runs inside your application (a desktop or a phone), with no server and nothing on the network of its own |
 | Extend | [Store adapters](reference/store-adapters.md#adding-a-backend) | you add a database behind the `Store` trait |
@@ -31,12 +36,13 @@ These pages are for people. The procedures and evidence that coding agents use l
 | Group | Page | What it answers |
 |---|---|---|
 | API | [The A2A server](reference/a2a-server.md) | the methods, follow-ups, continuing a finished task, push notifications, `ListTasks`, the extended card and its signature, the steps, text and reasoning streams, and the A2A extensions an agent serves |
+| API | [Extensions](reference/extensions.md) | every A2A extension URI an adam card can list: when it is listed, whether it is served, and its contract on the system's site |
 | Configuration | [Environment variables](reference/environment.md) | every variable of the binaries, the compose stack and the tests |
 | Configuration | [Agent files and `#[tool]`](reference/agent-files.md) | the folder layout and formats, validation, skills, subagents, MCP, dev reload, the macro |
 | Configuration | [The chart](../deploy/coder/README.md) | every value of the coder's Helm chart |
 | Configuration | [Parity of the surfaces](reference/parity.md) | every setting and feature by surface (coder, folder agent, embedded engine, orchestrator, platform), and the gaps |
 | Errors | [Errors](reference/errors.md) | error classes, the variant-to-class tree, A2A codes and exit codes |
-| Rust API | [The crate map](architecture.md#the-crate-map) | which crate does what; each crate's README is its reference |
+| Rust API | [Rustdoc of the library crates](rust/adam/index.html){target="_self"} | the generated API of every library crate (published with the site); [the crate map](architecture.md#the-crate-map) says which crate does what, and each crate's README is its guide |
 | Behaviour | [The coder agent](reference/coder-agent.md) | its flow and states, the rules its tools enforce, how a run ends |
 | Behaviour | [Child runs and remote tasks](reference/child-runs.md) | how a subagent waits, and every failure interleaving |
 | Behaviour | [Workspace and environments](reference/workspace-and-environments.md) | placement, a run's slots, devcontainers and run pods |
@@ -47,6 +53,7 @@ These pages are for people. The procedures and evidence that coding agents use l
 
 | Page | What it answers |
 |---|---|
+| [Concepts](concepts.md) | the ideas in one screen (run, journal, lease, store, host role, agent folder, tool, A2A server) and a glossary of terms with their files |
 | [Architecture](architecture.md) | the mental model, the crate map, the ports, the path of a task, the run lifecycle, the data schema, signals, errors |
 
 ## Decisions

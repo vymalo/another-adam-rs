@@ -1,0 +1,90 @@
+name: Docs site
+
+# The documentation site (docs/.vitepress, @vaam-apps/vitepress-md3) is built on every change to docs/ and deployed to
+# GitHub Pages from main. The structure it follows is docs/.vitepress/STRUCTURE.md.
+# The rustdoc of the library crates is built here too and published under /rust/ (ANR-943): a pull request builds
+# everything and uploads the artifact (that is its proof) but never deploys; only a push to main does.
+on:
+  pull_request:
+    paths: ["docs/**", "tools/docs-check/slug.mjs", "crates/**", "bin/**", "Cargo.toml", "Cargo.lock", ".github/workflows/docs-site.yml"]
+  push:
+    branches: [main]
+    paths: ["docs/**", "tools/docs-check/slug.mjs", "crates/**", "bin/**", "Cargo.toml", "Cargo.lock", ".github/workflows/docs-site.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pages-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: docs/package-lock.json
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.98.1
+      - uses: Swatinem/rust-cache@v2
+      # Libraries only (`--lib`: no binary pages), without the testkits and the fixture agent, which no embedder
+      # reads. All features, as the `rustdoc` job of ci.yml builds them, so every feature-gated item is on the page.
+      # `-D warnings`: a broken intra-doc link fails the site build.
+      - name: Build the rustdoc of the library crates
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: |
+          start=$(date +%s)
+          cargo doc --workspace --lib --no-deps --all-features --locked \
+            --exclude '*-testkit' --exclude adam-agent-fixture
+          took=$(( $(date +%s) - start ))
+          size=$(du -sh target/doc | cut -f1)
+          echo "rustdoc: ${took}s, ${size} (target/doc)"
+          {
+            echo "### rustdoc"
+            echo "- cargo doc: ${took}s"
+            echo "- target/doc: ${size}"
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Install the pinned site dependencies
+        run: npm --prefix docs ci --no-fund --no-audit
+      - name: Build the site
+        run: npm --prefix docs run build
+      # Crawls the built pages: every internal link must reach a page of dist/ and every #fragment an id on it. Before the
+      # rustdoc is copied in below, whose links (and /rust/ hrefs) it skips; the build alone sees neither dead ids nor
+      # links that resolve to nothing on the site.
+      - name: Check the links of the built site
+        run: npm --prefix docs run check-links
+      # After the site build, which empties its output. The Pages artifact is uploaded below.
+      - name: Publish the rustdoc under /rust/
+        run: |
+          rm -f target/doc/.lock
+          mkdir -p docs/.vitepress/dist/rust
+          cp -r target/doc/. docs/.vitepress/dist/rust/
+          test -f docs/.vitepress/dist/rust/adam/index.html
+          size=$(du -sh docs/.vitepress/dist | cut -f1)
+          echo "site with rustdoc: ${size}"
+          echo "- site with /rust/: ${size} (GitHub Pages limit: unverified)" >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-pages-artifact@v4
+        with:
+          path: docs/.vitepress/dist
+
+  deploy:
+    if: github.event_name != 'pull_request'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v5

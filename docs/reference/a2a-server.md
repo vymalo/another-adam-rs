@@ -75,6 +75,13 @@ at the same URL (`PUBLIC_URL`): the REST paths are relative to it.
   pick a method in the example dropdown. Swagger UI cannot show a stream as it arrives: a streaming operation's description
   gives the `curl`. The page loads nothing from another origin and the document holds no secret.
 
+## The document, as a file
+
+[`docs/api/a2a-server.openapi.json`](../api/a2a-server.openapi.json) is the same document, committed so a site can render it
+without a running server. It is built from one fixed default card (a bearer token required; push notifications and the
+extended card off), so it changes only when the server's code does. How it is held equal to the code, and how to rewrite
+it: [the document, for agents](../../.agents/docs/reference/a2a-server.md#the-committed-document).
+
 ## Push notifications
 
 A client names a webhook for a task and is told when the task changes, without holding a stream open. **A notification
@@ -662,9 +669,10 @@ stateDiagram-v2
 
 An agent that has prompt templates ([`commands/<name>.md`](agent-files.md#commands-commandsnamemd)) lists
 `https://agents.vymalo.com/a2a/extensions/commands/v1` on its card, and **only then**: an agent with no commands
-lists no such extension. The contract page for clients, `docs/api/commands-v1.md` of `vymalo/another-agentic-system`
-([ADR 0044](../decisions/0044-paged-tools-a-stable-prompt-prefix-a-plan-skills-commands-and-project-context.md), decision 9),
-is not written yet; this is the agent's side.
+lists no such extension. The contract page for clients is
+[`commands-v1`](https://vymalo.github.io/another-agentic-system/api/commands-v1)
+([ADR 0044](../decisions/0044-paged-tools-a-stable-prompt-prefix-a-plan-skills-commands-and-project-context.md), decision 9);
+this is the agent's side.
 
 The card's `params`, sorted by `name` (`argumentHint` only when the file has one):
 

@@ -291,6 +291,17 @@ later task finds the sessions an earlier one started, and no run reaches another
 this conversation's is "no session"). At most 16 sessions that are not closed and 20 rounds per session (decision 5's
 `max_open` and `max_rounds` as constants for now).
 
+**A session's own limits** ([ADR 0054](../decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md),
+slice 1). `subagent_start` takes an optional `config` of seven options: `max_turns`, `max_tool_calls`, `max_output_tokens`,
+`context_window`, `max_parallel_tool_calls`, `time_limit` (minutes) and `max_rounds`. An option chooses within what the
+subagent's folder allows and **never widens it**: a value above its bound is refused, in words that name the option
+(`config.max_turns is 51; at most 50`), and nothing starts; an option that is not one of the seven is refused too. What was
+admitted is kept in the session's header, and the round reads its limits from it. Five of them apply at the next model call
+(`max_turns`, `max_tool_calls`, `max_output_tokens`, `context_window`, `max_parallel_tool_calls`); `time_limit` and
+`max_rounds` apply to the next round. A later round copies the config and **clamps it to the bounds of that moment**, so a
+deployment that lowered a limit is obeyed and nothing is raised back. `max_output_tokens` is never `0` (that would leave the cap
+to the model) and a `context_window` is never so small that no history fits: it is held to the least that leaves room.
+
 ```mermaid
 sequenceDiagram
     autonumber

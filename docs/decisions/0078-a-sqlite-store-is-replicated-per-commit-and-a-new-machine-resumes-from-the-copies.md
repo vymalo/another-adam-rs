@@ -1,4 +1,4 @@
-# 0072. An agent's SQLite store is replicated per commit, and a new machine resumes a run from the copies
+# 0078. An agent's SQLite store is replicated per commit, and a new machine resumes a run from the copies
 
 Status: **proposed (2026-11-25)**, task ANR-272, epic ANR-13 (ROADMAP M11, fourth gap: "An embedded SQLite per agent,
 replicated on every commit"). **Nothing is built.** Every name and shape below is the design's, for the owner to confirm

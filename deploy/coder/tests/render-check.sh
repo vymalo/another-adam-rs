@@ -1700,7 +1700,7 @@ check "proxy: ... the node selector ..." dhas Deployment 'pool: infra'
 check "proxy: ... and the tolerations" dhas Deployment 'key: infra'
 
 # The allow-list (ADR 0042): the default hosts, once each, lower case, and nothing broad.
-allow_file() { rdoc ConfigMap coder-egress-allow | awk '/^  allow.txt: \|$/ { on = 1; next } on { sub(/^    /, ""); print }'; }
+allow_file() { rdoc ConfigMap coder-egress-allow | awk '/^  allow.txt: \|$/ { on = 1; next } on { sub(/^    /, ""); print }' | grep -v '^$'; }
 allows() { allow_file | grep -Fxq -- "$1"; }
 odd_entries() { allow_file | grep -v '^#' | grep -Ev '^[a-z0-9][a-z0-9.-]*[a-z0-9]$'; }
 helm_rp > "$out"
@@ -1799,10 +1799,10 @@ check "... the error says why" says "$message" 'disableAcknowledged'
 helm_rp --set runPods.admissionPolicy.enabled=false --set runPods.admissionPolicy.disableAcknowledged=true > "$out"
 check "acknowledged: no admission policy is rendered" lacks '^kind: ValidatingAdmissionPolicy'
 check "acknowledged: the rest is" has '^kind: ResourceQuota$'
-message=$(helm_rp --kube-version 1.29.0 2>&1 || true)
-check "refused: Kubernetes before 1.30 (no ValidatingAdmissionPolicy)" fails helm_rp --kube-version 1.29.0
-check "... the error names 1.30" says "$message" '1.30'
-check "Kubernetes 1.30 is enough" helm_rp --kube-version 1.30.0
+message=$(helm_rp --kube-version 1.36.0 2>&1 || true)
+check "refused: Kubernetes before 1.37 (the chart's floor, ADR 0080)" fails helm_rp --kube-version 1.36.0
+check "... the error names 1.37" says "$message" '1.37'
+check "Kubernetes 1.37 is enough" helm_rp --kube-version 1.37.0
 message=$(helm_rp --set replicaCount=2 2>&1 || true)
 check "refused: two workers on per-pod ReadWriteOnce volumes" fails helm_rp --set replicaCount=2
 check "... the error says a run pod mounts one claim" says "$message" 'mounts one claim'
@@ -2221,5 +2221,35 @@ check "maxWorking above maxOpen is refused" fails helm template coder "$chart" -
 check "a language_servers value that is not on or off is refused" fails helm template coder "$chart" --set image.tag=sha-abc1234 --set config.languageServers=maybe
 check "a setting beside its extraEnv variable is refused" fails helm template coder "$chart" --set image.tag=sha-abc1234 --set config.languageServers=on --set config.extraEnv.LANGUAGE_SERVERS=on
 check "a reference with no description is refused" fails helm template coder "$chart" --set image.tag=sha-abc1234 --set 'config.references[0].name=x' --set 'config.references[0].url=u'
+
+# The turn key (adam ADR 0068): from the ExternalSecret only, mounted as a file, in every role.
+helm template coder "$chart" --namespace coder-ns --set image.tag=sha-abc1234 > "$out"
+check "by default no turn key is rendered" lacks 'TURN_SIGNING|TURN_VERIFY|turn-signing'
+helm template coder "$chart" --namespace coder-ns --set image.tag=sha-abc1234 \
+  --set externalSecrets.properties.turnSigningKey=turn_signing_key > "$out"
+check "the ExternalSecret copies the key as a file, not a variable" \
+  dhas ExternalSecret 'secretKey: TURN_SIGNING_KEY.pem'
+check "... and the StatefulSet names the mounted file" \
+  dhas StatefulSet 'name: TURN_SIGNING_KEY_FILE'
+check "... at the mounted directory" dhas StatefulSet 'value: "/var/run/secrets/turn-signing/private-key.pem"'
+check "... with the Secret mounted read-only" dhas StatefulSet 'mountPath: /var/run/secrets/turn-signing'
+check "... and no verify set when its property is empty" lacks 'TURN_VERIFY_KEYS'
+check "the chart renders no Secret of its own for it" dlacks Secret 'TURN_SIGNING_KEY'
+helm template coder "$chart" --namespace coder-ns --set image.tag=sha-abc1234 \
+  --set externalSecrets.properties.turnSigningKey=turn_signing_key --set turnSigning.keyId='vault:adam#v2' \
+  --set externalSecrets.properties.turnVerifyKeys=turn_verify_keys > "$out"
+check "a key id becomes TURN_SIGNING_KEY_ID" dhas StatefulSet 'name: TURN_SIGNING_KEY_ID'
+check "a verify set becomes TURN_VERIFY_KEYS_FILE" dhas StatefulSet 'name: TURN_VERIFY_KEYS_FILE'
+check "... copied by the ExternalSecret" dhas ExternalSecret 'secretKey: TURN_VERIFY_KEYS.json'
+helm template coder "$chart" --namespace coder-ns --set image.tag=sha-abc1234 --set topology=split \
+  --set externalSecrets.properties.turnSigningKey=turn_signing_key > "$out"
+check "split: the front gets the turn key too" dhas Deployment 'name: TURN_SIGNING_KEY_FILE'
+check "... and so does the worker" dhas StatefulSet 'name: TURN_SIGNING_KEY_FILE'
+check "a turn key without the ExternalSecret is refused" \
+  fails helm template coder "$chart" --set image.tag=sha-abc1234 --set externalSecrets.enabled=false --set externalSecrets.properties.turnSigningKey=k
+check "a key id without a key is refused" \
+  fails helm template coder "$chart" --set image.tag=sha-abc1234 --set turnSigning.keyId=vault:adam#v2
+check "a verify set without a key is refused" \
+  fails helm template coder "$chart" --set image.tag=sha-abc1234 --set externalSecrets.properties.turnVerifyKeys=k
 
 if [ "$fail" -eq 0 ]; then echo "render checks passed"; else echo "render checks FAILED"; exit 1; fi

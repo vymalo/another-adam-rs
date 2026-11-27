@@ -195,6 +195,7 @@ pub(crate) fn message_chars(m: &Message) -> usize {
             tool_calls,
             reasoning,
             provider,
+            ..
         } => {
             // The reasoning a client echoes is sent, so it counts; so do the carrier's opaque
             // members, a call's own, and a raw reasoning block (all sent with the request).
@@ -346,29 +347,41 @@ fn estimate_tokens(messages: &[Message]) -> usize {
 /// shortens the same way. `counted` is only how the count is made cheaper ([`Chars`]): it carries
 /// the characters of the messages already counted, so only those appended since are walked, and it
 /// is left exact for the next turn.
+#[cfg(test)]
 pub(crate) fn record_shortenings(
     messages: &mut [Message],
     max_tokens: u32,
     output_id_of: &dyn Fn(&str) -> Option<String>,
     counted: &mut Chars,
 ) -> bool {
+    record_shortenings_from(messages, max_tokens, output_id_of, counted).is_some()
+}
+
+/// [`record_shortenings`], giving the position of the first message it changed (`None`: none). A
+/// signed message at or after it no longer holds its signature ([`crate::signing::unsign_from`]).
+pub(crate) fn record_shortenings_from(
+    messages: &mut [Message],
+    max_tokens: u32,
+    output_id_of: &dyn Fn(&str) -> Option<String>,
+    counted: &mut Chars,
+) -> Option<usize> {
     if max_tokens == 0 {
-        return false;
+        return None;
     }
     let budget = usize::try_from(max_tokens)
         .unwrap_or(usize::MAX)
         .saturating_mul(4);
     let mut total = counted.total(messages);
     if total <= budget {
-        return false;
+        return None;
     }
     let target = budget - budget / 4;
     let protected_from = messages
         .iter()
         .rposition(|m| matches!(m, Message::Assistant { .. }))
         .map_or(0, |i| i + 1);
-    let mut shortened_any = false;
-    for m in &mut messages[..protected_from] {
+    let mut first_changed: Option<usize> = None;
+    for (at, m) in messages[..protected_from].iter_mut().enumerate() {
         if total <= target {
             break;
         }
@@ -397,19 +410,19 @@ pub(crate) fn record_shortenings(
             if let Some(shortened) = shorten_output(content, total - target, id.as_deref()) {
                 total = total - len + shortened.chars().count();
                 *content = shortened;
-                shortened_any = true;
+                first_changed.get_or_insert(at);
             }
         }
         if let Some(added) = removal {
             images.clear();
             content.push('\n');
             content.push_str(&added);
-            shortened_any = true;
+            first_changed.get_or_insert(at);
         }
     }
     counted.chars = total;
     counted.len = messages.len();
-    shortened_any
+    first_changed
 }
 
 #[cfg(test)]
@@ -438,6 +451,7 @@ mod tests {
 
     fn call(id: &str) -> Message {
         Message::Assistant {
+            extra_content: None,
             content: vec![],
             tool_calls: vec![ToolCall {
                 id: id.into(),
@@ -565,6 +579,7 @@ mod tests {
     /// count pays for once per historical call.
     fn big_call(n: usize) -> Message {
         Message::Assistant {
+            extra_content: None,
             content: vec![],
             tool_calls: vec![ToolCall {
                 id: format!("c{n}"),
@@ -675,6 +690,7 @@ mod tests {
     #[test]
     fn the_carrier_counts_toward_the_estimate() {
         let plain = Message::Assistant {
+            extra_content: None,
             content: vec![],
             tool_calls: vec![ToolCall::new("c", "t", json!({}))],
             reasoning: None,
@@ -913,6 +929,7 @@ mod tests {
                 text.prop_map(Message::user_text),
                 text.prop_map(Message::assistant_text),
                 ("[a-z]{1,3}", 0usize..3, text).prop_map(|(id, n, args)| Message::Assistant {
+                    extra_content: None,
                     content: vec![],
                     tool_calls: (0..n)
                         .map(|i| ToolCall {
@@ -1068,5 +1085,49 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The position of the first message a shortening changed is given, for the signatures after
+    /// it to be dropped (ADR 0068), and none when nothing was shortened.
+    #[test]
+    fn the_first_changed_message_is_reported() {
+        let tool = |id: &str, n: usize| Message::Tool {
+            call_id: id.into(),
+            content: "x".repeat(n),
+            is_error: false,
+            images: Vec::new(),
+            extra_content: None,
+        };
+        let assistant = |id: &str| Message::Assistant {
+            content: Vec::new(),
+            tool_calls: vec![ToolCall {
+                id: id.into(),
+                name: "t".into(),
+                arguments: json!({}),
+                ..Default::default()
+            }],
+            reasoning: None,
+            provider: None,
+            extra_content: None,
+        };
+        let mut messages = vec![
+            Message::user_text("go"),
+            assistant("a"),
+            tool("a", 100),
+            assistant("b"),
+            tool("b", 20_000),
+            assistant("c"),
+        ];
+        let before = messages.clone();
+        assert_eq!(
+            record_shortenings_from(&mut messages, 100_000, &no_ids, &mut Chars::default()),
+            None
+        );
+        assert_eq!(messages, before);
+        let first = record_shortenings_from(&mut messages, 1_000, &no_ids, &mut Chars::default())
+            .expect("shortened");
+        assert!(first >= 2, "{first}");
+        assert_eq!(messages[..first], before[..first]);
+        assert_ne!(messages[first], before[first]);
     }
 }

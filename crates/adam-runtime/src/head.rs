@@ -24,6 +24,7 @@ use crate::envelope::{Envelope, VERSION as FULL_VERSION};
 use crate::events::{Artifact, ArtifactFile};
 use crate::retry::RetryRecord;
 use crate::runtime::RuntimeError;
+use crate::seal::Seal;
 
 /// The head's layout version. A run's `state` is `1` (the v4 envelope) or this.
 pub(crate) const VERSION: u32 = 5;
@@ -128,6 +129,16 @@ pub(crate) struct Head {
     pub hb: bool,
     /// The transcript set this head names.
     pub body: BodyRef,
+    /// The runtime's signature of this head ([ADR 0068] decision 4, `crate::seal`); absent without
+    /// turn keys. It is not a member of what it signs.
+    ///
+    /// [ADR 0068]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0068-adam-signs-its-own-history.md
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<String>,
+    /// The `{len, chain}` of the rows this head names, so that a writer that leaves them alone signs
+    /// again without reading them. Written beside `signature`; a reader recomputes it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seal: Option<Seal>,
 }
 
 impl Head {
@@ -171,6 +182,8 @@ impl Head {
                 generation: None,
                 len,
             },
+            signature: None,
+            seal: None,
         }
     }
 
@@ -231,9 +244,14 @@ impl Head {
             agent_wake,
             hb,
             body,
+            seal,
             ..
         } = self;
-        let parts = HeadParts { artifacts, body };
+        let parts = HeadParts {
+            artifacts,
+            body,
+            seal,
+        };
         let env = Envelope {
             v: FULL_VERSION,
             agent,
@@ -250,6 +268,7 @@ impl Head {
             remaining_secs,
             agent_wake,
             hb,
+            signature: None,
         };
         (env, parts)
     }
@@ -264,6 +283,8 @@ impl Head {
 pub(crate) struct HeadParts {
     /// The head's artifacts, in order.
     pub artifacts: Vec<HeadArtifact>,
+    /// The `{len, chain}` the head carried: what a commit that leaves the rows alone signs again.
+    pub seal: Option<Seal>,
     /// The generation and the prefix of it the head names.
     pub body: BodyRef,
 }
@@ -287,6 +308,7 @@ impl HeadParts {
         Ok(Self {
             artifacts,
             body: self.body,
+            seal: self.seal.clone(),
         })
     }
 
@@ -315,6 +337,9 @@ impl HeadParts {
             agent_wake: env.agent_wake,
             hb: env.hb,
             body: self.body,
+            // A commit signs what it writes (`worker::seal_update`); the base's are not carried.
+            signature: None,
+            seal: None,
         }
     }
 }
@@ -518,6 +543,18 @@ impl Stored {
         match self {
             Self::Full(envelope) => &mut envelope.error,
             Self::Head(head) => &mut head.error,
+        }
+    }
+
+    /// Set the signature (and a head's seal) of the document: what a writer that changed the inbox,
+    /// the error or the artifacts puts back after signing, or `None` to leave it unsigned.
+    pub(crate) fn set_signature(&mut self, signature: Option<String>, seal: Option<Seal>) {
+        match self {
+            Self::Full(envelope) => envelope.signature = signature,
+            Self::Head(head) => {
+                head.signature = signature;
+                head.seal = seal;
+            }
         }
     }
 

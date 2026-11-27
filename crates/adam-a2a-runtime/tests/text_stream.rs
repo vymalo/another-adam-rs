@@ -322,6 +322,7 @@ async fn the_words_before_a_tool_call_are_stated_as_a_working_status_with_the_st
     }
     let first = ModelResponse {
         message: ModelMessage::Assistant {
+            extra_content: None,
             content: vec![ContentPart::text("Let me look.")],
             tool_calls: vec![ToolCall {
                 id: "c1".into(),

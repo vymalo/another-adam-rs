@@ -60,6 +60,8 @@ removed the container engine this chart never turned on; a deployment that still
 | `A2A_BEARER_TOKENS` | `adam_coder_a2a_bearer_tokens` (comma-separated) | roles that serve A2A (`all`, `control-plane`): the front with `topology: split`, not the worker |
 | `SEARCH_MCP_TOKEN` | `search_mcp_token` (`externalSecrets.properties.searchMcpToken`) | roles that run workers, only with `mcp.websearch.url` set, see [Extra MCP servers](#extra-mcp-servers-web-search-and-context7) |
 | `CONTEXT7_API_KEY` | `context7_api_key` (`externalSecrets.properties.context7ApiKey`) | roles that run workers, only with `mcp.context7.enabled`, same section |
+| `TURN_SIGNING_KEY_FILE` | `turn_signing_key` (`externalSecrets.properties.turnSigningKey`) | **every role**: the key is mounted as a file, not a variable, see [The turn key](#the-turn-key) |
+| `TURN_VERIFY_KEYS_FILE` | `turn_verify_keys` (`externalSecrets.properties.turnVerifyKeys`) | every role, only with the turn key and a verify set, same section |
 
 `MODEL_BASE_URL` is a secret only by choice: the default is a literal from `config.modelBaseUrl`. With `config.role=control-plane` the chart renders neither `MODEL_API_KEY` nor `GITHUB_TOKEN`,
 in the pod or in the `ExternalSecret`, and `externalSecrets.properties.modelApiKey` and
@@ -68,6 +70,42 @@ without them fails (`githubToken` only with `github.auth: token`; see [GitHub](#
 
 The orchestrator holds one of the bearer tokens (its agent list names the
 environment variable it reads it from).
+
+## The turn key
+
+adam signs a run's history with an Ed25519 turn key ([ADR 0068](../../docs/decisions/0068-adam-signs-its-own-history.md)).
+The chart never carries the key: it copies it from the AWS secret through its `ExternalSecret` and mounts it as a
+file, because `TURN_SIGNING_KEY_FILE` names a path, not a value.
+
+```yaml
+externalSecrets:
+  key: prod/another-agentic/env
+  properties:
+    turnSigningKey: turn_signing_key     # a PKCS#8 PEM Ed25519 private key
+    turnVerifyKeys: turn_verify_keys     # optional: a JWKS of earlier public keys, with `revoked`
+turnSigning:
+  keyId: "vault:adam#v1"                 # optional: the key's vault reference
+```
+
+| What | Where |
+|---|---|
+| The key | `TURN_SIGNING_KEY.pem` in the `ExternalSecret`'s Secret, mounted at `/var/run/secrets/turn-signing/private-key.pem` (mode `0440`) |
+| The key's id | `TURN_SIGNING_KEY_ID` (`turnSigning.keyId`); empty is the key's RFC 7638 thumbprint |
+| The verify set | `TURN_VERIFY_KEYS.json`, mounted beside the key and named by `TURN_VERIFY_KEYS_FILE`; only when `externalSecrets.properties.turnVerifyKeys` is set |
+
+Every role reads it, the control plane included (a `control-plane` renders the mount too, unlike the model key).
+Generate a key with `openssl genpkey -algorithm ed25519`, and put its PEM in the AWS property as it is, newlines
+included. With `externalSecrets.enabled: false` the property is refused at render: a key has nowhere else to come
+from.
+
+A rotation is a rollout of every role: the key and the set are read at startup, and a worker that has not
+restarted would go on signing with the old key. During the overlap the set holds both public keys. A `keyId` of
+`vault:<name>#v<n>` with `n` above 1 needs the set to name every earlier version, `1` to `n-1`, as a key or as
+revoked, or the process refuses to start.
+
+**Status.** The binary still treats the key as optional (no key: no signature), so a deployment that has not set
+the property starts as before. The chart is the half that ships first: provision `turn_signing_key` now, then the
+requiredness lands (ADR 0068 slice T2).
 
 ## The model gateway's URL from the secret
 
@@ -465,9 +503,9 @@ githubMcp:
   resources: { requests: { cpu: 50m, memory: 64Mi }, limits: { memory: 256Mi } }
 ```
 
-* **Kubernetes 1.29 or later** (native sidecars are beta and on by default from 1.29 and GA in 1.33: *unverified*, from
-  memory; `tests` render for 1.31 in kubeconform). A cluster without them would treat `restartPolicy` on an init
-  container as an error, or run it as a one-shot init container that never finishes.
+* **Kubernetes 1.37 or later**, the chart's floor ([ADR 0080](../../docs/decisions/0080-helm-4-and-kubernetes-1-37-a-hard-cutover.md)):
+  `kubeVersion` in `Chart.yaml`, `helm template --kube-version 1.36.0` fails, and CI validates the renders with
+  kubeconform against 1.37.0. Native sidecars (an init container with `restartPolicy: Always`) are GA since 1.33.
 * `MCP_ALLOW_STDIO` stays on the roles that run workers for one release, for a consumer whose vendored agent folder
   still starts `github-mcp-server stdio` as a child process. The embedded files no longer do.
 * `githubMcp.port` outside 1 to 65535 fails the render. A control plane renders none of it.
@@ -783,7 +821,7 @@ What it renders, and why each is there:
 | `ConfigMap` `<release>-coder-run-pod` | the pod every run pod is made from (`pod.yaml`), mounted in the coder pod at `/etc/adam/run-pod` and named by `RUN_POD_TEMPLATE_FILE`: the workspace image by tag **and digest**, `requests: {cpu: 250m, memory: 512Mi}`, `limits: {memory: 2Gi}`, `CARGO_BUILD_JOBS=2`, uid 10001 non-root with no escalation and every capability dropped, no service account token, no model key and no Secret reference (ADR 0038), the coder's workspace claim at `/work` **whole, which the coder replaces by the run's own mounts** ([below](#what-a-run-pod-sees)), and an init container that copies `adam-exec`, alone, out of the coder's image into a read-only `emptyDir` at `/opt/adam/bin`. The coder adds the name, labels and annotations and narrows the `/work` mount; it refuses to start when the run container does not mount a volume at its `WORKSPACE_ROOT` once and whole; a changed template is a deploy (a checksum annotation) |
 | `PriorityClass` `<release>-run`, `ResourceQuota` | the class is value 0 with `preemptionPolicy: Never` and exists to be **scoped by**: a quota cannot select pods by label, only by priority class. The quota (`limits.memory: 8Gi`, `pods: 4`) counts the run pods and nothing else; a pod beyond it is refused (403 `exceeded quota`) and the coder waits for a slot (`runPods.waitSecs`, refused below `runPods.idleSecs + 62`). `runPods.priorityClassName` names a class you manage instead (then none is rendered) |
 | `ServiceAccount`, `Role`, `RoleBinding` | the coder pod's own ServiceAccount (its token is a projected volume mounted in the coder container alone: the pod automounts none, so neither the git sandbox nor the GitHub MCP sidecar has it; the front of `topology: split` and every run pod mount none) may `create`, `delete`, `get`, `list` and `watch` pods and `create` and `get` `pods/exec` (kube's exec is a WebSocket, which the API server authorizes as a GET: *unverified*, from memory), and nothing else: no Secret, no ConfigMap. `runPods.serviceAccount.name` names one you manage |
-| `ValidatingAdmissionPolicy` and its binding | **the guard that lets the coder make pods without being able to read the namespace's other Secrets.** Matched to pods created by that ServiceAccount, in this namespace, it denies a pod that lacks the run labels or the priority class, uses an image other than `runPods.image`, the tools image and `admissionPolicy.extraAllowedImages` (**or, for the `run` container alone, an image that starts with a prefix of `runPods.repositoryImages.allowedPrefixes`**: the init containers keep the exact list), has a volume other than an `emptyDir`, the work claim and the [cache](#the-package-cache) claim when it is on (so no `hostPath`, and **no Secret volume**), references **any Secret a container can read** (a `secretKeyRef`, or a Secret by `envFrom`: since ADR 0038 a run pod reads none, so the policy no longer names the ExternalSecret's Secret or a key), names a pull secret the chart did not render (`imagePullSecrets` of the values, none by default; a ServiceAccount you name with `runPods.serviceAccount.name` must carry no pull secret that is not in that value, because the cluster adds a ServiceAccount's pull secrets to the pod before the policy looks), is privileged or may escalate, may run as root (a `runAsUser` other than 0 and `runAsNonRoot` are required explicitly), uses the host's network, PID or IPC namespace, or does not set `automountServiceAccountToken: false`. `failurePolicy: Fail`. Without it the RBAC alone would let the coder make any pod in its namespace, so **the chart refuses to turn it off** unless `admissionPolicy.disableAcknowledged: true`, and it refuses a cluster older than 1.30 |
+| `ValidatingAdmissionPolicy` and its binding | **the guard that lets the coder make pods without being able to read the namespace's other Secrets.** Matched to pods created by that ServiceAccount, in this namespace, it denies a pod that lacks the run labels or the priority class, uses an image other than `runPods.image`, the tools image and `admissionPolicy.extraAllowedImages` (**or, for the `run` container alone, an image that starts with a prefix of `runPods.repositoryImages.allowedPrefixes`**: the init containers keep the exact list), has a volume other than an `emptyDir`, the work claim and the [cache](#the-package-cache) claim when it is on (so no `hostPath`, and **no Secret volume**), references **any Secret a container can read** (a `secretKeyRef`, or a Secret by `envFrom`: since ADR 0038 a run pod reads none, so the policy no longer names the ExternalSecret's Secret or a key), names a pull secret the chart did not render (`imagePullSecrets` of the values, none by default; a ServiceAccount you name with `runPods.serviceAccount.name` must carry no pull secret that is not in that value, because the cluster adds a ServiceAccount's pull secrets to the pod before the policy looks), is privileged or may escalate, may run as root (a `runAsUser` other than 0 and `runAsNonRoot` are required explicitly), uses the host's network, PID or IPC namespace, or does not set `automountServiceAccountToken: false`. `failurePolicy: Fail`. Without it the RBAC alone would let the coder make any pod in its namespace, so **the chart refuses to turn it off** unless `admissionPolicy.disableAcknowledged: true`, and the chart's `kubeVersion` refuses a cluster older than 1.37 (ADR 0080) |
 | `NetworkPolicy` `<release>-coder-run-pods` | **deny by default** ([ADR 0042](../../docs/decisions/0042-run-pods-reach-the-internet-through-an-egress-proxy.md)): no ingress; egress to DNS, to the egress proxy's pods on TCP 3128 and to `networkPolicy.extraEgress` (an in-cluster target such as a model gateway), and nothing else. There is no rule for the internet and no value that adds one: `networkPolicy.enabled: false` is refused. No rule names an IPv6 range, so IPv6 egress is denied |
 | a `git-sandbox` container in the coder pod, and a projected token volume | **the git sandbox**, where the coder's local git runs because a repository's configuration can name a program: [below](#the-git-sandbox) |
 | `Deployment`, `Service`, `ServiceAccount`, `ConfigMap`, `PodDisruptionBudget`, `NetworkPolicy` `<release>-coder-egress` | **the egress proxy**, the one way out of a run pod: [below](#the-egress-proxy) |
@@ -840,7 +878,7 @@ cache](#the-package-cache) is writable by every run; a run pod holds no model ke
 objects to a `kind` cluster and runs the environment against it as the coder's ServiceAccount (`tests/kind-run-pods.sh`): a pod from the template, commands
 in it, a kill, the idle sweep, the policy refusing nineteen changes to the pod, the quota refusing the fifth, and a run pod that sees only its own run on a volume the script
 seeds with two runs of one mirror, and whose slot it cannot rename, remove or replace (*verified 2026-10-27*: run 40456829784, job 122032008830), and, new with the egress proxy, the network policies: [below](#the-egress-proxy). `tests/git-in-run-pod.sh` runs real git in the pod's mounts (including the read-only `HEAD`, `commondir`, `gitdir` and `logs`: it writes, renames, replaces and removes them as the pod's uid, and the slots as mounts of their own: it renames, removes and exchanges them and gets `EBUSY`) as bind mounts in a private mount
-namespace (needs root; CI runs it before the kind job). It does not run the coder over a model. **Unverified on the cluster:** its Kubernetes version (1.30 or later), Longhorn
+namespace (needs root; CI runs it before the kind job). It does not run the coder over a model. **Unverified on the cluster:** its Kubernetes version (1.37 or later, ADR 0080), Longhorn
 sharing a `ReadWriteOnce` volume on one node, the pod and service CIDRs, that its CNI enforces NetworkPolicy (kind's, kindnet, does, and the job fails when it does not), and the HTTP status of an admission refusal (the
 coder treats 403, 422 and 400 as the deployment's mistake).
 
@@ -886,7 +924,7 @@ flowchart LR
 
 * **A native sidecar** (an init container with `restartPolicy: Always`, the first of them): it starts before the coder after a startup probe that runs `adam-git --version`
   through the relay in the work volume's root, so the coder never starts to a sandbox that does not answer, and it stops after the coder, so a step the coder finishes on SIGTERM
-  still finds it. A liveness probe asks the same every 30 s (six failures restart it: a sandbox saturated by hung commands is restarted, which kills them). Kubernetes 1.29 or later, as for
+  still finds it. A liveness probe asks the same every 30 s (six failures restart it: a sandbox saturated by hung commands is restarted, which kills them). Kubernetes 1.37 or later (the chart's floor), as for
   the GitHub MCP sidecar.
 * **Which commands go where** is the coder's ([`adam-workspace`](../../crates/adam-workspace/README.md#where-git-runs-the-git-sandbox)): everything that carries no credential goes to
   the sandbox, and a sandbox that cannot be reached is an error and never a fallback; `fetch`, `push` and `ls-remote` stay in the coder, on the bare mirror, after the mirror's
@@ -952,7 +990,7 @@ its own credential for an allowed registry or for GitHub and publish a repositor
 name server the attacker runs; the coder's own egress and that of agent folders (the chart's own `NetworkPolicy` is still ingress only).
 
 **Checked by** `tests/render-check.sh` (the three policies, the template's variables, `extraAllow` in the ConfigMap, the refusals, nothing of it with run pods off) and the `run-pods` job
-(`tests/kind-run-pods.sh`, on `kindest/node:v1.35.8`, whose kindnet enforces `NetworkPolicy`): a direct connection from a run pod to a public address, to the API server and to another pod's IP
+(`tests/kind-run-pods.sh`, on `kindest/node:v1.37.0`, whose kindnet enforces `NetworkPolicy`): a direct connection from a run pod to a public address, to the API server and to another pod's IP
 is refused after a control that the proxy's own pod reaches the public address, while DNS works; `curl` and `npm view` through the proxy succeed; `example.com` is answered 403 and the log has
 the refusal and nothing of a `Proxy-Authorization` header or a query sent to it; no policy names an IPv6 range. The script **fails** where a policy is not enforced
 (`ADAM_TEST_CNI_MAY_IGNORE_POLICIES=1` says a cluster is known not to), and retries a refusal for 60 s. *Unverified* until CI has run it.
@@ -1022,8 +1060,8 @@ that the pods can write to it, and a hit across two pods.
 * The CNPG `Cluster` fields and the `<cluster>-app` Secret with a `uri` key are
   from the CloudNativePG documentation; not yet checked against the installed
   operator version on the cluster.
-* Rendered with Helm v3.19.0 (`helm lint`, `helm template`); not applied to a
-  cluster and not validated against the CRD schemas.
+* Rendered with Helm v4.3.2 (`helm lint`, `helm template`, `tests/render-check.sh`); kubeconform checks the core
+  kinds and the two CRDs in CI; not applied to a cluster.
 * The git sandbox ([above](#the-git-sandbox)): the render's guarantees are asserted by `tests/render-check.sh`; that the sandbox container of a pod made from
   this chart has no token, no Secret and no view of the coder's processes, and runs the program a repository's configuration names without exposing a
   canary, is what `tests/kind-run-pods.sh` shows and is *unverified* until the `run-pods` job has run it (its assertions were walked on one machine with

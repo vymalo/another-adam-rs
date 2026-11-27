@@ -792,6 +792,8 @@ impl BoundDef {
     ///   when it names none, which leaves it to the model: ADR 0064), else the loop's defaults.
     /// * `context_window` is `None`: the window is a fact of the model alias (ADR 0054 decision
     ///   11), which the assembly does not have here, and `admit` applies only its floor.
+    ///   So **`admit` never enforces the model-window ceiling**: it is enforced at run time, by
+    ///   `effective_window` in `adam-llm-agent`, which takes the minimum with the model's window.
     /// * `max_parallel_tool_calls` is the deployment's `MAX_PARALLEL_TOOL_CALLS` lowered by the
     ///   folder's [`limits.max_parallel`](adam_agent_fs::Limits), which may never raise it: a folder
     ///   above the deployment's is clamped to it ([`Self::parallel_of`], ADR 0049, ADR 0054

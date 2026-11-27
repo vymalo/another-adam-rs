@@ -128,8 +128,9 @@ https://github.com/vymalo/another-adam-rs/blob/main/deploy/coder/README.md.
      chart renders the pod template (a ConfigMap; image, resources and volumes are values), a `PriorityClass` and a
      `ResourceQuota` scoped to it (a quota cannot select pods by label), a ServiceAccount with a Role for `pods` and
      `pods/exec`, a `ValidatingAdmissionPolicy` that refuses every pod of that ServiceAccount but the intended one,
-     and a `NetworkPolicy`; the coder pod gets a 1Gi limit (`runPods.coderResources`). It needs Kubernetes 1.30+
-     (no ExternalSecret: a run pod reads no Secret, ADR 0038), and refuses `replicaCount` above 1 on per-pod `ReadWriteOnce` volumes and a policy
+     and a `NetworkPolicy`; the coder pod gets a 1Gi limit (`runPods.coderResources`). It needs the chart's floor,
+     Kubernetes 1.37+ (ADR 0080). A run pod reads no Secret, so it needs no ExternalSecret (ADR 0038); the chart
+     refuses `replicaCount` above 1 on per-pod `ReadWriteOnce` volumes and a policy
      switched off without `runPods.admissionPolicy.disableAcknowledged`. The image ships `adam-kube-exec` and
      `/opt/adam/bin/adam-exec` for the pod's init container (no `opencode`, ADR 0038) (chart README, "Run pods").
      A repository may bring its own `devcontainer.json`: with `runPods.repositoryImages.allowedPrefixes` (empty by
@@ -139,7 +140,10 @@ https://github.com/vymalo/another-adam-rs/blob/main/deploy/coder/README.md.
    `deploy/coder/templates/_validate.tpl`; the default render is pinned by
    `deploy/coder/tests/golden/combined.yaml`; `deploy/coder/tests/render-check.sh` asserts the
    guarantees on the render. A new CRD kind needs its schema in `deploy/coder/tests/schemas`
-   (kubeconform has no `-ignore-missing-schemas`).
+   (kubeconform has no `-ignore-missing-schemas`). The chart is **Helm 4 only** (v4.3.2 in CI, ADR 0080) and its
+   `kubeVersion` floor is **Kubernetes 1.37**: `helm template --kube-version 1.36.0` fails. Helm 4 installs with
+   server-side apply, `--wait` is the kstatus watcher (`--wait=legacy` for the old behaviour) and `--atomic` is
+   deprecated for `--rollback-on-failure`.
 6. **Deploy a folder agent from the same image**: run the image with the entrypoint
    `tini -- adam-agent`, the folder mounted at `ADAM_AGENT_DIR`, readable by uid 10001
    (`adam-agent-folder`). The chart deploys the coder only. For a folder agent use an `AgentService`

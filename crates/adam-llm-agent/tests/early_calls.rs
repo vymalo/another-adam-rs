@@ -141,6 +141,7 @@ fn call(id: &str, name: &str, args: Value) -> ToolCall {
 fn asks(calls: Vec<ToolCall>, words: &str) -> ModelResponse {
     ModelResponse {
         message: Message::Assistant {
+            extra_content: None,
             content: if words.is_empty() {
                 Vec::new()
             } else {

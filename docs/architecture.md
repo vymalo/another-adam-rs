@@ -871,6 +871,33 @@ compaction is the first of a new prefix, and `Conversation::compactions` lists t
 `shortenings`; `tests/prefix.rs` holds the rule. Rolling back to a build without compaction turns a run that
 has compacted into a `NonDeterminism` error.
 
+### Signed turns: each assistant and tool turn is signed when it is committed
+
+An `LlmAgent` given turn keys signs every assistant message and tool result in the step that commits it
+([ADR 0068](decisions/0068-adam-signs-its-own-history.md), slice T3a-1). The signature names the run, the
+conversation, the row's position and a hash of every row before it, so a changed, moved or reordered row no longer
+verifies. A person's message is hashed but never signed. Without keys nothing changes.
+
+Two rules keep a signature true. What is signed is the row **as the store keeps it** (a NUL is already the replacement
+character, [ADR 0051](decisions/0051-a-nul-is-stored-as-the-replacement-character.md)). And a compaction or a
+shortening, which moves rows or changes their bytes, clears the signature of every row after the change, so the next
+commit signs those rows again. A signing failure fails the step: no turn is committed unsigned.
+
+The runtime signs the run's **head** too ([slice T3a-2](decisions/0068-adam-signs-its-own-history.md)). At every commit
+it signs the run, its conversation, how many rows the transcript has, a hash of all of them and the rest of the run's
+state (the inbox, the owed calls, the summary, the counters). When it reads a run back it recomputes the hash and checks
+that one signature before the agent runs. Change a field, add or drop a row, or move the run to another conversation and
+the run fails as corrupt, with no model call. This is on only when the runtime is given keys; without them nothing
+changes. A run with no signature at all, from before the keys, is accepted and signed at its next commit. If the keys cannot be reached when a run is picked up, the run waits and is tried again; it is not failed for it. A parent that reads a finished child's result checks the child first, and a child that does not check out is reported as failed, never as its forged output.
+
+Every turn is checked too ([slice T3a-3](decisions/0068-adam-signs-its-own-history.md)). Whenever a run's history comes back
+from outside the process (a worker picks the run up after a restart, a new task continues the conversation, a session
+starts its next round, the embedded engine reopens its file), each assistant and tool row of a signed run must carry a
+signature that verifies where the row stands, over everything before it, with a key that is still in the key set. A forged,
+unsigned, moved or revoked-key row fails the run before any model call. A history that is carried into a new run is signed
+again under the new run, so no signature names a run it does not belong to; a compaction and a shortening do the same for the
+rows they change. A run with no signature at all is still accepted once and signed at its next commit. A runtime that has keys but an agent that does not sign its turns fails the run at its first step, with an error that says to give the agent the same keys, instead of storing a history it could not read back. Reading a run's history back costs one signature check per turn, with no model call behind it when you ask for its state or continue it; polling a task's status does not pay it. Revoking a key makes every run it signed unreadable for good: to retire a key, add its replacement and keep the old one in the set.
+
 ### The access tier: which tools a step may use
 
 The person picks a tier for each message (`plan`, `edits`, `auto`, `bypass`; the A2A extension `access-tier/v1`, [ADR 0036](decisions/0036-the-coder-keeps-to-the-access-tier-the-person-picks.md)).

@@ -596,8 +596,10 @@ impl OpenAiCompatible {
         model: &str,
         run: Option<&str>,
         prompt_statement: Option<&adam_model::PromptStatement>,
+        call_headers: &BTreeMap<String, String>,
     ) -> Result<reqwest::Response, ModelError> {
         let body = Bytes::from(body);
+        let call_headers = request_headers(call_headers)?;
         let mut attempt = 0;
         let response = loop {
             let call = CredentialRequest {
@@ -612,6 +614,7 @@ impl OpenAiCompatible {
             let mut request = self
                 .http
                 .post(&self.url)
+                .headers(call_headers.clone())
                 .headers(credential_headers(&credentials)?)
                 .header(CONTENT_TYPE, "application/json")
                 .body(body.clone());
@@ -851,6 +854,35 @@ impl BoundedBody {
     }
 }
 
+/// The headers one call asks for ([`ModelRequest::headers`]): none that looks like a credential or
+/// frames the request, so a hook can never set the model's key. Values are hidden from `Debug`.
+fn request_headers(headers: &BTreeMap<String, String>) -> Result<HeaderMap, ModelError> {
+    const FRAMING: [&str; 5] = [
+        "content-type",
+        "content-length",
+        "accept",
+        "host",
+        "transfer-encoding",
+    ];
+    let mut out = HeaderMap::new();
+    for (name, value) in headers {
+        if adam_model::is_credential_header(name)
+            || FRAMING.iter().any(|f| name.eq_ignore_ascii_case(f))
+        {
+            return Err(ModelError::invalid_request(format!(
+                "the request asks for a header that cannot be sent: {name}"
+            )));
+        }
+        let refused =
+            || ModelError::invalid_request(format!("the request's header is not valid: {name}"));
+        let header_name = HeaderName::from_bytes(name.as_bytes()).map_err(|_| refused())?;
+        let mut header_value = HeaderValue::from_str(value).map_err(|_| refused())?;
+        header_value.set_sensitive(true);
+        out.insert(header_name, header_value);
+    }
+    Ok(out)
+}
+
 /// The headers a provider gave, as a request's: names checked, values sensitive (never in `Debug`).
 /// A provider may not set the headers that frame the request.
 fn credential_headers(credentials: &CredentialHeaders) -> Result<HeaderMap, ModelError> {
@@ -968,6 +1000,7 @@ impl ModelClient for OpenAiCompatible {
                 &req.model,
                 req.run.as_deref(),
                 req.prompt_statement.as_ref(),
+                &req.headers,
             )
             .await?;
         let bytes = read_body(response).await?;
@@ -997,6 +1030,7 @@ impl ModelClient for OpenAiCompatible {
                 &req.model,
                 req.run.as_deref(),
                 req.prompt_statement.as_ref(),
+                &req.headers,
             )
             .await?;
         let this = self.clone();

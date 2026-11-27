@@ -64,10 +64,10 @@ on:
 env:
   CARGO_TERM_COLOR: always
   IMAGE: ghcr.io/vymalo/another-adam-rs/coder
-  HELM_VERSION: v3.19.0
+  HELM_VERSION: v4.3.2
   KUBECONFORM_VERSION: v0.7.0
-  # Kubernetes version the rendered manifests are validated against.
-  KUBERNETES_VERSION: 1.31.0
+  # Kubernetes version the rendered manifests are validated against: the chart's floor (ADR 0080).
+  KUBERNETES_VERSION: 1.37.0
 
 concurrency:
   group: coder-${{ github.ref }}
@@ -82,7 +82,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: azure/setup-helm@v4
+      - uses: azure/setup-helm@v5
         with:
           version: ${{ env.HELM_VERSION }}
       - run: helm lint deploy/coder

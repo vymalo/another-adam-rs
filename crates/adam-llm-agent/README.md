@@ -19,11 +19,11 @@ instructions + a model + a toolset. It is served over A2A by
 | Item | What |
 |---|---|
 | `STOPPED_BY_THE_PERSON` | the error result a continued run gives a tool call that was still owed |
-| `LlmAgent`, `LlmAgentBuilder` | `LlmAgent::builder(name, model, model_alias)` then `.instructions(..)`, `.tool(..)`, `.dyn_tool(..)`, `.limits(..)`, `.max_parallel(n)` (the tool calls of a turn that run at once: 10 by default, clamped to 1..=32), `.wait_poll(..)`, `.stream_text(..)` (on by default: see *Streamed text*), `.reasoning_effort(Option<ReasoningEffort>)` (the level every turn asks for unless the run's context names one: see *Reasoning effort*), `.model_parking(ModelParking)` (how a run waits on a model that refused it: see *A run parked on the model*), `.model_fallback(ModelBinding)` (the model a run continues on, once, when its own is locked: see *A locked model*), `.model_choices(Vec<ModelBinding>)` (the models a message may name through `MODEL_CONTEXT_KEY`), `.admission(DynAdmission)` (the process's pools, ADR 0065: every model call takes a seat of `Pool::ModelCalls` and every tool call one of `Pool::ToolCalls`; see *The process's pools*), `.hooks(HookSet)` / `.plugin(one)` (compiled hooks inside each tool call's step, ADR 0050 slice H1; see *Hooks around a tool call*), `.build()` |
+| `LlmAgent`, `LlmAgentBuilder` | `LlmAgent::builder(name, model, model_alias)` then `.instructions(..)`, `.tool(..)`, `.dyn_tool(..)`, `.limits(..)`, `.max_parallel(n)` (the tool calls of a turn that run at once: 10 by default, clamped to 1..=32), `.wait_poll(..)`, `.stream_text(..)` (on by default: see *Streamed text*), `.reasoning_effort(Option<ReasoningEffort>)` (the level every turn asks for unless the run's context names one: see *Reasoning effort*), `.model_parking(ModelParking)` (how a run waits on a model that refused it: see *A run parked on the model*), `.model_fallback(ModelBinding)` (the model a run continues on, once, when its own is locked: see *A locked model*), `.model_choices(Vec<ModelBinding>)` (the models a message may name through `MODEL_CONTEXT_KEY`), `.admission(DynAdmission)` (the process's pools, ADR 0065: every model call takes a seat of `Pool::ModelCalls` and every tool call one of `Pool::ToolCalls`; see *The process's pools*), `.turn_keys(DynTurnKeys)` (sign every assistant and tool turn at commit, ADR 0068 slice T3a-1: see *Signed turns*), `.hooks(HookSet)` / `.plugin(one)` (compiled hooks inside each tool call's step, ADR 0050 slice H1; see *Hooks around a tool call*), `.build()` |
 | `ModelParking`, `ModelWait`, `ModelPark`, `MODEL_RESUME_KIND`, `DEFAULT_MODEL_PARK_LIMIT`, `MAX_MODEL_BACKOFF` | a run parked on the model (ADR 0067): `ModelParking::new(limit).when_unreachable(bool)`, the default a limit of 24 h and an unreachable endpoint that fails as before; `Conversation::model_wait` is the `ModelWait` of a parked run (`reason`, `status`, `slug`, `park`, `parked_since`, `parks`, `wake_at`); see *A run parked on the model* |
 | `LlmStarter` | the start-only half: `LlmStarter::new(name)` implements `adam_runtime::AgentStarter` with `State = Conversation`, needs no model or tools, and inits exactly like `LlmAgent` (same accepted payloads, same `unusable start message` rejection), and continues a prior run exactly like `LlmAgent` (see *Continuing a conversation*); it also splits and joins the conversation exactly like `LlmAgent` (`AgentStarter::split`/`join`), so a run it starts is written with a head and a body, not left in the v4 format |
 | `Limits` | `max_turns`, `max_tool_calls`, `max_output_tokens` (the cap a call asks for; `0` leaves it to the model, and `Limits::default()` is 4,096 for a hand-built agent: the 128,000 fallback and the model's profile are resolved and clamped by the assembly, ADR 0064), `max_history_tokens`; `max_turns` and `max_tool_calls` end the run with a closing turn (below), history shortens old tool output **in the stored history** (below), and a history that reaches its budget is **compacted** (*Compaction*, below) |
-| `HookSet`, `Plugin`, `Verdict`, `HookError`, `HookLimits`, `HookedCall`, `HookedText`, `HookedMessage`, `HookedEnd`, `MessageFile` | ADR 0050 slices H1, H1b and H1c (`run_ending`, step `end:<turn>`, `LlmAgentBuilder::max_run_continuations`), re-exported from `adam-plugin`: `HookSet::new().with(Arc::new(plugin)).with_limits(HookLimits { deadline, retries })`, and `Plugin` with `name`, `message_received(&mut HookedMessage { text, files })`, `before_tool(&mut HookedCall { tool, arguments })` and `after_tool(&HookedCall, &mut HookedText { text })`. Installed with `LlmAgentBuilder::hooks`/`.plugin`; see *Hooks around a tool call* and *A hook may refuse a person's message* |
+| `HookSet`, `Plugin`, `Verdict`, `HookError`, `HookLimits`, `HookedCall`, `HookedText`, `HookedMessage`, `HookedEnd`, `MessageFile`, `HookedModelRequest`, `ModelCallKind`, `HookedCompaction` | ADR 0050 slices H1, H1b, H1c, H3 and H9 (`run_ending`, step `end:<turn>`, `LlmAgentBuilder::max_run_continuations`; `model_request`; `compaction_before`), re-exported from `adam-plugin`: `HookSet::new().with(Arc::new(plugin)).with_limits(HookLimits { deadline, retries })`, and `Plugin` with `name`, `message_received(&mut HookedMessage { text, files })`, `before_tool(&mut HookedCall { tool, arguments })` and `after_tool(&HookedCall, &mut HookedText { text })`. `model_request` sees `HookedModelRequest { kind, temperature, max_output_tokens, metadata }` (`kind` is `Turn` or `Compaction`); `compaction_before` sees `HookedCompaction { context }` and may add context to the summary request or veto it with `Deny`, and the history is shortened instead. Installed with `LlmAgentBuilder::hooks`/`.plugin`; see *Hooks around a tool call* and *A hook may refuse a person's message* |
 | `HookedOutput`, `HookDecision`, `MessageDecision` | what the journaled `tool:<call id>` step records: `output` (a flattened `ToolOutput`), `hooks` (the decisions that were not `Continue`, each with `point`, `verdict`, `reason` and the failing `plugin`) and `args` (the arguments that ran, when a rewrite changed them); `MessageDecision` is what a message's step records: `text` (when a hook rewrote the message) and `hook` (the refusal). A record written before hooks existed is a bare `ToolOutput` and decodes; an older build reads a new one as its output |
 | `Tool` (trait), `DynTool` | `spec() -> ToolSpec`, `async call(&ToolCtx, Value) -> Result<ToolOutput, ToolError>` and the default methods `required_state() -> Vec<StateKey>` (none) and `asks_user() -> bool` (`false`: says the tool can end a call with `NeedsInput`, so the loop runs such a call alone; whether the person can be asked is decided per run, see *Child sessions*; `#[tool(asks_user)]` and `FnTool::asking_user()` set it) and `step_style() -> StepStyle` (how a call is drawn as a step: the default is a plain `tool` labelled with the tool's name; `#[tool(step = "subagent", label = "Hand to the helper", icon = "agent")]` sets it; a tool that wraps another must forward it, as `required_state` and `asks_user`; see *Steps*) and `read_answer(call_id, args, ui, payload) -> AnswerCheck` (`Accept`, `Read(text)`, `Refuse(Refusal)` or `End(Refusal)`; the default accepts: reads the answer to the tool's own question before the model does; see *The answer is read by the tool that asked*) |
 | `ToolOutput` | `text`, `error`, `with_artifact`, `pinned()` (a compaction that drops the result copies it into its marker, see *Compaction*), `with_loaded` (a loader's whole list, journaled with the result, see `Loaded` below). A tool can return a **file** (`with_artifact(Artifact::file(..))`, [ADR 0012](../../docs/decisions/0012-files-as-a2a-artifacts.md)): the model is told only the tool's `content` (a line such as `Shared chart.svg (1.2 KiB, image/svg+xml).`), the bytes go to the run's artifacts and never into the history, the step's output or the run's final output. The loop keeps at most `MAX_RUN_FILE_BYTES` (6 MiB) of files per run: a file that would go over is not emitted and the result, marked as an error, says so. That check comes after the result is journaled, so a tool that may return several files it did not choose keeps its result within `ToolCtx::files_left()` (`adam_runtime::ReceivedFiles` does). `ArtifactRef` (what the state and the final output list) has `bytes: Option<u64>` for a file, absent otherwise and in state written before it existed. `announcing(text)` (the member `answer`) makes `text` **the run's answer**, see *Announced answers*. `sandbox: SandboxUsage` is what the call reported with `ToolCtx::report_sandbox`, put there by the loop and journaled with the result (absent from a journal from before, not written while empty), see *Sandbox time* |
@@ -506,7 +506,7 @@ parks the run and returns.
 
 | Tool | Arguments | Result |
 |---|---|---|
-| `subagent_start` | `agent` (enum), `description` (at most 80 characters), `prompt`, `keep_open` (default `false`) | `{"session", "agent", "state": "working", "keep_open"}` at once; the parent keeps working |
+| `subagent_start` | `agent` (enum), `description` (at most 80 characters), `prompt`, `keep_open` (default `false`), `config` (optional: `max_turns`, `max_tool_calls`, `max_output_tokens`, `context_window`, `max_parallel_tool_calls`, `time_limit`, `max_rounds`; [ADR 0054](../../docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md)) | `{"session", "agent", "state": "working", "keep_open"}` at once; the parent keeps working; a `config` above the subagent's bounds, or with an option that is not one of the seven, is an error result and starts nothing |
 | `subagent_send` | `session`, `message` | `{"session", "round", "state", "delivered": "new_round" \| "steered" \| "queued"}` (`queued`: the round's agent says in its state, `queues_messages: true`, that it keeps the message until its remote can take it); an error result when the session is closed |
 | `subagent_read` | `session`, `wait` (default `false`), `offset`, `limit` | a header line, `report: done` or `failed` and the report as a numbered page (the paging convention), or `report: none yet` while the round works, or `report: blocked` and the question while the round waits for the person (`SessionView::waiting`) |
 | `subagent_close` | `session`, `cancel` (default `false`) | `{"session", "state": "closed"}` |
@@ -515,6 +515,17 @@ parks the run and returns.
 * **A session** is a conversation of child runs ("rounds") of one subagent, in **the parent's own conversation** (so a later
   task of it finds the session, and no other conversation does). Its id is round 1's run id. A round carries the session's
   header (`Conversation::session`, a `SessionHeader`) in its first message and every later round carries it on.
+* **The session's limits** (ADR 0054 slice 1). `subagent_start`'s `config` is held to the subagent's `SessionBounds` by
+  `SessionBounds::admit` (a request above a bound is refused, naming the option) and recorded in the session's header
+  (`SessionHeader::config`). A round reads its limits **from its header, narrowing what the agent has and never raising it**:
+  `max_turns` and `max_tool_calls` against `Limits` at each step, `max_output_tokens` in the request (never `0`: with the
+  folder's cap left to the model the session's is the cap), `max_parallel_tool_calls` for the run's segments, and
+  `context_window` as `min(model window, context_window)` for the compaction budget (never instead of the model's window; held
+  to at least 20,000 + the cap + 8,000, so a budget is left). These apply at the next model call. `time_limit` (the deadline of
+  the round, under the folder's) and `max_rounds` (read by `subagent_send`) apply from the next round. `subagent_send` copies
+  the header's config into round 2 **clamped to the bounds of that moment** (`SessionBounds::clamp`), before it checks the round
+  limit, so a lowered deployment limit is obeyed and the session's own `max_rounds` is enforced. Tests:
+  `tests/session_limits.rs`, `tests/compaction.rs` and `tests/sessions.rs`.
 * **Auto-close.** With `keep_open: false` the session is closed as soon as its round has ended (the report can still be read;
   a send is refused, in words that tell the model to start a new one). With `keep_open: true` it stays idle for the next
   `subagent_send`, whose round **continues the session's conversation** (round 2 sees round 1). Closing an idle session starts a
@@ -1001,6 +1012,44 @@ raise max_output_tokens or lower the reasoning effort` (a plain failure like the
 turn that is not such a cut, and any message that reaches the run, starts the count again. A `Length` turn **with**
 words is still a `truncated` answer. A closing turn that is itself cut with no words fails with the usual
 `turn limit exceeded` message, not this one.
+
+## Signed turns (ADR 0068, slice T3a-1)
+
+With `LlmAgentBuilder::turn_keys(keys)` every step signs what it commits: each assistant and tool message that has no
+`extra_content.adam.turn_signature` gets one, bound to the run, its conversation (`cnv`), its position in the transcript
+(`idx`) and the chain `prv` over every message before it, a person's included. A person's message is chained and never
+signed. The seam is one wrapper, `LlmAgent::sign_transition`, over the state `step` hands the runtime (every `messages.push`
+of the loop is covered, and the chain is folded once, in order, over the messages as stored), in `src/signing.rs`.
+
+* **As stored.** Before a message is hashed or signed it is made what the store will keep: a NUL in a string or a key
+  becomes U+FFFD (the store's own `adam_core::storable`, ADR 0051), in the message itself, so the signed bytes are the
+  bytes a read returns. A NUL in an answer or a tool call's arguments therefore does not break a signature.
+* **A compaction or a shortening clears signatures.** Both move rows or change their bytes, so the turn signature of every
+  assistant and tool row from the first changed position on is removed (`signing::unsign_from`; the summary row leads a
+  compacted transcript, so every kept row after it) and the next commit signs those rows again at their new positions.
+* **A carry signs again** (slice T3a-3). A history carried into a new run (`Conversation::continued`, a new task, a session
+  round, a close round) is cleared of its signatures (`continue_conversation`) and the new run's first commit signs every
+  row under its own id, with the chain of its own transcript; the runtime verified the rows under the old run before the
+  agent saw them. `answer_owed_calls`' synthetic results are signed in the same pass.
+* **A signing failure fails the step** with the keys' own class (`Refused` is `Unauthenticated`, `Unavailable` is
+  `Transient`, retried by the runtime); a row that cannot be written, or an index past `u32::MAX`, is `Internal`. Nothing
+  is committed unsigned.
+
+* **No keys, no change**: without `turn_keys` (the default, until the host configures them) the transcript is the bytes it
+  was. A host sets the keys itself; no variable is read here.
+* A signature is never sent to a model: the wire sends no `extra_content` of a message (`adam-model-openai`).
+* **The agent does not verify; the runtime does** (`adam-runtime`, `Sealer::check_turns`, slice T3a-3): a run whose head is
+  signed is refused `Corrupt` before a step if any assistant or tool row does not verify. So a runtime given keys needs an
+  `LlmAgent` given the same keys. A run that predates the keys is adopted and signed at its next commit. The journal's
+  signature is a later slice.
+* Cost: the chain is folded over the whole transcript each time a step commits a new turn (one RFC 8785 form and one
+  SHA-256 per message), and not at all when no turn is new.
+* Tests: `src/signing.rs` (a vector made independently in Python, `tests/vectors/turn_chain_vector.py`: the chain and both
+  signatures byte for byte, the user row unsigned, a second pass signs nothing, a provider's members kept, a NUL replaced
+  before signing, failing keys, `unsign_from`), `tests/compaction.rs` (a compacted run verifies at every row) and
+  `tests/turn_signatures.rs` (a real `Runtime`: failing keys commit no unsigned turn, a NUL verifies after the store,
+  rows verify against the key set at their position, an earlier change breaks every later `prv`, a moved row fails, no keys
+  means no signature, and through `adam-model-openai` to a mock server no request body holds the member).
 
 ## Features and environment
 

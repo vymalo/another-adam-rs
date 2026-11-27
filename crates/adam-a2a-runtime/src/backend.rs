@@ -1460,6 +1460,13 @@ mod tests {
                 Told::Internal,
             ),
             (RuntimeError::Store(S::internal(lower())), Told::Internal),
+            // A key set that cannot be read says nothing of the task: the client may retry.
+            (
+                RuntimeError::TurnKeys(adam_core::turn::TurnKeyError::Unavailable(Box::new(
+                    lower(),
+                ))),
+                Told::Unavailable,
+            ),
         ];
         for (e, told) in cases {
             let shown = e.to_string();

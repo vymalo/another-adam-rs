@@ -278,6 +278,7 @@ mod tests {
         let mock = MockModel::new();
         let response = ModelResponse {
             message: Message::Assistant {
+                extra_content: None,
                 content: vec![ContentPart::text("let me look")],
                 tool_calls: vec![ToolCall {
                     id: "c1".into(),

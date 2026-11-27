@@ -110,6 +110,7 @@ on the message and on each call, and sends it back value for value:
 | parse, completion | the unknown members of `choices[0].message` and of each `tool_calls[i]` (`extra_content`, and siblings) go into `Message::Assistant.provider.members` and `ToolCall.opaque`. The modelled members are not opaque: `role`, `content`, `tool_calls`, `reasoning_content`, `reasoning`, and the output-only `refusal`, `audio`, `function_call`, `annotations` on the message; `id`, `type`, `function` on the call |
 | parse, stream | a delta's own unknown members go to the message (the same filter); its unknown members on a tool call are accumulated per call (last value wins per key) and reach the finished call. A final chunk shaped as a whole `message` instead of a `delta` contributes its unknown members too — no provider we test sends one, so that path is defensive |
 | build | the members go out on the assistant message and on each call **only when the turn is bound to the request's model alias and endpoint**; the modelled keys win on a collision |
+| adam's maker | `extra_content.adam` is adam's own ([ADR 0068](../../docs/decisions/0068-adam-signs-its-own-history.md)). A build never sends `Message::Assistant.extra_content` or `Message::Tool.extra_content` (adam-only: another maker's members belong to the bound `provider.members` and go only to the model that produced them); a bound turn's members go out with adam's maker stripped, and none left means no member. A parse, streamed or not, drops only that key from the message's members and from each call's before the turn is recorded (a provider's empty `extra_content` stays as sent) |
 | provenance | a parse does not know either, so it leaves the turn unstamped; the client stamps `req.model` and its endpoint id in `complete` and in the streamed `Finished` |
 
 The **output-only** members (`refusal`, `audio`, `function_call`, `annotations`) are consumed and
@@ -315,7 +316,7 @@ adds roots to it. The crate reads no variable itself: `MODEL_CA_FILE` is read by
   `a_reasoning_block_alone_is_not_stored_without_echo`, `a_reasoning_block_is_cleared_but_members_stay_without_echo`,
   `opaque_members_are_dropped_when_the_run_changes_model`, `opaque_members_are_dropped_at_another_endpoint` and
   `the_client_stamps_the_requests_own_model_alias`; `src/wire.rs`'s `a_bound_turns_members_go_back_and_the_modelled_keys_win`,
-  `an_unbound_turn_sends_none_of_its_members` and `a_response_without_opaque_members_parses_as_before`.
+  `an_unbound_turn_sends_none_of_its_members` and `a_response_without_opaque_members_parses_as_before`; adam's maker: `a_request_never_carries_adams_member_but_keeps_the_other_makers`, `adams_member_in_a_bound_turns_own_members_is_not_sent_either`, `adams_member_in_a_reply_is_dropped_before_the_turn_is_recorded` and `adams_member_in_a_streamed_reply_is_dropped_too`.
 * The reasoning-wire cases by name: `src/wire.rs`'s `a_typed_level_wins_over_the_extra_body_and_keeps_its_other_members`
   (the ADR's pinned order), `each_wire_writes_its_own_member` (all three wires, each with an extra body carrying all three
   members), `an_emptied_reasoning_object_is_removed_and_its_other_members_stay`,

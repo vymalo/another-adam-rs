@@ -70,6 +70,7 @@ fn a_compacted_history_keeps_its_shortenings_in_the_head() {
     let mut state = Conversation::default();
     state.messages.push(Message::user_text("read the file"));
     state.messages.push(Message::Tool {
+        extra_content: None,
         call_id: "call-1".into(),
         content: format!("{TRUNCATION_MARKER_PREFIX} the output was long"),
         is_error: false,
@@ -194,6 +195,7 @@ fn the_round_trip_is_the_identity_over_every_shape() {
         messages: vec![
             Message::user_text("go"),
             Message::Tool {
+                extra_content: None,
                 call_id: "c".into(),
                 content: format!("{TRUNCATION_MARKER_PREFIX} long output"),
                 is_error: false,
@@ -269,6 +271,7 @@ fn a_provider_turn_and_a_calls_opaque_members_survive_a_resume() {
         ..Default::default()
     };
     state.messages.push(Message::Assistant {
+        extra_content: None,
         content: vec![],
         tool_calls: vec![call],
         reasoning: None,
