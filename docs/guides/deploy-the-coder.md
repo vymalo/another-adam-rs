@@ -168,6 +168,8 @@ The values you will actually set:
 
 Render-time guards stop a bad combination at `helm template`, not at rollout (`templates/_validate.tpl`).
 
+::: in-depth Why the contract release is a one-time window
+
 ## The contract release: a one-time window
 
 ADR 0055 shipped in two releases. The **expand** release (S0–S2b) writes the whole v4 `state`
@@ -203,6 +205,8 @@ Do **not** merge the contract and roll it in one step when your deployment rende
 (and digest) in your own values **before** merging, merge, then move the pin by hand after the old
 processes are gone — the chart's bump is a convenience for a deployment that does not need the
 boundary.
+
+:::
 
 ## Verify
 
@@ -307,6 +311,8 @@ Things to know:
 * To see whether a release is affected, run `helm template` with its values: it fails if it is. A pod that is already failing
   says `refusing to start with the GitHub App's private key in a file` in its log.
 
+::: in-depth Upgrading from the devcontainer variables
+
 ## Upgrading from the devcontainer variables
 
 [ADR 0052](../decisions/0052-no-podman-a-repositorys-own-environment-is-a-run-pod-of-its-image.md) removed the
@@ -315,6 +321,8 @@ repository's devcontainer on a container service, with no switch. A deployment t
 remove it and `CONTAINER_HOST` before moving `image.tag`. Every other removed variable (`DEVCONTAINER_*`) is ignored,
 with one warning at startup that names it. A repository that needs its own tools names an image its run pod runs
 (`runPods.repositoryImages.allowedPrefixes` and `use_repository_environment`, [Run pods](#run-pods)).
+
+:::
 
 ## A package cache shared by pods
 
