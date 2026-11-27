@@ -65,5 +65,13 @@ node tools/docs-check/check-docs.mjs
 5. checks the split: each pair links both ways, and no page for people outside `docs/decisions` and `docs/reviews`
    cites a `path:line`. `docs/reference/parity.md` is listed in the checker as mixed until it is split.
 
+The site has two more checks (`docs-site.yml`). The build fails on a dead link between pages. Its heading ids are
+GitHub's (`tools/docs-check/slug.mjs`, shared with the checker, so a `#59a-...` or em-dash anchor resolves on both).
+A relative link out of `docs/` (crate READMEs, `deploy/`, `.agents/docs/`) or to a file that is not a page is rewritten
+to `https://github.com/vymalo/another-adam-rs/blob/main/<path>` (`tree` for a folder): `.agents/docs` is not published,
+so GitHub is where a reader finds it. After the build, `npm --prefix docs run check-links` crawls `docs/.vitepress/dist/`
+and fails on a broken internal link or fragment; it runs before the rustdoc is copied into `dist/rust/` and skips `/rust/`
+hrefs.
+
 Crate READMEs that are a crate's rustdoc (`#![doc = include_str!("../README.md")]`: `adam`, `adam-git-sandbox`,
 `adam-service`, `adam-egress`, `adam-agent`) are doc-tested: run `cargo test --workspace --doc --locked` after editing one.
