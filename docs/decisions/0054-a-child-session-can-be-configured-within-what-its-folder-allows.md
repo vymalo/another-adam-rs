@@ -376,6 +376,6 @@ round that writes the tombstone until it has ended.
 1. **The first piece (ANR-1213)** adds `SessionHeader.deleted`, makes `SessionView::from_rounds` answer `None` for
    a deleted session (so it is never listed again and every tool refuses it as *no session*), and accepts
    `delete: true` on an **idle** session, whose closing round writes the tombstone. Its runs stay in the store.
-2. **A working session is refused**, with words that say to close it first — *not* cancelled by the delete, which is
-   what decision 10 says. The cancel-then-delete order is the second piece, together with the due rule and the
-   parent parked on `AwaitSession`, and it carries its own tests on the three stores.
+2. **`delete: true` implies `cancel: true`**, as decision 10 says: a working round is stopped as a close with cancel
+   stops it, and the closing round then writes the tombstone. The first cut of the change refused a working session
+   instead; that was wrong, and the review caught it — the flag is honoured now.

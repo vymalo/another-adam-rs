@@ -1187,7 +1187,7 @@ impl Tool for Close {
                     "delete": {
                         "type": "boolean",
                         "default": false,
-                        "description": "Delete the session: it is gone from every listing and every tool refuses it. Its runs stay in the store. An idle session is deleted at once; a working one is refused, so close it first.",
+                        "description": "Delete the session: it is gone from every listing and every tool refuses it, and its runs stay in the store. It implies cancel: true — a working round is stopped, as a close with cancel does, and then the tombstone is written.",
                     },
                 },
                 "required": ["session"],
@@ -1217,6 +1217,9 @@ impl Tool for Close {
             Ok(delete) => delete,
             Err(why) => return refuse(why),
         };
+        // `delete: true` implies `cancel: true` (ADR 0054 decision 10): it stops a working round as
+        // a close with cancel does, and the closing round it starts then writes the tombstone.
+        let cancel = cancel || delete;
         let starter = ctx.child_starter()?;
         let round_id = ctx.child_run_id();
         let mut note = None;
@@ -1233,12 +1236,6 @@ impl Tool for Close {
             {
                 return Ok(closed(session, note));
             }
-            if delete && view.state == SessionState::Working {
-                return refuse(format!(
-                    "session `{session}` is working; it is not deleted while a round runs: close \
-                     it with `cancel: true` first, then delete it"
-                ));
-            }
             if view.state == SessionState::Working {
                 if cancel {
                     starter
@@ -1253,7 +1250,7 @@ impl Tool for Close {
                         Some(now) => view = now,
                         None => return refuse(no_such_session(session)),
                     }
-                    if view.closed {
+                    if view.closed && !delete {
                         return Ok(closed(session, None));
                     }
                 } else if view.closed {
