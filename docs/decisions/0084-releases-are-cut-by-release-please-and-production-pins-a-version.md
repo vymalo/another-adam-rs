@@ -79,3 +79,22 @@ pushed to GHCR as OCI and signed.
 - **Unverified until the first tag:** the App token minting and the release pull request, the release image's build
   and smoke tests on a tag, the carbon copy (`imagetools create --prefer-index=false`) keeping the signed digest,
   creating the chart's package with `GITHUB_TOKEN`, and `cosign verify` of either. `release.yml` checks each in the run.
+
+## Amended 2026-11-27: the tag's commit keeps its `coder.yml` run (ANR-1195)
+
+The first release, v0.6.0, failed its gate: no `coder.yml` run on the tag's commit had passed its image job. The cause
+was not `cancel-in-progress` (already off for `main`) but the concurrency group. A group runs one workflow and holds
+one pending; a newer pending run **cancels the older pending run even with `cancel-in-progress: false`**. Seven docs
+pull requests merged within minutes of the release commit, so its run was replaced while it waited. The fix:
+
+1. **A run that is not for a pull request has a group of its own, its commit sha** (`coder-<sha>`); a pull request keeps
+   `coder-<ref>` and keeps cancelling. No `main`, tag or manual run is replaced by a later push, so the release commit
+   always gets an image job. The cost is that a burst of merges builds in parallel instead of skipping to the newest.
+2. **The gate accepts any `coder.yml` run on the commit**, a manual `workflow_dispatch` on the tag included (it
+   filters on `head_sha`, not on the event). That stays: it is the way to recover.
+3. **`bump the tag in the chart` cannot write a stale tag.** Its own group `coder-bump` serialises it, and it skips
+   when `main` has a non-bump commit newer than its own, so an older image job that finishes last never overwrites a
+   newer tag. A bump waiting behind a running one can be replaced by a newer pending bump, which is the one that
+   matters. If the newer commit's image job fails, the chart keeps the older tag until the next good build.
+4. `ci.yml` is not read by the gate; its group is unchanged.
+

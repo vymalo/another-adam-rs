@@ -69,8 +69,13 @@ env:
   # Kubernetes version the rendered manifests are validated against: the chart's floor (ADR 0080).
   KUBERNETES_VERSION: 1.37.0
 
+# A pull request run is replaced by the next push to its branch. Every other run (main, a manual dispatch,
+# a tag) has a group of its own, its commit: a group allows one running and one pending run, and a newer
+# pending run cancels the older one even with cancel-in-progress false, so a shared group lost the release
+# commit's run to a burst of merges (ANR-1195, ADR 0084 amended 2026-11-27). release.yml's gate reads this
+# run, so it must finish. The bump job below keeps its own group and does not write a stale tag.
 concurrency:
-  group: coder-${{ github.ref }}
+  group: coder-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:

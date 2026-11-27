@@ -42,6 +42,11 @@ Written at `ce99d98` plus this change on 2026-11-27. The model is vaam-apps/vpay
 6. **The release image is built from the tag's commit with coder.yml's build arguments** (`ADAM_BUILD_REVISION`, the
    revision label) and only after `coder.yml`'s job `build, smoke-test and push the image` concluded `success` on that
    commit, any event (`gate`, `:87-122`). Renaming that job breaks the gate.
+   **The run must survive later pushes.** `coder.yml`'s `concurrency.group` is `coder-<ref>` for a pull request and
+   `coder-<sha>` for everything else: a shared group holds one pending run and a newer pending run cancels the older
+   one even with `cancel-in-progress: false` (v0.6.0, run 46041005870, ANR-1195). The `bump` job has its own group
+   `coder-bump` and skips when `main` has a newer non-bump commit. A hand `workflow_dispatch` on the tag also passes the
+   gate (it filters `head_sha`, not the event); re-run `release.yml` after it.
 7. **No `latest`, no tag on main.** `release.yml` runs on `push: tags: ["v*"]` only.
 
 ## Read a release's digests
