@@ -261,6 +261,19 @@ where a store is involved (`crates/adam-llm-agent/tests/sessions.rs` holds the s
   of every agent that has subagents**: the first requests after the deploy miss the cache once. A `config` on a remote subagent
   is refused by option name unless it is `time_limit` or `max_rounds`, and a value that is not a whole number of 32 bits is
   refused naming its option.
+* *2026-11-27 (ANR-203, slice 1 part 4): slice 1 is complete.* `config` is on the A2A `start` of `child-sessions/v1`: camelCase members
+  (`maxTurns`, `maxToolCalls`, `maxOutputTokens`, `contextWindow`, `maxParallelToolCalls`, `timeLimit`, `maxRounds`), read by
+  `parse_start` in `adam-a2a-runtime` and admitted by the **same** `SessionBounds::admit` as the tool. Each `ChildSessionAgent` carries
+  its bounds (`with_bounds`; `Assembly::child_sessions` and the workers of `adam-agent` and `adam-coder` take them from
+  `Assembly::session_bounds()`). The refusal is `InvalidParams` with the option's words renamed `start.config.<member>`, and nothing
+  starts; an unknown member is refused, as is any other value `admit` refuses (`maxOutputTokens: 0` among them). A remote helper takes
+  only `timeLimit` and `maxRounds`, as the tool does. **A helper whose bounds are not known fails closed:** a role that binds no
+  agent (a control plane) refuses every `start.config`, because the deployment's `MAX_PARALLEL_TOOL_CALLS` and the model are known
+  only where the agent is bound. The admitted config is written into the header of round 1, and is reported as `config` (camelCase,
+  only the options set, absent when none) on the session object, on the parent's `sessions` rows and on the events. List and read
+  show it: a `subagent_list` row ends with `config: max_turns 20, time_limit 10`, and `subagent_read` has a `config:` line after its
+  head; a session with none shows nothing. No tool description changed, so the coder's tool-size golden is untouched. The contract
+  `child-sessions-v1.md` (in another repository) needs a `start.config` member and a `config` member of the session object.
 
 **2. The system prompt section** (decision 9). Depends on 1.
 * Files: `sessions.rs` (the table, `SessionTools::guide`), `crates/adam-assembly/src/def.rs` or `assembly.rs` (append at bind),

@@ -427,11 +427,16 @@ impl BoundDef {
             info,
             remotes,
             session_limits: self.session_limits,
-            session_bounds,
+            // The bounds the session tools hold a `config` to, handed to the A2A front too, so a
+            // person's `start.config` and the model's `config` are admitted by the same numbers
+            // (ADR 0054 decision 2).
             #[cfg(feature = "sessions")]
-            child_sessions: self.child_sessions,
+            child_sessions: self
+                .child_sessions
+                .map(|sessions| sessions.with_bounds(session_bounds.clone())),
             #[cfg(feature = "mcp")]
             prompt_commands: self.prompt_commands,
+            session_bounds,
         })
     }
 

@@ -175,6 +175,8 @@ pub(crate) struct Seen {
     pub closing_round: bool,
     /// Closed on the wire (see `wire_state`).
     pub closed: bool,
+    /// What the session was started with (ADR 0054); `None` when it has no configuration.
+    pub config: Option<adam_runtime::SessionConfig>,
 }
 
 impl Seen {
@@ -192,6 +194,13 @@ impl Seen {
             "keepOpen": self.keep_open,
             "by": self.by.word(),
         });
+        if let Some(config) = self
+            .config
+            .as_ref()
+            .and_then(crate::child_sessions::config_value)
+        {
+            object["config"] = config;
+        }
         let (name, round, report) = match event {
             Event::Opened => ("opened", Some(round), None),
             Event::Round => ("round", Some(round), None),
@@ -409,6 +418,7 @@ impl RuntimeTaskBackend {
             agent: self.session_agent_name(&s.agent),
             description: s.description.clone(),
             keep_open: s.keep_open,
+            config: s.config.clone(),
             by: if s.started_outside_a_run() {
                 By::Person
             } else {
@@ -465,6 +475,7 @@ mod tests {
             state,
             closing_round: false,
             closed,
+            config: None,
         }
     }
 
@@ -612,6 +623,23 @@ mod tests {
         assert!(closed.get("round").is_none() && closed.get("report").is_none());
         let opened = now.event_object(Event::Opened);
         assert!(opened.get("round").is_some() && opened.get("report").is_none());
+    }
+
+    #[test]
+    fn an_event_says_the_sessions_config_only_when_it_has_one() {
+        let plain = seen(1, Working, false);
+        assert!(plain.event_object(Event::Opened).get("config").is_none());
+        let configured = Seen {
+            config: adam_runtime::SessionConfig::from_value(json!({"maxTurns": 3, "timeLimit": 5}))
+                .ok(),
+            ..plain
+        };
+        for event in [Event::Opened, Event::Round, Event::Closed] {
+            assert_eq!(
+                configured.event_object(event)["config"],
+                json!({"maxTurns": 3, "timeLimit": 5})
+            );
+        }
     }
 
     #[test]

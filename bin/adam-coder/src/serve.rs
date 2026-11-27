@@ -415,7 +415,7 @@ pub async fn serve(
     // Only a role that runs workers builds the agent: model, GitHub client, workspaces, MCP
     // servers. A control plane starts, delivers to, cancels and views runs, which needs the
     // agent's name and `init` only (`CoderStarter`), so it takes no model or GitHub configuration.
-    let (agents, prompts) = match &config.worker {
+    let (agents, prompts, session_bounds) = match &config.worker {
         Some(worker) => {
             let (agent, janitor, sweep) = build_agent(
                 worker,
@@ -428,6 +428,10 @@ pub async fn serve(
             // The prompts of the MCP servers the deployment adds (`ADAM_EXTRA_MCP_FILE`) are
             // commands too; the coder's own `github` server has a bearer per call and gives none.
             let prompts = agent.assembly().prompt_commands().to_vec();
+            // What a person's `start.config` is held to: the bounds the session tools use, so the
+            // two cannot disagree (ADR 0054 decision 2). A control plane builds no agent and so
+            // knows none: it refuses a `start.config`.
+            let session_bounds = agent.assembly().session_bounds().to_vec();
             // The models a message may pick (`model-pick/v1`): the root's choices, the same list
             // its card advertises.
             let choices = agent.model_choices();
@@ -459,6 +463,7 @@ pub async fn serve(
                     .map_err(Into::into)
                 }),
                 prompts,
+                session_bounds,
             )
         }
         // The starters of the helpers too, so a person's session round can be started here and a
@@ -467,6 +472,7 @@ pub async fn serve(
             Agents::new(AGENT_NAME, move |builder| {
                 helpers.session_starters(builder.starter(CoderStarter))
             }),
+            Vec::new(),
             Vec::new(),
         ),
     };
@@ -493,7 +499,7 @@ pub async fn serve(
         // the backend expands a message that names one before it is stored.
         .commands(commands);
     let agents = match sessions {
-        Some(sessions) => agents.child_sessions(sessions),
+        Some(sessions) => agents.child_sessions(sessions.with_bounds(session_bounds)),
         None => agents,
     };
     // The largest upload the card lists (`uploads/v1`): the folder's, else the environment's.

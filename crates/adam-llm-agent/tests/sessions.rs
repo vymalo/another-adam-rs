@@ -3538,6 +3538,62 @@ mod cases {
         assert_eq!(config.max_tool_calls, None, "nothing is filled in");
     }
 
+    /// The listing row and the head of a read show the session's config, compact and in the
+    /// option's own name, and show nothing for a session that has none (ADR 0054 decision 3).
+    pub async fn list_and_read_show_the_sessions_config_and_nothing_without_one(store: DynStore) {
+        let rig = Rig::new();
+        rig.child_mock.push_text("one says 1");
+        rig.child_mock.push_text("two says 2");
+        let (parent_agent, child_agent) = (rig.parent(), rig.child());
+        let rt = rig.together(&store, &parent_agent, &child_agent);
+        let conv = conv_id();
+        let parent = rig.start(&rt, &conv).await;
+        let start = |id: &str, extra: Value| {
+            let mut args = json!({"agent": "helper", "description": id, "prompt": "do the work",
+                                  "keep_open": true});
+            if !extra.is_null() {
+                args["config"] = extra;
+            }
+            call(id, "subagent_start", args)
+        };
+        let configured = child_run_id(parent, "configured");
+        let plain = child_run_id(parent, "plain");
+        rig.parent_mock
+            .push_tool_calls(vec![start(
+                "configured",
+                json!({"max_turns": 3, "time_limit": 5}),
+            )])
+            .push_tool_calls(vec![start("plain", Value::Null)])
+            .push_tool_calls(vec![read_call("r1", configured, true)])
+            .push_tool_calls(vec![read_call("r2", plain, true)])
+            .push_tool_calls(vec![call("l", "subagent_list", json!({}))])
+            .push_text("done");
+        let worker = spawn_worker(&rt);
+        wait_done(&rt, parent).await;
+        worker.stop().await;
+
+        let results = tool_results(&state_of(&rt, parent).await);
+        let (_, one, _) = result_of(&results, "r1");
+        assert!(
+            one.contains("config: max_turns 3, time_limit 5"),
+            "the read says the config: {one}"
+        );
+        let (_, two, _) = result_of(&results, "r2");
+        assert!(!two.contains("config"), "no config, nothing said: {two}");
+        let (_, list, _) = result_of(&results, "l");
+        let row = |id: RunId| {
+            list.lines()
+                .find(|l| l.starts_with(&id.to_string()))
+                .unwrap_or_else(|| panic!("a row for {id}: {list}"))
+        };
+        assert!(
+            row(configured).ends_with("config: max_turns 3, time_limit 5"),
+            "the row says the config: {}",
+            row(configured)
+        );
+        assert!(!row(plain).contains("config"), "{}", row(plain));
+    }
+
     /// A remote subagent takes only `time_limit` and `max_rounds` (ADR 0054 decision 4): any other
     /// option is refused by name, since nothing would enforce it, and nothing starts.
     pub async fn a_remote_subagent_refuses_every_option_but_time_limit_and_max_rounds(
@@ -5508,6 +5564,7 @@ macro_rules! session_suite {
                 a_closing_round_does_not_hide_the_newest_round_that_worked,
                 each_limit_refuses_in_words,
                 a_start_config_beyond_the_bounds_is_refused_and_one_within_is_recorded,
+                list_and_read_show_the_sessions_config_and_nothing_without_one,
                 a_remote_subagent_refuses_every_option_but_time_limit_and_max_rounds,
                 a_config_value_of_the_wrong_type_is_refused_naming_the_option,
                 round_two_carries_the_config_clamped_to_the_bounds_of_now,

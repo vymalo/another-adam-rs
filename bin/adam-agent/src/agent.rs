@@ -280,7 +280,7 @@ pub async fn agents(
         .limits
         .as_ref()
         .and_then(|limits| limits.max_inline_upload_bytes);
-    let (agents, commands, card, choices, efforts) = match workers {
+    let (agents, commands, card, choices, efforts, session_bounds) = match workers {
         Some(parts) => {
             let profiles = parts.profiles;
             let assembly = assemble_parked(
@@ -324,6 +324,9 @@ pub async fn agents(
                 // The card says the levels the backend reads; a card that already lists
                 // `reasoning/v1` keeps its own entry.
                 .map(|card| adam_service::card_with_reasoning(card, &efforts, &name));
+            // What a person's `start.config` is held to: the bounds the session tools use, so the
+            // two cannot disagree (ADR 0054 decision 2).
+            let session_bounds = assembly.session_bounds().to_vec();
             let root = name.clone();
             let scheduler = adam_schedule::SchedulerAgent::new(&name);
             (
@@ -343,6 +346,7 @@ pub async fn agents(
                 card,
                 choices,
                 Some(efforts),
+                session_bounds,
             )
         }
         None => {
@@ -365,6 +369,9 @@ pub async fn agents(
                 // card lists neither.
                 None,
                 None,
+                // A control plane binds no agent, so it knows no bounds: it refuses a
+                // `start.config`.
+                Vec::new(),
             )
         }
     };
@@ -387,7 +394,7 @@ pub async fn agents(
         None => agents,
     };
     Ok(match sessions {
-        Some(sessions) => agents.child_sessions(sessions),
+        Some(sessions) => agents.child_sessions(sessions.with_bounds(session_bounds)),
         None => agents,
     })
 }

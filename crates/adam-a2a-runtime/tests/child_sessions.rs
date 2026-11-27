@@ -159,6 +159,8 @@ struct Options {
     view_poll: Duration,
     /// The helper has a tool that asks the person.
     asks: bool,
+    /// The bounds the card's helper is held to for a `start.config` (ADR 0054).
+    bounds: Option<SessionBounds>,
 }
 
 impl Options {
@@ -175,6 +177,7 @@ impl Options {
             idle: None,
             view_poll: Duration::from_millis(10),
             asks: false,
+            bounds: None,
         }
     }
 }
@@ -247,13 +250,15 @@ impl Rig {
             .event_sink(events.clone())
             .poll_interval(Duration::from_millis(10))
             .build();
-        let sessions = ChildSessions::new(
-            [ChildSessionAgent::new("planner", helper.clone(), "Plans.")],
-            options.max_open,
-        )
-        .unwrap()
-        .with_listing_page(options.listing_page)
-        .with_max_rounds(options.max_rounds);
+        let planner = ChildSessionAgent::new("planner", helper.clone(), "Plans.");
+        let planner = match &options.bounds {
+            Some(bounds) => planner.with_bounds(bounds.clone()),
+            None => planner,
+        };
+        let sessions = ChildSessions::new([planner], options.max_open)
+            .unwrap()
+            .with_listing_page(options.listing_page)
+            .with_max_rounds(options.max_rounds);
         let sessions = match options.limits {
             Some(limits) => sessions.with_limits(limits),
             None => sessions,
@@ -677,6 +682,120 @@ async fn a_context_whose_newest_runs_are_children_still_names_its_root_task() {
             Some(root_run),
             "the only task of the context, {CHILDREN} child runs behind it"
         );
+        rig.stop().await;
+    }
+}
+
+/// A person's `start.config` (ADR 0054): admitted by the helper's bounds, written into the header
+/// of round 1 as the front admitted it, and said on the session object. A refused one starts
+/// nothing, and a start with none has no `config` anywhere.
+#[tokio::test]
+async fn a_start_config_is_admitted_recorded_in_the_header_and_reported() {
+    for store in stores().await {
+        let rig = Rig::with(
+            &store,
+            Options {
+                bounds: Some(SessionBounds::default()),
+                ..Options::new()
+            },
+        );
+        rig.helper_mock.push_text("a plan");
+        let start_with = |config: Value| {
+            let mut message = said("plan it", Some("ctx-cfg"));
+            message.metadata = Some(HashMap::from([(
+                CHILD_SESSIONS_EXTENSION.to_owned(),
+                json!({"start": {"agent": "planner", "description": "Plan it",
+                                 "keepOpen": true, "config": config}}),
+            )]));
+            message
+        };
+        // Refused: above a bound, zero output tokens, an unknown member. Nothing is started.
+        for (config, words) in [
+            (
+                json!({"maxTurns": 51}),
+                "start.config.maxTurns is 51; at most 50",
+            ),
+            (
+                json!({"maxOutputTokens": 0}),
+                "start.config.maxOutputTokens",
+            ),
+            (json!({"turbo": true}), "start.config.turbo"),
+        ] {
+            match rig.submit(&alice(), start_with(config.clone()), None).await {
+                Err(BackendError::InvalidParams(why)) => {
+                    assert!(why.contains(words), "{config}: {why}")
+                }
+                other => panic!("{config}: expected InvalidParams, got {other:?}"),
+            }
+        }
+        assert_eq!(
+            rig.helper_mock.requests().len(),
+            0,
+            "a refused start ran no round"
+        );
+
+        let task = rig
+            .submit(
+                &alice(),
+                start_with(json!({"maxTurns": 3, "timeLimit": 5})),
+                None,
+            )
+            .await
+            .expect("a config within the bounds starts a session");
+        let (_, session) = parse_session_conversation_id(&task.context_id).unwrap();
+        let config = rig
+            .round_header(session)
+            .await
+            .config
+            .expect("the header holds the config");
+        assert_eq!(config.max_turns, Some(3));
+        assert_eq!(config.time_limit, Some(5));
+        assert_eq!(config.max_tool_calls, None, "nothing is filled in");
+        assert_eq!(
+            object(&task)["config"],
+            json!({"maxTurns": 3, "timeLimit": 5}),
+            "the session object says what it runs with"
+        );
+        let done = rig.until(&alice(), &task.id, TaskState::Completed).await;
+        assert_eq!(
+            object(&done)["config"],
+            json!({"maxTurns": 3, "timeLimit": 5})
+        );
+        // The parent object lists it on the session's row, too.
+        rig.parent_mock.push_text("parent says");
+        let parent = rig
+            .submit(&alice(), said("hello", Some("ctx-cfg")), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            object(&parent)["sessions"][0]["config"],
+            json!({"maxTurns": 3, "timeLimit": 5})
+        );
+        rig.stop().await;
+    }
+}
+
+/// Without bounds a helper takes no `start.config` (it fails closed), and a start with no config
+/// has no `config` on its object.
+#[tokio::test]
+async fn a_helper_with_no_bounds_refuses_a_config_and_a_start_without_one_reports_none() {
+    for store in stores().await {
+        let rig = Rig::new(&store);
+        rig.helper_mock.push_text("a plan");
+        let mut message = said("plan it", Some("ctx-nb"));
+        message.metadata = Some(HashMap::from([(
+            CHILD_SESSIONS_EXTENSION.to_owned(),
+            json!({"start": {"agent": "planner", "description": "d", "config": {"maxTurns": 3}}}),
+        )]));
+        assert!(invalid(rig.submit(&alice(), message, None).await));
+        let start = rig.start(&alice(), Some("ctx-nb"), "plan it", true).await;
+        assert!(
+            object(&start).get("config").is_none(),
+            "{:?}",
+            object(&start)
+        );
+        let session = parse_session_conversation_id(&start.context_id).unwrap().1;
+        assert_eq!(rig.round_header(session).await.config, None);
         rig.stop().await;
     }
 }

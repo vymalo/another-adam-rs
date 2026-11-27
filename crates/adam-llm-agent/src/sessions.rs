@@ -230,6 +230,22 @@ const CONFIG_OPTIONS: [(&str, &str); 7] = [
     ("max_rounds", "maxRounds"),
 ];
 
+/// A session's config as a list and a read say it: `max_turns 20, time_limit 10`, the options that
+/// are set, in the model's own names. `None` when none is, so nothing is shown (ADR 0054
+/// decision 3).
+fn config_words(config: &SessionConfig) -> Option<String> {
+    let set = serde_json::to_value(config).ok()?;
+    let parts: Vec<String> = CONFIG_OPTIONS
+        .iter()
+        .filter_map(|(own, wire)| {
+            set.get(*wire)
+                .and_then(Value::as_u64)
+                .map(|n| format!("{own} {n}"))
+        })
+        .collect();
+    (!parts.is_empty()).then(|| parts.join(", "))
+}
+
 /// The options a remote subagent refuses: every one but `time_limit` and `max_rounds` (ADR 0054
 /// decision 4).
 const REMOTE_REFUSED: [&str; 5] = [
@@ -486,6 +502,17 @@ fn read_output(
         view.round,
         state_word(view)
     );
+    // What the session runs with, when it was started with a config: a line of its own after the
+    // head, so a session with none reads as it always did.
+    let head = match view
+        .header
+        .as_ref()
+        .and_then(|h| h.config.as_ref())
+        .and_then(config_words)
+    {
+        Some(words) => format!("{head}\nconfig: {words}"),
+        None => head,
+    };
     // A round parked with no timer is **blocked** on the person (ADR 0045 decision 9): it asked a
     // question, or a model refused it until woken (ADR 0067), and only an answer moves it. The
     // parent is told why; nothing is a report yet, so nothing is counted as read.
@@ -1383,6 +1410,10 @@ impl Tool for List {
                 s.keep_open,
                 escape_text(s.description.as_bytes()),
             );
+            let line = match s.config.as_ref().and_then(config_words) {
+                Some(words) => format!("{line} config: {words}"),
+                None => line,
+            };
             out.push_str(&clip_item(&line));
             out.push('\n');
         }
@@ -1430,6 +1461,7 @@ mod tests {
                 started_by: by.or(Some(me)),
                 updated_at: Timestamp::now(),
             },
+            config: None,
         }
     }
 
