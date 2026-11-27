@@ -36,7 +36,7 @@ library's own plan is [the roadmap](docs/roadmap.md); every setting by surface i
 | **Storage** | Run store: PostgreSQL, MongoDB, SQLite | ✅ | CI runs the conformance suite on PostgreSQL 12 and 17 and MongoDB 5.0 and 8.0; SQLite is one process per file, Unix only; signals by `LISTEN`/`NOTIFY` on PostgreSQL, polling on MongoDB ([Store adapters](docs/reference/store-adapters.md)) |
 | | A store service, so an agent's pod holds no database credential | 📋 | [ADR 0053](docs/decisions/0053-sqlite-a-store-service-a-database-per-agent-and-a-static-coder.md), slices 4 and 5 |
 | | SQLite replicated per commit, resumed on a new machine | 📋 | proposed ([ADR 0078](docs/decisions/0078-a-sqlite-store-is-replicated-per-commit-and-a-new-machine-resumes-from-the-copies.md)) |
-| | The SQL adapters keep their rules in the database | 📋 | decided 2026-11-27; slices P0–P8 and S1–S2, nothing built ([ADR 0082](docs/decisions/0082-the-sql-adapters-keep-their-rules-in-the-database.md)) |
+| | The SQL adapters keep their rules in the database | 📋 | decided 2026-11-27; slices P0–P7 and S1–S2, nothing built ([ADR 0082](docs/decisions/0082-the-sql-adapters-keep-their-rules-in-the-database.md)) |
 | **Agents** | An agent as a Markdown folder, served by `adam-agent` with no build | ✅ | [Agent files](docs/reference/agent-files.md), [write an agent](docs/guides/write-an-agent.md) |
 | | `#[tool]` functions in Rust | ✅ | [The tool contract](docs/reference/agent-files.md#the-tool-contract), [embed adam](docs/guides/embed-adam.md) |
 | | Subagents, local and remote (A2A) | ✅ | [Child runs](docs/reference/child-runs.md) |
