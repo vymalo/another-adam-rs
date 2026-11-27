@@ -590,6 +590,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "adam-hook-exec"
+version = "0.6.0"
+dependencies = [
+ "adam-core",
+ "adam-error",
+ "adam-llm-agent",
+ "adam-model",
+ "adam-plugin",
+ "adam-runtime",
+ "async-trait",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "adam-host"
 version = "0.6.0"
 dependencies = [
@@ -622,6 +641,7 @@ dependencies = [
  "base64 0.22.1",
  "futures",
  "jiff",
+ "jsonschema",
  "proptest",
  "schemars 1.2.2",
  "secrecy",
@@ -858,6 +878,7 @@ dependencies = [
  "base64 0.22.1",
  "futures",
  "jiff",
+ "jsonschema",
  "proptest",
  "serde",
  "serde_json",
@@ -900,6 +921,7 @@ dependencies = [
  "adam-budget",
  "adam-core",
  "adam-error",
+ "adam-hook-exec",
  "adam-host",
  "adam-mcp",
  "adam-model",
@@ -917,7 +939,9 @@ dependencies = [
  "rustix",
  "rustls",
  "secrecy",
+ "serde",
  "serde_json",
+ "tempfile",
  "thiserror",
  "tokio",
  "tokio-util",

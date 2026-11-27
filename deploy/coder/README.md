@@ -110,9 +110,32 @@ restarted would go on signing with the old key. During the overlap the set holds
 `vault:<name>#v<n>` with `n` above 1 needs the set to name every earlier version, `1` to `n-1`, as a key or as
 revoked, or the process refuses to start.
 
+**Generated in the cluster.** A turn key is a secret the system can make itself, so it can be made here instead of by
+a person (`cluster-generated-secrets`): `turnSigning.generate.enabled=true` renders a **one-shot Job** that writes a
+PKCS#8 PEM Ed25519 key (`openssl genpkey -algorithm ed25519`) into a Secret the release owns — idempotently, a Secret
+that already holds it is left alone — and a **`PushSecret`** that copies it to `externalSecrets.key` under
+`turnSigning.generate.property` (`turn_signing_key`). The pods mount the generated Secret instead of the
+`ExternalSecret`'s, so `externalSecrets.properties.turnSigningKey` must stay empty: it is the *pull* side, and setting
+both is refused at render. The Job's image needs `openssl` and `kubectl`; pin it by digest in production. An
+`SSHKey` ESO generator is **not** a substitute — its private key is OpenSSH format, and adam reads PKCS#8 PEM
+(*verified 2026-11-27* in the ESO `SSHKey` generator page).
+
+The Job **runs as its own ServiceAccount** (`<fullname>-turn-key`), with a Role that lets it create Secrets in the
+release namespace and read or update the turn-key one by name, and nothing else: the coder's Role holds pods only, and
+the namespace's `default` account is granted nothing, so a Job on either would fail with a 403 and leave the rollout
+waiting for a Secret that never appears. `create` cannot be narrowed to a name — Kubernetes RBAC applies
+`resourceNames` to every verb except `create` and `deletecollection` (*verified 2026-11-27*,
+<https://kubernetes.io/docs/reference/access-authn-authz/rbac/#referring-to-resources>) — so the account can create a
+Secret of any name in that namespace; it exists for one Job and goes with the release.
+
+The Job's **name carries a hash of its pod template** (`<fullname>-turn-key-<8 hex>`), and the Secret and the
+`PushSecret` keep the stable `<fullname>-turn-key`. A Job's pod template is immutable, so a changed image or script
+must make a *new* Job: without the suffix, `helm upgrade` inside `ttlSecondsAfterFinished` (a day) fails with "field is
+immutable" and needs the Job deleted by hand.
+
 **Status.** The binary still treats the key as optional (no key: no signature), so a deployment that has not set
-the property starts as before. The chart is the half that ships first: provision `turn_signing_key` now, then the
-requiredness lands (ADR 0068 slice T2).
+the property starts as before. The chart is the half that ships first: provision `turn_signing_key` now — by hand, or
+with `turnSigning.generate` — then the requiredness lands (ADR 0068 slice T2, ANR-1025).
 
 ## The model gateway's URL from the secret
 

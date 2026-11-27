@@ -22,7 +22,8 @@ use adam_a2a_runtime::{ChildSessionAgent, ChildSessions, RuntimeTaskBackend};
 use adam_core::{DynStore, MemoryStore, NewRun, RunId, RunStatus, RunUpdate, Timestamp};
 use adam_llm_agent::{LlmAgent, SessionAgent, SessionTools, Tool, ToolCtx, ToolError, ToolOutput};
 use adam_model::{
-    DynModel, MockModel, ModelClient, ModelDelta, ModelError, ModelRequest, ModelResponse, ToolCall,
+    DynModel, MockModel, ModelClient, ModelDelta, ModelError, ModelRequest, ModelResponse,
+    ToolCall, Usage,
 };
 use adam_runtime::{
     BroadcastSink, ManualClock, Runtime, SessionBounds, SessionHeader, SessionLimits,
@@ -719,6 +720,10 @@ async fn a_start_config_is_admitted_recorded_in_the_header_and_reported() {
                 json!({"maxOutputTokens": 0}),
                 "start.config.maxOutputTokens",
             ),
+            (
+                json!({"tokenBudget": 999}),
+                "start.config.tokenBudget is 999; at least 1000",
+            ),
             (json!({"turbo": true}), "start.config.turbo"),
         ] {
             match rig.submit(&alice(), start_with(config.clone()), None).await {
@@ -737,7 +742,7 @@ async fn a_start_config_is_admitted_recorded_in_the_header_and_reported() {
         let task = rig
             .submit(
                 &alice(),
-                start_with(json!({"maxTurns": 3, "timeLimit": 5})),
+                start_with(json!({"maxTurns": 3, "timeLimit": 5, "tokenBudget": 5_000})),
                 None,
             )
             .await
@@ -751,15 +756,16 @@ async fn a_start_config_is_admitted_recorded_in_the_header_and_reported() {
         assert_eq!(config.max_turns, Some(3));
         assert_eq!(config.time_limit, Some(5));
         assert_eq!(config.max_tool_calls, None, "nothing is filled in");
+        assert_eq!(config.token_budget, Some(5_000));
         assert_eq!(
             object(&task)["config"],
-            json!({"maxTurns": 3, "timeLimit": 5}),
+            json!({"maxTurns": 3, "timeLimit": 5, "tokenBudget": 5_000}),
             "the session object says what it runs with"
         );
         let done = rig.until(&alice(), &task.id, TaskState::Completed).await;
         assert_eq!(
             object(&done)["config"],
-            json!({"maxTurns": 3, "timeLimit": 5})
+            json!({"maxTurns": 3, "timeLimit": 5, "tokenBudget": 5_000})
         );
         // The parent object lists it on the session's row, too.
         rig.parent_mock.push_text("parent says");
@@ -769,8 +775,62 @@ async fn a_start_config_is_admitted_recorded_in_the_header_and_reported() {
             .unwrap();
         assert_eq!(
             object(&parent)["sessions"][0]["config"],
-            json!({"maxTurns": 3, "timeLimit": 5})
+            json!({"maxTurns": 3, "timeLimit": 5, "tokenBudget": 5_000})
         );
+        rig.stop().await;
+    }
+}
+
+/// A session that spent its `token_budget` takes no more messages: the front refuses from the
+/// header the view already carries, and no round 2 is written (ADR 0054, decision 6).
+#[tokio::test]
+async fn a_message_to_a_session_that_spent_its_token_budget_is_refused() {
+    for store in stores().await {
+        let rig = Rig::with(
+            &store,
+            Options {
+                bounds: Some(SessionBounds::default()),
+                ..Options::new()
+            },
+        );
+        // One answer spends 1,100 of the 1,000 the person allowed.
+        let mut answer = ModelResponse::text("a plan");
+        answer.usage = Usage::new(600, 500);
+        rig.helper_mock.push_response(answer);
+        let mut start = said("plan it", Some("ctx-spent"));
+        start.metadata = Some(HashMap::from([(
+            CHILD_SESSIONS_EXTENSION.to_owned(),
+            json!({"start": {"agent": "planner", "description": "Plan it", "keepOpen": true,
+                             "config": {"tokenBudget": 1000}}}),
+        )]));
+        let task = rig.submit(&alice(), start, None).await.expect("start");
+        let (_, session) = parse_session_conversation_id(&task.context_id).unwrap();
+        rig.until(&alice(), &task.id, TaskState::Completed).await;
+        let header = rig.round_header(session).await;
+        assert_eq!(header.spent, 1_100);
+        assert!(header.is_spent(), "1,100 of 1,000");
+
+        let refused = rig
+            .submit(&alice(), said("more", Some(&task.context_id)), None)
+            .await;
+        match refused {
+            Err(BackendError::UnsupportedOperation(why)) => {
+                assert!(why.contains("has spent its token budget"), "{why}");
+                assert!(why.contains("1100 of 1000 tokens"), "{why}");
+            }
+            other => panic!("expected UnsupportedOperation, got {other:?}"),
+        }
+        let listed = rig
+            .runtime
+            .list_sessions("alice:ctx-spent", &[rig.helper.as_str()], 0, 10)
+            .await
+            .expect("list");
+        assert_eq!(
+            listed.sessions[0].round, 1,
+            "nothing was started by the refused message"
+        );
+        assert_eq!(listed.sessions[0].spent, 1_100);
+        assert_eq!(rig.helper_mock.requests().len(), 1);
         rig.stop().await;
     }
 }

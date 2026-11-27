@@ -2348,4 +2348,33 @@ check "refused: the tokens as a value in extraEnv, even with activity off" \
   fails helm_act --set-string config.extraEnv.ACTIVITY_BEARER_TOKENS=t
 check "refused: the address in extraEnv" fails helm_act_on --set-string config.extraEnv.ACTIVITY_LISTEN_ADDR=0.0.0.0:9100
 
+# The turn key generated in the cluster (convention cluster-generated-secrets): a one-shot Job writes it, a
+# PushSecret pushes it to AWS, and the pods mount the generated Secret instead of the ExternalSecret's.
+helm template coder "$chart" --namespace coder-ns --set image.tag=sha-abc1234 > "$out"
+check "by default no turn-key Job or PushSecret is rendered" lacks 'turn-key'
+helm template coder "$chart" --namespace coder-ns --set image.tag=sha-abc1234 \
+  --set turnSigning.generate.enabled=true > "$out"
+# The Job's name carries a hash of its pod template (a Job's template is immutable, so a change must make a new Job
+# rather than fail `helm upgrade`); the Secret and the PushSecret keep the stable name.
+check "generate: a Job makes the key" grep -qE 'name: coder-turn-key-[0-9a-f]{8}$' "$out"
+check "... it generates a PKCS#8 Ed25519 key with openssl" dhas Job 'openssl genpkey -algorithm ed25519'
+check "... and is idempotent: an existing key is left alone" dhas Job 'already exists'
+check "... it runs as its own ServiceAccount, not the default one" dhas Job 'serviceAccountName: coder-turn-key'
+check "... and mounts that account's token, the one pod that does" dhas Job 'automountServiceAccountToken: true'
+check "generate: the account exists and may write Secrets" dhas ServiceAccount 'name: coder-turn-key'
+check "... through a Role that creates Secrets" dhas Role 'resources: \["secrets"\]'
+check "... and reaches the turn-key one by name" dhas Role 'resourceNames: \["coder-turn-key"\]'
+check "... bound to that account" dhas RoleBinding 'name: coder-turn-key'
+check "a changed image makes a new Job, so an upgrade never meets an immutable template" \
+  sh -c 'a=$(helm template coder "'"$chart"'" --set image.tag=sha-abc1234 --set turnSigning.generate.enabled=true | grep -m1 -E "name: coder-turn-key-[0-9a-f]{8}$"); b=$(helm template coder "'"$chart"'" --set image.tag=sha-abc1234 --set turnSigning.generate.enabled=true --set turnSigning.generate.image=busybox:1.36 | grep -m1 -E "name: coder-turn-key-[0-9a-f]{8}$"); [ -n "$a" ] && [ -n "$b" ] && [ "$a" != "$b" ]'
+check "generate: a PushSecret copies it to the AWS secret" dhas PushSecret 'property: turn_signing_key'
+check "... from the Secret the Job writes" dhas PushSecret 'name: coder-turn-key'
+check "generate: the pods mount the generated Secret" dhas StatefulSet 'secretName: coder-turn-key'
+check "... with the generated key's item" dhas StatefulSet 'key: private-key.pem'
+check "generate: the ExternalSecret no longer copies a key" dlacks ExternalSecret 'TURN_SIGNING_KEY.pem'
+check "generate and a pulled key together are refused" \
+  fails helm template coder "$chart" --set image.tag=sha-abc1234 --set turnSigning.generate.enabled=true --set externalSecrets.properties.turnSigningKey=k
+check "generate without the ExternalSecret's store is refused" \
+  fails helm template coder "$chart" --set image.tag=sha-abc1234 --set turnSigning.generate.enabled=true --set externalSecrets.enabled=false
+
 if [ "$fail" -eq 0 ]; then echo "render checks passed"; else echo "render checks FAILED"; exit 1; fi

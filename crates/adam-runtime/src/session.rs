@@ -183,6 +183,13 @@ pub struct SessionHeader {
     /// when `false`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub closing: bool,
+    /// The session was **deleted** ([ADR 0054] decision 10): it is gone from every listing and every
+    /// tool refuses it with `no_such_session`, while its runs stay in the store. Written by the
+    /// closing round a `subagent_close` with `delete: true` starts. Absent when `false`.
+    ///
+    /// [ADR 0054]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub deleted: bool,
     /// The round's number, from 1: what orders the rounds of a session (timestamps tie, ids are
     /// hashes). `0` for a header written before it existed.
     #[serde(default)]
@@ -227,6 +234,34 @@ pub struct SessionHeader {
     /// [ADR 0054]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub config: Option<SessionConfig>,
+    /// The tokens the session has spent so far ([ADR 0054], decision 6): the earlier rounds' and
+    /// this round's, input and output, as `usage/v1` counts them. Each round's agent writes it into
+    /// the state it commits, so a listing reads it from the round's record like the rest of the
+    /// header, and a send refuses a session that spent its
+    /// [`config.token_budget`](SessionConfig::token_budget) without another store read. Absent when
+    /// `0`, which is what a header written before it existed reads.
+    ///
+    /// [ADR 0054]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub spent: u64,
+}
+
+impl SessionHeader {
+    /// The cap on the session's tokens, when it set one ([`SessionConfig::token_budget`]).
+    pub fn token_budget(&self) -> Option<u64> {
+        self.config.as_ref().and_then(|config| config.token_budget)
+    }
+
+    /// Whether the session has spent its token budget: a send is refused, and the next model call
+    /// of a round is its closing turn. One rule for the tool, the A2A front and the listing.
+    pub fn is_spent(&self) -> bool {
+        self.token_budget()
+            .is_some_and(|budget| self.spent >= budget)
+    }
+}
+
+fn is_zero_u64(n: &u64) -> bool {
+    *n == 0
 }
 
 /// The header a round's agent state holds, if it holds one.
@@ -429,6 +464,9 @@ pub struct SessionSummary {
     /// The configuration the session runs with, as its latest round's header says
     /// ([`SessionHeader::config`], ADR 0054); `None` when it has none.
     pub config: Option<SessionConfig>,
+    /// The tokens the session has spent so far, as its latest round's header says
+    /// ([`SessionHeader::spent`], ADR 0054 decision 6); `0` for a session with no header.
+    pub spent: u64,
 }
 
 /// The round a session's report is of ([`SessionSummary::report`]).
@@ -648,13 +686,43 @@ pub const CONTEXT_WINDOW_PROMPT_TOKENS: u32 = 20_000;
 /// [ADR 0054]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md
 pub const CONTEXT_WINDOW_HEADROOM_TOKENS: u32 = 8_000;
 
+/// The least `token_budget` a session may ask for ([ADR 0054], decision 4): below it a session is
+/// not worth the tokens of the answer.
+///
+/// [ADR 0054]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md
+pub const MIN_SESSION_TOKEN_BUDGET: u64 = 1_000;
+
+/// The most `token_budget` a session may ask for ([ADR 0054], decision 4): 2^53 − 1, the largest
+/// whole number a JSON number carries without losing one.
+///
+/// [ADR 0054]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md
+pub const MAX_SESSION_TOKEN_BUDGET: u64 = (1 << 53) - 1;
+
+/// The most entries of a session's `tools` or of its `deny_tools` ([ADR 0054], decision 4).
+///
+/// [ADR 0054]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md
+pub const MAX_SESSION_TOOL_ENTRIES: usize = 32;
+
+/// The most characters of one entry of a session's `tools` or `deny_tools` ([ADR 0054], decision 4).
+///
+/// [ADR 0054]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md
+pub const MAX_SESSION_TOOL_ENTRY_CHARS: usize = 200;
+
+/// The most tool names a refusal lists before it says `and N more`.
+const REFUSAL_LIST_NAMES: usize = 50;
+
+/// The most bytes of a session's `report_schema` as compact JSON: 16 KiB ([ADR 0054], decision 4).
+///
+/// [ADR 0054]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md
+pub const MAX_REPORT_SCHEMA_BYTES: usize = 16 * 1024;
+
 /// The configuration a session runs with ([ADR 0054]): every option optional, and each one only
 /// ever **narrows** what the subagent's folder and the deployment allow ([`SessionBounds::admit`]).
 ///
 /// An absent option stays absent and means "the folder's": nothing is filled in. The type is
-/// `#[non_exhaustive]` because the decision adds options slice by slice (`tools`, `token_budget`,
-/// `model`, …), and an option added must not break a builder. It serialises camelCase, which is how
-/// it crosses the wire in `start.config` and how it is journaled in a [`SessionHeader`].
+/// `#[non_exhaustive]` because the decision adds options slice by slice (`tools`, `model`, …), and
+/// an option added must not break a builder. It serialises camelCase, which is how it crosses the
+/// wire in `start.config` and how it is journaled in a [`SessionHeader`].
 ///
 /// [ADR 0054]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -690,7 +758,43 @@ pub struct SessionConfig {
     /// The most rounds the session may have, 1 to the root's effective `max_session_rounds`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_rounds: Option<u32>,
+    /// A cap on the tokens of the whole session, input and output, as `usage/v1` counts them
+    /// ([`MIN_SESSION_TOKEN_BUDGET`] to [`MAX_SESSION_TOKEN_BUDGET`]). Before each model call,
+    /// `spent` reaching it ends the round with the closing turn and the words `token budget
+    /// reached`, and a send to a session that spent it is refused. Nothing bounds it below that
+    /// ceiling today: any value narrows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_budget: Option<u64>,
+    /// An allow-list of the subagent's tools, in the folder's own syntax: exact names and `*`
+    /// patterns (`github__*` selects an MCP server). The session is offered only the tools it
+    /// matches, and `read_output` stays whatever it says. At most [`MAX_SESSION_TOOL_ENTRIES`]
+    /// entries of at most [`MAX_SESSION_TOOL_ENTRY_CHARS`] characters, none blank.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tools: Option<Vec<String>>,
+    /// A deny-list in the same syntax, applied after `tools`: a tool it matches is withheld even
+    /// when `tools` matches it too.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deny_tools: Option<Vec<String>>,
+    /// A JSON Schema (draft 2020-12) the round's final answer must match: one JSON value, checked
+    /// by the loop at the final answer ([ADR 0054], slice 9). At most [`MAX_REPORT_SCHEMA_BYTES`],
+    /// no `$ref` outside itself, and it must compile ([`SessionBounds::admit`]). Local subagents
+    /// only.
+    ///
+    /// [ADR 0054]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub report_schema: Option<Value>,
+    /// Text the parent agent (or the person) adds to this session, **after** the folder's own
+    /// instructions and never replacing them: at most [`MAX_SESSION_INSTRUCTIONS_CHARS`] characters,
+    /// rendered under a fixed heading that says where it comes from and that the text above wins
+    /// ([ADR 0054], decision 4).
+    ///
+    /// [ADR 0054]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instructions: Option<String>,
 }
+
+/// The most characters a session's `instructions` may hold ([ADR 0054], decision 4).
+pub const MAX_SESSION_INSTRUCTIONS_CHARS: usize = 4_000;
 
 impl SessionConfig {
     /// Whether no option is asked for: the folder's own settings, exactly as no `config` at all.
@@ -702,6 +806,30 @@ impl SessionConfig {
             && self.max_parallel_tool_calls.is_none()
             && self.time_limit.is_none()
             && self.max_rounds.is_none()
+            && self.token_budget.is_none()
+            && self.tools.is_none()
+            && self.deny_tools.is_none()
+            && self.report_schema.is_none()
+            && self.instructions.is_none()
+    }
+
+    /// What a round's context carries of this config under `vymalo.session.tools`
+    /// (`adam_llm_agent::SESSION_TOOLS_CONTEXT_KEY`, [ADR 0054] slice 3): `{"tools": [..],
+    /// "denyTools": [..]}`, only the members the config sets, and `{}` when it sets neither, so a
+    /// round never inherits another round's value. One function for the model's tools and the A2A
+    /// front, so the two write the same bytes.
+    ///
+    /// [ADR 0054]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md
+    #[must_use]
+    pub fn tools_context(&self) -> Value {
+        let mut entry = serde_json::Map::new();
+        if let Some(tools) = &self.tools {
+            entry.insert("tools".to_owned(), serde_json::json!(tools));
+        }
+        if let Some(deny) = &self.deny_tools {
+            entry.insert("denyTools".to_owned(), serde_json::json!(deny));
+        }
+        Value::Object(entry)
     }
 
     /// Read a `config` object ([ADR 0054], decision 1). **An unknown member is refused**, unlike the
@@ -709,8 +837,8 @@ impl SessionConfig {
     ///
     /// # Errors
     ///
-    /// A [`Refusal`] naming the member that is not an option, or the one whose value is not a
-    /// number.
+    /// A [`Refusal`] naming the member that is not an option, or the one whose value is not of its
+    /// type: a number, or for `tools` and `deny_tools` a list of strings.
     ///
     /// [ADR 0054]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md
     pub fn from_value(value: Value) -> Result<Self, Refusal> {
@@ -780,11 +908,39 @@ pub struct SessionBounds {
     pub time_limit: u32,
     /// The root's effective `max_session_rounds`.
     pub max_rounds: u32,
+    /// The folder's own cap on the session's tokens, when it ever sets one: **no folder does
+    /// today** ([ADR 0054], decision 4, "none today: any value narrows"), so this is `None` and
+    /// [`admit`](Self::admit) holds a request to the ADR's own ceiling.
+    ///
+    /// [ADR 0054]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md
+    pub token_budget: Option<u64>,
+    /// The names of the tools the folder and the deployment can offer the subagent (its own, and
+    /// an MCP server's as `server__tool`), **as far as the caller knows them**: a worker fills them
+    /// from the node it binds. Empty for a caller that knows none: a control plane binds no agent
+    /// and cannot list an MCP server's tools without calling the server.
+    pub tools: Vec<String>,
+    /// Whether [`tools`](Self::tools) is **every** tool the subagent can have: `false` when a
+    /// source adds tools while a run goes (an `mcp.json` server loaded by the task, or a source the
+    /// deployment gave), whose names no list made at startup holds. `admit` uses the two so that a
+    /// narrowing is never silently ignored (ADR 0054 decision 2):
+    ///
+    /// * a `tools` entry that matches no name is refused, listing the names, **only when the set is
+    ///   complete**; otherwise the shape alone is checked (an allow entry that matches nothing
+    ///   offers nothing, so it fails narrow);
+    /// * a `deny_tools` entry **without a `*`** that matches no name is refused **whenever any name
+    ///   is known**, even when the set is incomplete: a concrete name nobody knows is far more often
+    ///   a typo than a tool a source adds, and the refusal says to use a pattern for the latter;
+    /// * an entry with a `*` is checked only when the set is complete.
+    ///
+    /// With no name known (a control plane) only the shape is checked, so it admits what a worker
+    /// will accept.
+    pub tools_complete: bool,
 }
 
 impl Default for SessionBounds {
     /// The loop's own defaults: 50 turns, 200 tool calls, 4,096 output tokens, 10 calls at once,
-    /// 30 minutes, 20 rounds, and no known window.
+    /// 30 minutes, 20 rounds, no token budget, no known window and no known tools (an incomplete,
+    /// empty set).
     fn default() -> Self {
         Self {
             max_turns: 50,
@@ -794,6 +950,9 @@ impl Default for SessionBounds {
             max_parallel_tool_calls: 10,
             time_limit: 30,
             max_rounds: 20,
+            token_budget: None,
+            tools: Vec::new(),
+            tools_complete: false,
         }
     }
 }
@@ -899,8 +1058,143 @@ impl SessionBounds {
         if let Some(v) = requested.max_rounds {
             within("max_rounds", v, 1, self.max_rounds)?;
         }
+        if let Some(v) = requested.token_budget {
+            // The floor and the ceiling are the ADR's, not the folder's; a folder that ever sets a
+            // cap of its own lowers the ceiling further and never raises it.
+            if v < MIN_SESSION_TOKEN_BUDGET {
+                return Err(Refusal::new(
+                    Some("token_budget"),
+                    format!("config.token_budget is {v}; at least {MIN_SESSION_TOKEN_BUDGET}"),
+                ));
+            }
+            let ceiling = self.token_budget.unwrap_or(MAX_SESSION_TOKEN_BUDGET);
+            if v > ceiling {
+                return Err(Refusal::new(
+                    Some("token_budget"),
+                    format!("config.token_budget is {v}; at most {ceiling}"),
+                ));
+            }
+        }
+        if let Some(entries) = &requested.tools {
+            self.admit_tool_entries("tools", entries)?;
+        }
+        if let Some(entries) = &requested.deny_tools {
+            self.admit_tool_entries("deny_tools", entries)?;
+        }
+        if let Some(text) = &requested.instructions {
+            let chars = text.chars().count();
+            if chars > MAX_SESSION_INSTRUCTIONS_CHARS {
+                return Err(Refusal::new(
+                    Some("instructions"),
+                    format!(
+                        "config.instructions is {chars} characters; at most \
+                         {MAX_SESSION_INSTRUCTIONS_CHARS}"
+                    ),
+                ));
+            }
+        }
+        if let Some(schema) = &requested.report_schema {
+            report_schema_admissible(schema)?;
+        }
         Ok(requested)
     }
+
+    /// The entries of `tools` or `deny_tools`: each non-blank and short, not too many, and, as far
+    /// as the bound tool names are known (see [`tools_complete`](Self::tools_complete)), each
+    /// matching at least one of them.
+    fn admit_tool_entries(&self, option: &str, entries: &[String]) -> Result<(), Refusal> {
+        if entries.len() > MAX_SESSION_TOOL_ENTRIES {
+            return Err(Refusal::new(
+                Some(option),
+                format!(
+                    "config.{option} has {} entries; at most {MAX_SESSION_TOOL_ENTRIES}",
+                    entries.len()
+                ),
+            ));
+        }
+        for entry in entries {
+            if entry.trim().is_empty() {
+                return Err(Refusal::new(
+                    Some(option),
+                    format!("config.{option} has a blank entry; name a tool or a pattern"),
+                ));
+            }
+            let chars = entry.chars().count();
+            if chars > MAX_SESSION_TOOL_ENTRY_CHARS {
+                return Err(Refusal::new(
+                    Some(option),
+                    format!(
+                        "config.{option} has an entry of {chars} characters; at most \
+                         {MAX_SESSION_TOOL_ENTRY_CHARS}"
+                    ),
+                ));
+            }
+        }
+        let names = &self.tools;
+        for entry in entries {
+            let pattern = entry.contains('*');
+            // What is checked, and so refused: see `tools_complete`.
+            let checked = if option == "tools" || pattern {
+                self.tools_complete
+            } else {
+                self.tools_complete || !names.is_empty()
+            };
+            if !checked || names.iter().any(|name| glob(entry, name)) {
+                continue;
+            }
+            let listed: Vec<&str> = names
+                .iter()
+                .take(REFUSAL_LIST_NAMES)
+                .map(String::as_str)
+                .collect();
+            let mut list = if listed.is_empty() {
+                "none".to_owned()
+            } else {
+                listed.join(", ")
+            };
+            if names.len() > REFUSAL_LIST_NAMES {
+                list.push_str(&format!(" and {} more", names.len() - REFUSAL_LIST_NAMES));
+            }
+            let hint = if self.tools_complete {
+                String::new()
+            } else {
+                format!(
+                    "; the agent may get more tools while it runs: a pattern such as \"{entry}*\" \
+                     names those"
+                )
+            };
+            return Err(Refusal::new(
+                Some(option),
+                format!(
+                    "config.{option} has {entry:?}, which matches none of its tools: {list}{hint}"
+                ),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Whether `name` matches `pattern`, where `*` stands for any run of characters: the folder's own
+/// syntax for a list of tools or skills (`github__*` selects an MCP server). Without a `*` the
+/// two must be equal. A session's `tools` and `deny_tools` and the folder's `tools:` use this one
+/// function, so a pattern means the same in both.
+pub fn glob(pattern: &str, name: &str) -> bool {
+    let parts: Vec<&str> = pattern.split('*').collect();
+    // `split` yields at least one piece; without a `*` there is exactly one.
+    let (first, rest) = (parts[0], &parts[1..]);
+    let Some((last, middles)) = rest.split_last() else {
+        return pattern == name;
+    };
+    let Some(mut tail) = name.strip_prefix(first) else {
+        return false;
+    };
+    for middle in middles {
+        let Some(at) = tail.find(middle) else {
+            return false;
+        };
+        tail = &tail[at + middle.len()..];
+    }
+    tail.ends_with(last)
 }
 
 impl SessionBounds {
@@ -909,8 +1203,9 @@ impl SessionBounds {
     /// nothing is raised back. Unlike [`admit`](Self::admit) it refuses nothing: a value above its
     /// bound becomes the bound, and an absent option stays absent. A value below the least an option
     /// takes is raised to that least (`max_output_tokens` is never `0`, which would widen it;
-    /// `time_limit` never `0`, which would mean no limit; a `context_window` leaves a budget), but
-    /// never above the bound itself.
+    /// `time_limit` never `0`, which would mean no limit; `token_budget` never below
+    /// [`MIN_SESSION_TOKEN_BUDGET`]; a `context_window` leaves a budget), but never above the bound
+    /// itself.
     ///
     /// [ADR 0054]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md
     #[must_use]
@@ -951,8 +1246,75 @@ impl SessionBounds {
             max_rounds: config
                 .max_rounds
                 .map(|v| v.clamp(1, self.max_rounds.max(1))),
+            token_budget: config.token_budget.map(|v| {
+                let ceiling = self.token_budget.unwrap_or(MAX_SESSION_TOKEN_BUDGET);
+                v.max(MIN_SESSION_TOKEN_BUDGET).min(ceiling)
+            }),
+            // Entries narrow and are matched against the tools the round really has, so a
+            // deployment that dropped a tool since changes nothing here: an entry that matches
+            // nothing withholds nothing it should not.
+            tools: config.tools.clone(),
+            deny_tools: config.deny_tools.clone(),
+            report_schema: config.report_schema.clone(),
+            // Text has no bound to clamp to: `admit` already refused one that is too long, and a
+            // later round keeps what the session was started with.
+            instructions: config.instructions.clone(),
         }
     }
+}
+
+/// The first `$ref` or `$dynamicRef` of `schema` that does not point inside it (its text does not
+/// start with `#`), at any depth.
+fn outside_ref(schema: &Value) -> Option<&str> {
+    match schema {
+        Value::Object(members) => members.iter().find_map(|(key, value)| match value {
+            Value::String(target)
+                if (key == "$ref" || key == "$dynamicRef") && !target.starts_with('#') =>
+            {
+                Some(target.as_str())
+            }
+            _ => outside_ref(value),
+        }),
+        Value::Array(items) => items.iter().find_map(outside_ref),
+        _ => None,
+    }
+}
+
+/// Whether `schema` may be a session's `report_schema` ([ADR 0054], decision 4): a JSON object, at
+/// most [`MAX_REPORT_SCHEMA_BYTES`], no reference outside itself, and a schema of draft 2020-12 that
+/// compiles with nothing fetched.
+///
+/// [ADR 0054]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md
+fn report_schema_admissible(schema: &Value) -> Result<(), Refusal> {
+    let refuse = |message: String| Refusal::new(Some("report_schema"), message);
+    if !schema.is_object() {
+        return Err(refuse(
+            "config.report_schema must be a JSON Schema, an object".to_owned(),
+        ));
+    }
+    let bytes = serde_json::to_vec(schema).map_or(usize::MAX, |b| b.len());
+    if bytes > MAX_REPORT_SCHEMA_BYTES {
+        return Err(refuse(format!(
+            "config.report_schema is {bytes} bytes; at most {MAX_REPORT_SCHEMA_BYTES} (16 KiB)"
+        )));
+    }
+    if let Some(target) = outside_ref(schema) {
+        let shown: String = target.chars().take(80).collect();
+        return Err(refuse(format!(
+            "config.report_schema has a reference to {shown:?}; a report_schema may refer only to \
+             itself (a `$ref` that starts with `#`), never to another document"
+        )));
+    }
+    jsonschema::draft202012::options()
+        .offline()
+        .build(schema)
+        .map(|_| ())
+        .map_err(|why| {
+            let why: String = why.to_string().chars().take(300).collect();
+            refuse(format!(
+                "config.report_schema is not a JSON Schema of draft 2020-12 that compiles: {why}"
+            ))
+        })
 }
 
 /// `value` between `min` and `max`, or the sentence that says the option and the range.
@@ -1116,6 +1478,7 @@ pub(crate) fn page_of_sessions(
                 started_by: latest.parent_id,
                 report,
                 config: read.header.as_ref().and_then(|h| h.config.clone()),
+                spent: read.header.as_ref().map_or(0, |h| h.spent),
             })
         })
         .collect();
@@ -1211,6 +1574,11 @@ impl SessionView {
             .rposition(|(_, f)| !f.header.as_ref().is_some_and(|h| h.closing))
             .unwrap_or(last);
         let (latest, facts) = &runs[last];
+        // A deleted session is gone (ADR 0054 decision 10): not listed, and every tool's `view` is
+        // `None`, so each refuses it with `no_such_session`. Its runs stay in the store.
+        if facts.header.as_ref().is_some_and(|h| h.deleted) {
+            return None;
+        }
         let mut read = read_latest(latest, facts, now, idle_ttl);
         // The report is of another round: read its status, the one decode a closing round adds.
         if runs[worked].0.id != latest.id {
@@ -1317,9 +1685,14 @@ mod tests {
             decoded.workspace, None,
             "a header stored before `workspace`"
         );
+        assert_eq!(
+            decoded.spent, 0,
+            "a header stored before `spent` has spent nothing"
+        );
         let encoded = serde_json::to_value(&decoded).unwrap();
         assert!(encoded.get("root").is_none(), "absent when None");
         assert!(encoded.get("workspace").is_none(), "absent when None");
+        assert!(encoded.get("spent").is_none(), "absent when 0");
         let root = RunId::new();
         let header = SessionHeader {
             root: Some(root),
@@ -1343,11 +1716,13 @@ mod tests {
             keep_open: true,
             closed: false,
             closing: false,
+            deleted: false,
             round: 1,
             root: Some(root),
             workspace: Some(workspace),
             visible: false,
             config: None,
+            spent: 0,
         };
         let encoded = serde_json::to_value(&header).unwrap();
         assert_eq!(
@@ -1380,16 +1755,87 @@ mod tests {
             keep_open: true,
             closed: true,
             closing: true,
+            deleted: false,
             round: 3,
             root: None,
             workspace: None,
             visible: false,
             config: None,
+            spent: 0,
         };
         let payload = closing_round_payload(&header);
         assert_eq!(payload[SESSION_CLOSE_ROUND_KEY], Value::Bool(true));
         assert_eq!(payload.as_object().map(|o| o.len()), Some(2));
         assert_eq!(header_of(&payload), Some(header));
+    }
+
+    /// The tokens a session spent ([ADR 0054], decision 6) are a field of its header: they
+    /// round-trip, they are absent at `0`, and whether a session is spent is the header's rule
+    /// alone, so the tool, the A2A front and the listing cannot disagree.
+    ///
+    /// [ADR 0054]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md
+    #[test]
+    fn a_header_carries_the_tokens_the_session_spent() {
+        let mut header = header(RunId::new(), true, false);
+        header.config = Some(SessionConfig {
+            token_budget: Some(MIN_SESSION_TOKEN_BUDGET),
+            ..SessionConfig::default()
+        });
+        assert_eq!(header.token_budget(), Some(MIN_SESSION_TOKEN_BUDGET));
+        assert!(!header.is_spent(), "nothing spent yet");
+        header.spent = MIN_SESSION_TOKEN_BUDGET - 1;
+        assert!(!header.is_spent(), "one token left");
+        header.spent = MIN_SESSION_TOKEN_BUDGET;
+        assert!(header.is_spent(), "the budget itself is spent");
+
+        let encoded = serde_json::to_value(&header).unwrap();
+        assert_eq!(
+            encoded["spent"],
+            serde_json::json!(MIN_SESSION_TOKEN_BUDGET),
+            "written as a number"
+        );
+        let back: SessionHeader = serde_json::from_value(encoded).unwrap();
+        assert_eq!(back.spent, MIN_SESSION_TOKEN_BUDGET);
+
+        // No budget: any number of tokens is not a spent session.
+        header.config = None;
+        assert_eq!(header.token_budget(), None);
+        assert!(!header.is_spent());
+    }
+
+    /// The listing reads `spent` from the latest round's header, like the rest of it: a session
+    /// with no header reads `0`.
+    #[test]
+    fn a_listing_reads_the_spent_of_the_latest_round() {
+        let session = RunId::new();
+        let conversation = session_conversation_id("p", session);
+        let mut first = header(session, true, false);
+        first.spent = 700;
+        let mut second = header(session, true, false);
+        second.round = 2;
+        second.spent = 1_800;
+        let mut one = with_header(session, Some(first), RunStatus::Done, vec![]);
+        one.conversation_id = Some(conversation.clone());
+        let mut two = with_header(RunId::new(), Some(second), RunStatus::Done, vec![]);
+        two.conversation_id = Some(conversation.clone());
+        let list = page_of_sessions("p", rounds(vec![one, two]), 0, 10, t0(), idle_ttl());
+        assert_eq!(list.sessions.len(), 1);
+        assert_eq!(
+            list.sessions[0].spent, 1_800,
+            "the latest round's header says it"
+        );
+
+        // A session with no header has spent nothing to read.
+        let bare = RunId::new();
+        let list = page_of_sessions(
+            "p",
+            rounds(vec![with_header(bare, None, RunStatus::Done, vec![])]),
+            0,
+            10,
+            t0(),
+            idle_ttl(),
+        );
+        assert_eq!(list.sessions[0].spent, 0);
     }
 
     fn record(
@@ -1558,11 +2004,13 @@ mod tests {
             keep_open,
             closed,
             closing: false,
+            deleted: false,
             round: 1,
             root: None,
             workspace: None,
             visible: false,
             config: None,
+            spent: 0,
         }
     }
 
@@ -1742,6 +2190,22 @@ mod tests {
                     .expect("a message")
                     .remove("kind");
             },
+        );
+    }
+
+    /// A deleted session is not a session (ADR 0054 decision 10): `from_rounds` answers `None`, so
+    /// the listing drops it and every tool's `view` is `None`, which they refuse as
+    /// `no_such_session`. Its runs are still in the store — they are what was read here.
+    #[test]
+    fn a_deleted_session_is_not_a_session() {
+        let session = RunId::new();
+        let mut h = header(session, true, true);
+        h.closing = true;
+        h.deleted = true;
+        let rec = round_with_a_transcript(session, h, 1024);
+        assert!(
+            SessionView::from_rounds(session, vec![rec], t0(), idle_ttl()).is_none(),
+            "a deleted session is gone"
         );
     }
 
@@ -2051,7 +2515,7 @@ mod tests {
 
     /// Bounds as the assembly computes them for a `reviewer` whose folder allows more than any
     /// test asks for: 200 turns, 500 tool calls, 4,096 output tokens, a 200,000-token window, 10
-    /// calls at once, 30 minutes and 12 rounds.
+    /// calls at once, 30 minutes, 12 rounds and no token budget of its own.
     fn bounds() -> SessionBounds {
         SessionBounds {
             max_turns: 200,
@@ -2061,6 +2525,9 @@ mod tests {
             max_parallel_tool_calls: 10,
             time_limit: 30,
             max_rounds: 12,
+            token_budget: None,
+            tools: Vec::new(),
+            tools_complete: false,
         }
     }
 
@@ -2238,6 +2705,72 @@ mod tests {
         );
     }
 
+    /// `token_budget` is bounded by the ADR alone ([ADR 0054], decision 4: "none today: any value
+    /// narrows"): 1,000 to 2^53 − 1, with a folder's own cap, when it ever sets one, lowering the
+    /// ceiling and never raising it.
+    ///
+    /// [ADR 0054]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md
+    #[test]
+    fn token_budget_has_a_floor_and_the_adrs_ceiling() {
+        let ask = |v: u64| SessionConfig {
+            token_budget: Some(v),
+            ..SessionConfig::default()
+        };
+        let why = bounds().admit(ask(999)).expect_err("below the floor");
+        assert_eq!(why.option(), Some("token_budget"));
+        assert!(
+            why.message()
+                .contains("config.token_budget is 999; at least 1000"),
+            "{why}"
+        );
+        assert_eq!(
+            bounds()
+                .admit(ask(MIN_SESSION_TOKEN_BUDGET))
+                .expect("the floor itself")
+                .token_budget,
+            Some(MIN_SESSION_TOKEN_BUDGET)
+        );
+        assert_eq!(
+            bounds()
+                .admit(ask(MAX_SESSION_TOKEN_BUDGET))
+                .expect("the ceiling itself")
+                .token_budget,
+            Some(MAX_SESSION_TOKEN_BUDGET)
+        );
+        let why = bounds()
+            .admit(ask(MAX_SESSION_TOKEN_BUDGET + 1))
+            .expect_err("above the ceiling");
+        assert_eq!(why.option(), Some("token_budget"));
+        assert!(
+            why.message()
+                .contains(&format!("at most {MAX_SESSION_TOKEN_BUDGET}")),
+            "{why}"
+        );
+
+        // A folder's own cap, when there ever is one, lowers the ceiling and never raises it.
+        let folder = SessionBounds {
+            token_budget: Some(50_000),
+            ..bounds()
+        };
+        assert!(folder.admit(ask(50_001)).is_err());
+        assert_eq!(
+            folder
+                .admit(ask(50_000))
+                .expect("the folder's cap itself")
+                .token_budget,
+            Some(50_000)
+        );
+
+        // Clamp raises a value below the floor to it, and brings one above the ceiling down to it.
+        assert_eq!(
+            bounds().clamp(&ask(1)).token_budget,
+            Some(MIN_SESSION_TOKEN_BUDGET)
+        );
+        assert_eq!(folder.clamp(&ask(80_000)).token_budget, Some(50_000));
+        // Absent stays absent: nothing is filled in.
+        assert_eq!(bounds().clamp(&SessionConfig::default()).token_budget, None);
+    }
+
     #[test]
     fn admit_takes_a_lower_value_for_every_option_and_fills_nothing_in() {
         let requested = SessionConfig {
@@ -2248,6 +2781,9 @@ mod tests {
             max_parallel_tool_calls: Some(2),
             time_limit: Some(3),
             max_rounds: Some(4),
+            token_budget: Some(5_000),
+            report_schema: Some(serde_json::json!({"type": "object"})),
+            ..SessionConfig::default()
         };
         let admitted = bounds().admit(requested.clone()).expect("all lowered");
         assert_eq!(
@@ -2291,6 +2827,106 @@ mod tests {
         }
     }
 
+    fn reporting(schema: Value) -> SessionConfig {
+        SessionConfig {
+            report_schema: Some(schema),
+            ..SessionConfig::default()
+        }
+    }
+
+    #[test]
+    fn a_report_schema_of_draft_2020_12_is_admitted_as_asked() {
+        let schema = serde_json::json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {"node": {"$ref": "#/$defs/node"}},
+            "$defs": {"node": {"type": "object", "properties": {"next": {"$ref": "#/$defs/node"}}}},
+        });
+        let asked = reporting(schema);
+        assert_eq!(bounds().admit(asked.clone()).expect("admitted"), asked);
+        assert!(!asked.is_empty());
+    }
+
+    #[test]
+    fn a_report_schema_with_a_reference_outside_itself_is_refused_by_name() {
+        for outside in [
+            serde_json::json!({"$ref": "https://example.com/other.json"}),
+            serde_json::json!({"$ref": "other.json"}),
+            serde_json::json!({"properties": {"a": {"items": [{"$ref": "file:///etc/x.json"}]}}}),
+            serde_json::json!({"$dynamicRef": "https://example.com/meta"}),
+        ] {
+            let why = bounds()
+                .admit(reporting(outside.clone()))
+                .expect_err("a reference to another document");
+            assert_eq!(why.option(), Some("report_schema"), "{outside}");
+            assert!(
+                why.message().contains("config.report_schema")
+                    && why.message().contains("refer only to itself"),
+                "{}",
+                why.message()
+            );
+        }
+    }
+
+    #[test]
+    fn a_report_schema_over_16_kib_is_refused_and_one_at_the_limit_is_not() {
+        let padded = |len: usize| serde_json::json!({"description": "x".repeat(len)});
+        let overhead = serde_json::to_vec(&padded(0)).unwrap().len();
+        let at = padded(MAX_REPORT_SCHEMA_BYTES - overhead);
+        assert_eq!(
+            serde_json::to_vec(&at).unwrap().len(),
+            MAX_REPORT_SCHEMA_BYTES
+        );
+        bounds().admit(reporting(at)).expect("exactly 16 KiB");
+        let why = bounds()
+            .admit(reporting(padded(MAX_REPORT_SCHEMA_BYTES - overhead + 1)))
+            .expect_err("one byte over");
+        assert_eq!(why.option(), Some("report_schema"));
+        assert!(
+            why.message().contains("at most 16384 (16 KiB)"),
+            "{}",
+            why.message()
+        );
+    }
+
+    #[test]
+    fn a_report_schema_that_does_not_compile_or_is_not_an_object_is_refused() {
+        let broken = bounds()
+            .admit(reporting(serde_json::json!({"type": "no-such-type"})))
+            .expect_err("not a schema");
+        assert_eq!(broken.option(), Some("report_schema"));
+        assert!(
+            broken.message().contains("draft 2020-12 that compiles"),
+            "{}",
+            broken.message()
+        );
+        let scalar = bounds()
+            .admit(reporting(serde_json::json!("string")))
+            .expect_err("not an object");
+        assert!(
+            scalar.message().contains("an object"),
+            "{}",
+            scalar.message()
+        );
+    }
+
+    #[test]
+    fn a_report_schema_crosses_the_wire_camel_case_and_survives_a_clamp() {
+        let config = SessionConfig::from_value(serde_json::json!({
+            "reportSchema": {"type": "string"},
+        }))
+        .expect("an option");
+        assert_eq!(
+            config.report_schema,
+            Some(serde_json::json!({"type": "string"}))
+        );
+        assert_eq!(
+            serde_json::to_value(&config).unwrap(),
+            serde_json::json!({"reportSchema": {"type": "string"}})
+        );
+        assert_eq!(bounds().clamp(&config), config);
+    }
+
     #[test]
     fn clamp_brings_every_option_down_to_the_bounds_of_now_and_never_raises_one() {
         let ask = SessionConfig {
@@ -2301,6 +2937,9 @@ mod tests {
             max_parallel_tool_calls: Some(8),
             time_limit: Some(25),
             max_rounds: Some(10),
+            token_budget: Some(8_000),
+            report_schema: Some(serde_json::json!({"type": "object"})),
+            ..SessionConfig::default()
         };
         // A deployment that lowered every limit since the session started.
         let lowered = SessionBounds {
@@ -2311,6 +2950,9 @@ mod tests {
             max_parallel_tool_calls: 3,
             time_limit: 10,
             max_rounds: 5,
+            token_budget: Some(4_000),
+            tools: Vec::new(),
+            tools_complete: false,
         };
         let clamped = lowered.clamp(&ask);
         assert_eq!(clamped.max_turns, Some(40));
@@ -2320,6 +2962,7 @@ mod tests {
         assert_eq!(clamped.max_parallel_tool_calls, Some(3));
         assert_eq!(clamped.time_limit, Some(10));
         assert_eq!(clamped.max_rounds, Some(5));
+        assert_eq!(clamped.token_budget, Some(4_000));
         // Within the bounds: unchanged. Absent: stays absent.
         assert_eq!(bounds().clamp(&ask), ask);
         assert_eq!(
@@ -2516,5 +3159,210 @@ mod tests {
                 "version {v}"
             );
         }
+    }
+
+    // ── ADR 0054 slice 3: `tools` and `deny_tools` ───────────────────────────────────────────
+
+    /// Bounds of a worker that binds `reviewer` with these tools: two of its own and two of an MCP
+    /// server.
+    fn bound_with_tools() -> SessionBounds {
+        SessionBounds {
+            tools: [
+                "read_file",
+                "write_file",
+                "linear__list_issues",
+                "linear__get_issue",
+            ]
+            .map(str::to_owned)
+            .to_vec(),
+            tools_complete: true,
+            ..bounds()
+        }
+    }
+
+    /// The same, for an agent a source adds tools to while it runs (both shipped agents): the
+    /// names are known, but not all of them.
+    fn bound_with_incomplete_tools() -> SessionBounds {
+        SessionBounds {
+            tools_complete: false,
+            ..bound_with_tools()
+        }
+    }
+
+    fn listing(tools: &[&str], deny: &[&str]) -> SessionConfig {
+        let own = |names: &[&str]| {
+            (!names.is_empty()).then(|| names.iter().map(|n| (*n).to_owned()).collect())
+        };
+        SessionConfig {
+            tools: own(tools),
+            deny_tools: own(deny),
+            ..SessionConfig::default()
+        }
+    }
+
+    #[test]
+    fn a_star_matches_any_run() {
+        assert!(glob("linear__*", "linear__list_issues"));
+        assert!(glob("linear__*", "linear__"));
+        assert!(!glob("linear__*", "github__list"));
+        assert!(!glob("linear__*", "linear_"));
+        assert!(glob("*_issues", "linear__list_issues"));
+        assert!(glob("*", "anything"));
+        assert!(glob("a*b*c", "aXbYc"));
+        assert!(glob("a*b*c", "abc"));
+        assert!(!glob("a*b*c", "acb"));
+        assert!(!glob("a*b*c", "aXbY"));
+        assert!(glob("exact", "exact"));
+        assert!(!glob("exact", "exactly"));
+        // The pieces of a pattern cannot overlap: `ab*ba` needs four characters.
+        assert!(!glob("ab*ba", "aba"));
+    }
+
+    #[test]
+    fn a_tools_pattern_that_matches_no_bound_tool_is_refused_with_the_list() {
+        for (option, asked) in [
+            ("tools", listing(&["red_file"], &[])),
+            ("deny_tools", listing(&[], &["red_file"])),
+        ] {
+            let why = bound_with_tools().admit(asked).expect_err("matches none");
+            assert_eq!(why.option(), Some(option));
+            assert!(
+                why.message().contains(&format!(
+                    "config.{option} has \"red_file\", which matches none of its tools: \
+                     read_file, write_file, linear__list_issues, linear__get_issue"
+                )),
+                "{why}"
+            );
+        }
+        // The positive control: names and patterns that match something are admitted as asked.
+        let ok = listing(&["read_file", "linear__*"], &["write_*"]);
+        assert_eq!(bound_with_tools().admit(ok.clone()).expect("matches"), ok);
+    }
+
+    #[test]
+    fn an_incomplete_set_refuses_a_concrete_deny_entry_it_does_not_know_and_checks_no_pattern() {
+        let bound = bound_with_incomplete_tools();
+        // A typo of a concrete deny entry: refused, with the list and the way to name the rest.
+        let why = bound
+            .admit(listing(&[], &["red_file"]))
+            .expect_err("a concrete name no tool has");
+        assert_eq!(why.option(), Some("deny_tools"));
+        assert!(
+            why.message().contains(
+                "config.deny_tools has \"red_file\", which matches none of its tools: read_file, \
+                 write_file, linear__list_issues, linear__get_issue; the agent may get more tools \
+                 while it runs: a pattern such as \"red_file*\" names those"
+            ),
+            "{why}"
+        );
+        // A pattern, and an allow entry, are not checked: a source may add what they select.
+        let ok = listing(&["github__*", "later_tool"], &["github__*", "later_*"]);
+        assert_eq!(bound.admit(ok.clone()).expect("not checked"), ok);
+        // A known name is admitted.
+        assert!(bound.admit(listing(&[], &["write_file"])).is_ok());
+        // With no name known at all (a control plane) even a concrete deny entry is shape only.
+        assert!(bounds().admit(listing(&[], &["red_file"])).is_ok());
+    }
+
+    #[test]
+    fn a_complete_set_checks_patterns_and_allow_entries_too() {
+        let bound = bound_with_tools();
+        for asked in [
+            listing(&["github__*"], &[]),
+            listing(&[], &["github__*"]),
+            listing(&["later_tool"], &[]),
+        ] {
+            assert!(bound.admit(asked.clone()).is_err(), "{asked:?}");
+        }
+        // No hint to name more tools by pattern: the set is every tool there is.
+        let why = bound.admit(listing(&["x"], &[])).unwrap_err();
+        assert!(!why.message().contains("while it runs"), "{why}");
+        // A complete empty set (an agent with no tools) refuses with `none`.
+        let bare = SessionBounds {
+            tools: Vec::new(),
+            tools_complete: true,
+            ..bounds()
+        };
+        assert!(
+            bare.admit(listing(&["x"], &[]))
+                .unwrap_err()
+                .message()
+                .ends_with("matches none of its tools: none")
+        );
+    }
+
+    #[test]
+    fn a_server_pattern_selects_the_tools_of_an_mcp_server() {
+        let admitted = bound_with_tools()
+            .admit(listing(&["linear__*"], &[]))
+            .expect("linear__ matches linear__list_issues");
+        assert_eq!(admitted.tools, Some(vec!["linear__*".to_owned()]));
+        assert!(glob("linear__*", "linear__list_issues"));
+        // A server the agent has no tool of selects nothing.
+        let why = bound_with_tools()
+            .admit(listing(&["github__*"], &[]))
+            .expect_err("no github tools");
+        assert!(why.message().contains("\"github__*\""), "{why}");
+    }
+
+    #[test]
+    fn a_long_list_of_tools_is_cut_at_fifty_names() {
+        let many = SessionBounds {
+            tools: (0..53).map(|n| format!("tool_{n:02}")).collect(),
+            tools_complete: true,
+            ..bounds()
+        };
+        let why = many.admit(listing(&["nope"], &[])).expect_err("none");
+        assert!(why.message().contains("tool_49 and 3 more"), "{why}");
+        assert!(!why.message().contains("tool_50"), "{why}");
+    }
+
+    #[test]
+    fn without_known_tools_an_entry_is_admitted_by_its_shape_alone() {
+        let unknown = bounds();
+        assert!(unknown.tools.is_empty() && !unknown.tools_complete);
+        let ask = listing(&["anything_at_all", "server__*"], &["x"]);
+        assert_eq!(unknown.admit(ask.clone()).expect("shape only"), ask);
+        // The shape is still held.
+        for (asked, words) in [
+            (listing(&["  "], &[]), "config.tools has a blank entry"),
+            (listing(&[], &[""]), "config.deny_tools has a blank entry"),
+            (
+                listing(&[&"x".repeat(201)], &[]),
+                "config.tools has an entry of 201 characters; at most 200",
+            ),
+            (
+                listing(&[&"x".repeat(200)], &[&"y".repeat(201)]),
+                "config.deny_tools has an entry of 201 characters; at most 200",
+            ),
+        ] {
+            let why = unknown.admit(asked).expect_err("bad shape");
+            assert!(why.message().contains(words), "{why}");
+        }
+        let names: Vec<String> = (0..33).map(|n| format!("t{n}")).collect();
+        let too_many = SessionConfig {
+            tools: Some(names.clone()),
+            ..SessionConfig::default()
+        };
+        let why = unknown.admit(too_many).expect_err("33 entries");
+        assert_eq!(why.message(), "config.tools has 33 entries; at most 32");
+        let at_most = SessionConfig {
+            deny_tools: Some(names[..32].to_vec()),
+            ..SessionConfig::default()
+        };
+        assert!(unknown.admit(at_most).is_ok());
+    }
+
+    #[test]
+    fn tools_and_deny_tools_count_as_set_and_survive_a_clamp() {
+        assert!(!listing(&["a"], &[]).is_empty());
+        assert!(!listing(&[], &["a"]).is_empty());
+        let both = listing(&["a*"], &["ab"]);
+        assert_eq!(bounds().clamp(&both), both);
+        // The wire is camelCase and carries only what is set.
+        assert_eq!(
+            serde_json::to_value(&both).expect("serialises"),
+            serde_json::json!({"tools": ["a*"], "denyTools": ["ab"]})
+        );
     }
 }

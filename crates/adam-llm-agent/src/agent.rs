@@ -62,8 +62,11 @@ use crate::order;
 use crate::paging::backstop;
 use crate::plan::Plan;
 use crate::schedule::{self, Entry, Ordered, Queue, Segment};
+use crate::session_tools::{SessionNarrowing, narrowing_of};
 use crate::sessions::{
-    DueFacts, SUBAGENT_CLOSE, SUBAGENT_READ, SUBAGENT_SEND, SUBAGENT_START, is_due, report_call_id,
+    DueFacts, MAX_REPORT_CORRECTIONS, REPORT_MISMATCH, ReportVerdict, SUBAGENT_CLOSE,
+    SUBAGENT_READ, SUBAGENT_SEND, SUBAGENT_START, check_report, is_due, report_call_id,
+    report_correction,
 };
 
 /// Whether the history holds a call that started a session or sent to one.
@@ -87,12 +90,17 @@ fn has_started_session(state: &Conversation) -> bool {
 async fn apply_sources(
     sources: &[DynToolSource],
     source_ctx: Option<&SourceCtx>,
+    narrowing: &SessionNarrowing,
     request: &mut ModelRequest,
     inject: bool,
 ) -> Sourced {
     let (notes, offered, carried) = match source_ctx {
-        Some(source_ctx) => offered_by(sources, source_ctx, request).await,
-        None => (Vec::new(), Vec::new(), Vec::new()),
+        Some(source_ctx) => offered_by(sources, source_ctx, narrowing, request).await,
+        None => {
+            // No sources, but a session's `tools` and `deny_tools` hold all the same.
+            narrowing.retain(&mut request.tools);
+            (Vec::new(), Vec::new(), Vec::new())
+        }
     };
     let own = order::prepare(&mut request.tools, inject);
     Sourced {
@@ -126,10 +134,37 @@ fn carried_loaded(source_ctx: &SourceCtx, request: &ModelRequest) -> Vec<String>
         .collect()
 }
 
-/// The sources' part of [`apply_sources`].
+/// The heading a session's `instructions` are rendered under (ADR 0054, decision 4): they follow the
+/// folder's own text, and the text above wins — which is what the heading says.
+const SESSION_INSTRUCTIONS_HEADING: &str = "## Instructions from the parent agent or the person\n\n\
+They are added to the instructions above, which take precedence over them.\n\n";
+
+/// `system` with the session's `instructions` after it, when the round's header carries any: a
+/// session's text never replaces the folder's, it follows it under the heading.
+fn with_session_instructions(
+    system: Option<String>,
+    config: Option<&adam_runtime::SessionConfig>,
+) -> Option<String> {
+    let Some(text) = config
+        .and_then(|c| c.instructions.as_deref())
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+    else {
+        return system;
+    };
+    Some(match system {
+        Some(own) if !own.trim().is_empty() => {
+            format!("{own}\n\n{SESSION_INSTRUCTIONS_HEADING}{text}")
+        }
+        _ => format!("{SESSION_INSTRUCTIONS_HEADING}{text}"),
+    })
+}
+
+/// The sources' part of [`apply_sources`], and what a session's narrowing holds back.
 async fn offered_by(
     sources: &[DynToolSource],
     source_ctx: &SourceCtx,
+    narrowing: &SessionNarrowing,
     request: &mut ModelRequest,
 ) -> (Vec<ToolNote>, Vec<String>, Vec<String>) {
     let (more, notes) = offered(sources, source_ctx, &request.tools).await;
@@ -155,7 +190,7 @@ async fn offered_by(
     };
     // What a source holds back is not shown, the agent's own tools included.
     let names: Vec<&str> = request.tools.iter().map(|t| t.name.as_str()).collect();
-    let held = withheld(sources, source_ctx, &names).await;
+    let held = withheld(narrowing, sources, source_ctx, &names).await;
     if !held.is_empty() {
         request
             .tools
@@ -381,6 +416,9 @@ struct Prepared {
     tool_ctx: ToolCtx,
     /// The sources and what they see of the run, to check what a source holds back.
     holding: Option<(Vec<DynToolSource>, SourceCtx)>,
+    /// What the run's session narrows (ADR 0054 slice 3), checked **before** the sources' holds and
+    /// whether or not the agent has sources.
+    narrowing: Arc<SessionNarrowing>,
     unjournaled: Arc<Mutex<SandboxUsage>>,
     /// A person can approve a call of this run ([`CallFacts::approvable`]).
     approvable: bool,
@@ -463,6 +501,8 @@ struct CallFacts {
     loaded: Arc<[Loaded]>,
     /// The loaded tools a request did not carry (`Conversation::removed_tools`).
     removed_tools: Arc<[String]>,
+    /// The tools the run's session holds back ([`SessionNarrowing`]).
+    narrowing: Arc<SessionNarrowing>,
     /// How many custom events the transition's calls have emitted: one counter for all of them.
     event_budget: Arc<AtomicUsize>,
     /// Whether a person can approve a call a hook asks about (ADR 0050, slice H8): the run may ask
@@ -512,6 +552,8 @@ struct EarlyFacts {
     loaded: Arc<[Loaded]>,
     /// The loaded tools a request did not carry, as the turn starts.
     removed_tools: Arc<[String]>,
+    /// The tools the run's session holds back, as the turn starts.
+    narrowing: Arc<SessionNarrowing>,
     /// The transition's counter of custom events ([`CallFacts::event_budget`]).
     event_budget: Arc<AtomicUsize>,
     /// Whether a person can approve a call of the turn ([`CallFacts::approvable`]).
@@ -668,6 +710,7 @@ impl<'a> Early<'a> {
             task: self.facts.task.clone(),
             loaded: Arc::clone(&self.facts.loaded),
             removed_tools: Arc::clone(&self.facts.removed_tools),
+            narrowing: Arc::clone(&self.facts.narrowing),
             event_budget: Arc::clone(&self.facts.event_budget),
             approvable: self.facts.approvable,
         };
@@ -2381,6 +2424,7 @@ impl LlmAgent {
         // the one before is not the answer of this one.
         if !texts.as_slice().is_empty() {
             state.thinking_cuts = 0;
+            state.report_corrections = 0;
             state.announced = None;
             state.announced_final = false;
         }
@@ -2716,6 +2760,69 @@ impl LlmAgent {
         state.session.as_ref().and_then(|h| h.config.as_ref())
     }
 
+    /// The cap on the tokens of this run's session ([ADR 0054], decision 6), `None` for a run that
+    /// is no round of a session or a session that set none. Read at every model call, so a budget
+    /// an edit raises applies from the next call.
+    ///
+    /// [ADR 0054]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md
+    fn token_budget_of(&self, state: &Conversation) -> Option<u64> {
+        self.session_config(state)
+            .and_then(|config| config.token_budget)
+    }
+
+    /// Count the tokens of a model call of this round: `usage` adds to the round's own
+    /// ([`Conversation::usage`]) and, for a round of a session, to the session's so far
+    /// ([`Conversation::spent`]), which the header carries so that a listing and a send read it
+    /// from the committed record ([ADR 0054], decision 6).
+    ///
+    /// [ADR 0054]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md
+    fn count_tokens(state: &mut Conversation, usage: adam_model::Usage) {
+        state.usage = state.usage.saturating_add(usage);
+        // A run that is nobody's round has no session to spend for: it keeps `0`, so its state is
+        // the bytes it always was.
+        if let Some(header) = &mut state.session {
+            state.spent = state.spent.saturating_add(usage.total_tokens());
+            header.spent = state.spent;
+        }
+    }
+
+    /// The check of a final answer against the `report_schema` of its session ([ADR 0054], slice 9):
+    /// `None` when the session has none or the answer matches it, so the answer ends the round as
+    /// it would. A mismatch with a correction left (`retry`) puts the problems to the model as a
+    /// turn and goes on ([`MAX_REPORT_CORRECTIONS`] times, each a model call counted in
+    /// `max_turns`); otherwise the round fails with [`REPORT_MISMATCH`].
+    ///
+    /// [ADR 0054]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md
+    fn report_gate(&self, state: &mut Conversation, answer: &str, retry: bool) -> Option<Flow> {
+        let schema = self.session_config(state)?.report_schema.clone()?;
+        let problems = match check_report(&schema, answer) {
+            ReportVerdict::Matches => return None,
+            ReportVerdict::Unusable(why) => {
+                return Some(Flow::Fail(format!(
+                    "report_schema does not compile, so no report can match it: {why}"
+                )));
+            }
+            ReportVerdict::Mismatch(problems) => problems,
+        };
+        if retry && state.report_corrections < MAX_REPORT_CORRECTIONS {
+            let first = state.report_corrections == 0;
+            state.report_corrections += 1;
+            // The answer that did not match is not the answer any more: a tool's announcement
+            // would otherwise be checked again, and end the round, in place of the corrected words.
+            state.announced = None;
+            state.announced_final = false;
+            state.messages.push(Message::user_text(report_correction(
+                &problems,
+                first.then_some(&schema),
+            )));
+            return Some(Flow::Next);
+        }
+        Some(Flow::Fail(format!(
+            "{REPORT_MISMATCH}: {}",
+            problems.join("; ")
+        )))
+    }
+
     /// The agent's [`Limits`] narrowed by its session's `max_turns` and `max_tool_calls`: read at
     /// every step, so the next model call obeys them. A value of `0` is no narrowing (a header is
     /// never trusted to widen), and nothing here is ever raised.
@@ -3020,11 +3127,29 @@ impl LlmAgent {
                 answer: None,
             });
         }
+        // The session's tokens, the earlier rounds' and this one's, reached its budget ([ADR 0054],
+        // decision 6): this model call is the closing turn and the round ends with it.
+        //
+        // [ADR 0054]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md
+        if state.limit.is_none()
+            && self
+                .token_budget_of(state)
+                .is_some_and(|budget| state.spent >= budget)
+        {
+            state.limit = Some(LimitHit {
+                limit: LimitKind::TokenBudget,
+                answered: false,
+                answer: None,
+            });
+        }
         let closing = state.limit.is_some();
         let live = self.live_model(state);
         let live_alias = live.alias.to_owned();
         let mut request = ModelRequest::new(live_alias.clone());
-        request.system = self.instructions.clone();
+        request.system = with_session_instructions(
+            self.instructions.clone(),
+            state.session.as_ref().and_then(|h| h.config.as_ref()),
+        );
         // What is sent about an image is decided here, from the reference and the deployment's
         // settings now, and recorded nowhere: the same settings give the same lines every turn.
         let image_limits = self.model.input_modalities(&live_alias).images;
@@ -3056,6 +3181,7 @@ impl LlmAgent {
 
         let model = self.model.clone();
         let sources = self.sources.clone();
+        let narrowing = Arc::new(narrowing_of(state, context.map(|c| &**c)));
         let turn = state.turns;
         // The step start seeded a journal written before `loaded` existed; a fresh run (or a
         // continuation) has no seed, and its task-loaded groups are journaled here.
@@ -3136,6 +3262,7 @@ impl LlmAgent {
             task: state.task().map(Arc::from),
             loaded: Arc::from(state.loaded.clone()),
             removed_tools: Arc::from(state.removed_tools.clone()),
+            narrowing: Arc::new(narrowing_of(state, context.map(|c| &**c))),
             event_budget: Arc::clone(&state.event_budget.0),
             approvable: approvable(ctx, state),
             turn: crate::early::Turn {
@@ -3170,7 +3297,14 @@ impl LlmAgent {
                     own_order,
                     offered,
                     mut carried,
-                } = apply_sources(&sources, source_ctx.as_ref(), &mut request, ordered).await;
+                } = apply_sources(
+                    &sources,
+                    source_ctx.as_ref(),
+                    &narrowing,
+                    &mut request,
+                    ordered,
+                )
+                .await;
                 let loaders = match source_ctx.as_ref() {
                     Some(ctx) if need_loaders => {
                         Some(crate::source::loaders_offered(&sources, ctx).await)
@@ -3478,7 +3612,7 @@ impl LlmAgent {
             reasoning: _,
         } = response;
         // The call's tokens count whatever its answer was: the provider took them.
-        state.usage = state.usage.saturating_add(usage);
+        Self::count_tokens(state, usage);
         state
             .usage_totals
             .add(self.model.provider(), &live_alias, usage);
@@ -3582,6 +3716,10 @@ impl LlmAgent {
             if said.trim().is_empty() {
                 return Ok((Flow::Fail(self.limit_message(state, limit)), early));
             }
+            // No turn is left for a correction: an answer that does not match fails the round.
+            if let Some(flow) = self.report_gate(state, &said, false) {
+                return Ok((flow, early));
+            }
             let output = limited_output(state, limit, said, finish == FinishReason::Length, stream);
             if let Some(hit) = &mut state.limit {
                 hit.answered = true;
@@ -3593,6 +3731,9 @@ impl LlmAgent {
             // What a tool announced as the answer is the run's answer (the last announcement wins);
             // without one, the words that end the turn are.
             if let Some(announced) = state.announced.clone() {
+                if let Some(flow) = self.report_gate(state, &announced, true) {
+                    return Ok((flow, early));
+                }
                 if self.run_ending(ctx, state, &announced).await? {
                     return Ok((Flow::Next, early));
                 }
@@ -3635,6 +3776,9 @@ impl LlmAgent {
                     state.messages.push(Message::user_text(THINKING_CUT_TURN));
                 }
                 return Ok((Flow::Next, early));
+            }
+            if let Some(flow) = self.report_gate(state, &text, true) {
+                return Ok((flow, early));
             }
             if self.run_ending(ctx, state, &text).await? {
                 return Ok((Flow::Next, early));
@@ -3840,7 +3984,10 @@ impl LlmAgent {
         let live = self.live_model(state);
         let live_alias = live.alias.to_owned();
         let mut request = ModelRequest::new(live_alias.clone());
-        request.system = self.instructions.clone();
+        request.system = with_session_instructions(
+            self.instructions.clone(),
+            state.session.as_ref().and_then(|h| h.config.as_ref()),
+        );
         // The summary request is the request before it and one more message, so a provider's cache
         // serves it: its images are the ones the last request sent. A history that a provider
         // rejected as too long is sent shorter, with each image said in a few words.
@@ -3864,6 +4011,7 @@ impl LlmAgent {
         let model = self.model.clone();
         let ordered = self.max_parallel > 1;
         let sources = self.sources.clone();
+        let narrowing = Arc::new(narrowing_of(state, Some(&state.context)));
         let source_ctx = (!sources.is_empty()).then(|| {
             SourceCtx::new(
                 ctx.run_id(),
@@ -3908,7 +4056,14 @@ impl LlmAgent {
                     )
                     .await;
                 }
-                apply_sources(&sources, source_ctx.as_ref(), &mut request, ordered).await;
+                apply_sources(
+                    &sources,
+                    source_ctx.as_ref(),
+                    &narrowing,
+                    &mut request,
+                    ordered,
+                )
+                .await;
                 // The compaction hooks (ADR 0050, slice H9) run here, inside the journaled step:
                 // a replay of a recorded summary asks none. A hook may add context to the request
                 // or veto the summary, and the history is shortened instead; it never writes the
@@ -4069,10 +4224,11 @@ impl LlmAgent {
                 return Ok(Compacted::No);
             }
             Ok(done) => {
-                // The call was made and counts, whatever its summary is worth.
+                // The call was made and counts, whatever its summary is worth. A summary is a
+                // model call of the round: its tokens count toward the session's spend too.
                 self.report_usage(ctx, state, done.call.clone(), &live_alias, done.usage, None)
                     .await;
-                state.usage = state.usage.saturating_add(done.usage);
+                Self::count_tokens(state, done.usage);
                 state
                     .usage_totals
                     .add(self.model.provider(), &live_alias, done.usage);
@@ -4686,6 +4842,7 @@ impl LlmAgent {
                         task: state.task().map(Arc::from),
                         loaded: Arc::from(state.loaded.clone()),
                         removed_tools: Arc::from(state.removed_tools.clone()),
+                        narrowing: Arc::new(narrowing_of(state, context.map(|c| &**c))),
                         event_budget: Arc::clone(&state.event_budget.0),
                         approvable: approvable(ctx, state),
                     },
@@ -5039,6 +5196,7 @@ impl LlmAgent {
                 task: state.task().map(Arc::from),
                 loaded: Arc::from(state.loaded.clone()),
                 removed_tools: Arc::from(state.removed_tools.clone()),
+                narrowing: Arc::new(narrowing_of(state, context.map(|c| &**c))),
                 event_budget: Arc::clone(&state.event_budget.0),
                 approvable: approvable(ctx, state),
             };
@@ -5574,6 +5732,7 @@ impl LlmAgent {
             task,
             loaded,
             removed_tools,
+            narrowing,
             event_budget,
             approvable,
             ..
@@ -5614,6 +5773,7 @@ impl LlmAgent {
         Prepared {
             tool_ctx,
             holding,
+            narrowing,
             // What the call reported as sandbox usage rides in its result, which the step journals; a
             // call that ends in an error has no result to carry it, and leaves it here.
             unjournaled: Arc::new(Mutex::new(SandboxUsage::new())),
@@ -5644,6 +5804,7 @@ impl LlmAgent {
         let Prepared {
             tool_ctx,
             holding,
+            narrowing,
             unjournaled,
             approvable,
         } = prepared;
@@ -5659,8 +5820,14 @@ impl LlmAgent {
                 Duration::from_millis(ms) + SOURCE_LIMIT_MARGIN
             });
         async move {
+            // A session's own narrowing, first and with or without sources (ADR 0054 slice 3).
+            if let Some(held) = narrowing.hold(&name) {
+                return Ok(HookedOutput::plain(
+                    ToolOutput::error(held.reason).sanitized(),
+                ));
+            }
             if let Some((sources, source_ctx)) = &holding
-                && let Some(held) = withheld(sources, source_ctx, &[name.as_str()])
+                && let Some(held) = withheld(&narrowing, sources, source_ctx, &[name.as_str()])
                     .await
                     .into_iter()
                     .next()
@@ -6506,6 +6673,16 @@ impl LlmAgent {
             LimitKind::RepeatedCall => "the same tool call was repeated with the same result \
                  and the run was stopped (doom_loop)"
                 .to_owned(),
+            LimitKind::TokenBudget => match self.token_budget_of(state) {
+                Some(budget) => format!(
+                    "token budget reached: the session has spent {} of its {budget} tokens",
+                    state.spent
+                ),
+                None => format!(
+                    "token budget reached: the session has spent {} tokens",
+                    state.spent
+                ),
+            },
         }
     }
 
@@ -6859,6 +7036,9 @@ fn start_conversation(input: Inbound) -> Result<Conversation, AgentError> {
     conversation.model_run = parse_model_run(&input.payload);
     conversation.root_step = parse_root_step(&input.payload);
     conversation.session = parse_session(&input.payload);
+    // A round of a session starts from the tokens its earlier rounds spent, which the header it was
+    // started with carries (ADR 0054, decision 6).
+    conversation.spent = conversation.session.as_ref().map_or(0, |h| h.spent);
     conversation.prompt_statement = parse_prompt_statement(&input.payload);
     if let Some(context) = parse_context(&input.payload) {
         conversation.merge_context(context);
@@ -7126,12 +7306,15 @@ fn continue_conversation(
             .rev()
             .find(|m| matches!(m, Message::Assistant { .. }))
             .cloned();
+        let session = parse_session(&input.payload).or_else(|| prior.session.clone());
         let mut conversation = Conversation {
             messages: last.into_iter().collect(),
             continued_from: Some(prior_run),
             context: prior.context.clone(),
             plan: prior.plan.clone(),
-            session: parse_session(&input.payload).or_else(|| prior.session.clone()),
+            // The closing round keeps the session's spend: it calls no model, so it only carries it.
+            spent: session.as_ref().map_or(0, |h| h.spent),
+            session,
             ..Conversation::default()
         };
         // The carried answer was signed under the run it came from; this run signs it again.
@@ -7153,6 +7336,9 @@ fn continue_conversation(
     // A later task brings its own; a round of a session, the run that sent it.
     conversation.prompt_statement = parse_prompt_statement(&input.payload);
     if let Some(header) = parse_session(&input.payload) {
+        // The session's spend comes from the header the round was started with: the earlier
+        // rounds' tokens, carried by it (ADR 0054, decision 6).
+        conversation.spent = header.spent;
         conversation.session = Some(header);
     }
     // The context of the run before comes along; what this message says about its sender is
@@ -8431,6 +8617,16 @@ impl LlmAgent {
                         && state.deferred.is_empty()
                         && ctx.arrived().await? == 0
                     {
+                        // The answer a tool handed over is the round's report: it is held to the
+                        // session's `report_schema` like the words of a turn are.
+                        match self.report_gate(&mut state, &text, true) {
+                            Some(Flow::Fail(error)) => {
+                                self.forget_chars(ctx.run_id());
+                                return Ok(Transition::Fail { state, error });
+                            }
+                            Some(_) => return Ok(Transition::Continue(state)),
+                            None => {}
+                        }
                         if self.run_ending(ctx, &mut state, &text).await? {
                             return Ok(Transition::Continue(state));
                         }
@@ -9289,5 +9485,40 @@ mod compaction_gate_tests {
         );
         let room = agent(1100);
         assert!(room.compaction_due(&state), "the tail fits");
+    }
+}
+
+#[cfg(test)]
+mod session_instructions_tests {
+    use super::*;
+
+    /// A session's `instructions` follow the folder's, under a heading that says where they come
+    /// from and that the text above wins (ADR 0054, decision 4). Nothing is added without them.
+    #[test]
+    fn a_sessions_instructions_follow_the_folders_under_a_heading() {
+        let config = adam_runtime::SessionConfig::from_value(serde_json::json!({
+            "instructions": "Answer in one paragraph."
+        }))
+        .expect("a config");
+        let out = with_session_instructions(Some("You are the coder.".into()), Some(&config))
+            .expect("a system");
+        assert!(out.starts_with("You are the coder."), "{out}");
+        assert!(
+            out.contains("Instructions from the parent agent or the person"),
+            "{out}"
+        );
+        assert!(out.ends_with("Answer in one paragraph."), "{out}");
+
+        // No session, and a session that asks for nothing: the folder's text alone, no heading.
+        assert_eq!(
+            with_session_instructions(Some("You are the coder.".into()), None),
+            Some("You are the coder.".into())
+        );
+        let none =
+            adam_runtime::SessionConfig::from_value(serde_json::json!({})).expect("a config");
+        assert_eq!(
+            with_session_instructions(Some("You are the coder.".into()), Some(&none)),
+            Some("You are the coder.".into())
+        );
     }
 }

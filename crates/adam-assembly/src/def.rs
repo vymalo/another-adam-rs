@@ -12,9 +12,11 @@ use adam_agent_fs::{
     ToolsLoading,
 };
 use adam_core::{DynSecretSource, ProcessEnv};
-use adam_llm_agent::{DynTool, DynToolSource, Limits, LlmStarter, SESSION_TOOLS, ToolSet};
+use adam_llm_agent::{
+    DynTool, DynToolSource, Limits, LlmStarter, SESSION_TOOLS, SessionTools, ToolSet,
+};
 use adam_model::ReasoningEffort;
-use adam_runtime::{RuntimeBuilder, SessionLimits};
+use adam_runtime::{RuntimeBuilder, SessionLimits, glob};
 use secrecy::SecretString;
 
 use crate::assembly::{BoundDef, Rounds};
@@ -465,7 +467,11 @@ impl AgentDef {
     /// worker does.
     ///
     /// Both roles call one function (`bounds_of`), so a control plane that answers A2A and a worker
-    /// that runs the rounds admit the same `start.config`. **Give both roles the same
+    /// that runs the rounds admit the same numbers in a `start.config`. **They do not admit the same
+    /// tool names**: a worker knows the names of the tools it binds and refuses a concrete
+    /// `deny_tools` entry no tool has (and, when no source adds tools at run time, any `tools` entry
+    /// that selects none); this control plane knows no name (`SessionBounds::tools` is empty), so it
+    /// checks the shape alone and admits what a worker may still refuse. **Give both roles the same
     /// `MAX_PARALLEL_TOOL_CALLS` and `SESSION_MAX_ROUNDS`**: a control plane with a larger value
     /// would admit what a worker then narrows at run time, never the reverse. The model's window is
     /// a fact of the model, which neither role knows here: `context_window` is `None`, `admit`
@@ -482,6 +488,8 @@ impl AgentDef {
                     &target,
                     self.max_parallel,
                     max_rounds,
+                    Vec::new(),
+                    false,
                 );
                 (target.name, bounds)
             })
@@ -1142,6 +1150,14 @@ impl Walk<'_> {
             &mut tools,
             parent.is_none().then_some(self.session_limits),
         )?;
+        // An agent that has the session tools reads what they are, after the skills catalog: the
+        // same bytes for the same helpers, whatever the deployment's limits (ADR 0054 decision 9).
+        if !session_targets.is_empty() {
+            prompt.push_str("\n\n");
+            prompt.push_str(&SessionTools::guide_for(
+                session_targets.iter().map(|target| target.name.as_str()),
+            ));
+        }
         let retry = retry_policies(&origin, manifest, &tools)?;
         let plugins = self.plugins_of(&origin, manifest, parent)?;
         // The root's modes: a name in a mode's `tools:` is one of the agent's tools (fail closed),
@@ -1754,26 +1770,6 @@ fn retry_policies(
     Ok(policies)
 }
 
-/// Whether `name` matches `pattern`, where `*` stands for any run of characters.
-fn glob(pattern: &str, name: &str) -> bool {
-    let parts: Vec<&str> = pattern.split('*').collect();
-    // `split` yields at least one piece; without a `*` there is exactly one.
-    let (first, rest) = (parts[0], &parts[1..]);
-    let Some((last, middles)) = rest.split_last() else {
-        return pattern == name;
-    };
-    let Some(mut tail) = name.strip_prefix(first) else {
-        return false;
-    };
-    for middle in middles {
-        let Some(at) = tail.find(middle) else {
-            return false;
-        };
-        tail = &tail[at + middle.len()..];
-    }
-    tail.ends_with(last)
-}
-
 /// Render the prompt of one agent: `instructions.md` and each `instructions/*.md`, then joined
 /// the way [`Instructions::prompt`] joins them.
 fn render_prompt(
@@ -1874,24 +1870,6 @@ fn render_prompt(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn a_star_matches_any_run() {
-        assert!(glob("linear__*", "linear__list_issues"));
-        assert!(glob("linear__*", "linear__"));
-        assert!(!glob("linear__*", "github__list"));
-        assert!(!glob("linear__*", "linear_"));
-        assert!(glob("*_issues", "linear__list_issues"));
-        assert!(glob("*", "anything"));
-        assert!(glob("a*b*c", "aXbYc"));
-        assert!(glob("a*b*c", "abc"));
-        assert!(!glob("a*b*c", "acb"));
-        assert!(!glob("a*b*c", "aXbY"));
-        assert!(glob("exact", "exact"));
-        assert!(!glob("exact", "exactly"));
-        // The pieces of a pattern cannot overlap: `ab*ba` needs four characters.
-        assert!(!glob("ab*ba", "aba"));
-    }
 
     #[test]
     fn a_subagents_run_limit_is_30_minutes_unless_its_file_says_otherwise() {

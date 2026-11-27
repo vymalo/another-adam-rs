@@ -63,9 +63,18 @@ before you rely on a detail here.
      the process at startup.
    * Secrets and endpoints never go in the file: the validator rejects `api_key`, `apiKey`,
      `token`, `secret`, `password` and `base_url` (`docs/reference/agent-files.md`, "File formats").
+   * `plugins:` names **compiled hooks the deployment registered**, never a program: each entry is a
+     name or `{name, options}` of scalars, and it must be one the serving binary or the embedding host
+     registered (`AgentDef::plugin`, or `plugin_with` when the entry's options decide how the plugin is
+     made). A name nobody registered stops startup (exit 78), a subagent runs its parent's plugins and
+     then its own, and an option whose name looks like a secret is refused. **No shipped binary
+     registers one yet** (*verified 2026-11-27*), so `plugins:` in a folder `adam-agent` serves is exit
+     78: `adam-plugin`'s `Audit` (one JSON line per observed event) and the `adam-hooks/1` program
+     adapter (`adam-hook-exec`) are for a host that registers them. `hooks:` stays an ignored key.
 3. **Body**: the system prompt. Optional `skills/<name>/SKILL.md` (Agent Skills format, loaded on
    demand by `load_skill` and `read_skill_file`, which take a plain string name and page; a folder with no `skills:` has all of them, `skills: []` none) and `subagents/` (each one tool of the parent, a
    child run with only the tools it lists and never `ask_user`; registered as `<name>/<subagent>`).
+   A root with subagents also gets the five session tools (`subagent_start` .. `subagent_list`) and a fixed *Child sessions* section at the end of its prompt, after the skills catalog (the tools, the helpers sorted, what `config` takes): do not write a paragraph about them in the instructions.
    A subagent file with `a2a: <agent-card URL>` is a **remote subagent** (another A2A agent): render the URL into
    the file, and give its token through `auth: bearer:VAR` (a variable of the process, from a Secret; unset is exit
    78). Plain `http` to a service of the same cluster needs `A2A_ALLOW_INSECURE_REMOTES=true` on `adam-agent`, and

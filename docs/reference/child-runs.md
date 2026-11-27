@@ -250,7 +250,7 @@ reading it sleeps until its timer.
 
 [ADR 0045](../decisions/0045-a-subagent-can-run-in-the-background-as-a-session.md) lets a subagent run in the
 background as a session that is sent more messages. The runtime half (slice 1) is in `crates/adam-runtime`; the five tools
-(slice 2) are in `crates/adam-llm-agent` (`sessions.rs`) and are given to a root with subagents by `adam-assembly`. A person can start the same sessions over A2A (`child-sessions/v1`, slice 6): the rounds are runs of the same helper agents, started by the front of a `control-plane` process through start-only registrations (`AgentDef::session_starters`) and stepped by a worker; see [the A2A server](a2a-server.md#child-sessions-child-sessionsv1).
+(slice 2) are in `crates/adam-llm-agent` (`sessions.rs`) and are given to a root with subagents by `adam-assembly`, which also ends that root's instructions with a short *Child sessions* section that tells the model what each tool does ([ADR 0054](../decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md) decision 9). A person can start the same sessions over A2A (`child-sessions/v1`, slice 6): the rounds are runs of the same helper agents, started by the front of a `control-plane` process through start-only registrations (`AgentDef::session_starters`) and stepped by a worker; see [the A2A server](a2a-server.md#child-sessions-child-sessionsv1).
 
 **What the runtime has.**
 
@@ -285,22 +285,54 @@ background as a session that is sent more messages. The runtime half (slice 1) i
 `subagent_read` reads the latest round: working, or its report as a numbered page; with `wait: true` and a working round it
 returns `ToolError::AwaitSession` and the parent parks on a `PendingWait::Session`. `subagent_close` asks a working round to be
 the last (`SESSION_CLOSE_KIND` in its inbox: it finishes, then the session takes no more) or, with `cancel`, cancels it; an idle
-session is closed by a round that calls no model (`header.closing`) and ends with the last answer again.
+session is closed by a round that calls no model (`header.closing`) and ends with the last answer again. `delete: true`
+closes it with a **tombstone** (`header.deleted`): a deleted session is never listed again and every tool refuses it as `no
+session`, while **its runs stay in the store**. It **implies `cancel: true`** (ADR 0054 decision 10): a working round is
+stopped as a close with cancel stops it, and the closing round then writes the tombstone.
 `subagent_list` pages the sessions of the conversation. The sessions are reached by **the conversation**, not by the task: a
 later task finds the sessions an earlier one started, and no run reaches another conversation's (an id that is not one of
 this conversation's is "no session"). At most 16 sessions that are not closed and 20 rounds per session (decision 5's
 `max_open` and `max_rounds` as constants for now).
 
 **A session's own limits** ([ADR 0054](../decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md),
-slice 1). `subagent_start` takes an optional `config` of seven options: `max_turns`, `max_tool_calls`, `max_output_tokens`,
-`context_window`, `max_parallel_tool_calls`, `time_limit` (minutes) and `max_rounds`. An option chooses within what the
+slice 1). `subagent_start` takes an optional `config` of eleven options: eight numbers, `max_turns`, `max_tool_calls`,
+`max_output_tokens`, `context_window`, `max_parallel_tool_calls`, `time_limit` (minutes), `max_rounds` and `token_budget`
+(below), two lists of tool names, `tools` and `deny_tools` (below), and `report_schema` (below). An option chooses within what the
 subagent's folder allows and **never widens it**: a value above its bound is refused, in words that name the option
-(`config.max_turns is 51; at most 50`), and nothing starts; an option that is not one of the seven is refused too. What was
+(`config.max_turns is 51; at most 50`), and nothing starts; an option that is not one of the eleven is refused too. What was
 admitted is kept in the session's header, and the round reads its limits from it. Five of them apply at the next model call
-(`max_turns`, `max_tool_calls`, `max_output_tokens`, `context_window`, `max_parallel_tool_calls`); `time_limit` and
+(`max_turns`, `max_tool_calls`, `max_output_tokens`, `context_window`, `max_parallel_tool_calls`, and `token_budget`, below); `time_limit` and
 `max_rounds` apply to the next round. A later round copies the config and **clamps it to the bounds of that moment**, so a
 deployment that lowered a limit is obeyed and nothing is raised back. `max_output_tokens` is never `0` (that would leave the cap
 to the model) and a `context_window` is never so small that no history fits: it is held to the least that leaves room.
+
+**The token budget** (slice 6). `token_budget` caps the whole session's tokens, input and output as `usage/v1` counts them:
+1,000 to 2^53 − 1, and no folder bounds it today, so any value narrows. Before each model call, the tokens the session has
+spent (`spent`: the earlier rounds' carried by the header, plus this round's own calls) reaching the budget makes that call
+the **closing turn**, and the round ends with `limit: "token_budget"` — or, when the closing turn says nothing, with the words
+`token budget reached`. `spent` is written into the header at every commit, so `subagent_list`, `subagent_read` and the A2A
+session object's listing read it from the round's record, and a **send to a spent session is refused** (`subagent_send` in
+words, the A2A front as `UnsupportedOperation`) from the header the send already reads: no round starts and no model is
+called. A session with no budget spends and is never refused.
+
+`config` also takes `tools` and `deny_tools` (ADR 0054, slice 3): lists of tool names, in the folder's own syntax (an exact name or
+a `*` pattern; `github__*` selects an MCP server). The session is offered only the tools `tools` matches, less the ones `deny_tools`
+matches (the deny-list is applied after the allow-list); `read_output` always stays. A hidden tool is not in the model's request,
+and a call to it anyway is refused without running; this holds even when an oversized message context was dropped, because the session's header, not the
+context, is the truth. At most 32 entries, each at most 200 characters, none blank. **Which names are
+checked at the start depends on what the starter knows.** The tool names of a subagent are known where the agent is bound (a
+worker), not on a control plane that only answers A2A; and a worker knows the whole set only when no source adds tools to the
+agent while it runs. **Neither shipped agent has the whole set** (both add tools through sources), so in practice: a concrete
+`deny_tools` name that is none of the subagent's tools is refused with the list (it is almost always a typo; to deny a tool a
+source adds, use a pattern, `name*`), and a `tools` entry or a pattern that selects nothing is admitted and just offers less.
+A remote subagent takes neither. They apply from the next model call; a later round carries them on.
+
+`report_schema` is a JSON Schema (draft 2020-12, at most 16 KiB, no reference outside itself) that the subagent's final answer
+must match, for a helper that runs here (a remote one refuses it). The subagent is not shown the schema unless its first answer
+fails it, so describe the shape in `prompt` too. An answer that is not one JSON value, or does not match, is sent back to the
+model with the first three problems, twice at most, and each of those turns counts in `max_turns`; after that the round fails
+with `report does not match report_schema`. It applies to every round of the session, the first included; a `format`
+is only an annotation under draft 2020-12 and is not enforced.
 
 ```mermaid
 sequenceDiagram
@@ -341,12 +373,17 @@ stateDiagram-v2
     Idle --> Working: subagent_send starts the next round
     Idle --> Closed: subagent_close starts a round that calls no model
     Idle --> Closed: idle for idle_ttl (read, not written)
+    Working --> Deleted: subagent_close with delete (it cancels the round first)
+    Idle --> Deleted: subagent_close with delete (a tombstone in the closing round)
+    Closed --> Deleted: subagent_close with delete
     Closed --> [*]
+    Deleted --> [*]
 ```
 
 A closed session is **never reopened**, and `Closed` is derived, not stored: the latest round's header says `closed`, or a close
 request waits in its inbox, or the round has ended in a session that is not kept open (which is why a round cancelled by its
-parent closes such a session, and leaves a kept-open one idle).
+parent closes such a session, and leaves a kept-open one idle). `Deleted` is derived the same way, from the latest
+round's header: nothing removes a run.
 
 **The turn-end wait.** A turn whose model answers with no tool call while a session this run started still works, or a round
 ended and was not reported, does not end the run: the loop reads the sessions in a journaled step `sessions:<turn>` (skipped when no
