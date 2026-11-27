@@ -92,7 +92,7 @@ pub const CONTEXT_CHILD_SESSIONS: &str = "vymalo.childSessions";
 /// The context key under which a round carries the tools its session's `config` narrows (ADR 0054
 /// slice 3): `{"tools": [..], "denyTools": [..]}`. It is the loop's
 /// `adam_llm_agent::SESSION_TOOLS_CONTEXT_KEY` (a test keeps the two equal), written from the
-/// header's config by [`put_header`] on every round a person starts, **over** whatever the
+/// header's config by `put_header` on every round a person starts, **over** whatever the
 /// message's own context said: a person's request never sets it.
 pub const CONTEXT_SESSION_TOOLS: &str = "vymalo.session.tools";
 

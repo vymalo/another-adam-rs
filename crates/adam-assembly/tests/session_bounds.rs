@@ -63,15 +63,15 @@ fn bound_of(assembly: &Assembly) -> SessionBounds {
 
 /// The bounds with the one fact only a worker has taken out: the names of the tools the subagent is
 /// bound with (`tools`, ADR 0054 slice 3), which a control plane that binds no agent does not know.
-fn without_tools(bounds: Vec<(String, SessionBounds)>) -> Vec<(String, SessionBounds)> {
+fn without_tools(bounds: &[(String, SessionBounds)]) -> Vec<(String, SessionBounds)> {
     bounds
-        .into_iter()
+        .iter()
         .map(|(name, bound)| {
             (
-                name,
+                name.clone(),
                 SessionBounds {
                     tools: None,
-                    ..bound
+                    ..bound.clone()
                 },
             )
         })
