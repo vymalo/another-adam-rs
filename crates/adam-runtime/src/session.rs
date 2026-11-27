@@ -183,6 +183,13 @@ pub struct SessionHeader {
     /// when `false`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub closing: bool,
+    /// The session was **deleted** ([ADR 0054] decision 10): it is gone from every listing and every
+    /// tool refuses it with `no_such_session`, while its runs stay in the store. Written by the
+    /// closing round a `subagent_close` with `delete: true` starts. Absent when `false`.
+    ///
+    /// [ADR 0054]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub deleted: bool,
     /// The round's number, from 1: what orders the rounds of a session (timestamps tie, ids are
     /// hashes). `0` for a header written before it existed.
     #[serde(default)]
@@ -1211,6 +1218,11 @@ impl SessionView {
             .rposition(|(_, f)| !f.header.as_ref().is_some_and(|h| h.closing))
             .unwrap_or(last);
         let (latest, facts) = &runs[last];
+        // A deleted session is gone (ADR 0054 decision 10): not listed, and every tool's `view` is
+        // `None`, so each refuses it with `no_such_session`. Its runs stay in the store.
+        if facts.header.as_ref().is_some_and(|h| h.deleted) {
+            return None;
+        }
         let mut read = read_latest(latest, facts, now, idle_ttl);
         // The report is of another round: read its status, the one decode a closing round adds.
         if runs[worked].0.id != latest.id {
@@ -1742,6 +1754,22 @@ mod tests {
                     .expect("a message")
                     .remove("kind");
             },
+        );
+    }
+
+    /// A deleted session is not a session (ADR 0054 decision 10): `from_rounds` answers `None`, so
+    /// the listing drops it and every tool's `view` is `None`, which they refuse as
+    /// `no_such_session`. Its runs are still in the store — they are what was read here.
+    #[test]
+    fn a_deleted_session_is_not_a_session() {
+        let session = RunId::new();
+        let mut h = header(session, true, true);
+        h.closing = true;
+        h.deleted = true;
+        let rec = round_with_a_transcript(session, h, 1024);
+        assert!(
+            SessionView::from_rounds(session, vec![rec], t0(), idle_ttl()).is_none(),
+            "a deleted session is gone"
         );
     }
 
