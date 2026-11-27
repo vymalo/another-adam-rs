@@ -1959,6 +1959,53 @@ async fn a_shortening_leaves_the_estimate_to_start_again() {
     assert_eq!(state.last_prompt, None);
 }
 
+/// ADR 0068, slice T3a-3: a shortening changes the bytes of an old result and with them every later
+/// `prv`; the rows from the first one it changed are signed again at the commit, and the transcript
+/// the run ends with verifies at every assistant and tool row, at the position it is stored at.
+#[tokio::test]
+async fn a_shortened_transcript_is_signed_again_and_verifies() {
+    use adam_core::turn::{
+        ChainHash, ConversationHash, TurnKeys, TurnPosition, turn_signature, verify_turn,
+    };
+    let keys = <dyn TurnKeys>::ephemeral().unwrap();
+    let set = keys.key_set().await.unwrap();
+    let rig = Rig::with(MockModel::new(), BUDGET, |b| b.turn_keys(keys.clone()));
+    rig.mock
+        .push_response(reported(
+            ModelResponse::tool_calls(vec![big("c0", 3000)]),
+            100,
+        ))
+        .push_response(reported(
+            ModelResponse::tool_calls(vec![big("c1", 3000)]),
+            100,
+        ))
+        .push_text("done");
+    let run = rig.start().await;
+    let view = rig.work(run).await;
+    assert_eq!(view.status, RunStatus::Done, "{view:#?}");
+    let state = conversation(&rig.rt, &view).await;
+    assert_eq!(state.shortenings.len(), 1, "the history was shortened");
+    let stored = rig.rt.state(run).await.unwrap().unwrap();
+    let rows = stored["messages"].as_array().unwrap();
+    let cnv = ConversationHash::of(None, run);
+    let mut signed_rows = 0;
+    for (idx, row) in rows.iter().enumerate() {
+        if row["role"] == "user" {
+            assert!(turn_signature(row).is_none());
+            continue;
+        }
+        let at = TurnPosition {
+            run,
+            cnv,
+            idx: u32::try_from(idx).unwrap(),
+            prv: ChainHash::over(run, &cnv, &rows[..idx]),
+        };
+        verify_turn(&set, &at, row).unwrap_or_else(|e| panic!("row {idx} ({}): {e}", row["role"]));
+        signed_rows += 1;
+    }
+    assert!(signed_rows >= 5, "{signed_rows} assistant and tool rows");
+}
+
 // ---------------------------------------------------------------------------
 // Sessions and subagents
 // ---------------------------------------------------------------------------

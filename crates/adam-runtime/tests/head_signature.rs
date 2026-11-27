@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 
 use adam_core::turn::{
     ChainHash, ConversationHash, CurrentKey, DynTurnKeys, KeyId, KeySet, Signature, TurnKeyError,
-    TurnKeys, verify_head,
+    TurnKeys, TurnPosition, set_turn_signature, sign_turn, turn_signature, verify_head,
 };
 use adam_core::{
     BodyRow, BodyWrite, DynStore, MemoryStore, RunId, RunStatus, RunUpdate, head_body,
@@ -38,8 +38,14 @@ struct ChatAgent {
     name: String,
     /// Declare a split (a v5 head and body rows), or keep the whole state.
     splits: bool,
-    /// Give each assistant row a turn signature (opaque: the loop's own signing is T3a-1).
-    signed_rows: bool,
+    /// The keys the agent signs its assistant rows with, as `LlmAgent::turn_keys` does: every
+    /// unsigned assistant row, in order, over the chain of the rows before it (ADR 0068). Set by
+    /// [`runtime`] to the keys the runtime has, so a runtime with keys has an agent that signs; a
+    /// runtime without keys has an agent that does not (a run from before the keys).
+    keys: Option<DynTurnKeys>,
+    /// The `role` of the row each step appends: `assistant` (a turn, signed when the agent has
+    /// keys) unless a test needs a history with no turn in it.
+    row_role: &'static str,
     /// Steps taken.
     steps: Arc<AtomicUsize>,
 }
@@ -49,7 +55,8 @@ impl ChatAgent {
         Self {
             name: format!("{prefix}-{}", Uuid::new_v4().simple()),
             splits,
-            signed_rows: false,
+            keys: None,
+            row_role: "assistant",
             steps: Arc::new(AtomicUsize::new(0)),
         }
     }
@@ -86,14 +93,33 @@ impl Agent for ChatAgent {
         })
     }
 
-    async fn step(&self, _ctx: &mut Ctx, mut state: Chat) -> Result<Transition<Chat>, AgentError> {
+    async fn step(&self, ctx: &mut Ctx, mut state: Chat) -> Result<Transition<Chat>, AgentError> {
         self.steps.fetch_add(1, SeqCst);
         state.turns += 1;
-        let mut row = json!({"role": "assistant", "text": format!("turn {}", state.turns)});
-        if self.signed_rows {
-            row["extra_content"] = json!({"adam": {"turn_signature": "opaque"}});
+        state
+            .messages
+            .push(json!({"role": self.row_role, "text": format!("turn {}", state.turns)}));
+        if let Some(keys) = &self.keys {
+            let cnv = ConversationHash::of(ctx.conversation_id(), ctx.run_id());
+            let mut prv = ChainHash::seed(ctx.run_id(), &cnv);
+            for idx in 0..state.messages.len() {
+                if state.messages[idx]["role"] == "assistant"
+                    && turn_signature(&state.messages[idx]).is_none()
+                {
+                    let at = TurnPosition {
+                        run: ctx.run_id(),
+                        cnv,
+                        idx: u32::try_from(idx).unwrap(),
+                        prv,
+                    };
+                    let jws = sign_turn(keys.as_ref(), &at, &state.messages[idx])
+                        .await
+                        .expect("the keys sign");
+                    assert!(set_turn_signature(&mut state.messages[idx], jws));
+                }
+                prv = prv.next(&state.messages[idx]);
+            }
         }
-        state.messages.push(row);
         Ok(Transition::Park {
             state,
             wake_at: None,
@@ -110,8 +136,10 @@ fn keys() -> DynTurnKeys {
 }
 
 fn runtime(store: &DynStore, agent: &ChatAgent, keys: Option<&DynTurnKeys>) -> Runtime {
+    let mut agent = agent.clone();
+    agent.keys = keys.cloned();
     let mut builder = Runtime::builder(store.clone())
-        .agent(agent.clone())
+        .agent(agent)
         .worker_id(format!("w-{}", Uuid::new_v4().simple()))
         .poll_interval(Duration::from_millis(10))
         .lease_ttl(Duration::from_secs(10));
@@ -575,8 +603,7 @@ async fn an_unsigned_head_is_adopted_unless_it_covers_a_signed_turn() {
     signing.state(run).await.expect("signed now").expect("run");
 
     // A run whose rows carry a turn signature must keep its head signature.
-    let mut signed_agent = ChatAgent::new("strip", true);
-    signed_agent.signed_rows = true;
+    let signed_agent = ChatAgent::new("strip", true);
     let rt = runtime(&store, &signed_agent, Some(&keys));
     let run = parked_run(&rt, &signed_agent, "c").await;
     rt.state(run).await.expect("intact").expect("run");
@@ -654,6 +681,52 @@ async fn a_refused_run_fails_before_its_agent_is_stepped() {
     assert_eq!(agent.steps.load(SeqCst), 1, "the agent was not stepped");
 }
 
+/// A keyed runtime over an agent that never signs its turns would sign a head over unsigned
+/// assistant rows that its own next decode refuses for good. The run ends at its first step with
+/// the configuration error, and nothing signed is stored.
+#[tokio::test]
+async fn a_keyed_runtime_with_an_agent_that_does_not_sign_fails_the_run_and_stores_no_signed_head()
+{
+    for store in [memory(), without_bodies()] {
+        let keys = keys();
+        let agent = ChatAgent::new("unsigned", true);
+        // The runtime has keys; the agent has none.
+        let rt = Runtime::builder(store.clone())
+            .agent(agent.clone())
+            .turn_keys(keys.clone())
+            .worker_id(format!("w-{}", Uuid::new_v4().simple()))
+            .poll_interval(Duration::from_millis(10))
+            .build();
+        let run = rt
+            .start(&agent.name, hello("hi"), Some("c"))
+            .await
+            .expect("start");
+        let worker = spawn_worker(&rt);
+        wait_for(&rt, run, "the run to fail", |v| {
+            v.status == RunStatus::Failed
+        })
+        .await;
+        worker.stop().await;
+        let view = rt.view(run).await.unwrap().unwrap();
+        let error = view.error.expect("the failure says why");
+        assert!(
+            error.contains("did not sign its turns") && error.contains("LlmAgent::turn_keys"),
+            "{error}"
+        );
+        assert_eq!(agent.steps.load(SeqCst), 1, "stepped once, never again");
+        // The unsigned turn was never committed, and what was is readable by the runtime that
+        // wrote it: the run's state is the user's message alone (the head is signed over it, as
+        // it was before the step).
+        let state = rt.state(run).await.expect("readable").expect("run");
+        assert_eq!(
+            state["messages"].as_array().map(Vec::len),
+            Some(1),
+            "{state}"
+        );
+        assert_eq!(state["turns"], 0);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // What is not a forgery
 // ---------------------------------------------------------------------------
@@ -672,8 +745,10 @@ async fn a_key_outage_at_claim_leaves_the_run_and_it_completes_later() {
         let flaky = Flaky::over(&keys);
         flaky.failures.store(1, SeqCst);
         let flaky_keys: DynTurnKeys = flaky.clone();
+        let mut signing = agent.clone();
+        signing.keys = Some(keys.clone());
         let rt = Runtime::builder(store.clone())
-            .agent(agent.clone())
+            .agent(signing)
             .worker_id(format!("w-{}", Uuid::new_v4().simple()))
             .poll_interval(Duration::from_millis(10))
             .lease_ttl(Duration::from_millis(300))
@@ -704,8 +779,18 @@ async fn a_front_end_without_the_agent_reads_and_delivers_to_a_signed_v4_run() {
     let store = without_bodies();
     let keys = keys();
     // A splitting agent on a store with no bodies: a v4 state chained over the agent's own rows.
-    let agent = ChatAgent::new("front", true);
-    let worker_rt = runtime(&store, &agent, Some(&keys));
+    let mut agent = ChatAgent::new("front", true);
+    // The agent's rows are not turns here (a `note` is no assistant or tool row, so nothing is
+    // asked to be signed): the worker adopts what the front end writes unsigned. The next test is
+    // the same run with signed turns.
+    agent.row_role = "note";
+    let worker_rt = Runtime::builder(store.clone())
+        .agent(agent.clone())
+        .worker_id(format!("w-{}", Uuid::new_v4().simple()))
+        .poll_interval(Duration::from_millis(10))
+        .lease_ttl(Duration::from_secs(10))
+        .turn_keys(keys.clone())
+        .build();
     let run = parked_run(&worker_rt, &agent, "c").await;
     let rec = store.load_run(run).await.unwrap().unwrap();
     assert_eq!(rec.state["v"], 1, "a v4 state, the whole run");
@@ -735,6 +820,37 @@ async fn a_front_end_without_the_agent_reads_and_delivers_to_a_signed_v4_run() {
     parked_after(&worker_rt, run, 2).await;
     worker.stop().await;
     assert!(store.load_run(run).await.unwrap().unwrap().state["signature"].is_string());
+}
+
+/// The gap of the test above, for an agent that signs its turns (ADR 0068, slice T3a-3): the front
+/// end's delivery is written unsigned, and the worker refuses an unsigned head over signed turns,
+/// so the run fails instead of being adopted. A front end that hosts no agent must register it as
+/// a starter, or it strands a signed run.
+#[tokio::test]
+async fn a_front_end_without_the_agent_strands_a_run_whose_turns_are_signed() {
+    let store = without_bodies();
+    let keys = keys();
+    let agent = ChatAgent::new("stranded", true);
+    let worker_rt = runtime(&store, &agent, Some(&keys));
+    let run = parked_run(&worker_rt, &agent, "c").await;
+    let front = Runtime::builder(store.clone())
+        .turn_keys(keys.clone())
+        .build();
+    front
+        .deliver(run, hello("from the front"))
+        .await
+        .expect("a front end delivers to it");
+    let worker = spawn_worker(&worker_rt);
+    wait_for(&worker_rt, run, "the run to be refused", |v| {
+        v.status == RunStatus::Failed
+    })
+    .await;
+    worker.stop().await;
+    assert_eq!(
+        agent.steps.load(SeqCst),
+        1,
+        "the agent was not stepped again"
+    );
 }
 
 /// A state that does not decode as the agent's is `Corrupt`, never an empty transcript.

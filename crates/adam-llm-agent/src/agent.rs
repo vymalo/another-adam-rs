@@ -6663,17 +6663,24 @@ fn continue_conversation(
             .rev()
             .find(|m| matches!(m, Message::Assistant { .. }))
             .cloned();
-        return Ok(Conversation {
+        let mut conversation = Conversation {
             messages: last.into_iter().collect(),
             continued_from: Some(prior_run),
             context: prior.context.clone(),
             plan: prior.plan.clone(),
             session: parse_session(&input.payload).or_else(|| prior.session.clone()),
             ..Conversation::default()
-        });
+        };
+        // The carried answer was signed under the run it came from; this run signs it again.
+        crate::signing::unsign_from(&mut conversation.messages, 0);
+        return Ok(conversation);
     }
     let text = start_text(input)?;
     let mut conversation = prior.continued(text, prior_run);
+    // A carried row was signed under the run it came from, at its place in that run's chain. The
+    // runtime verified it there before handing it over (`prior_state`); this run signs every row
+    // again at its first commit, under its own id (ADR 0068 decision 5).
+    crate::signing::unsign_from(&mut conversation.messages, 0);
     conversation.pending_images = parse_inbound_images(&input.payload);
     // A round of a session works for the run that started it, as the first one did, and says what
     // the session is.

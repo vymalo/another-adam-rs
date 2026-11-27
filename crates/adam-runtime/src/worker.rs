@@ -34,7 +34,7 @@ use crate::retry::{
     Decision, RUNTIME_RETRY_KEY, RetryRecord, StepRetry, Verdict, class_name, decide,
 };
 use crate::runtime::{Inner, MAX_COMMIT_RETRIES, Runtime, RuntimeError};
-use crate::seal::{Seal, attach, chain_over};
+use crate::seal::{Seal, Sealer, attach, chain_over};
 
 type InFlight = Arc<Mutex<HashSet<RunId>>>;
 
@@ -692,6 +692,7 @@ async fn transition(
     let plan = plan(
         inner,
         run,
+        &rec.agent,
         &env,
         rec.state.get("agent"),
         base_head.is_some(),
@@ -952,9 +953,11 @@ fn panic_message(panic: &Box<dyn std::any::Any + Send>) -> String {
 ///
 /// `base_agent` is the agent state the run had before the step: the step took `base.agent` by
 /// move, so the paths that commit the state untouched read it from the record instead.
+#[allow(clippy::too_many_arguments)] // one transition, described by its parts
 fn plan(
     inner: &Inner,
     run: RunId,
+    agent: &str,
     base: &Envelope,
     base_agent: Option<&Value>,
     v5: bool,
@@ -1102,6 +1105,7 @@ fn plan(
         }
     };
 
+    let stepped = result.is_ok();
     let next = match result {
         Ok(Stepped {
             transition: Transition::Continue(s),
@@ -1183,6 +1187,27 @@ fn plan(
             }
         },
     };
+    // A runtime with keys needs an agent that signs its turns: a step whose rows hold an unsigned
+    // assistant or tool row ends the run here, with its state untouched, before anything is
+    // signed or written (ADR 0068). Retrying would call the model again for the same refusal.
+    if stepped && inner.sealer.is_some() {
+        let transcript;
+        let rows: &[Value] = match &next.split {
+            Some((_, rows)) => rows,
+            None => {
+                transcript = inner
+                    .transcript_of(run, agent, &next.agent)
+                    .ok()
+                    .flatten()
+                    .unwrap_or_default();
+                &transcript
+            }
+        };
+        if let Err(e) = Sealer::require_signed_turns(run, rows) {
+            tracing::error!(run = %run, error = %report(&e), "the agent did not sign its turns under a runtime with turn keys; failing the run");
+            return Plan::Commit(Box::new(failed(e.to_string())));
+        }
+    }
     Plan::Commit(Box::new(next))
 }
 
@@ -1405,6 +1430,8 @@ async fn seal_update(
     let (len, chain, seal) = if is_head {
         match &next.split {
             Some((_, rows)) if !next.split_refused => {
+                // Before anything is signed: never a head the next decode would refuse.
+                Sealer::require_signed_turns(rec.id, rows).map_err(refuse)?;
                 let (seal, chain) = Seal::over(rec.id, conversation, rows).map_err(refuse)?;
                 (seal.len, chain, Some(seal))
             }
@@ -1433,6 +1460,15 @@ async fn seal_update(
                 source: None,
             })
             .map_err(refuse)?;
+        if let Err(e) = Sealer::require_signed_turns(rec.id, &rows) {
+            // A run that ends over a history that was never signed (an adopted run, decision 11)
+            // is written as it was read, unsigned, so it can still be failed. Anything else
+            // would be signed over unsigned turns: refused.
+            if next.status == RunStatus::Failed && rec.state.get("signature").is_none() {
+                return Ok(());
+            }
+            return Err(refuse(e));
+        }
         let (len, chain) = chain_over(rec.id, conversation, &rows).map_err(refuse)?;
         (len, chain, None)
     };

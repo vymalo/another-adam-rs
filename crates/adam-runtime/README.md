@@ -546,10 +546,35 @@ slice T3a-2) makes the runtime sign what it commits as a run's state and check i
 * **Mixed fleets.** A worker without keys drops head signatures when it writes, so a signed turn later makes that head
   refused; and release N gives an agent that does not sign its turns no downgrade resistance (stripping `signature` passes
   adoption).
-* **Not done** (T3a-3 and T2): the turns' own signatures are not verified on re-entry, the journal is not signed, and no
-  host sets the keys yet (the engine and the service), so only an embedder that calls `turn_keys` is affected.
+* **The turns** (slice T3a-3). After the head, every row that is a turn (`role` `assistant` or `tool`) of a **signed** run is
+  verified at its position over the rows before it (`Sealer::check_turns`, in `check_read`): it must carry a turn signature
+  whose key is in the key set and not revoked. Unsigned, forged, moved, spliced or revoked-key: `RuntimeError::Corrupt`,
+  before the agent steps; a key set that cannot be read is `RuntimeError::TurnKeys` and keeps the lease. This is every read of
+  the rows: a claim (resume), the prior state of a new task or a session round, `Runtime::state`. **A runtime with keys needs
+  an agent that signs its turns** (`LlmAgent::turn_keys`): a row-shaped agent whose assistant rows are unsigned is refused as
+  soon as the head is signed. An unsigned head with no signed row is still adopted.
+* **A keyed runtime with an agent that does not sign.** The runtime refuses to commit a head it would itself refuse on the
+  next read. Before it signs, it checks that every assistant and tool row of the transcript it is about to sign carries a turn
+  signature (presence only; no key is read). If one does not, the run **fails at that step** with
+  `RuntimeError::UnsignedTurns` (class `Invalid`, so permanent: a configuration the same run never recovers from), whose
+  text says "the runtime has turn keys but the agent did not sign its turns ... give the agent the same keys, e.g.
+  `LlmAgent::turn_keys`"; the run's state is untouched and nothing signed over unsigned turns is stored. The commit's own
+  guard (`seal_update`) refuses the same way for any path that reaches it, with a `StoreError::InvalidInput`.
+* **Cost.** A decode that reads the rows reads the key set **once** (the head and every turn share the read) and does one
+  SHA-256 pass plus one Ed25519 verification and one canonical-JSON form per turn: O(rows) per decode, with no model call to
+  hide it behind. Reads that decode: a claim (a resume or a step), `Runtime::state` (the engine's reopen calls it), and the
+  prior state of a new task or a session round. A2A `GetTask` and `ListTasks` go through `Runtime::view`, which checks
+  nothing, so polling a task does not pay it. No cache: a repeated `Runtime::state` of a long run pays in full each time
+  (a follow-up if it shows).
+* **Revoking a key is destructive for the history it signed (2026-11-27).** A revoked key makes every past run that key
+  signed, a head or any turn, permanently `Corrupt` on read: `Runtime::state`, a claim, and any continuation (new task,
+  session round). A client polling `GetTask` still sees the status. **To retire a key without losing history, rotate:**
+  add the new key and keep the old one in the set (not revoked), so old runs verify while new commits are signed with the new
+  one; revoke only a key you consider compromised, knowing what it takes with it.
+* **Not done** (T2 and later): the journal is not signed, and no host sets the keys yet (the engine and the service), so
+  only an embedder that calls `turn_keys` is affected.
 
-Tests: `tests/head_signature.rs`.
+Tests: `tests/head_signature.rs`; `src/seal.rs` (`turn_tests`); and, with a real `LlmAgent`, `adam-llm-agent`'s `tests/turn_reentry.rs`.
 
 ## Several processes
 
