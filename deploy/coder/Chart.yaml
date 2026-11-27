@@ -4,6 +4,6 @@ description: "The adam-rs coder agent (A2A): coding task to verified pull reques
 type: application
 version: 0.5.0
 appVersion: "0.1.0"
-kubeVersion: ">=1.27.0-0"
+kubeVersion: ">=1.37.0-0"
 sources:
   - https://github.com/vymalo/another-adam-rs

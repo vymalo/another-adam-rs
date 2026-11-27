@@ -1700,7 +1700,7 @@ check "proxy: ... the node selector ..." dhas Deployment 'pool: infra'
 check "proxy: ... and the tolerations" dhas Deployment 'key: infra'
 
 # The allow-list (ADR 0042): the default hosts, once each, lower case, and nothing broad.
-allow_file() { rdoc ConfigMap coder-egress-allow | awk '/^  allow.txt: \|$/ { on = 1; next } on { sub(/^    /, ""); print }'; }
+allow_file() { rdoc ConfigMap coder-egress-allow | awk '/^  allow.txt: \|$/ { on = 1; next } on { sub(/^    /, ""); print }' | grep -v '^$'; }
 allows() { allow_file | grep -Fxq -- "$1"; }
 odd_entries() { allow_file | grep -v '^#' | grep -Ev '^[a-z0-9][a-z0-9.-]*[a-z0-9]$'; }
 helm_rp > "$out"
@@ -1799,10 +1799,10 @@ check "... the error says why" says "$message" 'disableAcknowledged'
 helm_rp --set runPods.admissionPolicy.enabled=false --set runPods.admissionPolicy.disableAcknowledged=true > "$out"
 check "acknowledged: no admission policy is rendered" lacks '^kind: ValidatingAdmissionPolicy'
 check "acknowledged: the rest is" has '^kind: ResourceQuota$'
-message=$(helm_rp --kube-version 1.29.0 2>&1 || true)
-check "refused: Kubernetes before 1.30 (no ValidatingAdmissionPolicy)" fails helm_rp --kube-version 1.29.0
-check "... the error names 1.30" says "$message" '1.30'
-check "Kubernetes 1.30 is enough" helm_rp --kube-version 1.30.0
+message=$(helm_rp --kube-version 1.36.0 2>&1 || true)
+check "refused: Kubernetes before 1.37 (the chart's floor, ADR 0080)" fails helm_rp --kube-version 1.36.0
+check "... the error names 1.37" says "$message" '1.37'
+check "Kubernetes 1.37 is enough" helm_rp --kube-version 1.37.0
 message=$(helm_rp --set replicaCount=2 2>&1 || true)
 check "refused: two workers on per-pod ReadWriteOnce volumes" fails helm_rp --set replicaCount=2
 check "... the error says a run pod mounts one claim" says "$message" 'mounts one claim'

@@ -44,4 +44,4 @@ workspace image the kind job runs (`deploy/coder/tests/kind-run-pods.sh:412`).
 
 * That the cluster's own network plugin enforces `NetworkPolicy`: only kind's was exercised.
 * That git, cargo, pip and go read the proxy variables (the kind job tries curl and npm).
-* What the chart README's "Verified and unverified" lists for run pods: the Kubernetes version (1.30 or later), Longhorn sharing a `ReadWriteOnce` volume, the pod and service CIDRs, and the HTTP status of an admission refusal.
+* What the chart README's "Verified and unverified" lists for run pods: the Kubernetes version (1.37 or later, the chart's floor, ADR 0080), Longhorn sharing a `ReadWriteOnce` volume, the pod and service CIDRs, and the HTTP status of an admission refusal.

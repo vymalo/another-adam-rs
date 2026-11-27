@@ -626,15 +626,16 @@ jobs:
   # that no rule names an IPv6 range is checked) and a CNI other than kindnet.
   # ADAM_TEST_REQUIRE_KUBERNETES makes the test fail instead of skipping, so a typo in the variables cannot
   # turn the job green. The runner's preinstalled `kind` is used with the node image pinned here
-  # (Kubernetes v1.35.8, whose network plugin, kindnet, enforces NetworkPolicies: the platform's run-pods-e2e
-  # requires the refusal there and passed, *verified 2026-10-27*, run 40435825771); the script stops on a
-  # cluster older than Kubernetes 1.30.
+  # (Kubernetes v1.37.0, the chart's floor, ADR 0080; whose network plugin, kindnet, enforces NetworkPolicies:
+  # the platform's run-pods-e2e requires the refusal there and passed on v1.35.8, *verified 2026-10-27*, run
+  # 40435825771; v1.37.0 is *unverified* until this job runs on it); the script stops on a cluster older than
+  # Kubernetes 1.37.
   run-pods:
     runs-on: ubuntu-latest
     timeout-minutes: 60
     env:
       # The digest of the index of the tag, as the platform pins it.
-      KIND_NODE_IMAGE: kindest/node:v1.35.8@sha256:07b2536e30b803ed61d1677a79df6115f798ce64c80f9e22f6ed45afd09323c0
+      KIND_NODE_IMAGE: kindest/node:v1.37.0@sha256:a1ed56cfb0e7b93589bdf97c8cd566405a265939e3620fc4f5de89adff580ae5
     steps:
       - uses: actions/checkout@v4
       # ADR 0041: what git does in a run pod whose mirror is mounted read-only and whose worktree's own
