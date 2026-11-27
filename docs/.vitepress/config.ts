@@ -6,15 +6,14 @@ import { withMermaid } from "vitepress-plugin-mermaid";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 
-// The sidebar of a folder: every page in it, titled by its first heading.
-function pages(dir: string, skip: string[] = []) {
-  return readdirSync(join(root, dir))
-    .filter((f) => f.endsWith(".md") && f !== "README.md" && !skip.includes(f))
-    .sort()
-    .map((f) => {
-      const text = readFileSync(join(root, dir, f), "utf8").match(/^# (.+)$/m)?.[1];
-      return { text: (text ?? f.replace(/\.md$/, "")).replace(/`/g, ""), link: `/${dir}/${f.replace(/\.md$/, "")}` };
-    });
+// The sidebar entries of a folder, titled by each page's first heading. With `only`, just those pages in that order;
+// otherwise every page, less `skip`.
+function pages(dir: string, skip: string[] = [], only?: string[]) {
+  const files = only ?? readdirSync(join(root, dir)).filter((f) => f.endsWith(".md") && f !== "README.md" && !skip.includes(f)).sort();
+  return files.map((f) => {
+    const text = readFileSync(join(root, dir, f), "utf8").match(/^# (.+)$/m)?.[1];
+    return { text: (text ?? f.replace(/\.md$/, "")).replace(/`/g, ""), link: `/${dir}/${f.replace(/\.md$/, "")}` };
+  });
 }
 
 // The shared section structure: see STRUCTURE.md. The system's and the platform's sites use the same one.
@@ -28,7 +27,24 @@ const sidebar = [
       { text: "Try the agents", link: "/guides/try-the-agents" },
     ],
   },
-  { text: "Guides", collapsed: true, items: pages("guides", ["run-locally.md", "try-the-agents.md"]) },
+  {
+    text: "Guides",
+    collapsed: true,
+    items: [
+      { text: "Use", items: pages("guides", [], ["write-an-agent.md"]) },
+      { text: "Deploy", items: pages("guides", [], ["deploy-the-coder.md"]) },
+      {
+        text: "Operate",
+        items: pages("guides", [], [
+          "upgrade-an-adam-deployment.md",
+          "egress-and-run-pod-network.md",
+          "read-a-stuck-run.md",
+          "troubleshoot-by-error-class.md",
+        ]),
+      },
+      { text: "Extend", items: pages("guides", [], ["embed-adam.md", "embed-in-an-app.md"]) },
+    ],
+  },
   {
     text: "Reference",
     collapsed: true,
@@ -42,8 +58,20 @@ const sidebar = [
     ],
   },
   { text: "Decisions", collapsed: true, items: [{ text: "ADR index", link: "/decisions/" }, ...pages("decisions")] },
-  { text: "Contributing", items: [{ text: "How to contribute", link: "/contributing" }] },
+  {
+    text: "Contributing",
+    items: [{ text: "How to contribute", link: "/contributing" }, ...pages("guides", [], ["testing.md"])],
+  },
 ];
+
+// A guide that no group lists would be missing from the sidebar without a word: fail the build instead.
+{
+  const grouped = new Set(JSON.stringify(sidebar).match(/\/guides\/[\w-]+/g));
+  const missing = readdirSync(join(root, "guides"))
+    .filter((f) => f.endsWith(".md") && f !== "README.md")
+    .filter((f) => !grouped.has(`/guides/${f.replace(/\.md$/, "")}`));
+  if (missing.length) throw new Error(`docs/guides: not in the sidebar (add to a group in .vitepress/config.ts): ${missing.join(", ")}`);
+}
 
 // Prose writes <agent> or <ThreadShare> meaning a placeholder; Vue would read it as a component and fail the build.
 // Only real HTML elements pass through, everything else is shown as the text it is.
