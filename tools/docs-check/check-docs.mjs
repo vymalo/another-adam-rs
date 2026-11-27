@@ -52,6 +52,29 @@ mermaid.initialize({ startOnLoad: false });
 
 const lineOf = (src, index) => src.slice(0, index).split('\n').length;
 
+// `::: name` opens a container and a bare `:::` closes the innermost one; a fenced block is code (the same
+// character, at least as long, nothing after it closes it). Returns the line of each `::: in-depth` left open —
+// the same rule as `docs/.vitepress/theme/in-depth.ts`, which warns at build; this is the gate.
+function unclosedInDepth(src) {
+  const open = [];
+  let fence = null;
+  const lines = src.split('\n');
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i].trimStart();
+    const f = /^(`{3,}|~{3,})(.*)$/.exec(line);
+    if (fence) {
+      if (f && f[1][0] === fence.ch && f[1].length >= fence.len && f[2].trim() === '') fence = null;
+      continue;
+    }
+    if (f && !(f[1][0] === '`' && f[2].includes('`'))) { fence = { ch: f[1][0], len: f[1].length }; continue; }
+    const m = /^:{3,}\s*(.*?)\s*$/.exec(line);
+    if (!m) continue;
+    if (m[1] === '') open.pop();
+    else open.push({ name: m[1].split(/\s/)[0], line: i + 1 });
+  }
+  return open.filter((o) => o.name === 'in-depth').map((o) => o.line);
+}
+
 // GitHub's heading slug: lowercase, drop punctuation, spaces to hyphens, `-1`, `-2` for repeats.
 function anchors(file) {
   const seen = new Map();
@@ -76,6 +99,8 @@ const failures = [];
 for (const file of markdownFiles(root)) {
   const rel = path.relative(root, file);
   const src = fs.readFileSync(file, 'utf8');
+
+  for (const line of unclosedInDepth(src)) failures.push(`${rel}:${line} unclosed ::: in-depth`);
 
   for (const m of src.matchAll(/```mermaid\n([\s\S]*?)```/g)) {
     diagrams++;
