@@ -50,6 +50,17 @@ statement names the person. A process key is shared by every run the process ste
    gives no run keys signs exactly as before. `SignedRequests::with_key_source` chooses. A new variant must
    fail to compile in the request path, as a new `KeyStatus` or `SignatureType` does.
 
+*Amended 2026-11-28 (the keyring and the name).* Decision 3 gains its implementation, `RunKeyring`
+(`crates/adam-core/src/turn/run_cert/keyring.rs`), and the name the CSR asks for: the request's
+`subjectAltName` is a **critical** URI, `urn:another:person:<sub>:agent:<run>` — the PKI decision of
+2026-11-26 — where `<sub>` is the person's subject as the host read it, restricted to the URI's
+unreserved characters (RFC 3986 §2.3) so it cannot be bent, and `<run>` is the run's id. Decision 5
+gains what the slice had to decide: the renewal is read on `current()` (the call before a signature),
+a failed renewal is retried no sooner than `RENEW_RETRY_SECS` (15 s) so an outage costs one CA round
+trip per window and not one per model call, and a leaf whose `notAfter` has passed refuses with
+`RunKeyError::Expired` (`Transient`) — the call is not sent. The leaf must certify the key the
+request asked about, or the chain is refused (`RunKeyError::Chain`, `Internal`).
+
 5. **Renewal at two thirds of the leaf's life, with a new key each time.** The adapter renews when two thirds
    of the interval from the leaf's `notBefore` to its `notAfter` have passed: a new key pair, a new CSR, a new
    leaf. It never re-issues a certificate for the same key, so a key that leaked stops being usable at the
@@ -144,7 +155,8 @@ stateDiagram-v2
 | Slice | What | State |
 |---|---|---|
 | R1 | the ports (`RunCertIssuer`, `RunKeys`, `CertificateRequest`, `RunCertError`), the closed `KeySource`, the fake issuer and `run_cert_issuer_conformance!` | **built**, 2026-11-28 |
-| R2 | an issuer adapter (an HTTP CA, a token, a trust anchor), and the renewal clock with its test | not built |
+| R2a | the renewal clock and the keyring: `RunKeyring`, `RunSubject`, `RunClock`, a key per run, a CSR with the person-and-run SAN, the chain cached, renewal at two thirds with a new key, fail closed on an expired leaf, a sentinel test | **built**, 2026-11-28 |
+| R2b | an issuer adapter (an HTTP CA, a token, a trust anchor) | not built |
 | R3 | the wiring: `RUN_CERT_ISSUER_URL` and the two files, a run key per run, and the request path choosing `KeySource::Run` | not built |
 | R4 | the gateway side: the verifier checks `x5c` against its CA and binds the chain to the run | another party's work, not adam's |
 
