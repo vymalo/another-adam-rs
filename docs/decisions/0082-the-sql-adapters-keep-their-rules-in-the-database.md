@@ -1,6 +1,6 @@
 # 0082. The SQL adapters keep their rules in the database
 
-Status: **Accepted** (2026-11-27). Slice P0 is built (2026-11-27); P1–P7, S1 and S2 are not. The owner decided on 2026-11-27:
+Status: **Accepted** (2026-11-27). Slices P0 and P1 are built (2026-11-27); P2–P7, S1 and S2 are not. The owner decided on 2026-11-27:
 
 > *"If something can be done in SQL, we better use SQL rather than rust"*
 >
@@ -230,7 +230,7 @@ function unless decision 1 says it carries a rule.
 | Slice | Area | Decisive test | Status |
 |---|---|---|---|
 | P0 | the version 7 step, the SQLSTATE table, the refusal below 18, CI, compose and the chart on 18 | migrate a fresh database and call every function; a server below 18 is refused before any DDL | built 2026-11-27 |
-| P1 | the `served` column; the reads select it, inline | the listing cases and the body cases on which document a read serves | to do |
+| P1 | the `served` column; the reads select it, inline | the listing cases and the body cases on which document a read serves | built 2026-11-27 |
 | P2 | the claim function; renewal and release stay inline | concurrent claims are exclusive; a pinned run never goes to another worker; an ended lease is taken over | to do |
 | P3 | the `sched_at` function, the inline create, the headless commit | one winner among concurrent commits; a stale version and a missing run come back as outcomes | to do |
 | P4 | the journal append | non-determinism is detected; concurrent writers agree on the first entry | to do |
@@ -245,6 +245,14 @@ version 7 is the step the functions arrive in (none yet; each later slice that a
 10's note); the `AD001`–`AD004` table is `adam_postgres::AdamSqlState`, and `classify` and the store follow it; a
 fresh-database test compares the schema's functions with its list (empty) and calls each; CI, the dev stack, the
 bench and the chart run PostgreSQL 18.7. The proofs are on the [agent page](../../.agents/docs/decisions/0082-the-sql-adapters-keep-their-rules-in-the-database.md#p0-built-2026-11-27).
+
+*2026-11-27, P1 built:* schema version 8 adds `served` to the runs table as a virtual generated column
+with decision 12's expression, by one `ALTER TABLE .. ADD COLUMN IF NOT EXISTS` for a fresh and an
+upgraded database alike; the table keeps its file (no rewrite). `load_run`, `load_head`, the claim,
+`open_run_for_conversation` and the listings select it, inline. The listing's prefix bound stays a
+parameter the process computes: it is a value, not a rule, and the rule, `starts_with`, is already in
+the statement. No function yet. The proofs, and the mutation that no case catches, are on the [agent
+page](../../.agents/docs/decisions/0082-the-sql-adapters-keep-their-rules-in-the-database.md#p1-built-2026-11-27).
 
 ## Consequences
 

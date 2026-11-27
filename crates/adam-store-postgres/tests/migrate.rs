@@ -111,7 +111,7 @@ async fn a_version_1_schema_migrates_to_the_current_one_and_keeps_its_runs() {
     store.migrate().await.unwrap();
     assert!(has_owner_column(&pool, &p).await, "the column was added");
     assert_eq!(version(&pool, &p).await, SCHEMA_VERSION.to_string());
-    assert_eq!(SCHEMA_VERSION, 7);
+    assert_eq!(SCHEMA_VERSION, 8);
     // The push table exists now (a missing table would be a backend error).
     assert!(
         store
@@ -512,11 +512,13 @@ async fn a_version_5_schema_gets_the_head_and_the_body_and_keeps_its_runs() {
         .await
         .unwrap();
 
-    // Back to version 5: no head columns, no body table.
+    // Back to version 5: no head columns, no body table, no served column (which reads the head).
     support::exec(&pool, &format!("DROP TABLE {p}body")).await;
     support::exec(
         &pool,
-        &format!("ALTER TABLE {p}runs DROP COLUMN head, DROP COLUMN head_version"),
+        &format!(
+            "ALTER TABLE {p}runs DROP COLUMN served, DROP COLUMN head, DROP COLUMN head_version"
+        ),
     )
     .await;
     support::exec(
@@ -545,6 +547,114 @@ async fn a_version_5_schema_gets_the_head_and_the_body_and_keeps_its_runs() {
     assert_eq!(
         store.load_head(run.id).await.unwrap().unwrap().state,
         json!({"turn": 1})
+    );
+
+    drop_tables(&pool, &p).await;
+}
+
+/// The columns of a table in their order, with what `pg_attribute.attgenerated` says of each
+/// (`""` for a plain column, `"v"` for a virtual generated one, `"s"` for a stored one).
+async fn columns(pool: &Pool, table: &str) -> Vec<(String, String)> {
+    let client = pool.get().await.unwrap();
+    client
+        .query(
+            "SELECT attname::text, attgenerated::text FROM pg_attribute
+              WHERE attrelid = to_regclass($1) AND attnum > 0 AND NOT attisdropped
+              ORDER BY attnum",
+            &[&table],
+        )
+        .await
+        .unwrap()
+        .iter()
+        .map(|row| (row.get(0), row.get(1)))
+        .collect()
+}
+
+/// Schema version 8 (ADR 0082, decision 12, slice P1): a version 7 database gets the `served`
+/// column on its next start, as a **virtual** column (no row is rewritten: the table keeps its
+/// file), with the same columns a fresh database gets, and its runs read as before, the head
+/// included.
+#[tokio::test]
+async fn a_version_7_schema_gets_the_served_column_without_a_rewrite() {
+    let Some(url) = support::test_url() else {
+        return;
+    };
+    let pool = support::pool(&url, 2);
+    let p = format!(
+        "adam_mig_{}_",
+        &uuid::Uuid::new_v4().simple().to_string()[..12]
+    );
+    let store = PgStore::from_pool(pool.clone())
+        .with_table_prefix(&p)
+        .unwrap();
+    store.migrate().await.unwrap();
+    let runs = format!("{p}runs");
+    let fresh = columns(&pool, &runs).await;
+    assert!(
+        fresh.contains(&("served".to_owned(), "v".to_owned())),
+        "a fresh database has the virtual column: {fresh:?}"
+    );
+    let agent = format!("v7-{}", &uuid::Uuid::new_v4().simple().to_string()[..12]);
+    let plain = store
+        .create_run(NewRun::new(&agent, json!({"turn": 1})))
+        .await
+        .unwrap();
+    let headed = store
+        .create_run(NewRun::new(&agent, json!({"turn": 1})))
+        .await
+        .unwrap();
+    let head = json!({"v": 5, "agent": {"turn": 2}, "body": {"generation": null, "len": 0}});
+    store
+        .commit_run(
+            headed.id,
+            headed.version,
+            RunUpdate::new(RunStatus::Runnable, json!({"turn": 2})).head(head.clone()),
+        )
+        .await
+        .unwrap();
+
+    // Back to version 7: no served column.
+    support::exec(&pool, &format!("ALTER TABLE {runs} DROP COLUMN served")).await;
+    support::exec(
+        &pool,
+        &format!("UPDATE {p}meta SET value = '7' WHERE key = 'schema_version'"),
+    )
+    .await;
+    let file: u32 = support::scalar(
+        &pool,
+        "SELECT pg_relation_filenode(to_regclass($1))::oid",
+        &[&runs],
+    )
+    .await;
+
+    store.migrate().await.unwrap();
+    assert_eq!(version(&pool, &p).await, SCHEMA_VERSION.to_string());
+    let upgraded = columns(&pool, &runs).await;
+    assert!(
+        upgraded.contains(&("served".to_owned(), "v".to_owned())),
+        "the upgrade adds the virtual column: {upgraded:?}"
+    );
+    assert_eq!(
+        upgraded.iter().map(|(n, _)| n).collect::<Vec<_>>(),
+        fresh.iter().map(|(n, _)| n).collect::<Vec<_>>(),
+        "a fresh and an upgraded table have the same columns in the same order"
+    );
+    let after: u32 = support::scalar(
+        &pool,
+        "SELECT pg_relation_filenode(to_regclass($1))::oid",
+        &[&runs],
+    )
+    .await;
+    assert_eq!(file, after, "adding a virtual column rewrote the table");
+
+    let loaded = store.load_run(plain.id).await.unwrap().expect("the run");
+    assert_eq!(loaded.state, json!({"turn": 1}), "no head: the state");
+    let loaded = store.load_head(headed.id).await.unwrap().expect("the run");
+    assert_eq!(
+        (&loaded.state["v"], &loaded.state["agent"]),
+        (&head["v"], &head["agent"]),
+        "a current head is served: {}",
+        loaded.state
     );
 
     drop_tables(&pool, &p).await;

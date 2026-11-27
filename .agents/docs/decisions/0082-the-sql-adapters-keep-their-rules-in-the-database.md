@@ -5,7 +5,7 @@ which states the decision. This page holds the survey it was written from (every
 its `path:line`), the third-party facts with their sources, and what each slice must prove.
 
 Surveyed at `origin/main` `45abb141` on 2026-11-27. Line numbers are at that commit; re-read them before a slice.
-Slice P0 is built (2026-11-27): [its proofs](#p0-built-2026-11-27). The survey's `src/lib.rs` lines are still
+Slice P0 is built (2026-11-27): [its proofs](#p0-built-2026-11-27). Slice P1 is built (2026-11-27): [its proofs](#p1-built-2026-11-27). The survey's `src/lib.rs` lines are still
 `45abb141`'s; P0 moved most of them down by about 150 lines.
 
 ## How to check a slice against this page
@@ -115,8 +115,8 @@ complete.
 | `RETURNING` returns no row the `WHERE` did not match | *unverified* (the page implies it: "Returning Data from Modified Rows"; it does not say it) | https://www.postgresql.org/docs/18/dml-returning.html |
 | Generated columns are virtual by default (18): computed when read; the expression only immutable, the current row, no other generated column; a virtual one uses only built-in functions and types, operators and casts included; no value can be written to one in `INSERT` or `UPDATE` | *verified 2026-11-27* | https://www.postgresql.org/docs/18/ddl-generated-columns.html, https://www.postgresql.org/docs/18/release-18.html |
 | "Adding a virtual generated column never requires a rewrite" | *verified 2026-11-27* | https://www.postgresql.org/docs/18/sql-altertable.html (Notes) |
-| `jsonb_typeof` and the `jsonb` and integer `=` operators of the served expression are immutable | *unverified*: the server refuses a generated column whose expression is not, so the migration of a fresh database that adds the column is the proof (P1: the column is P1's, not P0's) | — |
-| A virtual generated column can be read in `UPDATE .. RETURNING` (the claim) | *unverified*: P2's claim cases are the proof | — |
+| `jsonb_typeof` and the `jsonb` and integer `=` operators of the served expression are immutable | *verified 2026-11-27*: the server refuses a generated column whose expression is not, and the migration of a fresh database and of a version 7 one added it on 18.7 (P1, `tests/migrate.rs`) | `crates/adam-store-postgres/tests/migrate.rs` `a_version_7_schema_gets_the_served_column_without_a_rewrite` |
+| A virtual generated column can be read in `UPDATE .. RETURNING` (the claim) | *verified 2026-11-27* on 18.7: P1's inline claim returns `r.served`, and the claim cases of `store_conformance!` and `tests/claim.rs` pass | `claim_due_sql` in `crates/adam-store-postgres/src/lib.rs` |
 | PostgreSQL 18.0 was released 2025-09-25 | *verified 2026-11-27* | https://www.postgresql.org/docs/18/release-18.html |
 | The bundled SQLite is 3.54.1 (`RETURNING`, triggers with `RAISE`, `GLOB`) | *verified 2026-11-27* | `Cargo.lock`: `libsqlite3-sys` 0.39.1, its `sqlite3/sqlite3.h` |
 | The supported range today: PostgreSQL 12+, CI 12 and 17, compose 16 | *verified 2026-11-27* | `crates/adam-store-postgres/README.md:3`, `.github/workflows/ci.yml:319`–`:320`, `compose.yaml:29`, `docs/reference/store-adapters.md:111` |
@@ -197,12 +197,54 @@ names no operator release, and on CloudNativePG 1.27 or older it is 17, below th
 - The required checks of the repository: the conformance jobs were named after both matrix values and are now named
   after MongoDB's alone.
 
+## P1, built (2026-11-27)
+
+The branch of ANR-1148 `local/anr-1148-p1`, on `origin/main` `e8809b4d`.
+
+### What it is
+
+| Piece | Where | What |
+|---|---|---|
+| The column | `crates/adam-store-postgres/src/lib.rs`, `SERVED_EXPRESSION` and the `ALTER TABLE {runs} ADD COLUMN IF NOT EXISTS served JSONB GENERATED ALWAYS AS (..) VIRTUAL` statement in `Sql::new`, after `migrate_body` and before the (empty) function list | survey row 1. One statement for a fresh and an upgraded database, so both end with the same columns in the same order (`a_version_7_schema_gets_the_served_column_without_a_rewrite` compares them). On a database at 5 or older the head columns come first (`upgrade_body`, or `migrate_body` in the same list), so the column's inputs always exist |
+| The reads | `served_columns` (selects `{p}served` where the `CASE` was), `run_from_row` (decodes `served`) | `load_run`, `load_head`, `open_run`, `claim_due_any` and `claim_due_pinned` (`UPDATE .. RETURNING r.served`: the claim reads a virtual column in `RETURNING`, so the evidence row "A virtual generated column can be read in `UPDATE .. RETURNING`" is now *verified 2026-11-27* on 18.7 by `claim_*` of `store_conformance!` and `tests/claim.rs`), `list_prefix`, `list_exact`. `count_*` select no document and are unchanged. Every read stays inline, prepared once |
+| The version | `SCHEMA_VERSION = 8`, `tests/fixtures/schema-v8.sql` (`git mv` from v7, regenerated with `ADAM_WRITE_FIXTURE=1`), `the_statements_equal_the_version_8_fixture`; `tests/migrate.rs` (`assert_eq!(SCHEMA_VERSION, 8)`), `tests/fixture.rs` (`"8"`) | the version 7 → 8 step is the ordinary migration transaction (nothing concurrent to build). The version 5 test now drops `served` with the head columns: PostgreSQL refuses `DROP COLUMN head` while a generated column reads it |
+| The prefix bound (row 18, "P1 decides") | `prefix_end`, `scope_sql` | **stays a parameter the process computes**: it is a value, not a rule, and the rule (`starts_with`) is already in the statement. As an expression (`$7 || chr(1114111)`) it would depend on the database's encoding, and it would not fix the gap below |
+
+### What was run (2026-11-27, toolchain 1.98.1, `postgres:18.7` at the pinned digest)
+
+| Gate | Result |
+|---|---|
+| `cargo test -p adam-store-postgres --no-fail-fast` (`ADAM_TEST_POSTGRES_URL`, `ADAM_TEST_REQUIRE_DB=1`, a fresh `ADAM_TEST_TABLE_PREFIX`) | lib 10, `body_writers` 6, `claim` 2, `conformance` 79, `errors` 6, `fixture` 1, `functions` 4, `head_view` 2, `migrate` 9 (one new), `time` 4 passed; 0 failed, 0 ignored |
+| `cargo fmt --all --check`; `cargo clippy -p adam-store-postgres --all-targets --locked -- -D warnings` | clean |
+| Not run here | `adam-runtime` and `adam-notify-postgres` against the server, and the workspace-wide clippy and nextest: the shared disk ran out during the `adam-runtime` build. CI (`ADAM_TEST_REQUIRE_DB=1`) is the proof for those; this slice changes no code of theirs |
+
+### Broken on purpose
+
+| Mutation | Failing cases |
+|---|---|
+| `head_version <> version` in `SERVED_EXPRESSION` (serve the state when the head is current) | `store_conformance!`/`body_conformance!`: `body_a_stale_head_serves_the_state`, `body_a_first_split_writes_the_whole_transcript`, `body_an_append_writes_only_the_delta`, `body_the_generation_is_stable_across_appends`, `body_a_compaction_starts_a_new_generation_and_the_gc_collects_the_old`, `body_a_stale_version_is_a_conflict`, `body_a_nul_is_stored_as_the_replacement_character`, `measure_the_headless_transcript` (8 of 79); `tests/body_writers.rs` 2, `tests/head_view.rs` 1, `tests/migrate.rs` 1 |
+| `AND starts_with(conversation_id, $7)` replaced by `AND true` | **none: the mutation survives**, and must. In byte order (`COLLATE "C"`), a text `t` with `p <= t < p || U+10FFFF` starts with `p` (a first difference below `p`'s length puts `t` below `p` or above the bound), so `starts_with` never removes a row the range admits. It is a guard, not a rule a case can see |
+
+A run with the default prefix `adam_test_` after a run of the unmutated code passes under the first mutation too: the
+tables are already at version 8, so `migrate` runs no DDL and the column keeps its correct expression. A mutation of
+a migration statement is only seen on a fresh prefix (or a fresh database, as in CI).
+
+### A finding for the owner: a prefix listing misses ids that continue with U+10FFFF
+
+The bound `prefix || U+10FFFF` is not above every text that starts with the prefix: `'a' || U+10FFFF || 'b'` sorts
+**above** `'a' || U+10FFFF` (*verified 2026-11-27* on 18.7: `E'a\U0010FFFFb' COLLATE "C" < E'a\U0010FFFF'` is
+false, `starts_with(E'a\U0010FFFFb', 'a')` is true), so `list_runs` and `count_runs` with the prefix `a` miss a
+conversation id `a`, U+10FFFF, `b`, and the id `a`, U+10FFFF itself. U+10FFFF is a noncharacter, so a real id is
+unlikely to hold it. An exact bound is the prefix's successor (its last code point raised by one, skipping the
+surrogates, dropping trailing U+10FFFF, and no bound at all for a prefix made only of them). Not changed here: it is a
+change of what a listing returns, outside P1.
+
 ## Slice proofs
 
 | Slice | Functions | Decisive cases (the testkit's names) | Broken on purpose |
 |---|---|---|---|
 | P0 (built 2026-11-27, [above](#p0-built-2026-11-27)) | none yet; the version 7 step, the `AD` table in `adam-postgres`, the server check | a new `every_function_is_created_and_answers` (fresh database, `migrate`, call each listed function, compare `pg_proc` for the prefix with the list); a server below 18 refused before any DDL (`server_version_num` below 180000); the CI matrix's two rows `{ postgres: "18" }`, `ci.yml:384`, `coder.yml:275` and `compose.yaml:29` on 18; the chart's `cnpg-cluster.yaml` pins `imageName` at 18, or the pull request shows the operator's default is 18 or later (a pin changes the chart's render, which another repository reads: say so) | list a function the schema lacks, and one it has but the list does not; let a 17 server through the check |
-| P1 | the `served` column; the inline reads, `list_runs`, `count_runs` select it | `body_every_read_serves_the_current_head`, `body_a_stale_head_serves_the_state`, `body_a_tombstoned_run_with_a_stale_head_serves_the_head`, `body_a_head_that_is_json_null_is_not_a_head`, `list_runs_*`, `count_runs_ignores_the_page`, `run_header_matches_the_record`; `tests/head_view.rs` counts still one lease and one head | serve the state when the head is current (in the column's expression); drop the `starts_with` (in the inline statement) |
+| P1 (built 2026-11-27, [above](#p1-built-2026-11-27)) | the `served` column; the inline reads, `list_runs`, `count_runs` select it | `body_every_read_serves_the_current_head`, `body_a_stale_head_serves_the_state`, `body_a_tombstoned_run_with_a_stale_head_serves_the_head`, `body_a_head_that_is_json_null_is_not_a_head`, `list_runs_*`, `count_runs_ignores_the_page`, `run_header_matches_the_record`; `tests/head_view.rs` counts still one lease and one head | serve the state when the head is current (in the column's expression); drop the `starts_with` (in the inline statement): survives, see above |
 | P2 | `claim_due` (renewal, release, `lease_until` and `activity` stay inline) | `claim_is_exclusive_under_concurrency`, `claim_skips_busy_runs`, `pinned_claims_are_exclusive_and_stable_under_concurrency`, `pinned_claim_never_gives_a_run_to_another_worker`, `any_claim_ignores_and_never_sets_the_owner`, `lease_expiry_allows_takeover`, `renew_and_release_lease`; `activity_conformance!` | remove `SKIP LOCKED`; drop the owner filter; let a renewal extend an ended lease |
 | P3 | `sched_at`, `commit_run` (headless); the inline create calls `sched_at` | `concurrent_commits_single_winner`, `commit_stale_version_conflicts`, `commit_missing_run`, `claim_respects_due_rules`, `conversation_race_single_winner`, `create_duplicate_id`, `two_creates_with_different_ids_in_one_conversation_leave_one_open_run`; `headless_measurement!` | compute `sched_at` from `updated_at` for a parked run; report `actual = expected` |
 | P4 | `journal_put` | `journal_detects_nondeterminism`, `journal_first_writer_wins`, `journal_concurrent_writers_agree`, `journal_requires_run` | compare nothing on conflict |
