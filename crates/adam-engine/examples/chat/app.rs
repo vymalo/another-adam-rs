@@ -2,23 +2,33 @@
 //! (`tests/example.rs`): lines in, the runs' events out.
 //!
 //! A plain line is a `send` to the current conversation (the first starts one). `/steer <text>`,
-//! `/answer <text>` and `/cancel` reach the run being followed, `/list` lists the engine's runs and
-//! `/quit` shuts the engine down (the step in flight finishes first). At the end of the input the
+//! `/answer <text>` and `/cancel` reach the run being followed, `/approve` and `/deny [reason]`
+//! answer the approval it waits for, `/list` lists the engine's runs and `/quit` shuts the engine
+//! down (the step in flight finishes first). At the end of the input the
 //! followed run is still followed until it ends or asks a question, so `printf 'hi\n' | chat`
 //! prints the answer; then the engine shuts down. While a run is followed its events are printed as
-//! they come: the text as it streams, the question when it waits, `Behind` when the reader lost
-//! events, and how it ended.
+//! they come: the text as it streams, the question when it waits, the call it asks the person to
+//! approve, `Behind` when the reader lost events, and how it ended.
+//!
+//! The host's own tool and hook are here too: `save_note` keeps a line in the host's notes, and
+//! [`AsksBeforeSaving`] asks the person before every call of it (ADR 0047 slice 5), which the chat
+//! shows as an approval to answer with `/approve` or `/deny`.
 
 use std::io::{self, Write};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use adam_engine::adam_core::RunId;
+use adam_engine::adam_llm_agent::{
+    FnTool, HookResult, HookedCall, Plugin, ToolError, ToolOutput, Verdict,
+};
 use adam_engine::adam_runtime::RunEvent;
 use adam_engine::{
-    ConversationId, Delivered, Engine, EngineError, EngineEvent, ListQuery, RunEvents, RunInfo,
-    RunState, Say,
+    ConversationId, Decision, Delivered, Engine, EngineError, EngineEvent, ListQuery, RunEvents,
+    RunInfo, RunState, Say,
 };
 use futures::StreamExt;
+use serde_json::json;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt};
 
 /// How long a new run waits for the run it replaces to say how it ended: its `Ended` comes within
@@ -26,7 +36,61 @@ use tokio::io::{AsyncBufRead, AsyncBufReadExt};
 const DRAIN: Duration = Duration::from_secs(5);
 
 /// What `/help` and an unknown command print.
-pub const HELP: &str = "type a message, or /steer <text>, /answer <text>, /cancel, /list, /quit";
+pub const HELP: &str = "type a message, or /steer <text>, /answer <text>, /approve, /deny [reason], /cancel, /list, /quit";
+
+/// The notes the host keeps: what `save_note` saved, once the person approved it.
+pub type Notes = Arc<Mutex<Vec<String>>>;
+
+/// The host's tool: keeps `text` in `notes` (an application writes its own file instead).
+pub fn save_note(notes: Notes) -> FnTool {
+    FnTool::raw(
+        "save_note",
+        "Save a short note for the person, to read later.",
+        json!({
+            "type": "object",
+            "properties": {"text": {"type": "string", "description": "The note."}},
+            "required": ["text"]
+        }),
+        move |_ctx, args| {
+            let notes = notes.clone();
+            async move {
+                let text = args
+                    .get("text")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| ToolError::Permanent("a note needs its `text`".to_owned()))?
+                    .to_owned();
+                notes
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(text);
+                Ok::<_, ToolError>(ToolOutput::text("saved"))
+            }
+        },
+    )
+}
+
+/// The host's hook: asks the person before every `save_note` (`EngineBuilder::plugin`). The run
+/// waits in `RunState::AwaitingApproval` until the person answers, and the note is saved only on a
+/// yes.
+pub struct AsksBeforeSaving;
+
+impl Plugin for AsksBeforeSaving {
+    fn name(&self) -> &str {
+        "asks-before-saving"
+    }
+
+    fn before_tool(&self, call: &mut HookedCall<'_>) -> HookResult {
+        if call.tool != "save_note" {
+            return Ok(Verdict::Continue);
+        }
+        let text = call
+            .arguments
+            .get("text")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        Ok(Verdict::Ask(format!("Save the note {text:?}?")))
+    }
+}
 
 /// Read `input` a line at a time and write what happens to `out`, until `/quit`, or the end of
 /// `input` and then the end of the followed run (or its question); then shut `engine` down.
@@ -98,6 +162,8 @@ struct Followed {
     lost: bool,
     /// The question last printed, so a second read of the same wait prints nothing.
     asked: Option<String>,
+    /// The call whose approval the run waits for, as its `ApprovalAsked` said.
+    approval: Option<String>,
 }
 
 struct Chat<W> {
@@ -147,6 +213,11 @@ impl<W: Write> Chat<W> {
                     }
                 }
             }
+            "/approve" => self.approve(Decision::Approve).await?,
+            "/deny" => {
+                let reason = (!rest.is_empty()).then(|| rest.to_owned());
+                self.approve(Decision::Refuse(reason)).await?;
+            }
             _ if command.starts_with('/') => self.out.line(HELP)?,
             _ => self.send(line).await?,
         }
@@ -187,6 +258,7 @@ impl<W: Write> Chat<W> {
             shown: false,
             lost: false,
             asked: None,
+            approval: None,
         });
         // Subscribed first, then read: a question asked before the subscription is in this read,
         // one asked after it comes with a `Status` event.
@@ -221,6 +293,25 @@ impl<W: Write> Chat<W> {
     fn answered(&mut self) {
         if let Some(followed) = &mut self.followed {
             followed.asked = None;
+            followed.approval = None;
+        }
+    }
+
+    /// Answer the approval the followed run waits for: a host's two buttons.
+    async fn approve(&mut self, decision: Decision) -> io::Result<()> {
+        let Some(followed) = &self.followed else {
+            return self.out.line("! no run is open: type a message first");
+        };
+        let Some(call) = followed.approval.clone() else {
+            return self.out.line("! the run waits for no approval");
+        };
+        match self.engine.approve(followed.run, &call, decision).await {
+            // The stream says how it was answered.
+            Ok(_) => {
+                self.answered();
+                Ok(())
+            }
+            Err(e) => self.out.refused(&e),
         }
     }
 
@@ -313,6 +404,22 @@ impl<W: Write> Chat<W> {
             Ok(EngineEvent::Snapshot(info)) => self.waits(&info)?,
             // The resource report (ADR 0065): this chat shows nothing of it.
             Ok(EngineEvent::Resources(_)) => {}
+            // A hook asks the person to approve a call (ADR 0047 slice 5): the question, and how to
+            // answer. Printed once; the run waits as it does on a question.
+            Ok(EngineEvent::ApprovalAsked(request)) => {
+                followed.approval = Some(request.call_id.clone());
+                followed.asked = Some(request.question.clone());
+                self.out.end_line()?;
+                self.out
+                    .line(&format!("? {} ({})", request.question, request.tool))?;
+                self.out
+                    .line("  (answer with /approve, or /deny [reason])")?;
+            }
+            Ok(EngineEvent::ApprovalAnswered { approved, .. }) => {
+                followed.approval = None;
+                self.out
+                    .line(if approved { "[approved]" } else { "[refused]" })?;
+            }
             Ok(EngineEvent::Ended(info)) => {
                 let whole = followed.lost || !followed.shown;
                 self.followed = None;

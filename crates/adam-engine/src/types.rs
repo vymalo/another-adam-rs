@@ -145,6 +145,14 @@ pub enum RunState {
     /// It asked the person a question ([`RunInfo::question`]) and waits for
     /// [`answer`](crate::Engine::answer).
     Waiting,
+    /// A hook asked the person to approve a tool call before it runs ([ADR 0047] slice 5, ADR 0050
+    /// slice H8): [`RunInfo::approval`] says which call, and the run waits for
+    /// [`approve`](crate::Engine::approve). Not [`Waiting`](Self::Waiting): a free-text answer is
+    /// read as a yes only when it is a clear one (`yes`, `ok`, ...), so a host shows a yes and a no
+    /// rather than a text box.
+    ///
+    /// [ADR 0047]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0047-adam-rs-can-be-embedded-in-an-application.md
+    AwaitingApproval,
     /// It finished with its answer ([`RunInfo::output`]).
     Done,
     /// It failed ([`RunInfo::error`]).
@@ -157,6 +165,12 @@ impl RunState {
     /// Whether the run has ended: nothing more happens to it.
     pub fn is_terminal(self) -> bool {
         matches!(self, Self::Done | Self::Failed | Self::Cancelled)
+    }
+
+    /// Whether the run waits for the person: a question ([`Waiting`](Self::Waiting)) or an approval
+    /// ([`AwaitingApproval`](Self::AwaitingApproval)). A message sent to it is its answer.
+    pub fn waits_for_the_person(self) -> bool {
+        matches!(self, Self::Waiting | Self::AwaitingApproval)
     }
 
     fn of(state: &TaskState) -> Self {
@@ -181,12 +195,72 @@ pub struct RunInfo {
     pub conversation: ConversationId,
     /// Its state.
     pub state: RunState,
-    /// The question, while it is [`Waiting`](RunState::Waiting).
+    /// The question, while it is [`Waiting`](RunState::Waiting); while it is
+    /// [`AwaitingApproval`](RunState::AwaitingApproval), the question as a person would read it in
+    /// text (the hook's words, then how to answer), through the redactor of
+    /// [`EngineBuilder::step_io`](crate::EngineBuilder::step_io).
     pub question: Option<String>,
     /// The answer, once [`Done`](RunState::Done).
     pub output: Option<String>,
     /// Why it failed, or the reason it was cancelled.
     pub error: Option<String>,
+    /// The call the person is asked to approve, while it is
+    /// [`AwaitingApproval`](RunState::AwaitingApproval); `None` in every other state.
+    pub approval: Option<ApprovalRequest>,
+}
+
+/// A tool call a hook asked the person to approve ([`RunState::AwaitingApproval`]): what a host
+/// shows beside a yes and a no, and the `call_id` its [`approve`](crate::Engine::approve) names.
+///
+/// Nothing in it is more than the call's step shows: `arguments` is what the step's input carries,
+/// scrubbed by the redactor of [`EngineBuilder::step_io`](crate::EngineBuilder::step_io) and cut to
+/// the contract's bounds (`None` when the steps carry no input), and `question` went through the same
+/// redactor.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ApprovalRequest {
+    /// The call's id: what [`approve`](crate::Engine::approve) names, and the id of the call's step
+    /// (`tool:<call id>`).
+    pub call_id: String,
+    /// The tool it calls.
+    pub tool: String,
+    /// What the hook asked, in its own words.
+    pub question: String,
+    /// The arguments the call runs with once approved (the ones the hooks left), as the call's step
+    /// shows them; `None` when the steps carry no input.
+    pub arguments: Option<serde_json::Map<String, serde_json::Value>>,
+}
+
+/// The person's answer to an approval ([`Engine::approve`](crate::Engine::approve)): a host has a
+/// button for each. A closed enum: an approval is yes or no.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Decision {
+    /// Run the call, once, with the arguments the request showed.
+    Approve,
+    /// Do not run it. The reason, when the person gave one, is what the model is told they
+    /// answered; the run goes on without the call.
+    Refuse(Option<String>),
+}
+
+impl Decision {
+    /// A refusal with the person's reason.
+    pub fn refuse_because(reason: impl Into<String>) -> Self {
+        Self::Refuse(Some(reason.into()))
+    }
+
+    /// The text the run reads as the answer, as a person who typed it would have written it: `yes`
+    /// for an approval; the reason for a refusal, or `no` with none. A reason that would itself read
+    /// as a yes (`ok`) is sent as `no: ok`, so a refusal never runs the call.
+    pub(crate) fn answer_text(&self) -> String {
+        match self {
+            Self::Approve => "yes".to_owned(),
+            Self::Refuse(reason) => match reason.as_deref().map(str::trim) {
+                None | Some("") => "no".to_owned(),
+                Some(reason) if adam_llm_agent::approves(reason) => format!("no: {reason}"),
+                Some(reason) => reason.to_owned(),
+            },
+        }
+    }
 }
 
 impl RunInfo {
@@ -202,7 +276,7 @@ impl RunInfo {
             .and_then(|m| m.text())
             .map(str::to_owned);
         let (question, output, error) = match state {
-            RunState::Waiting => (said, None, None),
+            RunState::Waiting | RunState::AwaitingApproval => (said, None, None),
             RunState::Done => (None, said, None),
             RunState::Failed | RunState::Cancelled => (None, None, said),
             RunState::Submitted | RunState::Working => (None, None, None),
@@ -214,7 +288,17 @@ impl RunInfo {
             question,
             output,
             error,
+            approval: None,
         })
+    }
+
+    /// The run as waiting for `approval`: a run the task says is [`Waiting`](RunState::Waiting),
+    /// whose state says the question is a hook's approval.
+    pub(crate) fn awaiting(mut self, approval: ApprovalRequest, question: Option<String>) -> Self {
+        self.state = RunState::AwaitingApproval;
+        self.question = question.or(self.question);
+        self.approval = Some(approval);
+        self
     }
 }
 

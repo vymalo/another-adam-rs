@@ -13,10 +13,11 @@ use std::time::Duration;
 use adam_engine::adam_agent_fs::{Dir, Strictness};
 use adam_engine::adam_assembly::AgentDef;
 use adam_engine::adam_core::MemoryStore;
+use adam_engine::adam_llm_agent::ToolSet;
 use adam_engine::adam_model::{
     DynModel, MockModel, ModelClient, ModelDelta, ModelError, ModelRequest, ModelResponse, ToolCall,
 };
-use adam_engine::{Engine, ListQuery, RunState};
+use adam_engine::{Engine, EngineBuilder, ListQuery, RunState};
 use async_trait::async_trait;
 use futures::StreamExt;
 use futures::stream::BoxStream;
@@ -167,6 +168,15 @@ struct Session {
 
 impl Session {
     async fn new(call: usize, hold: Hold) -> Self {
+        Self::with(call, hold, |builder| builder).await
+    }
+
+    /// [`new`](Self::new), with what `more` adds to the engine's builder.
+    async fn with(
+        call: usize,
+        hold: Hold,
+        more: impl FnOnce(EngineBuilder) -> EngineBuilder,
+    ) -> Self {
         let mock = Arc::new(MockModel::new());
         let gate = Arc::new(Gate::default());
         let model: DynModel = Arc::new(Held {
@@ -176,10 +186,15 @@ impl Session {
             calls: Mutex::new(0),
             gate: gate.clone(),
         });
-        let engine = Engine::builder(Arc::new(MemoryStore::new()), chat(), model, "m")
-            .start()
-            .await
-            .expect("the example's agent starts");
+        let engine = more(Engine::builder(
+            Arc::new(MemoryStore::new()),
+            chat(),
+            model,
+            "m",
+        ))
+        .start()
+        .await
+        .expect("the example's agent starts");
         let (keys, input) = tokio::io::duplex(4096);
         let screen = Transcript::default();
         let app = tokio::spawn(app::run(
@@ -402,4 +417,80 @@ async fn quit_during_a_step_says_it_waits_for_it() {
         screen.text(),
         "[stopping: the current step finishes first]\nbye\n"
     );
+}
+
+fn save(id: &str, text: &str) -> ToolCall {
+    ToolCall {
+        id: id.into(),
+        name: "save_note".into(),
+        arguments: json!({ "text": text }),
+        ..Default::default()
+    }
+}
+
+/// The host's hook asks before `save_note` (ADR 0047 slice 5): the chat prints the approval,
+/// `/approve` saves the note once, and `/deny` with a reason saves nothing and the model hears the
+/// person's words. The whole transcript, line for line.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_example_asks_before_saving_a_note() {
+    let notes = app::Notes::default();
+    let mut s = Session::with(usize::MAX, Hold::Start, |builder| {
+        builder
+            .tools(ToolSet::new().tool(app::save_note(notes.clone())))
+            .plugin(app::AsksBeforeSaving)
+    })
+    .await;
+    s.mock
+        .push_tool_calls(vec![save("n1", "buy milk")])
+        .push_text("Saved it.")
+        .push_tool_calls(vec![save("n2", "call Ada")])
+        .push_text("I did not save it.");
+
+    s.type_line("remember to buy milk").await;
+    s.screen.wait_count("(answer with /approve", 1).await;
+    assert!(
+        notes.lock().unwrap().is_empty(),
+        "nothing is saved before the yes"
+    );
+    s.type_line("/approve").await;
+    s.screen.wait_count("[done]", 1).await;
+    s.type_line("remember to call Ada").await;
+    s.screen.wait_count("(answer with /approve", 2).await;
+    s.type_line("/deny not now").await;
+    s.screen.wait_count("[done]", 2).await;
+    s.type_line("/approve").await;
+    s.screen.wait_count("! no run is open", 1).await;
+    let (screen, _engine, mock) = s.quit().await;
+
+    // A refusal is not journaled: the store has it at the commit of the step that read it, which
+    // may come before or after the model's next words are on the screen. Its place among them is
+    // the only thing that varies.
+    let text = screen.text();
+    let second = text.find("call Ada").expect("the second approval");
+    let refused = text.find("[refused]").expect("the refusal is said");
+    assert!(
+        refused > second && refused < text.rfind("[done]").unwrap(),
+        "{text}"
+    );
+    assert_eq!(
+        text.replacen("[refused]\n", "", 1),
+        "? Save the note \"buy milk\"? (save_note)\n  (answer with /approve, or /deny [reason])\n\
+         [approved]\n\
+         Saved it.\n\
+         [done]\n\
+         ? Save the note \"call Ada\"? (save_note)\n  (answer with /approve, or /deny [reason])\n\
+         I did not save it.\n\
+         [done]\n\
+         ! no run is open: type a message first\n\
+         bye\n"
+    );
+    assert_eq!(
+        notes.lock().unwrap().as_slice(),
+        ["buy milk"],
+        "saved once, on the yes"
+    );
+    let requests = mock.requests();
+    assert_eq!(requests.len(), 4);
+    let refused = requests[3].messages.last().unwrap().text();
+    assert!(refused.contains("They answered: not now"), "{refused}");
 }

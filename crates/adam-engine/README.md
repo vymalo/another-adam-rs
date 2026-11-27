@@ -12,6 +12,8 @@ let engine = Engine::builder(store, agent, model, "my-alias")   // DynStore, Age
     .limits(limits)                                              // optional: Limits::default()
     .models(profiles)                                            // optional: ModelProfiles::default()
     .reasoning_effort(ReasoningEffort::High)                     // optional: the root's level, over preset/profile
+    .plugin(AsksBeforeWriting)                                   // optional: the host's hooks (an `Ask` parks for approval)
+    .step_io(StepIo::default().redact(scrub))                    // optional: what a step (and an approval) shows of a call
     .start()
     .await?;
 let turn = engine.send(None, Say::new("hello")).await?;          // a new conversation
@@ -25,7 +27,8 @@ engine.shutdown().await?;
 | `send(None, say)` | starts a run in a new conversation (`Delivered::Started`) | `Invalid` for no text or no id; `Stopped` (`Rejected`) after `shutdown` |
 | `send(Some(&conversation), say)` | the latest run of the conversation has ended: a new run that continues it, the agent starting from its state, the transcript included (`Continued`); it is still open: the message is delivered to it, as a steer while it works (`Steered`) or as the answer while it waits (`Answered`), by the state read just before. A `Say` that already started a run starts nothing (`Repeated`) | `NotFound` for a conversation the engine has no run in; `Refused` (`Rejected`) for a child session that refuses it (closed, at its rounds, or its rounds already working) |
 | `steer(run, say)` | a message for a run that works: it reads it at its next step, and a run about to finish takes another step first; a waiting run takes it as its answer | `Finished` (`Rejected`) for a run that ended; `NotFound`; `Unavailable` (`Transient`) when its state moved under the call |
-| `answer(run, say)` | the answer to the question a waiting run asked; it works again | `NotWaiting` (`Rejected`) for a run that works; `Finished` for one that ended; `NotFound`. A refusal names the state read after it, never one it did not read |
+| `answer(run, say)` | the answer to the question a waiting run asked; it works again. A run that awaits an approval takes the text as its answer too, read by `adam_llm_agent::approves`: only a clear yes (`yes`, `ok`, ...) runs the call | `NotWaiting` (`Rejected`) for a run that works; `Finished` for one that ended; `NotFound`. A refusal names the state read after it, never one it did not read |
+| `approve(run, call_id, Decision)` | answers the approval the run waits for (`RunState::AwaitingApproval`, the call `RunInfo::approval` names): `Decision::Approve` runs that call once, with the arguments the request showed, in the journaled step `tool:<call id>:approved`; `Decision::Refuse(reason)` answers the call with the reason (`no` without one; a reason that reads as a yes, `ok`, is sent as `no: ok`) and the run goes on. Two clicks on one approval are read once (the message id is the run's, the call's and the parked version's). See [Approvals](#approvals) | `NotAwaitingApproval` (`Rejected`) for a run that works, waits on a plain question, or awaits another call's approval (named in `awaited`): nothing is delivered; `Finished`; `NotFound` (a firing too: nobody approves one); `Stopped` |
 | `cancel(run)` | ends the run `Cancelled`, a schedule's firing included; a cancelled run is answered as it is | `Finished` for a run that ended otherwise; `NotFound` |
 | `list(ListQuery)` | a `Page<RunInfo>` of the engine's runs, the most recently updated first, by cursor (`page_size`, at most 100, default 50; `conversation`; `after(token)`) | `Invalid` for a token of another query |
 | `helpers()` | the helpers a person may start a child session with (`SessionHelper`: `name`, `description`): the root's local subagents; empty without one | |
@@ -40,6 +43,8 @@ engine.shutdown().await?;
 | `events(run)` | `RunEvents`, a `futures::Stream` of `Result<EngineEvent, EngineError>`: the run's recent events, then the live ones, then `Ended` once the store says the run has ended; a run that has already ended gives `Ended` at once. See [A run's events](#a-runs-events) | `NotFound` for a run the engine does not have, refused at the call (the stream would have nothing to say) |
 | `resources()` | `ResourceReport`: what the process's pools hold now, the ceiling of each (`adam_budget::Limit`, `Unlimited` when the deployment set none, never a zero), the token bucket when the budget meters one, and the host's device readings when it pushed a device — the report of ADR 0065 decision 9, which names no person, run or conversation. A stream of a working run also carries it at most every 2 s (`EngineEvent::Resources`); see [A run's events](#a-runs-events) | |
 | `set_device_state(device)`, `EngineBuilder::device_state(device)` | the host's `DynDeviceState` (`adam_device_state::DeviceState`): the four readings the report carries. The readings reach the report **and lower the admission** from the next ask on, by `adam_budget::DeviceRules` (battery below 20 % or low-power: one run at a time, never below one; hot device: new model and tool calls held); no new background command and no ask-first for a clone or large fetch on a metered network are **not enforced** (an `Ask` cannot say). Without one, the report carries no readings, which is not a device on mains and cool (ADR 0065 decision 8) | |
+| `EngineBuilder::hooks(HookSet)`, `EngineBuilder::plugin(plugin)` | the host's hooks around the agent loop (ADR 0050), as `LlmAgentBuilder::hooks`/`plugin` take them, for **every** agent the engine runs, the root and each subagent, before the plugins its file names (`adam_assembly::BoundDef::hooks`). A `before_tool` hook's `Verdict::Ask` parks the run for the person's approval. Default none; `plugin` appends, `hooks` replaces | |
+| `EngineBuilder::step_io(StepIo)` | what a tool call's step shows of its input and output, and what is scrubbed first (`adam_llm_agent::StepIo`), for every agent; an approval shows its call through it too, never more than the step does. Default `StepIo::default()`: both shown, cut to the contract's bounds, no redactor | |
 | `EngineBuilder::device_rules(rules)`, `set_device_rules(rules)` | the person's switches, `adam_budget::DeviceRules`, every rule on by default; they act on the admission only | |
 | `admission()` | the admission as the engine asks it, device rules included, so a host's own run takes a seat the rules count; `None` without one | |
 | `shutdown()` | waits for the messages being written, then nothing new is claimed and the steps in flight finish and commit; it returns once the worker has stopped, and so does every concurrent or later call; every clone stops; reads and `cancel` still work. Dropping a `shutdown` before it is done (a timeout around it) aborts the worker, and so does dropping the last engine, as a killed process would: the next engine started with the same fixed worker id claims its runs at once, any other once their leases run out | what the worker ended with |
@@ -51,14 +56,21 @@ envelope, on a device `PromptStatement::envelope`, which every model call of tha
 keys, ADR 0068 amended 2026-11-25; the engine's caller always activates `prompt-statement/v1`; the id makes a send idempotent: the same `Say` again reaches
 the run its first attempt started; `Say::with_model(alias)` asks that the run be answered by `alias` with its profile's cap and
 level, refused as `EngineError::Invalid`, nothing written, when the root agent cannot be bound to it (not its own alias, and no profile in `EngineBuilder::models` that resolves for it), and as `EngineError::Refused` once the run has switched to its fallback; ADR 0064 amended 2026-11-23), `Turn { conversation, run, delivered, info }`, `Delivered` (`Started`, `Continued`, `Steered`, `Answered`,
-`Repeated`: a closed enum, so a new way of delivering breaks a `match` on purpose), `RunInfo { run, conversation,
-state, question, output, error }`, `RunState` (`Submitted`, `Working`, `Waiting`, `Done`, `Failed`, `Cancelled`),
+`Repeated`: a closed enum, so a new way of delivering breaks a `match` on purpose; a message to a run that awaits an
+approval is `Answered`), `RunInfo { run, conversation, state, question, output, error, approval }` (**`approval` is
+new**: `Some(ApprovalRequest)` only while `AwaitingApproval`), `RunState` (`Submitted`, `Working`, `Waiting`,
+`AwaitingApproval` (**new**, slice 5), `Done`, `Failed`, `Cancelled`; `waits_for_the_person()` is `Waiting` or
+`AwaitingApproval`), `ApprovalRequest { call_id, tool, question, arguments }` and `Decision` (`Approve`,
+`Refuse(Option<String>)`, `Decision::refuse_because(reason)`: a closed enum, an approval is yes or no),
 `ConversationId`, `ListQuery`, `Page<T>`, `Limits`, `EngineEvent`, `RunEvents` and `EngineError`, which implements
 `adam_error::Classify`: decide from the class. No A2A or driver type is in a signature: a live event is adam's own
 `adam_runtime::RunEvent`.
 
-**`RunState` is `#[non_exhaustive]`** because slice 5's approvals may add a state (a run that waits for the person's
-yes to a tool call): match it with a `_` arm.
+**`RunState` is `#[non_exhaustive]`**, and slice 5 added `AwaitingApproval` to it: a host that matched it with a `_`
+arm, as this page asked, still compiles, and its `_` arm now receives an approval. `EngineError` gained
+`NotAwaitingApproval { run, call_id, state, awaited }` (`Rejected`), and `EngineEvent` `ApprovalAsked` and
+`ApprovalAnswered`; both enums are `#[non_exhaustive]`. **Breaking** only for code that builds a `RunInfo` with a
+struct literal, which the crate's `#[non_exhaustive]` already forbids outside it: none.
 
 **The engine's own API is the supported one.** The crates it re-exports (`adam_a2a_runtime` and the others) are
 there for the types a host passes in (`AgentDef`, `DynModel`, `DynStore`, `SecretSource`), not as a second way in.
@@ -132,8 +144,55 @@ again.
 **A file the agent hands over** (a tool's file artifact) reaches the events without its bytes (below); `files(run)` lists
 the run's files and `file(run, sha256)` reads one's bytes from the store. **Not yet**: the backend is given the engine's ring too, and its A2A streaming path (`TaskBackend::subscribe`) builds a file part from a live
 event's bytes: the engine never calls it, and a future caller that streams a task through it must read files from the
-store, since the ring withholds them. Approvals are slice 5: today a run waits only on a question, and `answer`
-answers it.
+store, since the ring withholds them.
+
+## Approvals
+
+[ADR 0047](../../docs/decisions/0047-adam-rs-can-be-embedded-in-an-application.md) slice 5, over [ADR
+0050](../../docs/decisions/0050-hooks-around-the-agent-loop-compiled-first-and-programs-second.md) slice H8: a hook of
+the host's asks the person before a tool call runs, and the host answers with a yes or a no.
+
+```rust
+struct AsksBeforeWriting;
+impl Plugin for AsksBeforeWriting {                                      // adam_engine::adam_llm_agent::Plugin
+    fn name(&self) -> &str { "asks" }
+    fn before_tool(&self, call: &mut HookedCall<'_>) -> HookResult {
+        Ok(if call.tool == "write_file" { Verdict::Ask("Write this file?".into()) } else { Verdict::Continue })
+    }
+}
+let engine = Engine::builder(store, agent, model, "m").plugin(AsksBeforeWriting).start().await?;
+// ... a run's stream says `EngineEvent::ApprovalAsked(request)`, or `get` says `RunState::AwaitingApproval`:
+engine.approve(run, &request.call_id, Decision::Approve).await?;          // or Decision::refuse_because("not now")
+```
+
+* **The state.** A run whose question is a hook's approval is `RunState::AwaitingApproval`, not `Waiting`: a typed
+  answer runs the call only when it is a clear yes, so a host shows a yes and a no rather than a text box.
+  `RunInfo::approval` is the `ApprovalRequest`: the `call_id` that `approve` names (and the call's step id,
+  `tool:<call id>`), the `tool`, the hook's own `question`, and the `arguments` the call runs with once approved.
+  `RunInfo::question` is the question as a person reads it in text. The engine reads it from the run's head
+  (`Conversation::approval`, and the question it parks on, for the same call) on every `get`, `list`, `send` and the
+  others, one more read of the store for a run that waits.
+* **Nothing more than the step shows.** `arguments` is what the call's step input carries (`StepIo::shown_input`:
+  scrubbed by the redactor of `EngineBuilder::step_io`, then cut to 4 KiB; `None` when the steps carry no input), and
+  `question` (both of them) went through the same redactor. Without a redactor the arguments are shown as the model
+  gave them, as the steps are: a host whose tools see secrets gives one.
+* **The events.** `EngineEvent::ApprovalAsked(ApprovalRequest)` when the store shows the run waiting for it, once per
+  approval in a stream (a stream opened on a waiting run starts with it); `EngineEvent::ApprovalAnswered { call_id,
+  approved }` once the store has the answer: `true` when the call's step `tool:<call id>:approved` is journaled,
+  `false` when the call has its answer in the history without that step (a no). The stream reads the store on a
+  status, on the agent's `input_required` with `"approval": true` and on the end of the asked call's step; a no is
+  not journaled, so its `ApprovalAnswered` may come after the model's next words. A reader that reads only after the
+  answer hears `ApprovalAnswered` alone: an approval that no longer waits is not offered. A cancel says no answer.
+* **The answer.** `approve(run, call_id, Decision)` checks that the run awaits that call's approval (else
+  `NotAwaitingApproval`, `Rejected`, with the call it does await; `Finished` for an ended run; `NotFound`), then sends
+  the plain follow-up `answer` sends, `yes` or the refusal's words, under the id `approval:<run>:<call id>:<version>`.
+  `answer(run, say)`, `steer` and `send` to the conversation reach an approval too, as text. Every hook is asked only
+  in the step that asked: neither the person's yes, nor a replay, nor a restart asks again (H8's journal).
+* **Who is asked.** The hooks of `EngineBuilder::plugin`/`hooks` run in every agent; a child run that may not ask the
+  person, and a schedule's firing, read `Ask` as `Deny` (H8), so only the conversation's own runs, and a kept-open
+  child session's rounds, wait for an approval.
+* **Not an A2A extension yet.** The engine is the host's; announcing approvals to A2A clients is a new extension (ADR
+  0047's confirmed decision 4), not built.
 
 ## `uploads/v1`
 
@@ -170,6 +229,7 @@ while let Some(event) = events.next().await {
   once the worker has stopped and the run has not ended (after `shutdown`, at once rather than at a poll; when every
   `Engine` is dropped; when the worker failed), since nothing would step it; `NotFound` if the run is gone; or the
   store's error when a read fails. Call `events` again on a live engine to go on.
+* **Approvals.** `ApprovalAsked` and `ApprovalAnswered`, read from the store: see [Approvals](#approvals).
 * **Bounded whatever the reader does.** The runtime emits into one ring (`tokio::sync::broadcast`) of `event_capacity`
   events, every run's, one copy shared by every reader. A reader that does not keep up holds nothing more: the ring
   overwrites its oldest events, and the reader learns it on its next read, `Behind { skipped }` (how many events of the
@@ -178,7 +238,7 @@ while let Some(event) = events.next().await {
   store, or `Ended` if the run is over. The live events after a `Snapshot` may have been emitted before it: take a text
   piece by its `offset` and a step by its `id`. A stream holds besides the run's recent events it started with (the
   runtime's replay: at most `REPLAY_EVENTS_PER_RUN`, 64, of the run, within its 16 MiB for every run, see
-  [`adam-runtime`](../adam-runtime/README.md#a-late-subscriber)) and at most two items. So a reader that reads only
+  [`adam-runtime`](../adam-runtime/README.md#a-late-subscriber)) and at most four items. So a reader that reads only
   after its run is over gets at most `REPLAY_EVENTS_PER_RUN + event_capacity` live events (80 with a ring of 16), then
   `Behind`, then `Ended` with the whole output.
 * **The resource report.** While the run works, at most every 2 s the stream carries one
@@ -216,12 +276,15 @@ MODEL_BASE_URL=https://gateway.example.com/v1 MODEL_API_KEY=... MODEL=my-model c
   `CARGO_MANIFEST_DIR`, the build machine's path: the development path. An application ships its agent with
   `include_agent!` instead (a comment shows how).
 * `app.rs` is the loop, `run(engine, input, out)`: a plain line is a `send` to the conversation; `/steer <text>`,
-  `/answer <text>`, `/cancel`, `/list` and `/quit` (which says `[stopping: the current step finishes first]` while a
+  `/answer <text>`, `/approve`, `/deny [reason]`, `/cancel`, `/list` and `/quit` (which says `[stopping: the current step finishes first]` while a
   step is in flight). At the end of the input it follows the run to its end or its question, then shuts the engine
   down, so `printf 'hi\n' | ...` prints the answer. A send that starts a new run first reads the last one's end. It prints
   the followed run's text as it streams (a piece by its `offset`, so a repeat is not printed twice), its question when
   it waits (read with `get` on a `Status`), `[behind: N events skipped]`, and how it ended; a refusal is printed with
-  its class.
+  its class. It also holds the host's own tool and hook: `save_note` keeps a line in the host's notes, and
+  `AsksBeforeSaving` asks before every call of it; `main.rs` installs both (`EngineBuilder::tools`, `plugin`), and the
+  chat prints an approval as `? Save the note "..."? (save_note)` to answer with `/approve` or `/deny [reason]`, then
+  `[approved]` or `[refused]`.
 * `adam-model-openai`, `secrecy` and tokio's `io-std` and `io-util` are **dev-dependencies**: the embedded check reads
   normal dependencies only, so the engine's tree still holds no HTTP client and no TLS stack.
 
@@ -387,7 +450,38 @@ shows what the last did, over `MemoryStore`, the example's own agent folder and 
   refused by the example, and ends a waiting run `[cancelled]`;
 * `the_end_of_the_input_waits_for_the_run`: an input that ends while the model has not answered still gets the whole
   reply, `[done]`, then `bye`; one that ends after a question gets the question, then `bye`;
-* `quit_during_a_step_says_it_waits_for_it`: `/quit` while the model works prints the stopping line, then `bye`.
+* `quit_during_a_step_says_it_waits_for_it`: `/quit` while the model works prints the stopping line, then `bye`;
+* `the_example_asks_before_saving_a_note`: with the example's tool and hook, the approval is printed, `/approve` saves
+  the note once (`[approved]` before the model's next words), `/deny not now` saves nothing and the model reads
+  `They answered: not now`, and `/approve` with no open run is refused by the example; the whole transcript, the place
+  of `[refused]` among the model's words aside (a no is not journaled).
+
+`tests/approval.rs` (ADR 0047 slice 5's proofs), a host's `effect` tool that counts its runs and a hook that asks
+before it:
+
+* `a_yes_runs_the_same_call_once_across_restarts` (Unix: the SQLite store, three engines over one file, one after the
+  other): A parks on the approval (`AwaitingApproval`, the request with its call, tool, question and arguments; the
+  tool not run) and is dropped; B shows the same approval without asking the hook, its stream starts with
+  `ApprovalAsked`, takes `approve(.., Approve)`, runs the call (`ApprovalAnswered { approved: true }`) and is dropped
+  while its next model call waits; C finishes the run. The tool ran once, the hook asked once, and C's one model
+  request holds the call's result once;
+* `a_replay_never_asks_twice`: a `FaultyStore` (`adam-store-testkit`, a dev-dependency) loses the commit of the park; the transition runs again from the
+  journal and parks without asking the hook; a reader that reads at once hears the lost attempt's ask and takes it for
+  no answer, hears `ApprovalAsked` once over more than a poll of the store, then `ApprovalAnswered { true }` and the
+  end; the tool ran once;
+* `a_no_refuses_the_call_and_the_run_goes_on`: with a redactor (`EngineBuilder::step_io`), the request shows the
+  scrubbed arguments and question; `Decision::refuse_because("not that file")` never runs the call, the model reads
+  `They answered: not that file`, the run ends with its answer, the stream says `ApprovalAnswered { false }`, and no
+  event of the stream holds the secret;
+* `a_refusal_that_says_ok_is_still_a_no`: `refuse_because("OK")` runs nothing; the model reads `no: OK`;
+* `an_answer_for_another_call_or_no_approval_is_refused`: another call's id (`NotAwaitingApproval`, `awaited` the
+  real one, nothing delivered), a run that works and one that waits on `ask_user` (`awaited: None`), an ended run
+  (`Finished`) and an unknown one (`NotFound`); and `send` of `Yes.` to the conversation is `Answered` and runs the call.
+
+Each was seen failing once against a change that breaks what it holds (an approval sent as `no`, no approval read
+from the head, the approval said at every read, a refusal sent as `yes`, the raw arguments shown, an `ok` reason sent
+as is, no check of the call id, a `send` to an approval delivered as a steer, a no read from an absence), then
+passing.
 
 `tests/resume_process.rs` (Unix), `a_killed_process_resumes_its_run`, on a SQLite file in the test's own directory
 (`adam-store-sqlite`, a dev-dependency only, so the embedded tree is unchanged): the test runs its own binary again as

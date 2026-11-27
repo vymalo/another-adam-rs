@@ -526,6 +526,7 @@ dependencies = [
  "adam-runtime",
  "adam-schedule",
  "adam-store-sqlite",
+ "adam-store-testkit",
  "adam-ui",
  "async-trait",
  "futures",

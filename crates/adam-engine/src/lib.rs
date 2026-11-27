@@ -19,7 +19,9 @@
 //! [`Engine::builder`] takes the store, the agent's definition, the model and its alias; `start`
 //! binds the agent with the screen's tools of an embedded agent and starts the worker. Then
 //! [`Engine::send`] starts or continues a conversation, [`Engine::steer`] and [`Engine::answer`]
-//! reach a run that works or waits, [`Engine::cancel`] ends one, and [`Engine::list`] and
+//! reach a run that works or waits, [`Engine::approve`] answers a hook's ask to run a tool call
+//! ([`RunState::AwaitingApproval`], the host's hooks given with [`EngineBuilder::plugin`]),
+//! [`Engine::cancel`] ends one, and [`Engine::list`] and
 //! [`Engine::get`] read them. [`Engine::events`] follows a run's events to its end, bounded in
 //! memory however slowly it is read ([`RunEvents`]). No A2A type is in a signature: inside, every
 //! call is the code the A2A server calls (`RuntimeTaskBackend`).
@@ -62,9 +64,9 @@ pub use error::EngineError;
 pub use events::{EngineEvent, RunEvents, WithheldFile};
 pub use resources::ResourceReport;
 pub use types::{
-    ConversationId, DEFAULT_PAGE_SIZE, Delivered, Firing, FiringQuery, ListQuery, MAX_PAGE_SIZE,
-    Page, RunFile, RunInfo, RunState, Say, SessionHelper, SessionInfo, SessionState, StartSession,
-    Turn,
+    ApprovalRequest, ConversationId, DEFAULT_PAGE_SIZE, Decision, Delivered, Firing, FiringQuery,
+    ListQuery, MAX_PAGE_SIZE, Page, RunFile, RunInfo, RunState, Say, SessionHelper, SessionInfo,
+    SessionState, StartSession, Turn,
 };
 
 use std::sync::Arc;

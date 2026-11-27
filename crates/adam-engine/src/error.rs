@@ -18,7 +18,7 @@ use crate::engine::Expected;
 /// | `Agent` | the agent definition's own (`Invalid` for a file that does not bind) |
 /// | `NoRuntime`, `Invalid` | `Invalid` |
 /// | `NotFound` | `NotFound` |
-/// | `NotWaiting`, `Finished`, `Stopped`, `WorkerIdInUse`, `Refused` | `Rejected` |
+/// | `NotWaiting`, `NotAwaitingApproval`, `Finished`, `Stopped`, `WorkerIdInUse`, `Refused` | `Rejected` |
 /// | `Unavailable` (a store that is down, or a run whose state moved under the call: try again) | `Transient` |
 /// | `Store` | the store's own |
 /// | `Schedules` | the reconcile's own |
@@ -46,6 +46,20 @@ pub enum EngineError {
         run: RunId,
         /// Its state when it was refused.
         state: RunState,
+    },
+    /// [`approve`](crate::Engine::approve) of a call the run does not wait to have approved: it
+    /// works, waits on a plain question, or waits for the approval of another call (`awaited`).
+    /// Nothing was delivered.
+    #[error("run {run} is {state:?} and does not await the approval of call {call_id:?}{}", awaited_text(awaited.as_deref()))]
+    NotAwaitingApproval {
+        /// The run that was answered.
+        run: RunId,
+        /// The call the answer named.
+        call_id: String,
+        /// The run's state when it was refused.
+        state: RunState,
+        /// The call whose approval it does wait for, if any.
+        awaited: Option<String>,
     },
     /// A message or a cancel for a run that has ended (a cancel of a cancelled run is not one: it
     /// answers the run as it is).
@@ -116,6 +130,7 @@ impl Classify for EngineError {
             Self::NoRuntime | Self::Invalid(_) | Self::NoTurnKeys => ErrorClass::Invalid,
             Self::NotFound(_) => ErrorClass::NotFound,
             Self::NotWaiting { .. }
+            | Self::NotAwaitingApproval { .. }
             | Self::Finished { .. }
             | Self::Stopped
             | Self::WorkerIdInUse { .. }
@@ -126,6 +141,11 @@ impl Classify for EngineError {
             Self::Internal { .. } => ErrorClass::Internal,
         }
     }
+}
+
+/// What a refused approval says of the call the run does wait for.
+fn awaited_text(awaited: Option<&str>) -> String {
+    awaited.map_or_else(String::new, |call| format!(" (it awaits call {call:?})"))
 }
 
 impl EngineError {
@@ -246,6 +266,7 @@ mod tests {
             }
             EngineError::NotFound(_) => ErrorClass::NotFound,
             EngineError::NotWaiting { .. }
+            | EngineError::NotAwaitingApproval { .. }
             | EngineError::Finished { .. }
             | EngineError::Stopped
             | EngineError::WorkerIdInUse { .. }
@@ -328,6 +349,18 @@ mod tests {
             }
             .class(),
             ErrorClass::Rejected
+        );
+        let wrong = EngineError::NotAwaitingApproval {
+            run,
+            call_id: "c9".into(),
+            state: RunState::AwaitingApproval,
+            awaited: Some("c1".into()),
+        };
+        assert_eq!(wrong.class(), ErrorClass::Rejected);
+        assert_eq!(wrong.class(), expected(&wrong));
+        assert!(
+            wrong.to_string().contains(r#"(it awaits call "c1")"#),
+            "{wrong}"
         );
     }
 }
