@@ -111,7 +111,7 @@ async fn a_version_1_schema_migrates_to_the_current_one_and_keeps_its_runs() {
     store.migrate().await.unwrap();
     assert!(has_owner_column(&pool, &p).await, "the column was added");
     assert_eq!(version(&pool, &p).await, SCHEMA_VERSION.to_string());
-    assert_eq!(SCHEMA_VERSION, 8);
+    assert_eq!(SCHEMA_VERSION, 9);
     // The push table exists now (a missing table would be a backend error).
     assert!(
         store
@@ -178,14 +178,14 @@ async fn an_older_release_migrating_does_not_lower_the_version() {
         .with_table_prefix(&p)
         .unwrap();
     store.migrate().await.unwrap();
-    // A future release wrote version 9.
+    // A future release wrote version 10.
     support::exec(
         &pool,
-        &format!("UPDATE {p}meta SET value = '9' WHERE key = 'schema_version'"),
+        &format!("UPDATE {p}meta SET value = '10' WHERE key = 'schema_version'"),
     )
     .await;
     store.migrate().await.unwrap();
-    assert_eq!(version(&pool, &p).await, "9");
+    assert_eq!(version(&pool, &p).await, "10");
     drop_tables(&pool, &p).await;
 }
 
@@ -514,6 +514,7 @@ async fn a_version_5_schema_gets_the_head_and_the_body_and_keeps_its_runs() {
 
     // Back to version 5: no head columns, no body table, no served column (which reads the head).
     support::exec(&pool, &format!("DROP TABLE {p}body")).await;
+    support::drop_claim_function(&pool, &p).await;
     support::exec(
         &pool,
         &format!(
@@ -614,6 +615,7 @@ async fn a_version_7_schema_gets_the_served_column_without_a_rewrite() {
         .unwrap();
 
     // Back to version 7: no served column.
+    support::drop_claim_function(&pool, &p).await;
     support::exec(&pool, &format!("ALTER TABLE {runs} DROP COLUMN served")).await;
     support::exec(
         &pool,

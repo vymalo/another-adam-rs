@@ -93,7 +93,7 @@ async fn a_sqlx_migrated_database_opens_and_upgrades_to_the_head_and_body() {
             .get(0)
     };
     assert_eq!(version, SCHEMA_VERSION.to_string());
-    assert_eq!(version, "8");
+    assert_eq!(version, "9");
 
     // The old run reads as it was written: no head, so the whole state is served.
     let loaded = store

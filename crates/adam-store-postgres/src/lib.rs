@@ -98,7 +98,10 @@ use uuid::Uuid;
 ///   current (`head_version = version`) or the state is the `null` tombstone, else the state. It
 ///   is computed when it is read, so adding it rewrites and stores nothing, and every read selects
 ///   it instead of repeating the expression. No function yet.
-pub const SCHEMA_VERSION: i32 = 8;
+/// * 9: the claim is a function, `<prefix>claim_due` (ADR 0082, decision 1, slice P2): due, not
+///   busy, lease free and the pinned owner, locked with `SKIP LOCKED`, leased and returned in claim
+///   order, in one `BEGIN ATOMIC` body. Renewal and release stay inline.
+pub const SCHEMA_VERSION: i32 = 9;
 
 /// The oldest server [`Store::migrate`] accepts, as PostgreSQL's `server_version_num`: 18.0, the
 /// floor of [ADR 0082](../../docs/decisions/0082-the-sql-adapters-keep-their-rules-in-the-database.md)
@@ -681,8 +684,7 @@ struct Sql {
     journal_get: Arc<str>,
     journal_insert: Arc<str>,
     journal_list: Arc<str>,
-    claim_due_any: Arc<str>,
-    claim_due_pinned: Arc<str>,
+    claim_due: Arc<str>,
     renew_lease: Arc<str>,
     release_lease: Arc<str>,
     lease_until: Arc<str>,
@@ -902,8 +904,8 @@ impl Sql {
         //   release later; a column a SQL-standard body reads is altered only by dropping and
         //   recreating the function in the same transaction;
         // * `tests/functions.rs` lists every function and calls it on a fresh database.
-        // Slices P0 and P1 create none (P1 adds the `served` column, above).
-        let migrate_functions: Vec<Arc<str>> = Vec::new();
+        // Slices P0 and P1 create none (P1 adds the `served` column, above); P2 adds the claim.
+        let migrate_functions: Vec<Arc<str>> = vec![Arc::from(claim_due_function(p, &runs))];
         migrate.extend(migrate_functions);
         // Record the version, and raise it from an older one. Never lower it: a process
         // running an older release must not undo a newer one's migration.
@@ -1022,8 +1024,10 @@ impl Sql {
             journal_list: Arc::from(format!(
                 "SELECT seq, name, ok, payload, recorded_at FROM {journal} WHERE run_id = $1 ORDER BY seq"
             )),
-            claim_due_any: Arc::from(claim_due_sql(&runs, ClaimScope::Any)),
-            claim_due_pinned: Arc::from(claim_due_sql(&runs, ClaimScope::Pinned)),
+            claim_due: Arc::from(format!(
+                "SELECT {} FROM {p}claim_due($1, $2, $3, $4, $5, $6, $7)",
+                served_columns("")
+            )),
             renew_lease: Arc::from(format!(
                 "UPDATE {runs} SET lease_until = $4
                   WHERE id = $1 AND lease_owner = $2 AND lease_until > $3"
@@ -1130,35 +1134,54 @@ impl Sql {
     }
 }
 
-/// The claiming statement. `$1` agents, `$2` now, `$3` limit, `$4` worker, `$5` lease end, `$6` the
-/// runs the caller is stepping, which are never claimed. The pinned form filters on `owner` and
-/// sets it (`COALESCE` keeps an existing owner).
-fn claim_due_sql(runs: &str, scope: ClaimScope) -> String {
-    let (filter, set_owner) = match scope {
-        ClaimScope::Any => ("", ""),
-        ClaimScope::Pinned => (
-            "AND (owner IS NULL OR owner = $4)",
-            ", owner = COALESCE(r.owner, $4)",
-        ),
-    };
+/// The claim function (schema version 9, ADR 0082 slice P2): `<prefix>claim_due(agents, worker,
+/// pinned, busy, now, until, max)`. It picks the runs of `agents` that are due (`sched_at <= now`),
+/// not in `busy` (the runs the caller is stepping) and whose lease is free or ended, in claim order
+/// (`sched_at`, `id`), at most `max`, locks them with `FOR UPDATE SKIP LOCKED` so a claim never
+/// waits for a row another worker holds, sets the lease (`lease_owner = worker`,
+/// `lease_until = until`) and returns the claimed runs in that order, each as the record a reader
+/// is served (the `served` column). With `pinned`, only a run no worker owns or the worker owns is
+/// a candidate, and the claim ties it to the worker (`COALESCE` keeps an existing owner); without
+/// it the owner is neither read nor written.
+///
+/// Both times are arguments (decision 2): the database's clock is never read. A SQL-standard body
+/// (`BEGIN ATOMIC`) is parsed and bound when the function is created, so a renamed column fails
+/// the migration, not a claim. The one statement is a data-modifying `WITH` whose rows are then
+/// ordered: the order of an `UPDATE .. RETURNING` is unspecified.
+fn claim_due_function(p: &str, runs: &str) -> String {
     format!(
-        "WITH due AS (
-            SELECT id FROM {runs}
-             WHERE agent = ANY($1)
-               AND id <> ALL($6)
-               AND sched_at <= $2
-               AND (lease_until IS NULL OR lease_until <= $2)
-               {filter}
-             ORDER BY sched_at, id
-             LIMIT $3
-             FOR UPDATE SKIP LOCKED
-         )
-         UPDATE {runs} r
-            SET lease_owner = $4, lease_until = $5{set_owner}
-           FROM due
-          WHERE r.id = due.id
-         RETURNING {}, r.sched_at",
-        served_columns("r.")
+        "CREATE OR REPLACE FUNCTION {p}claim_due(
+             in_agents text[], in_worker text, in_pinned boolean, in_busy uuid[],
+             in_now timestamptz, in_until timestamptz, in_limit bigint)
+         RETURNS TABLE (id uuid, agent text, conversation_id text, parent_id uuid, status text,
+                        served jsonb, wake_at timestamptz, version bigint,
+                        created_at timestamptz, updated_at timestamptz)
+         LANGUAGE sql
+         BEGIN ATOMIC
+             WITH due AS (
+                 SELECT d.id FROM {runs} d
+                  WHERE d.agent = ANY(in_agents)
+                    AND d.id <> ALL(in_busy)
+                    AND d.sched_at <= in_now
+                    AND (d.lease_until IS NULL OR d.lease_until <= in_now)
+                    AND (NOT in_pinned OR d.owner IS NULL OR d.owner = in_worker)
+                  ORDER BY d.sched_at, d.id
+                  LIMIT in_limit
+                  FOR UPDATE SKIP LOCKED
+             ), claimed AS (
+                 UPDATE {runs} r
+                    SET lease_owner = in_worker, lease_until = in_until,
+                        owner = CASE WHEN in_pinned THEN COALESCE(r.owner, in_worker) ELSE r.owner END
+                   FROM due
+                  WHERE r.id = due.id
+                 RETURNING r.id, r.agent, r.conversation_id, r.parent_id, r.status, r.served,
+                           r.wake_at, r.version, r.created_at, r.updated_at, r.sched_at
+             )
+             SELECT c.id, c.agent, c.conversation_id, c.parent_id, c.status, c.served,
+                    c.wake_at, c.version, c.created_at, c.updated_at
+               FROM claimed c
+              ORDER BY c.sched_at, c.id;
+         END"
     )
 }
 
@@ -1747,35 +1770,29 @@ impl Store for PgStore {
         }
         let now = truncate_ms(now);
         let until = add_ttl(now, ttl);
-        let statement = match scope {
-            ClaimScope::Any => &self.sql.claim_due_any,
-            ClaimScope::Pinned => &self.sql.claim_due_pinned,
-        };
+        let pinned = matches!(scope, ClaimScope::Pinned);
         let busy: Vec<Uuid> = busy.iter().map(|id| id.0).collect();
         let limit = i64::try_from(limit).unwrap_or(i64::MAX);
         let (now_sql, until_sql) = (sql_time(now), sql_time(until));
-        let params: &[&(dyn ToSql + Sync)] =
-            &[&agents, &now_sql, &limit, &worker, &until_sql, &busy];
+        let params: &[&(dyn ToSql + Sync)] = &[
+            &agents, &worker, &pinned, &busy, &now_sql, &until_sql, &limit,
+        ];
         let client = self.pool.get().await.map_err(classify_pool)?;
-        let stmt = client.prepare_cached(statement).await.map_err(classify)?;
+        let stmt = client
+            .prepare_cached(&self.sql.claim_due)
+            .await
+            .map_err(classify)?;
         let rows = client.query(&stmt, params).await.map_err(classify)?;
-        // RETURNING order is unspecified; restore the claim order.
-        let mut claimed = rows
-            .iter()
+        // The function returns the runs in claim order (`sched_at`, `id`).
+        rows.iter()
             .map(|row| {
-                let sched = time(row, "sched_at")?;
-                Ok((sched, run_from_row(row)?))
+                Ok(Lease {
+                    run: run_from_row(row)?,
+                    worker: worker.to_owned(),
+                    until,
+                })
             })
-            .collect::<StoreResult<Vec<_>>>()?;
-        claimed.sort_by(|(a, x), (b, y)| a.cmp(b).then(x.id.cmp(&y.id)));
-        Ok(claimed
-            .into_iter()
-            .map(|(_, run)| Lease {
-                run,
-                worker: worker.to_owned(),
-                until,
-            })
-            .collect())
+            .collect()
     }
 
     async fn renew_lease(
@@ -2556,24 +2573,24 @@ mod tests {
     /// fixture: a start on a current schema runs no DDL, so such a change would never reach a
     /// database (ADR 0082, decision 10).
     #[test]
-    fn the_statements_equal_the_version_8_fixture() {
-        assert_eq!(SCHEMA_VERSION, 8, "a new version gets a fixture of its own");
+    fn the_statements_equal_the_version_9_fixture() {
+        assert_eq!(SCHEMA_VERSION, 9, "a new version gets a fixture of its own");
         let sql = Sql::new("adam_");
         assert!(
             sql.migrate.len() > 4,
             "the fixture must hold the whole migration"
         );
         let mut generated = String::from(
-            "-- The schema version 8 that adam-store-postgres emits.\n\
-             -- Regenerate with ADAM_WRITE_FIXTURE=1 cargo test -p adam-store-postgres --lib the_statements_equal_the_version_8_fixture\n",
+            "-- The schema version 9 that adam-store-postgres emits.\n\
+             -- Regenerate with ADAM_WRITE_FIXTURE=1 cargo test -p adam-store-postgres --lib the_statements_equal_the_version_9_fixture\n",
         );
         generated.push_str(&sql.migrate.join(";\n\n"));
         generated.push_str(";\n");
-        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/schema-v8.sql");
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/schema-v9.sql");
         if std::env::var_os("ADAM_WRITE_FIXTURE").is_some() {
             std::fs::write(path, &generated).expect("write the fixture");
         }
-        let fixture = include_str!("../tests/fixtures/schema-v8.sql");
+        let fixture = include_str!("../tests/fixtures/schema-v9.sql");
         assert_eq!(
             normalise(&(sql.migrate.join("; ") + ";")),
             normalise(fixture)

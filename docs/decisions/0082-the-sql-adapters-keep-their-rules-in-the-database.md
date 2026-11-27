@@ -1,6 +1,6 @@
 # 0082. The SQL adapters keep their rules in the database
 
-Status: **Accepted** (2026-11-27). Slices P0 and P1 are built (2026-11-27); P2–P7, S1 and S2 are not. The owner decided on 2026-11-27:
+Status: **Accepted** (2026-11-27). Slices P0, P1 and P2 are built (2026-11-27); P3–P7, S1 and S2 are not. The owner decided on 2026-11-27:
 
 > *"If something can be done in SQL, we better use SQL rather than rust"*
 >
@@ -231,7 +231,7 @@ function unless decision 1 says it carries a rule.
 |---|---|---|---|
 | P0 | the version 7 step, the SQLSTATE table, the refusal below 18, CI, compose and the chart on 18 | migrate a fresh database and call every function; a server below 18 is refused before any DDL | built 2026-11-27 |
 | P1 | the `served` column; the reads select it, inline | the listing cases and the body cases on which document a read serves | built 2026-11-27 |
-| P2 | the claim function; renewal and release stay inline | concurrent claims are exclusive; a pinned run never goes to another worker; an ended lease is taken over | to do |
+| P2 | the claim function; renewal and release stay inline | concurrent claims are exclusive; a pinned run never goes to another worker; an ended lease is taken over | built 2026-11-27 |
 | P3 | the `sched_at` function, the inline create, the headless commit | one winner among concurrent commits; a stale version and a missing run come back as outcomes | to do |
 | P4 | the journal append | non-determinism is detected; concurrent writers agree on the first entry | to do |
 | P5 | the commit with a head, a body and blob references | the body suite and the three body resolutions | to do |
@@ -257,6 +257,14 @@ For the owner: the migration's connection runs with `statement_timeout = 0` and 
 `ADD COLUMN` waits for its `ACCESS EXCLUSIVE` lock on the runs table for as long as a long transaction holds the
 table, and the store's other statements queue behind it meanwhile. This was already true of the earlier
 `ADD COLUMN` steps, and P1 leaves the code as it is.
+
+*2026-11-27, P2 built:* schema version 9 creates `<prefix>claim_due(agents, worker, pinned, busy, now, until,
+max)`, a SQL-standard (`BEGIN ATOMIC`) function: the due runs not busy, with a free or ended lease and, when pinned,
+no other owner, in claim order, locked with `SKIP LOCKED`, leased and returned as the served record. `claim_due` calls
+it, and the Rust sort of the claimed rows is gone. Renewal and release stay inline. The claim reads `created_at`,
+`updated_at` and other columns, so a migration that alters one drops and recreates the function (decision 10). The
+proofs, the mutations and a first measurement of the cost of a call are on the [agent
+page](../../.agents/docs/decisions/0082-the-sql-adapters-keep-their-rules-in-the-database.md#p2-built-2026-11-27).
 
 ## Consequences
 
