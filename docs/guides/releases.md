@@ -32,7 +32,7 @@ sequenceDiagram
     Note over RP: CI runs on the release pull request
     RP->>RP: the release pull request merges: tag vX.Y.Z, GitHub release
     Coder->>GH: the merge commit, as for any commit: sha-XXXXXXX
-    Rel->>Coder: wait until its image job passed on the tag's commit
+    Rel->>Coder: wait until its image job passed on the tag's commit (a run no later push cancels)
     Rel->>GH: build with provenance and SBOM, push by digest
     Rel->>Rel: smoke-test that digest
     Rel->>GH: sign the digest, then tag X.Y.Z and X.Y
