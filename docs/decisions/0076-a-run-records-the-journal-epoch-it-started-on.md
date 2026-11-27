@@ -1,9 +1,12 @@
 # 0076. A run records the journal epoch it started on, and a worker steps only the epochs its code can replay
 
-Status: **Proposed** (2026-11-25). A design for the owner to rule on, not a ruling: it changes what a rolling deploy
-may do to a run in flight, and the recommendations below are the author's. Slice 1 is safe to start under any ruling;
-the choices in decisions 2 to 4 wait for the owner. It adds no setting and no feature a user sets, so
-`docs/reference/parity.md` is unchanged; a slice that adds a setting updates it.
+Status: **Accepted** (2026-11-26). The owner accepted this decision and **its seven recommendations as written**, with
+the platform's AD-059, on 2026-11-26 (recorded in another-context's `decisions-2026-11-26.md`, row 113,
+skyengpro/another-context#177); the platform's half merged first (another-agentic-platform#156, `628c5a7`). The table
+under *Open questions* is the ruling: an integer epoch, `Permanent` with an `Unsupported` source, the envelope now and
+a column only with slice 5, a refused run waits rather than fails, a follow-up run starts on the current epoch, a child
+records its own, and no `partition` value until a rollout shows the rule is not enough. It adds no setting and no
+feature a user sets, so `docs/reference/parity.md` is unchanged; a slice that adds a setting updates it.
 
 ## Premise, checked at `main` (e24f185f, 2026-11-25)
 
@@ -55,7 +58,7 @@ a run by its version today**, so the first worker to poll takes it.
 `podManagementPolicy: Parallel` (`deploy/coder/templates/statefulset.yaml:12-18`). During a rollout an old pod and a new
 pod share one store, so "stop every worker of the old revision first" is not something the chart can do.
 
-## Decision (proposed)
+## Decision
 
 ### 1. A run records an integer `epoch` in its envelope when it starts
 

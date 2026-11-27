@@ -9,7 +9,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use adam_core::Timestamp;
 use adam_memory::{
-    AttemptDraft, AttemptId, DynSiMemory, FolderSiMemory, MemoryError, Scrubber, Settings, SiMemory,
+    AttemptDraft, AttemptId, DynSiMemory, FolderSiMemory, MemoryError, Observation, Outcome,
+    Scrubber, Settings, SiMemory,
 };
 use adam_memory_testkit::{Plan, draft, scope};
 use tempfile::TempDir;
@@ -113,6 +114,48 @@ fn a_corrupt_file_is_reported_not_served() {
     std::fs::write(&file, "{ not json").unwrap();
     let error = store.recall(&scope("corrupt")).unwrap_err();
     assert!(matches!(error, MemoryError::Corrupt { .. }), "{error}");
+}
+
+/// The scope a file belongs to is checked on the write path too, not only on `recall`/`sweep`:
+/// a copied folder must not let one scope extend, or silently re-stamp, another scope's problem.
+#[test]
+fn a_write_never_extends_or_restamps_another_scopes_file() {
+    let dir = TempDir::new().unwrap();
+    let alpha = scope("alpha");
+    let beta = scope("beta");
+    let store = FolderSiMemory::open(dir.path(), settings()).unwrap();
+
+    store.record(&alpha, one_draft()).unwrap();
+    let alpha_file = json_files(dir.path()).remove(0);
+    store.record(&beta, one_draft()).unwrap();
+    let beta_file = json_files(dir.path())
+        .into_iter()
+        .find(|path| path != &alpha_file)
+        .expect("beta's own file");
+
+    // The same problem file, now in beta's folder: a copied folder, in miniature.
+    std::fs::copy(&alpha_file, &beta_file).unwrap();
+
+    let error = store
+        .record(&beta, draft("the lockfile is stale", "run/tool:2"))
+        .unwrap_err();
+    assert!(
+        matches!(&error, MemoryError::Corrupt { reason, .. } if reason.contains("another scope")),
+        "{error}"
+    );
+
+    let error = store
+        .observe(
+            &beta,
+            "the lockfile is stale",
+            &AttemptId::new("run/tool:1"),
+            Observation::new(Outcome::Success, "the build resolved"),
+        )
+        .unwrap_err();
+    assert!(
+        matches!(&error, MemoryError::Corrupt { reason, .. } if reason.contains("another scope")),
+        "{error}"
+    );
 }
 
 fn json_files(root: &Path) -> Vec<PathBuf> {

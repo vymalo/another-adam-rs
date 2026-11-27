@@ -212,6 +212,138 @@ impl SessionTools {
             .map(|agent| (agent.name.clone(), agent.bounds.clone()))
             .collect()
     }
+
+    /// The section a model reads about these tools ([ADR 0054] decision 9): the helpers, what each
+    /// tool does and takes, when to keep a session open, and that `config` only narrows. The
+    /// assembly appends it to the instructions of an agent that has the tools. See
+    /// [`guide_for`](Self::guide_for).
+    ///
+    /// [ADR 0054]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md
+    pub fn guide(&self) -> String {
+        Self::guide_for(self.roster.names())
+    }
+
+    /// The section for helpers called `helpers`, which need not be sorted. It names the tools and
+    /// the helpers and nothing per session: no limit and no count, so a deployment that changes a
+    /// limit does not change the prompt, and it is the same bytes for the same helpers. It is
+    /// made from the table the tests hold to the specs, so a tool or an argument cannot be
+    /// documented that the specs lack, or the other way round.
+    pub fn guide_for<'a>(helpers: impl IntoIterator<Item = &'a str>) -> String {
+        let mut helpers: Vec<&str> = helpers.into_iter().collect();
+        helpers.sort_unstable();
+        let helpers: Vec<String> = helpers.iter().map(|h| format!("`{h}`")).collect();
+        let mut out = String::from(
+            "## Child sessions\n\n\
+             A session runs a helper in the background: you keep working while it works. \
+             The helpers you can start a session on: ",
+        );
+        out.push_str(&helpers.join(", "));
+        out.push_str(".\n\nThe session tools (an argument marked `?` is optional):");
+        for tool in &GUIDE {
+            let args: Vec<String> = tool
+                .args
+                .iter()
+                .map(|(name, required)| {
+                    if *required {
+                        format!("`{name}`")
+                    } else {
+                        format!("`{name}?`")
+                    }
+                })
+                .collect();
+            out.push_str(&format!(
+                "\n- `{}` ({}): {}",
+                tool.name,
+                args.join(", "),
+                tool.purpose
+            ));
+        }
+        let options: Vec<String> = CONFIG_OPTIONS
+            .iter()
+            .map(|(own, _)| format!("`{own}`"))
+            .collect();
+        out.push_str(&format!(
+            "\n\nOptions of `config`: {}. They only narrow what a helper allows: a value above \
+             what the helper allows is refused, and the refusal names the option and says what is \
+             allowed. An option you leave out is the helper's own.",
+            options.join(", ")
+        ));
+        out.push_str(&format!(
+            "\n\nA helper does not see this conversation: put everything it needs in `prompt`. \
+             By default a session closes when its round has ended. Keep one open (`keep_open`) \
+             only when you will send it more, and close what you kept open with `{SUBAGENT_CLOSE}` \
+             when you are done."
+        ));
+        out
+    }
+}
+
+/// One session tool as the guide says it: the name, what it does and the arguments it takes (each
+/// with whether it is required). The specs say the same in JSON Schema; a test holds the two to
+/// each other, so a rename in one and not the other fails.
+struct GuideTool {
+    name: &'static str,
+    purpose: &'static str,
+    args: &'static [(&'static str, bool)],
+}
+
+/// The session tools in [`SESSION_TOOLS`] order: the one source of [`SessionTools::guide_for`].
+const GUIDE: [GuideTool; 5] = [
+    GuideTool {
+        name: SUBAGENT_START,
+        purpose: "start a session on a helper and get its session id at once. Give it a \
+                  `config` to narrow its limits, and `keep_open` to keep it for more messages.",
+        args: &[
+            ("agent", true),
+            ("description", true),
+            ("prompt", true),
+            ("keep_open", false),
+            ("config", false),
+        ],
+    },
+    GuideTool {
+        name: SUBAGENT_SEND,
+        purpose: "send a message to a session. It starts the next round of an idle session, \
+                  and is steered into a round that works. A closed session takes none.",
+        args: &[("session", true), ("message", true)],
+    },
+    GuideTool {
+        name: SUBAGENT_READ,
+        purpose: "read the report of a session's latest round, paged by lines. Pass `wait` to \
+                  wait for a working round to end; never poll.",
+        args: &[
+            ("session", true),
+            ("wait", false),
+            ("offset", false),
+            ("limit", false),
+        ],
+    },
+    GuideTool {
+        name: SUBAGENT_CLOSE,
+        purpose: "close a session for good: it takes no more messages. A working round \
+                  finishes unless you pass `cancel`, and `delete` removes an idle session from \
+                  every listing.",
+        args: &[("session", true), ("cancel", false), ("delete", false)],
+    },
+    GuideTool {
+        name: SUBAGENT_LIST,
+        purpose: "list the sessions of this conversation and their state, the open ones first, \
+                  paged by sessions.",
+        args: &[("offset", false), ("limit", false)],
+    },
+];
+
+/// The arguments of `tool` that a call must give, in the table's order: the `required` of its spec,
+/// so the table and the spec cannot name different ones. (`subagent_list` has none and its spec has
+/// no `required`, which keeps its bytes as they were.)
+fn required_of(tool: &str) -> Vec<&'static str> {
+    GUIDE
+        .iter()
+        .filter(|row| row.name == tool)
+        .flat_map(|row| row.args.iter())
+        .filter(|(_, required)| *required)
+        .map(|(name, _)| *name)
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -220,7 +352,7 @@ impl SessionTools {
 
 /// The options of `config` as the model writes them (snake_case, like the other arguments), and
 /// the camelCase the wire and the header use for the same names.
-const CONFIG_OPTIONS: [(&str, &str); 8] = [
+const CONFIG_OPTIONS: [(&str, &str); 9] = [
     ("max_turns", "maxTurns"),
     ("max_tool_calls", "maxToolCalls"),
     ("max_output_tokens", "maxOutputTokens"),
@@ -229,6 +361,7 @@ const CONFIG_OPTIONS: [(&str, &str); 8] = [
     ("time_limit", "timeLimit"),
     ("max_rounds", "maxRounds"),
     ("token_budget", "tokenBudget"),
+    ("report_schema", "reportSchema"),
 ];
 
 /// A session's config as a list and a read say it: `max_turns 20, time_limit 10`, the options that
@@ -239,9 +372,12 @@ fn config_words(config: &SessionConfig) -> Option<String> {
     let parts: Vec<String> = CONFIG_OPTIONS
         .iter()
         .filter_map(|(own, wire)| {
-            set.get(*wire)
-                .and_then(Value::as_u64)
-                .map(|n| format!("{own} {n}"))
+            let value = set.get(*wire)?;
+            // The schema is not a number and not worth the line: say it is set.
+            if *own == "report_schema" {
+                return Some("report_schema set".to_owned());
+            }
+            value.as_u64().map(|n| format!("{own} {n}"))
         })
         .collect();
     (!parts.is_empty()).then(|| parts.join(", "))
@@ -249,13 +385,14 @@ fn config_words(config: &SessionConfig) -> Option<String> {
 
 /// The options a remote subagent refuses: every one but `time_limit` and `max_rounds` (ADR 0054
 /// decision 4).
-const REMOTE_REFUSED: [&str; 6] = [
+const REMOTE_REFUSED: [&str; 7] = [
     "max_turns",
     "max_tool_calls",
     "max_output_tokens",
     "context_window",
     "max_parallel_tool_calls",
     "token_budget",
+    "report_schema",
 ];
 
 /// The [`SessionConfig`] a `subagent_start` call asked for, or the sentence that says what is wrong
@@ -274,6 +411,18 @@ fn config_of(value: &Value) -> Result<SessionConfig, String> {
                 options.join(", ")
             ));
         };
+        // The report schema is a JSON Schema, an object: `admit` holds it to the rest (its size, its
+        // references, that it compiles).
+        if *name == "reportSchema" {
+            if !value.is_null() && !value.is_object() {
+                return Err("config.report_schema must be a JSON Schema, an object".to_owned());
+            }
+            if value.is_null() {
+                continue;
+            }
+            wire.insert((*name).to_owned(), value.clone());
+            continue;
+        }
         // Every option is a whole number: 32 bits, but `token_budget`, which counts tokens and goes
         // to 2^53 − 1. Say so by name here, so the refusal is ours: serde's names no option and
         // echoes what the model wrote, without a bound. A `0` passes to `admit`, which refuses it
@@ -482,6 +631,90 @@ pub(crate) fn is_due(session: &SessionSummary, facts: &DueFacts) -> bool {
             || (round.started_outside_a_run() && facts.since.is_none_or(|t| round.updated_at >= t)))
 }
 
+/// The corrective turns a round's final answer is given when it does not match the session's
+/// `report_schema` ([ADR 0054], slice 9): each is a model turn, counted in `max_turns`. After them
+/// the round fails with [`REPORT_MISMATCH`].
+///
+/// [ADR 0054]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md
+pub const MAX_REPORT_CORRECTIONS: u32 = 2;
+
+/// Why a round fails when its final answer still does not match its `report_schema` after
+/// [`MAX_REPORT_CORRECTIONS`] corrective turns (the problems follow it, after a colon).
+pub const REPORT_MISMATCH: &str = "report does not match report_schema";
+
+/// The problems a corrective turn tells the model.
+const REPORT_PROBLEMS_SHOWN: usize = 3;
+
+/// The most characters of one problem: a problem echoes the value it is about.
+const REPORT_PROBLEM_CHARS: usize = 300;
+
+/// What a final answer is against the `report_schema` of its session.
+pub(crate) enum ReportVerdict {
+    /// One JSON value that matches.
+    Matches,
+    /// Not one JSON value, or one that does not match: the first problems, in words.
+    Mismatch(Vec<String>),
+    /// The schema itself does not compile. Admission refuses such a schema, so this is a header
+    /// that was not admitted; no answer could match it.
+    Unusable(String),
+}
+
+/// `answer` against `schema` (draft 2020-12, nothing fetched): the answer is parsed as one JSON value
+/// first, and at most [`REPORT_PROBLEMS_SHOWN`] problems are returned, each with its place.
+pub(crate) fn check_report(schema: &Value, answer: &str) -> ReportVerdict {
+    let validator = match jsonschema::draft202012::options().offline().build(schema) {
+        Ok(validator) => validator,
+        Err(why) => return ReportVerdict::Unusable(why.to_string()),
+    };
+    let instance: Value = match serde_json::from_str(answer.trim()) {
+        Ok(instance) => instance,
+        Err(why) => {
+            return ReportVerdict::Mismatch(vec![format!(
+                "the answer is not one JSON value ({why})"
+            )]);
+        }
+    };
+    let problems: Vec<String> = validator
+        .iter_errors(&instance)
+        .take(REPORT_PROBLEMS_SHOWN)
+        .map(|e| {
+            let at = e.instance_path().to_string();
+            let problem: String = e.to_string().chars().take(REPORT_PROBLEM_CHARS).collect();
+            if at.is_empty() {
+                problem
+            } else {
+                format!("{problem} (at {at})")
+            }
+        })
+        .collect();
+    if problems.is_empty() {
+        ReportVerdict::Matches
+    } else {
+        ReportVerdict::Mismatch(problems)
+    }
+}
+
+/// The corrective turn: the problems, and what to do. The schema is told with the first one only,
+/// since the round does not otherwise see its configuration.
+pub(crate) fn report_correction(problems: &[String], schema: Option<&Value>) -> String {
+    let listed: Vec<String> = problems
+        .iter()
+        .enumerate()
+        .map(|(i, p)| format!("{}. {p}", i + 1))
+        .collect();
+    let mut text = format!(
+        "[Your answer is not a report yet: it does not match the report schema of this session. \
+         Problems: {}. Answer again with one JSON value that matches the schema, and nothing \
+         else: no words around it and no code fence.",
+        listed.join("; ")
+    );
+    if let Some(schema) = schema {
+        text = format!("{text} The schema: {schema}");
+    }
+    text.push(']');
+    text
+}
+
 fn header_json(header: &SessionHeader) -> Value {
     serde_json::to_value(header).unwrap_or(Value::Null)
 }
@@ -676,11 +909,21 @@ impl Tool for Start {
                                                 with a closing answer, and a spent session takes \
                                                 no more messages.",
                             },
+                            "report_schema": {
+                                "type": "object",
+                                "description": "A JSON Schema (draft 2020-12, at most 16 KiB, \
+                                                with no reference outside itself) that the \
+                                                subagent's final answer must match: one JSON \
+                                                value (a `format` is only an annotation, not \
+                                                enforced). The subagent is not shown it unless a \
+                                                first answer fails it: describe the shape in \
+                                                `prompt` too. Not for a remote subagent.",
+                            },
                         },
                         "additionalProperties": false,
                     },
                 },
-                "required": ["agent", "description", "prompt"],
+                "required": required_of(SUBAGENT_START),
                 "additionalProperties": false,
             }),
         }
@@ -827,6 +1070,7 @@ impl Tool for Start {
             keep_open: keep,
             closed: false,
             closing: false,
+            deleted: false,
             round: 1,
             // The run this call's model calls name, which the orchestrator bound: the round's
             // calls name it too (ADR 0067).
@@ -882,7 +1126,7 @@ impl Tool for Send {
                         "description": "What to tell the subagent.",
                     },
                 },
-                "required": ["session", "message"],
+                "required": required_of(SUBAGENT_SEND),
                 "additionalProperties": false,
             }),
         }
@@ -1011,6 +1255,7 @@ impl Tool for Send {
                 keep_open: true,
                 closed: false,
                 closing: false,
+                deleted: false,
                 round: 0,
                 root: None,
                 workspace: None,
@@ -1121,7 +1366,7 @@ impl Tool for Read {
                         "description": "The most report lines to return.",
                     },
                 },
-                "required": ["session"],
+                "required": required_of(SUBAGENT_READ),
                 "additionalProperties": false,
             }),
         }
@@ -1221,8 +1466,13 @@ impl Tool for Close {
                         "default": false,
                         "description": "Stop a working round instead of letting it finish.",
                     },
+                    "delete": {
+                        "type": "boolean",
+                        "default": false,
+                        "description": "Delete the session: it is gone from every listing and every tool refuses it. Its runs stay in the store. An idle session is deleted at once; a working one is refused, so close it first.",
+                    },
                 },
-                "required": ["session"],
+                "required": required_of(SUBAGENT_CLOSE),
                 "additionalProperties": false,
             }),
         }
@@ -1245,6 +1495,10 @@ impl Tool for Close {
             Ok(cancel) => cancel,
             Err(why) => return refuse(why),
         };
+        let delete = match bool_arg(&args, "delete", false) {
+            Ok(delete) => delete,
+            Err(why) => return refuse(why),
+        };
         let starter = ctx.child_starter()?;
         let round_id = ctx.child_run_id();
         let mut note = None;
@@ -1256,8 +1510,16 @@ impl Tool for Close {
             else {
                 return refuse(no_such_session(session));
             };
-            if view.latest_run == round_id || (view.closed && view.state != SessionState::Working) {
+            if view.latest_run == round_id
+                || (view.closed && view.state != SessionState::Working && !delete)
+            {
                 return Ok(closed(session, note));
+            }
+            if delete && view.state == SessionState::Working {
+                return refuse(format!(
+                    "session `{session}` is working; it is not deleted while a round runs: close \
+                     it with `cancel: true` first, then delete it"
+                ));
             }
             if view.state == SessionState::Working {
                 if cancel {
@@ -1299,6 +1561,7 @@ impl Tool for Close {
                 keep_open: true,
                 closed: false,
                 closing: false,
+                deleted: false,
                 round: 0,
                 root: None,
                 workspace: None,
@@ -1309,6 +1572,7 @@ impl Tool for Close {
             header.round = view.round + 1;
             header.closed = true;
             header.closing = true;
+            header.deleted = delete;
             let input = Inbound::new(MESSAGE_KIND, adam_runtime::closing_round_payload(&header));
             match starter
                 .start_round(
@@ -1516,6 +1780,31 @@ mod tests {
                 since: None,
             },
         )
+    }
+
+    #[test]
+    fn each_spec_takes_the_arguments_the_table_lists() {
+        let tools = SessionTools::new(Vec::<SessionAgent>::new()).tools();
+        assert_eq!(tools.len(), GUIDE.len());
+        for (tool, row) in tools.iter().zip(GUIDE.iter()) {
+            let spec = tool.spec();
+            assert_eq!(spec.name, row.name);
+            let mut have: Vec<&str> = spec.parameters["properties"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect();
+            have.sort_unstable();
+            let mut want: Vec<&str> = row.args.iter().map(|(name, _)| *name).collect();
+            want.sort_unstable();
+            assert_eq!(have, want, "{}", row.name);
+            let required: Vec<&str> = spec.parameters["required"]
+                .as_array()
+                .map(|names| names.iter().filter_map(Value::as_str).collect())
+                .unwrap_or_default();
+            assert_eq!(required, required_of(row.name), "{}", row.name);
+        }
     }
 
     #[test]

@@ -66,6 +66,41 @@ fn probe_call(id: &str) -> ToolCall {
     }
 }
 
+/// `finish { text }` hands `text` over as the answer and ends the turn with it
+/// ([`ToolOutput::final_answer`]); `announce { text }` only announces it.
+struct Hands {
+    ends_turn: bool,
+}
+
+#[async_trait]
+impl Tool for Hands {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: if self.ends_turn { "finish" } else { "announce" }.into(),
+            description: "Hand over the answer.".into(),
+            parameters: json!({"type": "object"}),
+        }
+    }
+
+    async fn call(&self, _ctx: &ToolCtx, args: Value) -> Result<ToolOutput, ToolError> {
+        let text = args["text"].as_str().unwrap_or_default().to_owned();
+        Ok(if self.ends_turn {
+            ToolOutput::text("Delivered.").final_answer(text)
+        } else {
+            ToolOutput::text("Announced.").announcing(text)
+        })
+    }
+}
+
+fn hand_over(id: &str, tool: &str, text: &str) -> ToolCall {
+    ToolCall {
+        id: id.into(),
+        name: tool.into(),
+        arguments: json!({ "text": text }),
+        ..Default::default()
+    }
+}
+
 struct Rig {
     mock: Arc<MockModel>,
     probe: Arc<Probe>,
@@ -99,6 +134,8 @@ impl Rig {
             .limits(limits)
             .max_parallel(max_parallel)
             .tool(Shared(probe.clone()))
+            .tool(Hands { ends_turn: true })
+            .tool(Hands { ends_turn: false })
             .build();
         let store: DynStore = Arc::new(MemoryStore::new());
         let rt = Runtime::builder(store)
@@ -115,7 +152,8 @@ impl Rig {
         Self { mock, probe, rt }
     }
 
-    /// Run a round of a session whose header holds `config` (`None`: no config) to its end.
+    /// Run a round of a session whose header holds `config` (`None`: no config) to its end, which
+    /// must be `Done`.
     async fn round(&self, config: Option<Value>) -> (Vec<ModelRequest>, Conversation) {
         let (requests, state, _) = self.round_with(config, 0, RunStatus::Done).await;
         (requests, state)
@@ -131,6 +169,14 @@ impl Rig {
         self.round_with(config, 0, want).await
     }
 
+    /// [`round`](Self::round), whichever way it ends: the run's view, the requests, the state.
+    async fn round_to_its_end(
+        &self,
+        config: Option<Value>,
+    ) -> (RunView, Vec<ModelRequest>, Conversation) {
+        self.round_of(config, 0).await
+    }
+
     /// A round whose session header already says `spent` tokens were spent before it, ending in
     /// `want`: what a later round of a session is.
     async fn round_with(
@@ -139,6 +185,18 @@ impl Rig {
         spent: u64,
         want: RunStatus,
     ) -> (Vec<ModelRequest>, Conversation, RunView) {
+        let (view, requests, state) = self.round_of(config, spent).await;
+        assert_eq!(view.status, want, "{view:#?}");
+        (requests, state, view)
+    }
+
+    /// The round the helpers above start: `config` in the header and, when it is not `0`, `spent`,
+    /// run to its end whichever way it ends.
+    async fn round_of(
+        &self,
+        config: Option<Value>,
+        spent: u64,
+    ) -> (RunView, Vec<ModelRequest>, Conversation) {
         let mut first = user_message("go");
         let session = RunId::new();
         let mut header = json!({
@@ -187,12 +245,11 @@ impl Rig {
         };
         let _ = stop.send(());
         worker.await.unwrap().unwrap();
-        assert_eq!(view.status, want, "{view:#?}");
         let state = self.rt.state(run).await.unwrap().unwrap();
         (
+            view,
             self.mock.requests(),
             serde_json::from_value(state).expect("a Conversation"),
-            view,
         )
     }
 }
@@ -457,4 +514,234 @@ async fn a_round_with_no_token_budget_spends_and_is_never_spent() {
     assert_eq!(requests.len(), 1);
     assert_eq!(state.spent, 10_000_000, "it counts, without a cap");
     assert!(!state.session.as_ref().expect("a header").is_spent());
+}
+
+// ---------------------------------------------------------------------------
+// report_schema: the final answer (ADR 0054, slice 9)
+// ---------------------------------------------------------------------------
+
+fn verdict_schema() -> Value {
+    json!({
+        "type": "object",
+        "required": ["verdict"],
+        "properties": {"verdict": {"type": "string", "enum": ["ok", "bad"]}},
+        "additionalProperties": false,
+    })
+}
+
+fn report_config(extra: Value) -> Value {
+    let mut config = json!({"reportSchema": verdict_schema()});
+    if let (Some(config), Some(extra)) = (config.as_object_mut(), extra.as_object()) {
+        config.extend(extra.clone());
+    }
+    config
+}
+
+fn last_user_text(request: &ModelRequest) -> String {
+    match request.messages.last() {
+        Some(message @ Message::User { .. }) => message.text(),
+        other => panic!("the request ends with a user turn, not {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_matching_answer_is_the_report_and_costs_no_extra_turn() {
+    let rig = Rig::new(Limits::default(), 10);
+    rig.mock.push_text(r#"{"verdict": "ok"}"#);
+    let (view, requests, state) = rig.round_to_its_end(Some(report_config(json!({})))).await;
+    assert_eq!(view.status, RunStatus::Done, "{view:#?}");
+    assert_eq!(requests.len(), 1, "no corrective turn");
+    assert_eq!(state.turns, 1);
+    assert_eq!(state.report_corrections, 0);
+    assert_eq!(
+        view.output.as_ref().and_then(|o| o["text"].as_str()),
+        Some(r#"{"verdict": "ok"}"#),
+        "the report is the answer as the model wrote it"
+    );
+}
+
+#[tokio::test]
+async fn a_mismatch_gets_two_corrective_turns_and_then_fails_the_round_with_the_reason() {
+    let rig = Rig::new(Limits::default(), 10);
+    rig.mock.push_text("I am done, all good.");
+    rig.mock.push_text(r#"{"verdict": "maybe"}"#);
+    rig.mock.push_text(r#"{"verdict": 5}"#);
+    // Never reached: a third correction would be a fourth call.
+    rig.mock.push_text(r#"{"verdict": "ok"}"#);
+    let (view, requests, state) = rig.round_to_its_end(Some(report_config(json!({})))).await;
+
+    assert_eq!(view.status, RunStatus::Failed, "{view:#?}");
+    let error = view.error.expect("a reason");
+    assert!(
+        error.starts_with("report does not match report_schema"),
+        "{error}"
+    );
+    assert!(
+        error.contains("is not of type"),
+        "the last problems: {error}"
+    );
+    assert_eq!(requests.len(), 3, "the answer and exactly two corrections");
+    assert_eq!(state.turns, 3, "each correction is a model call");
+    assert_eq!(state.report_corrections, 2);
+
+    let first = last_user_text(&requests[1]);
+    assert!(
+        first.contains("does not match the report schema"),
+        "{first}"
+    );
+    assert!(first.contains("not one JSON value"), "{first}");
+    assert!(
+        first.contains("The schema:") && first.contains("additionalProperties"),
+        "the first correction tells the schema: {first}"
+    );
+    let second = last_user_text(&requests[2]);
+    assert!(second.contains("maybe"), "its problems: {second}");
+    assert!(!second.contains("The schema:"), "told once: {second}");
+}
+
+#[tokio::test]
+async fn a_corrected_answer_ends_the_round_as_the_report() {
+    let rig = Rig::new(Limits::default(), 10);
+    rig.mock.push_text(r#"{"verdict": "maybe"}"#);
+    rig.mock.push_text(r#"{"verdict": "bad"}"#);
+    let (view, requests, state) = rig.round_to_its_end(Some(report_config(json!({})))).await;
+    assert_eq!(view.status, RunStatus::Done, "{view:#?}");
+    assert_eq!(requests.len(), 2);
+    assert_eq!(state.report_corrections, 1);
+    assert_eq!(
+        view.output.as_ref().and_then(|o| o["text"].as_str()),
+        Some(r#"{"verdict": "bad"}"#)
+    );
+}
+
+#[tokio::test]
+async fn the_problems_a_correction_tells_are_the_first_three() {
+    let rig = Rig::new(Limits::default(), 10);
+    let schema = json!({
+        "type": "object",
+        "properties": {
+            "a": {"type": "integer"}, "b": {"type": "integer"},
+            "c": {"type": "integer"}, "d": {"type": "integer"},
+        },
+    });
+    rig.mock
+        .push_text(r#"{"a": "x", "b": "x", "c": "x", "d": "x"}"#);
+    rig.mock.push_text(r#"{"a": 1}"#);
+    let (_, requests, _) = rig
+        .round_to_its_end(Some(json!({"reportSchema": schema})))
+        .await;
+    let told = last_user_text(&requests[1]);
+    assert!(
+        told.contains("1. ") && told.contains("2. ") && told.contains("3. "),
+        "{told}"
+    );
+    assert!(!told.contains("4. "), "at most three: {told}");
+}
+
+#[tokio::test]
+async fn a_correction_is_a_turn_of_max_turns_and_an_answer_at_the_closing_turn_must_still_match() {
+    // One turn allowed: the correction is the closing turn, which calls nothing.
+    let rig = Rig::new(Limits::default(), 10);
+    rig.mock.push_text("not json");
+    rig.mock.push_text(r#"{"verdict": "ok"}"#);
+    let (view, requests, _) = rig
+        .round_to_its_end(Some(report_config(json!({"maxTurns": 1}))))
+        .await;
+    assert_eq!(view.status, RunStatus::Done, "{view:#?}");
+    assert_eq!(requests.len(), 2);
+    assert!(
+        matches!(requests[1].tool_choice, ToolChoice::None),
+        "the correction used the turn the limit counts, so the second call is the closing turn"
+    );
+
+    // A closing answer that does not match is no report: the round fails, with no turn to correct.
+    let rig = Rig::new(Limits::default(), 10);
+    rig.mock.push_text("not json");
+    rig.mock.push_text(r#"{"verdict": "maybe"}"#);
+    let (view, requests, state) = rig
+        .round_to_its_end(Some(report_config(json!({"maxTurns": 1}))))
+        .await;
+    assert_eq!(view.status, RunStatus::Failed, "{view:#?}");
+    assert!(
+        view.error
+            .as_deref()
+            .is_some_and(|e| e.starts_with("report does not match report_schema")),
+        "{view:#?}"
+    );
+    assert_eq!(requests.len(), 2, "no further turn");
+    assert_eq!(state.turns, 2);
+}
+
+#[tokio::test]
+async fn a_round_without_a_report_schema_ends_with_whatever_it_answers() {
+    let rig = Rig::new(Limits::default(), 10);
+    rig.mock.push_text("not json at all");
+    let (requests, state) = rig.round(Some(json!({"maxTurns": 5}))).await;
+    assert_eq!(requests.len(), 1);
+    assert_eq!(state.report_corrections, 0);
+}
+
+#[tokio::test]
+async fn a_tools_final_answer_is_held_to_the_report_schema_and_never_ends_the_round_unchecked() {
+    let rig = Rig::new(Limits::default(), 10);
+    rig.mock
+        .push_tool_calls(vec![hand_over("f1", "finish", "not json")]);
+    rig.mock
+        .push_tool_calls(vec![hand_over("f2", "finish", r#"{"verdict": "maybe"}"#)]);
+    rig.mock
+        .push_tool_calls(vec![hand_over("f3", "finish", "still not json")]);
+    // Never reached: two corrections, then the round fails.
+    rig.mock.push_text(r#"{"verdict": "ok"}"#);
+    let (view, requests, state) = rig.round_to_its_end(Some(report_config(json!({})))).await;
+    assert_eq!(view.status, RunStatus::Failed, "{view:#?}");
+    assert!(
+        view.error
+            .as_deref()
+            .is_some_and(|e| e.starts_with("report does not match report_schema")),
+        "{view:#?}"
+    );
+    assert_eq!(
+        requests.len(),
+        3,
+        "the hand-over and exactly two corrections"
+    );
+    assert_eq!(state.report_corrections, 2);
+    assert!(
+        last_user_text(&requests[1]).contains("does not match the report schema"),
+        "the first hand-over was corrected, not accepted"
+    );
+
+    // A hand-over that matches ends the round with no model call after it.
+    let rig = Rig::new(Limits::default(), 10);
+    rig.mock
+        .push_tool_calls(vec![hand_over("f1", "finish", "not json")]);
+    rig.mock
+        .push_tool_calls(vec![hand_over("f2", "finish", r#"{"verdict": "ok"}"#)]);
+    let (view, requests, state) = rig.round_to_its_end(Some(report_config(json!({})))).await;
+    assert_eq!(view.status, RunStatus::Done, "{view:#?}");
+    assert_eq!(requests.len(), 2);
+    assert_eq!(state.report_corrections, 1);
+    assert_eq!(
+        view.output.as_ref().and_then(|o| o["text"].as_str()),
+        Some(r#"{"verdict": "ok"}"#)
+    );
+}
+
+#[tokio::test]
+async fn a_corrected_answer_replaces_the_announced_one_that_did_not_match() {
+    let rig = Rig::new(Limits::default(), 10);
+    rig.mock
+        .push_tool_calls(vec![hand_over("a1", "announce", "not json")]);
+    rig.mock.push_text("That is my answer.");
+    rig.mock.push_text(r#"{"verdict": "bad"}"#);
+    let (view, requests, state) = rig.round_to_its_end(Some(report_config(json!({})))).await;
+    assert_eq!(view.status, RunStatus::Done, "{view:#?}");
+    assert_eq!(requests.len(), 3);
+    assert_eq!(state.report_corrections, 1);
+    assert_eq!(state.announced, None, "the old announcement is gone");
+    assert_eq!(
+        view.output.as_ref().and_then(|o| o["text"].as_str()),
+        Some(r#"{"verdict": "bad"}"#),
+        "the corrected words are the report, not the announcement checked again"
+    );
 }

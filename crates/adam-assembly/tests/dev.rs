@@ -950,7 +950,12 @@ async fn remote_subagent_settings_are_applied_again_on_reload() {
         &remote_root(&name, "After.", &server.card_url()),
     );
     live.reload().unwrap();
-    assert_eq!(live.info()[0].prompt, "After.");
+    // The root has a subagent, so its instructions end with the section about the session tools.
+    let after = format!(
+        "After.\n\n{}",
+        adam_llm_agent::SessionTools::guide_for(["billing"])
+    );
+    assert_eq!(live.info()[0].prompt, after);
 
     model
         .push_tool_calls(vec![ToolCall {
@@ -964,7 +969,7 @@ async fn remote_subagent_settings_are_applied_again_on_reload() {
     wait_done(&rt, run).await;
     worker.stop().await;
     let requests = model.requests();
-    assert_eq!(plain(&requests[0].system).as_deref(), Some("After."));
+    assert_eq!(plain(&requests[0].system).as_deref(), Some(after.as_str()));
     let Some(adam_model::Message::Tool {
         content, is_error, ..
     }) = requests[1].messages.last()

@@ -22,6 +22,7 @@ A page here that has a page for people sits at the same relative path, and the t
 | [Errors: rules to check](reference/errors.md) | [Errors](../../docs/reference/errors.md) | the rules every error enum keeps |
 | [Agent files: the decisions to keep](reference/agent-files.md) | [Agent files](../../docs/reference/agent-files.md) | the owner's decisions behind the folder format |
 | [Child runs: the tests](reference/child-runs.md) | [Child runs](../../docs/reference/child-runs.md) | the test of every failure interleaving, and how the tests make each happen |
+| [Hook programs: the invariants](reference/hooks-protocol.md) | [Hook programs](../../docs/reference/hooks-protocol.md) | the invariants of the stdio adapter, the test behind each claim, and what is not built (P2, H1d) |
 | [ADR 0081: the evidence](decisions/0081-an-agent-keeps-a-self-improvement-memory-near-it-and-what-holds-becomes-the-deployments-memory.md) | [ADR 0081](../../docs/decisions/0081-an-agent-keeps-a-self-improvement-memory-near-it-and-what-holds-becomes-the-deployments-memory.md) | the paper, the code the memory decision was checked against, the draft's values and the proof of each slice |
 | [0082: the evidence](decisions/0082-the-sql-adapters-keep-their-rules-in-the-database.md) | [ADR 0082](../../docs/decisions/0082-the-sql-adapters-keep-their-rules-in-the-database.md) | the survey of every rule the SQL adapters enforce in Rust, with `path:line`, the sources of the facts, and each slice's decisive cases and mutations |
 

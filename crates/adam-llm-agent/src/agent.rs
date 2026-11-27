@@ -63,7 +63,9 @@ use crate::paging::backstop;
 use crate::plan::Plan;
 use crate::schedule::{self, Entry, Ordered, Queue, Segment};
 use crate::sessions::{
-    DueFacts, SUBAGENT_CLOSE, SUBAGENT_READ, SUBAGENT_SEND, SUBAGENT_START, is_due, report_call_id,
+    DueFacts, MAX_REPORT_CORRECTIONS, REPORT_MISMATCH, ReportVerdict, SUBAGENT_CLOSE,
+    SUBAGENT_READ, SUBAGENT_SEND, SUBAGENT_START, check_report, is_due, report_call_id,
+    report_correction,
 };
 
 /// Whether the history holds a call that started a session or sent to one.
@@ -124,6 +126,32 @@ fn carried_loaded(source_ctx: &SourceCtx, request: &ModelRequest) -> Vec<String>
         .filter(|tool| request.tools.iter().any(|spec| spec.name == tool.as_str()))
         .cloned()
         .collect()
+}
+
+/// The heading a session's `instructions` are rendered under (ADR 0054, decision 4): they follow the
+/// folder's own text, and the text above wins — which is what the heading says.
+const SESSION_INSTRUCTIONS_HEADING: &str = "## Instructions from the parent agent or the person\n\n\
+They are added to the instructions above, which take precedence over them.\n\n";
+
+/// `system` with the session's `instructions` after it, when the round's header carries any: a
+/// session's text never replaces the folder's, it follows it under the heading.
+fn with_session_instructions(
+    system: Option<String>,
+    config: Option<&adam_runtime::SessionConfig>,
+) -> Option<String> {
+    let Some(text) = config
+        .and_then(|c| c.instructions.as_deref())
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+    else {
+        return system;
+    };
+    Some(match system {
+        Some(own) if !own.trim().is_empty() => {
+            format!("{own}\n\n{SESSION_INSTRUCTIONS_HEADING}{text}")
+        }
+        _ => format!("{SESSION_INSTRUCTIONS_HEADING}{text}"),
+    })
 }
 
 /// The sources' part of [`apply_sources`].
@@ -2381,6 +2409,7 @@ impl LlmAgent {
         // the one before is not the answer of this one.
         if !texts.as_slice().is_empty() {
             state.thinking_cuts = 0;
+            state.report_corrections = 0;
             state.announced = None;
             state.announced_final = false;
         }
@@ -2742,6 +2771,43 @@ impl LlmAgent {
         }
     }
 
+    /// The check of a final answer against the `report_schema` of its session ([ADR 0054], slice 9):
+    /// `None` when the session has none or the answer matches it, so the answer ends the round as
+    /// it would. A mismatch with a correction left (`retry`) puts the problems to the model as a
+    /// turn and goes on ([`MAX_REPORT_CORRECTIONS`] times, each a model call counted in
+    /// `max_turns`); otherwise the round fails with [`REPORT_MISMATCH`].
+    ///
+    /// [ADR 0054]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md
+    fn report_gate(&self, state: &mut Conversation, answer: &str, retry: bool) -> Option<Flow> {
+        let schema = self.session_config(state)?.report_schema.clone()?;
+        let problems = match check_report(&schema, answer) {
+            ReportVerdict::Matches => return None,
+            ReportVerdict::Unusable(why) => {
+                return Some(Flow::Fail(format!(
+                    "report_schema does not compile, so no report can match it: {why}"
+                )));
+            }
+            ReportVerdict::Mismatch(problems) => problems,
+        };
+        if retry && state.report_corrections < MAX_REPORT_CORRECTIONS {
+            let first = state.report_corrections == 0;
+            state.report_corrections += 1;
+            // The answer that did not match is not the answer any more: a tool's announcement
+            // would otherwise be checked again, and end the round, in place of the corrected words.
+            state.announced = None;
+            state.announced_final = false;
+            state.messages.push(Message::user_text(report_correction(
+                &problems,
+                first.then_some(&schema),
+            )));
+            return Some(Flow::Next);
+        }
+        Some(Flow::Fail(format!(
+            "{REPORT_MISMATCH}: {}",
+            problems.join("; ")
+        )))
+    }
+
     /// The agent's [`Limits`] narrowed by its session's `max_turns` and `max_tool_calls`: read at
     /// every step, so the next model call obeys them. A value of `0` is no narrowing (a header is
     /// never trusted to widen), and nothing here is ever raised.
@@ -3065,7 +3131,10 @@ impl LlmAgent {
         let live = self.live_model(state);
         let live_alias = live.alias.to_owned();
         let mut request = ModelRequest::new(live_alias.clone());
-        request.system = self.instructions.clone();
+        request.system = with_session_instructions(
+            self.instructions.clone(),
+            state.session.as_ref().and_then(|h| h.config.as_ref()),
+        );
         // What is sent about an image is decided here, from the reference and the deployment's
         // settings now, and recorded nowhere: the same settings give the same lines every turn.
         let image_limits = self.model.input_modalities(&live_alias).images;
@@ -3623,6 +3692,10 @@ impl LlmAgent {
             if said.trim().is_empty() {
                 return Ok((Flow::Fail(self.limit_message(state, limit)), early));
             }
+            // No turn is left for a correction: an answer that does not match fails the round.
+            if let Some(flow) = self.report_gate(state, &said, false) {
+                return Ok((flow, early));
+            }
             let output = limited_output(state, limit, said, finish == FinishReason::Length, stream);
             if let Some(hit) = &mut state.limit {
                 hit.answered = true;
@@ -3634,6 +3707,9 @@ impl LlmAgent {
             // What a tool announced as the answer is the run's answer (the last announcement wins);
             // without one, the words that end the turn are.
             if let Some(announced) = state.announced.clone() {
+                if let Some(flow) = self.report_gate(state, &announced, true) {
+                    return Ok((flow, early));
+                }
                 if self.run_ending(ctx, state, &announced).await? {
                     return Ok((Flow::Next, early));
                 }
@@ -3676,6 +3752,9 @@ impl LlmAgent {
                     state.messages.push(Message::user_text(THINKING_CUT_TURN));
                 }
                 return Ok((Flow::Next, early));
+            }
+            if let Some(flow) = self.report_gate(state, &text, true) {
+                return Ok((flow, early));
             }
             if self.run_ending(ctx, state, &text).await? {
                 return Ok((Flow::Next, early));
@@ -3881,7 +3960,10 @@ impl LlmAgent {
         let live = self.live_model(state);
         let live_alias = live.alias.to_owned();
         let mut request = ModelRequest::new(live_alias.clone());
-        request.system = self.instructions.clone();
+        request.system = with_session_instructions(
+            self.instructions.clone(),
+            state.session.as_ref().and_then(|h| h.config.as_ref()),
+        );
         // The summary request is the request before it and one more message, so a provider's cache
         // serves it: its images are the ones the last request sent. A history that a provider
         // rejected as too long is sent shorter, with each image said in a few words.
@@ -8492,6 +8574,16 @@ impl LlmAgent {
                         && state.deferred.is_empty()
                         && ctx.arrived().await? == 0
                     {
+                        // The answer a tool handed over is the round's report: it is held to the
+                        // session's `report_schema` like the words of a turn are.
+                        match self.report_gate(&mut state, &text, true) {
+                            Some(Flow::Fail(error)) => {
+                                self.forget_chars(ctx.run_id());
+                                return Ok(Transition::Fail { state, error });
+                            }
+                            Some(_) => return Ok(Transition::Continue(state)),
+                            None => {}
+                        }
                         if self.run_ending(ctx, &mut state, &text).await? {
                             return Ok(Transition::Continue(state));
                         }
@@ -9350,5 +9442,40 @@ mod compaction_gate_tests {
         );
         let room = agent(1100);
         assert!(room.compaction_due(&state), "the tail fits");
+    }
+}
+
+#[cfg(test)]
+mod session_instructions_tests {
+    use super::*;
+
+    /// A session's `instructions` follow the folder's, under a heading that says where they come
+    /// from and that the text above wins (ADR 0054, decision 4). Nothing is added without them.
+    #[test]
+    fn a_sessions_instructions_follow_the_folders_under_a_heading() {
+        let config = adam_runtime::SessionConfig::from_value(serde_json::json!({
+            "instructions": "Answer in one paragraph."
+        }))
+        .expect("a config");
+        let out = with_session_instructions(Some("You are the coder.".into()), Some(&config))
+            .expect("a system");
+        assert!(out.starts_with("You are the coder."), "{out}");
+        assert!(
+            out.contains("Instructions from the parent agent or the person"),
+            "{out}"
+        );
+        assert!(out.ends_with("Answer in one paragraph."), "{out}");
+
+        // No session, and a session that asks for nothing: the folder's text alone, no heading.
+        assert_eq!(
+            with_session_instructions(Some("You are the coder.".into()), None),
+            Some("You are the coder.".into())
+        );
+        let none =
+            adam_runtime::SessionConfig::from_value(serde_json::json!({})).expect("a config");
+        assert_eq!(
+            with_session_instructions(Some("You are the coder.".into()), Some(&none)),
+            Some("You are the coder.".into())
+        );
     }
 }
