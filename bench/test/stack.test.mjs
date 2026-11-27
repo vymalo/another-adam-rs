@@ -555,7 +555,7 @@ test('finding 2: the git sandbox has no secret, no network, a read-only root and
 test('compose: every container of the stack that is ours runs the pinned coder image, tag and digest, the same as bench/pins.json', compose, () => {
   for (const name of ['meter-1', 'meter-2', 'pub-coder-1', 'pub-coder-2', 'pub-git', 'gitbox-1', 'gitbox-2', 'pusher-1', 'pusher-2']) assert.equal(config.services[name].image, coderRef(PINS), name);
   const images = new Set(Object.values(config.services).map((s) => s.image).filter(Boolean));
-  assert.deepEqual([...images].filter((i) => !i.startsWith('ghcr.io/vymalo/another-adam-rs/coder')).sort(), ['adam-bench-git-server', 'postgres:16', 'wiremock/wiremock:3.13.2'].sort().filter((i) => images.has(i)));
+  assert.deepEqual([...images].filter((i) => !i.startsWith('ghcr.io/vymalo/another-adam-rs/coder')).sort(), ['adam-bench-git-server', 'postgres:18.7@sha256:64c8b0d31e4ab6ea665e8426ea406a94bf52de3c05b3a4a8bf713704eefa9328', 'wiremock/wiremock:3.13.2'].sort().filter((i) => images.has(i)));
 });
 
 test('compose: no privileged, no cap_add, no devices, no Docker socket, and no model key anywhere', compose, () => {

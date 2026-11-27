@@ -280,9 +280,11 @@ jobs:
     outputs:
       pushed: ${{ steps.guard.outputs.push }}
     services:
-      # The coder's database for the container smoke test.
+      # The coder's database for the container smoke test: PostgreSQL 18.7, the store's floor (ADR 0082,
+      # decision 11), by tag and digest (the OCI index of docker.io/library/postgres:18.7, *verified
+      # 2026-11-27* from the registry), the same image as ci.yml and compose.yaml.
       postgres:
-        image: postgres:17
+        image: postgres:18.7@sha256:64c8b0d31e4ab6ea665e8426ea406a94bf52de3c05b3a4a8bf713704eefa9328
         env:
           POSTGRES_PASSWORD: postgres
         ports: ["5432:5432"]
