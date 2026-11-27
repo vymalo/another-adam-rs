@@ -57,10 +57,13 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
-use adam_a2a_runtime::{CONTEXT_THREAD_TOOLS, integral_numbers};
+use adam_a2a_runtime::{CONTEXT_THREAD_TOOLS, CONTEXT_UPLOADS, integral_numbers};
 use adam_core::time::Timestamp;
 use adam_llm_agent::{Listing, SourceCtx, ToolCtx, ToolError, ToolNote, ToolOutput, ToolSource};
-use adam_mcp::{CallOptions, Endpoint, EndpointError, McpPolicy, RemoteTool};
+use adam_mcp::{
+    CallOptions, Endpoint, EndpointError, McpPolicy, RemoteTool, UploadError, UploadRequest,
+    Uploaded, Uploader,
+};
 use adam_model::ToolSpec;
 use async_trait::async_trait;
 use secrecy::{ExposeSecret, SecretString};
@@ -152,6 +155,31 @@ impl std::fmt::Debug for Grant {
             .field("token", &"[redacted]")
             .field("expires_at", &self.expires_at)
             .finish()
+    }
+}
+
+/// What a run may do for `uploads/v1` ([`ThreadToolsClient::upload_access`]): the thread-tools
+/// grant the slot is asked with, and the most the orchestrator says one file may be. `Debug` shows
+/// the limit and no credential.
+#[derive(Clone)]
+pub struct UploadAccess {
+    grant: Grant,
+    max_bytes: Option<u64>,
+}
+
+impl UploadAccess {
+    /// The most one file may be, as the activating message said; `None` when it named none (the
+    /// orchestrator still checks the size when the slot is asked).
+    pub fn max_bytes(&self) -> Option<u64> {
+        self.max_bytes
+    }
+}
+
+impl std::fmt::Debug for UploadAccess {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UploadAccess")
+            .field("max_bytes", &self.max_bytes)
+            .finish_non_exhaustive()
     }
 }
 
@@ -250,6 +278,45 @@ impl ThreadToolsClient {
             token: SecretString::from(token.to_owned()),
             expires_at,
         })
+    }
+
+    /// What the run's context allows for `uploads/v1`, or the reason it allows none: the latest
+    /// message must have **activated** the extension ([`CONTEXT_UPLOADS`]) and the run must hold a
+    /// usable thread-tools grant (the slot is asked of that endpoint). The reasons are for the model:
+    /// they carry no URL and no token.
+    ///
+    /// # Errors
+    ///
+    /// A sentence that says which of the two is missing.
+    pub fn upload_access(&self, context: &Map<String, Value>) -> Result<UploadAccess, String> {
+        let Some(Value::Object(limits)) = context.get(CONTEXT_UPLOADS) else {
+            return Err("no message of this conversation offered uploads".to_owned());
+        };
+        let grant = self.grant(context).map_err(|why| why.reason().to_owned())?;
+        let whole = |key: &str| limits.get(key).and_then(Value::as_u64);
+        Ok(UploadAccess {
+            grant,
+            max_bytes: whole("maxBytes"),
+        })
+    }
+
+    /// Send `bytes` to the bucket by reference: ask the thread tools for a slot, `PUT`, keep the id.
+    /// The first failure ends it; the bytes go nowhere else.
+    ///
+    /// # Errors
+    ///
+    /// [`UploadError`]: the endpoint, the orchestrator's refusal (its code is in the error) or the
+    /// bucket. No text of it holds the slot's URL, a signed header or the grant's token.
+    pub async fn upload(
+        &self,
+        access: &UploadAccess,
+        request: &UploadRequest,
+        bytes: Vec<u8>,
+    ) -> Result<Uploaded, UploadError> {
+        let endpoint = self.endpoint(&access.grant)?;
+        Uploader::new(&self.policy)
+            .upload(&endpoint, request, bytes)
+            .await
     }
 
     /// The endpoint of `grant`, under the policy.

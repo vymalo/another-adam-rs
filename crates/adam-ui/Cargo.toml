@@ -40,9 +40,14 @@ adam-core.workspace = true
 adam-model.workspace = true
 adam-mcp-testkit.workspace = true
 adam-store-testkit.workspace = true
+wiremock.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
 
 # These tests need the thread-tools client: an embedded build (no default features) leaves them out.
+[[test]]
+name = "uploads"
+required-features = ["thread-tools"]
+
 [[test]]
 name = "ask_v5"
 required-features = ["thread-tools"]

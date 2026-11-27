@@ -201,7 +201,7 @@ limit of its own; `EndpointError::Timeout` names the time of that call) and send
 listed tool's own `_meta["thread-tools/v1"].timeoutSecs` says (`RemoteTool::meta` is the tool's `_meta` as listed), capped
 by `McpPolicy::thread_tools_max_call` (`THREAD_TOOLS_MAX_CALL_SECS`, 3600 s). A plain `call_tool` is a call with neither.
 
-## Uploads (`uploads/v1`, the agent's side, part 1)
+## Uploads (`uploads/v1`, the agent's side)
 
 `Uploader` asks the thread-tools endpoint for a slot (`tools/call request_upload {filename, mediaType, size,
 sha256}`, over an [`Endpoint`](#an-endpoint-a-message-announces)), `PUT`s the bytes to the returned `url` with
@@ -222,8 +222,9 @@ exactly the returned signed `headers`, and returns `Uploaded {upload_id, expires
   crate logs neither. A test captures every log line at `TRACE` and looks for the signature, the query, the checksum
   and the path. **One exception, outside this crate: `rmcp` logs each tool result it receives at `debug`, and the
   slot is one. Filter the `rmcp` log target out of any log that leaves the process**, as for `allow_url_secrets`.
-* **Not here (parts 2 and 3):** the artifact that names the `uploadId`, the inline threshold that decides when to ask
-  (`UPLOADS_INLINE_MAX_BYTES`), and the end-to-end and parity cells. No tool calls `Uploader` yet.
+* **Not here:** the artifact that names the `uploadId`, the inline threshold that decides when to ask and the
+  activation check are the callers'. The first caller is the coder's `share_file`, through `adam_ui::Ui::upload`
+  (`bin/adam-coder/README.md`, "Sharing a file"); the end-to-end through the orchestrator and the parity cells are not built.
 * Tests: `tests/upload.rs` (a fake thread-tools endpoint and a WireMock bucket). The testkit's
   `ThreadToolsServer::set_structured_answer` answers a tool with a fixed JSON body.
 

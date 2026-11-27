@@ -344,6 +344,11 @@ pub struct ToolEnv {
     /// The language servers by language ([`lsp`]): the closed table of the images. A test points a
     /// language at the scripted server; production never changes it.
     pub language_table: ServerTable,
+    /// The size over which `share_file` sends a file by reference (`uploads/v1`) instead of inline:
+    /// the agent folder's `limits.max_inline_upload_bytes`, else `UPLOADS_INLINE_MAX_BYTES`, else
+    /// 10 MiB (`adam_service::inline_upload_threshold`, the number the card is served under). The
+    /// inline form is never larger than `MAX_ARTIFACT_FILE_BYTES` whatever this says.
+    pub inline_upload_threshold: u64,
     /// What a tool wants to add to its own result without being the one that builds it (a slot
     /// made while reading: which commit it holds): by call, taken by [`Gated`] when the call ends.
     notices: std::sync::Mutex<std::collections::HashMap<String, Vec<String>>>,
@@ -373,6 +378,7 @@ impl ToolEnv {
             references: References::default(),
             commands: Commands::new(),
             language_table: ServerTable::production(),
+            inline_upload_threshold: adam_a2a::DEFAULT_UPLOADS_INLINE_MAX_BYTES,
             notices: std::sync::Mutex::default(),
         }
     }
@@ -409,6 +415,14 @@ impl ToolEnv {
     #[must_use]
     pub fn with_unavailable_wait(mut self, wait: Duration) -> Self {
         self.unavailable_wait = Some(wait);
+        self
+    }
+
+    /// Send a file over `bytes` by reference (`uploads/v1`): see
+    /// [`inline_upload_threshold`](Self::inline_upload_threshold).
+    #[must_use]
+    pub fn with_inline_upload_threshold(mut self, bytes: u64) -> Self {
+        self.inline_upload_threshold = bytes;
         self
     }
 

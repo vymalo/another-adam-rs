@@ -993,6 +993,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "tracing",
+ "wiremock",
 ]
 
 [[package]]

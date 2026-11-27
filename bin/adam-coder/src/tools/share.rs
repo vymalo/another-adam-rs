@@ -39,6 +39,23 @@
 //! The bytes go only into the artifact; they are never in the model's history (the loop records a
 //! tool's `content` and the artifact's size, nothing else).
 //!
+//! # A file over the inline threshold
+//!
+//! A file larger than the threshold `uploads/v1` serves (`ToolEnv::inline_upload_threshold`: the
+//! agent folder's `limits.max_inline_upload_bytes`, else `UPLOADS_INLINE_MAX_BYTES`, else 10 MiB) is
+//! **not** put in the artifact. The tool asks the thread tools for a presigned slot, `PUT`s the bytes
+//! to the bucket and returns an artifact that names the `uploadId` and carries no bytes
+//! ([`Artifact::upload_ref`]); the journal, the step's output and the final output never hold them.
+//! The inline form is never larger than [`MAX_ARTIFACT_FILE_BYTES`], so with the default threshold
+//! a file between 4 and 10 MiB is uploaded too when it can be.
+//!
+//! It can be only when a message of the conversation **activated** `uploads/v1` and the run holds a
+//! thread-tools grant. Without them a file over the inline limit is **refused** with a sentence the
+//! model reads; it is never put inline, and a refused upload (the orchestrator's `too_large`,
+//! `over_limit`, ..., or a bucket that says no) is the same kind of result. Text the process
+//! hides is scrubbed out of a text file **before** it is hashed and sent. A file is held in memory
+//! while it goes: at most [`MAX_UPLOADED_FILE_BYTES`].
+//!
 //! # Retry safety
 //!
 //! A repeat reads the file again and returns the same artifact (the artifact's id follows its
@@ -49,11 +66,16 @@ use std::path::Path;
 use std::sync::Arc;
 
 use adam::prelude::*;
-use adam_runtime::{Artifact, MAX_ARTIFACT_FILE_BYTES, checked_media_type};
+use adam_runtime::{Artifact, MAX_ARTIFACT_FILE_BYTES, checked_media_type, human_size};
 use adam_workspace::SlotDir;
 
 use super::files::open_for_read;
 use super::{Outcome, ToolEnv, non_empty, notes_error};
+
+/// The most a file sent by reference may be: the uploader holds the bytes in memory while it
+/// hashes and sends them, so the coder's own ceiling is the one the inline threshold may be set to
+/// (256 MiB), whatever the orchestrator would take.
+const MAX_UPLOADED_FILE_BYTES: u64 = adam_a2a::UPLOADS_INLINE_MAX_BYTES_CEILING;
 
 /// Longest name of a shared file's artifact, in characters.
 const MAX_NAME_CHARS: usize = 120;
@@ -107,30 +129,73 @@ pub async fn share_file(
     };
     ctx.emit_progress(format!("sharing {path} ({})", slot.dir()))
         .await;
+    let threshold = env.inline_upload_threshold;
+    // The most that may go inline: the threshold, and never more than an artifact can hold.
+    let inline_max = threshold.min(MAX_ARTIFACT_FILE_BYTES as u64);
+    let access = env.ui.upload_access(ctx.context_map());
+    // What is read: up to the inline limit, and, when a slot can be asked for, up to what it takes.
+    let read_cap = match &access {
+        Ok(access) => inline_max.max(
+            access
+                .max_bytes()
+                .map_or(MAX_UPLOADED_FILE_BYTES, |m| m.min(MAX_UPLOADED_FILE_BYTES)),
+        ),
+        Err(_) => inline_max,
+    };
     let (root, rel, name) = (
         Arc::clone(slot.root()),
         path.to_owned(),
         name.as_deref().and_then(non_empty).map(str::to_owned),
     );
-    let read = tokio::task::spawn_blocking(move || share_in(&root, &rel, name.as_deref()))
-        .await
-        .map_err(|e| ToolError::Transient(format!("the read was interrupted: {e}")))?;
+    let read = tokio::task::spawn_blocking(move || {
+        share_in_capped(&root, &rel, name.as_deref(), read_cap)
+    })
+    .await
+    .map_err(|e| ToolError::Transient(format!("the read was interrupted: {e}")))?;
     let shared = match read {
         Ok(shared) => shared,
-        Err(reason) => return Ok(ToolOutput::error(reason)),
+        Err(ShareError::Refused(reason)) => return Ok(ToolOutput::error(reason)),
+        Err(ShareError::TooLarge(len)) => {
+            return Ok(ToolOutput::error(match &access {
+                Ok(_) => too_large_to_upload(path, len, read_cap),
+                Err(why) if threshold < MAX_ARTIFACT_FILE_BYTES as u64 => format!(
+                    "`{path}` is {len} bytes: too large to share inline (over {threshold} bytes) \
+                     and uploads are not available ({why}). Make it smaller or tell the person \
+                     it is too big to share"
+                ),
+                Err(_) => too_large(path.trim(), len),
+            }));
+        }
     };
-    // The name or the type may still be refused by the artifact (a filename with a `:` or a control
-    // character).
-    let artifact = match Artifact::file(
-        shared.name,
-        shared.media_type,
-        shared.filename,
-        shared.bytes,
-    ) {
-        Ok(artifact) => artifact,
-        Err(e) => return Ok(ToolOutput::error(e.to_string())),
+    let artifact = if shared.bytes.len() as u64 <= inline_max {
+        // The name or the type may still be refused by the artifact (a filename with a `:` or a
+        // control character).
+        match Artifact::file(
+            shared.name,
+            shared.media_type,
+            shared.filename,
+            shared.bytes,
+        ) {
+            Ok(artifact) => artifact,
+            Err(e) => return Ok(ToolOutput::error(e.to_string())),
+        }
+    } else {
+        // Over the threshold: by reference, or not at all. `access` is `Ok` here, for the read
+        // went past the inline limit only when a slot could be asked for.
+        let Ok(access) = &access else {
+            return Ok(ToolOutput::error(
+                "the file is too large to share inline and uploads are not available",
+            ));
+        };
+        match upload(&env, ctx, access, shared).await {
+            Ok(done) => done,
+            Err(refused) => return Ok(ToolOutput::error(refused)),
+        }
     };
-    let line = artifact.shared_line();
+    let line = match &artifact.file {
+        Some(_) => artifact.shared_line(),
+        None => by_reference_line(&artifact),
+    };
     // The run delivered something: a scratch run that ends here may complete without a pull
     // request (`CoderAgent`). Noted once however often the file is shared. In the notes of the
     // run that shares, not of its root: a subagent's file stays on the subagent's run and the
@@ -149,29 +214,120 @@ pub async fn share_file(
     Ok(ToolOutput::text(line).with_artifact(artifact))
 }
 
-/// Read `rel` under `root` for sharing, or the reason the model is told.
+/// Why a file could not be read for sharing.
+#[derive(Debug)]
+enum ShareError {
+    /// The file is this many bytes, over the cap it was read under.
+    TooLarge(u64),
+    /// Anything else, as the model is told.
+    Refused(String),
+}
+
+/// Send `shared` to the bucket by reference and make the artifact that names it.
+///
+/// Text the process hides is scrubbed out of a text file first (the tool's own wrapper scrubs the
+/// artifacts it returns, and this one holds no bytes), so the hash, the size and the object are
+/// the scrubbed file's. A refusal, in any of its forms, is the sentence the model reads: **never**
+/// a fallback to inline.
+async fn upload(
+    env: &ToolEnv,
+    ctx: &ToolCtx,
+    access: &adam_ui::UploadAccess,
+    shared: Shared,
+) -> Result<Artifact, String> {
+    let Shared {
+        name,
+        filename,
+        media_type,
+        mut bytes,
+    } = shared;
+    if let Ok(text) = std::str::from_utf8(&bytes).map(str::to_owned) {
+        bytes = env.redactor.scrub_values(text).into_bytes();
+    }
+    let request = adam_ui::UploadRequest::for_bytes(&filename, &media_type, &bytes);
+    ctx.emit_progress(format!(
+        "uploading {filename} ({})",
+        human_size(bytes.len())
+    ))
+    .await;
+    let uploaded = tokio::select! {
+        biased;
+        () = ctx.cancelled() => return Err("the upload was cancelled".to_owned()),
+        done = env.ui.upload(access, &request, bytes) => done,
+    }
+    .map_err(|e| {
+        let why = match &e {
+            adam_ui::UploadError::Refused { code, message } => format!("{message} ({code})"),
+            other => other.to_string(),
+        };
+        format!(
+            "`{filename}` was not uploaded, so it is not shared: {why}. It is too large to share \
+             inline, so there is no other way to share it; make it smaller or tell the person"
+        )
+    })?;
+    Artifact::upload_ref(name, media_type, filename, uploaded.upload_id).map_err(|e| e.to_string())
+}
+
+/// What the model is told of a file sent by reference.
+fn by_reference_line(artifact: &Artifact) -> String {
+    match adam_runtime::upload_ref_of(artifact.mime_type.as_deref(), &artifact.data) {
+        Some(upload) => format!(
+            "Shared {} ({}) by upload: the file is in the conversation's file store and the \
+             person gets it as a download.",
+            upload.filename, upload.media_type
+        ),
+        None => format!("Shared {}.", artifact.name),
+    }
+}
+
+fn too_large_to_upload(shown: &str, len: u64, cap: u64) -> String {
+    format!(
+        "`{}` is {len} bytes, over the {cap} bytes an upload may be here: make it smaller \
+         (compress or split it) or tell the person it is too big to share",
+        shown.trim()
+    )
+}
+
+/// Read `rel` under `root` for sharing, or the reason the model is told: a file of at most
+/// [`MAX_ARTIFACT_FILE_BYTES`].
+#[cfg(test)]
 fn share_in(root: &SlotDir, rel: &str, name: Option<&str>) -> Result<Shared, String> {
+    share_in_capped(root, rel, name, MAX_ARTIFACT_FILE_BYTES as u64).map_err(|e| match e {
+        ShareError::TooLarge(len) => too_large(rel.trim(), len),
+        ShareError::Refused(reason) => reason,
+    })
+}
+
+/// [`share_in`] for a file of at most `cap` bytes.
+fn share_in_capped(
+    root: &SlotDir,
+    rel: &str,
+    name: Option<&str>,
+    cap: u64,
+) -> Result<Shared, ShareError> {
     let shown = rel.trim();
-    let (file, meta) = open_for_read(root, rel)?;
+    let (file, meta) = open_for_read(root, rel).map_err(ShareError::Refused)?;
     if meta.is_dir() {
-        return Err(format!(
+        return Err(ShareError::Refused(format!(
             "`{shown}` is a directory: share one file (make an archive of it first, with a \
              command, if the person needs the whole directory)"
-        ));
+        )));
     }
     if !meta.is_file() {
-        return Err(format!("`{shown}` is not a regular file"));
+        return Err(ShareError::Refused(format!(
+            "`{shown}` is not a regular file"
+        )));
     }
-    if meta.size() > MAX_ARTIFACT_FILE_BYTES as u64 {
-        return Err(too_large(shown, meta.size()));
+    if meta.size() > cap {
+        return Err(ShareError::TooLarge(meta.size()));
     }
     // Read one byte more than the cap: a file that grew after `fstat` is refused, not cut.
     let mut bytes = Vec::with_capacity(usize::try_from(meta.size()).unwrap_or(0));
-    file.take(MAX_ARTIFACT_FILE_BYTES as u64 + 1)
+    file.take(cap + 1)
         .read_to_end(&mut bytes)
-        .map_err(|e| format!("cannot read `{shown}`: {e}"))?;
-    if bytes.len() > MAX_ARTIFACT_FILE_BYTES {
-        return Err(too_large(shown, bytes.len() as u64));
+        .map_err(|e| ShareError::Refused(format!("cannot read `{shown}`: {e}")))?;
+    if bytes.len() as u64 > cap {
+        return Err(ShareError::TooLarge(bytes.len() as u64));
     }
 
     // The name the person sees is the one the model gave the path, not the target of a link.

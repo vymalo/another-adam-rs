@@ -325,6 +325,11 @@ pub(crate) fn task_from_view(
 /// URL, so a client shows a link where it would otherwise show JSON. The data
 /// part is unchanged, and the artifact id does not depend on the extra part.
 ///
+/// **A file sent by reference is a data part with no bytes.** An artifact made by
+/// [`adam_runtime::Artifact::upload_ref`] becomes one `data` part (`{}`) with the `filename`, the
+/// `mediaType` and, under the `uploads/v1` URI in its metadata, the `uploadId`
+/// (`docs/api/uploads-v1.md`, section 4).
+///
 /// **A file is a file.** A file artifact ([`adam_runtime::ArtifactRef::file`]) becomes one A2A
 /// `raw` part (`Part.raw` of the A2A v1 `a2a.proto`: the bytes, base64 in JSON) with the
 /// `mediaType` and the `filename`, and nothing else: no extension is needed, a plain A2A client
@@ -354,6 +359,27 @@ pub(crate) fn artifact_of_with(
         if let Some(mime) = &artifact.mime_type {
             part = part.with_media_type(mime.clone());
         }
+        return Some(Artifact {
+            artifact_id: id,
+            name: Some(artifact.name.clone()),
+            description: None,
+            parts: vec![part],
+            metadata: None,
+            extensions: None,
+        });
+    }
+    // A file sent by reference (`uploads/v1`): the contract's part, with no bytes. A data part
+    // that carries the file's name and type and, under the extension's URI, the id the
+    // orchestrator issued.
+    if let Some(upload) = adam_runtime::upload_ref_of(artifact.mime_type.as_deref(), &artifact.data)
+    {
+        let mut part = Part::data(json!({}))
+            .with_filename(upload.filename.to_owned())
+            .with_media_type(upload.media_type.to_owned());
+        part.metadata = Some(HashMap::from([(
+            adam_a2a::UPLOADS_EXTENSION.to_owned(),
+            json!({"uploadId": upload.upload_id}),
+        )]));
         return Some(Artifact {
             artifact_id: id,
             name: Some(artifact.name.clone()),
@@ -642,6 +668,39 @@ mod tests {
     use adam_runtime::{ArtifactRef, FileRef};
 
     use super::*;
+
+    /// A file sent by reference is the contract's data part: `{}`, the name and the type of the
+    /// file and, under the extension's URI, the upload id. No bytes, no `raw`, no `url`.
+    #[test]
+    fn an_upload_reference_is_a_data_part_that_names_the_upload() {
+        let reference = adam_runtime::Artifact::upload_ref(
+            "Report",
+            "application/pdf",
+            "report.pdf",
+            "k1.cGF5.mac",
+        )
+        .unwrap();
+        let served = artifact_of(&ArtifactRef::from(&reference), None).expect("served");
+        assert_eq!(served.name.as_deref(), Some("Report"));
+        let wire = serde_json::to_value(&served.parts).unwrap();
+        assert_eq!(
+            wire,
+            json!([{
+                "data": {},
+                "filename": "report.pdf",
+                "mediaType": "application/pdf",
+                "metadata": {adam_a2a::UPLOADS_EXTENSION: {"uploadId": "k1.cGF5.mac"}}
+            }])
+        );
+        // A JSON artifact that only looks like one (another media type) stays the JSON it is.
+        let forged = ArtifactRef::new(
+            "x",
+            Some("application/json".into()),
+            json!({"filename": "a", "mediaType": "a/b", "uploadId": "i"}),
+        );
+        let served = artifact_of(&forged, None).unwrap();
+        assert!(serde_json::to_value(&served.parts).unwrap()[0]["metadata"].is_null());
+    }
 
     fn view(status: RunStatus) -> RunView {
         RunView {
