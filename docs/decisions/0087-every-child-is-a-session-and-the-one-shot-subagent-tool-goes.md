@@ -3,13 +3,18 @@
 Status: **Accepted** (2026-11-27). The owner decided on 2026-11-27: *"I don't like the idea of the parent waiting for the
 one-shot. [...] We should remove the one-shot thing; a normal child session can also be one-shot. We can simply have
 sealed sub-agents, where the user cannot talk to the child, or with other specs. I mean, while creating the sub-agent,
-the agent has config options."* Decisions 2 (the defaults of `wait` and `access`), 3 (who sees a sealed session) and 6
+the agent has config options."* Decisions 2 (the defaults of `wait` and `mode`), 3 (who sees a sealed session) and 6
 (one release of a wrapper) are this ADR's choices for the owner to confirm. Reverses the one-shot child runs of
 [ADR 0039](0039-the-agent-loop-takes-opencodes-structure-and-agents-get-plugins.md); amends
 [ADR 0045](0045-a-subagent-can-run-in-the-background-as-a-session.md),
 [ADR 0054](0054-a-child-session-can-be-configured-within-what-its-folder-allows.md) and
 [ADR 0037](0037-parallel-subagent-calls-and-an-editing-worker.md); serves
 [ADR 0085](0085-runs-are-exported-as-training-records.md).
+
+*Amended 2026-11-27, the owner:* *"We'll stay only with sub-agents with sessions, and have one option for sealed or
+one-shot sub-agents while creating them."* Decision 2's `access` and ADR 0045's `keep_open` overlapped (a session that
+closes after its round is already sealed), so they are **one option, `mode`**, below; `keep_open` is read for one
+release and mapped onto it. The default `one_shot` is this ADR's choice for the owner to confirm.
 
 ## Context
 
@@ -29,28 +34,29 @@ has no conversation id, it is not listed by conversation, so the exporter of ADR
 ## Decision
 
 1. **Every child is a session.** A subagent is started only with `subagent_start`, and every child run has a session's
-   conversation id. A one-shot use is a session that closes after its first round (`keep_open: false`, as today's
+   conversation id. A one-shot use is a session that closes after its first round (`mode: one_shot`, as today's
    default).
-2. **`subagent_start` gains two options, chosen per call:**
+2. **`subagent_start` takes two options, chosen per call** (amended 2026-11-27):
+   * `mode`, a closed enum (Rule 3), the one option the owner asked for. It replaces `keep_open`:
+
+     | Value | After the first round | Who may send the next one |
+     |---|---|---|
+     | `one_shot` (default) | the session closes | nobody |
+     | `sealed` | the session stays open | the parent only: the person cannot write to it |
+     | `open` | the session stays open | the parent and the person |
+
    * `wait` (boolean, default `false`): the call returns the session's first report as its result, and the parent parks
      until then, as a tool call does. Waiting is the parent's choice for one call, not a kind of child.
-   * `access`, a closed enum (Rule 3), default `parent_and_person`:
-
-     | Value | Who may send a round after the first |
-     |---|---|
-     | `parent_and_person` | the parent and the person |
-     | `parent` | the parent only: the person cannot write to it |
-     | `sealed` | nobody: one round, then closed (implies `keep_open: false`) |
-3. **A person always sees a child,** whatever its `access`: its rounds, reports and status, as `child-sessions/v1`
-   shows them today. `access` limits who writes, never who reads.
-4. **A subagent's file sets the defaults and the ceiling.** The file gains optional `session:` defaults (`keep_open`,
-   `wait`, `access`). A call may only narrow what the file allows, by ADR 0054's rule: a subagent filed
-   `access: parent` cannot be opened to the person by its parent.
+3. **A person always sees a child,** whatever its `mode`: its rounds, reports and status, as `child-sessions/v1`
+   shows them today. `mode` limits who writes, never who reads.
+4. **A subagent's file sets the defaults and the ceiling.** The file gains optional `session:` defaults (`mode`,
+   `wait`). A call may only narrow what the file allows, by ADR 0054's rule (`open` is wider than `sealed`, which is
+   wider than `one_shot`): a subagent filed `mode: sealed` cannot be opened to the person by its parent.
 5. **Several children run side by side.** Two `subagent_start` calls in one turn start two sessions at once. That
    subsumes ADR 0037's parallel subagent calls. A remote subagent (A2A) takes the same options, as remote sessions do
    today.
 6. **The subagents' own tools become wrappers for one release, then go.** In slice C1 each named tool calls
-   `subagent_start` with `wait: true`, `keep_open: false` and `access: sealed`. That is today's behaviour exactly,
+   `subagent_start` with `mode: one_shot` and `wait: true`. That is today's behaviour exactly,
    plus a conversation id. Slice C4 removes them, and an agent file that names one in `tools:` then refuses to load
    with a message naming `subagent_start`.
 
@@ -59,9 +65,9 @@ has no conversation id, it is not listed by conversation, so the exporter of ADR
 | Slice | What |
 |---|---|
 | C1 | Every child gets a session's conversation id; the named subagent tools wrap `subagent_start`. ADR 0085's exporter reaches every child. |
-| C2 | `wait` and `access` on `subagent_start`, local and remote; the person's write is refused by `access`; tests for each value. |
+| C2 | `mode` and `wait` on `subagent_start`, local and remote; `keep_open` read for one release and mapped onto `mode`; the person's write is refused by `mode`; tests for each value. |
 | C3 | `session:` defaults in a subagent's file, narrowed by ADR 0054's rule; `docs/reference/agent-files.md`. |
-| C4 | The named tools go; the coder's instructions, the dev agents and the parity page use `subagent_start`; `child-sessions/v1` carries `access`. |
+| C4 | The named tools go; the coder's instructions, the dev agents and the parity page use `subagent_start`; `child-sessions/v1` carries `mode`. |
 
 ## Consequences
 
