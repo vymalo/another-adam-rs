@@ -1,0 +1,54 @@
+name: Commit Lint
+
+# Conventional Commits on everything that can land on main (ADR 0084): release-please reads the subjects
+# to choose the next version and write the changelog. A squash merge makes the pull request's title the
+# commit on main, and a rebase or merge keeps each commit, so both are checked. The rule is
+# tools/commit-lint.sh, the same script the local hook (.githooks/commit-msg) runs. No third-party action.
+
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: commit-lint-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  commit-lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The whole range of the pull request's commits.
+          fetch-depth: 0
+          persist-credentials: false
+      - name: The title and every commit are Conventional Commits
+        env:
+          # Through the environment: a title is text a person typed, never part of the script.
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -eu
+          failed=0
+          echo "the title:"
+          if sh tools/commit-lint.sh --message "$PR_TITLE"; then echo "  ok  $PR_TITLE"; else failed=1; fi
+          echo "the commits of ${BASE_SHA}..${HEAD_SHA}, merges skipped:"
+          log="$RUNNER_TEMP/commits"
+          git log --no-merges --format='%h%x09%s' "${BASE_SHA}..${HEAD_SHA}" > "$log"
+          while IFS="$(printf '\t')" read -r sha subject; do
+            if sh tools/commit-lint.sh --message "$subject" 2> /dev/null; then
+              echo "  ok  $sha $subject"
+            else
+              echo "  no  $sha $subject"
+              failed=1
+            fi
+          done < "$log"
+          if [ "$failed" -ne 0 ]; then
+            echo "::error::not every subject is a Conventional Commit: edit the title on GitHub, or reword the commits (git commit --amend, or a rebase) and push again"
+            exit 1
+          fi
