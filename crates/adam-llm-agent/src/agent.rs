@@ -291,6 +291,68 @@ pub const NOT_ASKABLE: &str = "nobody can answer this run: only a kept-open suba
 client shows child sessions may ask the person. Do what you can without asking, and say in your \
 final answer what is still needed";
 
+/// The result of a call a `before_tool` hook asked a person to approve, in a run nobody can approve
+/// it in: a child run that may not ask the person (ADR 0045 decision 9) or a firing of a schedule.
+/// Such a run reads `Ask` as `Deny` (ADR 0050, decision 12, slice H8), and the step records a `deny`.
+pub const NOT_APPROVABLE: &str = "a hook asks a person to approve this call, and nobody can approve \
+it in this run: the call is not run. Do what you can without it, and say in your final answer what \
+is still needed";
+
+/// The result of a call a hook asked a person to approve while it ran beside other calls of its
+/// turn: the run cannot wait on one of several, so the model is told to call the tool alone.
+const APPROVAL_NOT_ALONGSIDE: &str = "a hook asks a person to approve this call, which cannot wait \
+for an answer beside other calls: the call is not run. Call the tool alone to have it approved";
+
+/// The journaled step that runs a call a person approved (ADR 0050, decision 12, slice H8):
+/// `tool:<call id>:approved`. It is taken only after a recorded `Ask` and the person's yes, so its
+/// seq never depends on which plugins are configured; a replay that finds it recorded runs nothing.
+#[must_use]
+pub fn approval_step(call_id: &str) -> String {
+    format!("tool:{call_id}:approved")
+}
+
+/// Whether a person's answer to an approval is a yes: one of `yes`, `y`, `approve`, `approved`,
+/// `allow`, `ok`, `okay`, without regard to case, surrounding space or a final `.` or `!`. Anything
+/// else is a no (ADR 0050, decision 12): a call runs only on a clear yes, and the words of any other
+/// answer are the reason the call is refused with.
+#[must_use]
+pub fn approves(answer: &str) -> bool {
+    let word = answer
+        .trim()
+        .trim_end_matches(['.', '!'])
+        .trim()
+        .to_lowercase();
+    matches!(
+        word.as_str(),
+        "yes" | "y" | "approve" | "approved" | "allow" | "ok" | "okay"
+    )
+}
+
+/// The question a person reads for an approval: the hook's own words, then what to answer.
+fn approval_question(tool: &str, question: &str) -> String {
+    format!(
+        "{question}\n\nApprove the call to `{tool}`? Answer yes to run it; any other answer \
+         refuses it."
+    )
+}
+
+/// What the model reads for a call the person did not approve: the refusal, with their words.
+fn not_approved(answer: &str) -> String {
+    let answer = answer.trim();
+    if answer.is_empty() {
+        "not run: the person did not approve the call".to_owned()
+    } else {
+        format!("not run: the person did not approve the call. They answered: {answer}")
+    }
+}
+
+/// Whether a person can approve a call of the run in `state` (ADR 0050, decision 12, slice H8): it
+/// may ask the person (ADR 0045 decision 9) and somebody answers it (it is no firing of a schedule).
+fn approvable(ctx: &Ctx, state: &Conversation) -> bool {
+    state.may_ask_person(ctx.conversation_id())
+        && !is_unattended(ctx.conversation_id(), Some(&state.context))
+}
+
 /// Whether nobody answers a run: a firing of a schedule (its conversation is under
 /// `adam.schedule:`), or a child of one (its context carries `adam_runtime::UNATTENDED_CONTEXT_KEY`,
 /// which the scheduler sets and children inherit).
@@ -320,6 +382,8 @@ struct Prepared {
     /// The sources and what they see of the run, to check what a source holds back.
     holding: Option<(Vec<DynToolSource>, SourceCtx)>,
     unjournaled: Arc<Mutex<SandboxUsage>>,
+    /// A person can approve a call of this run ([`CallFacts::approvable`]).
+    approvable: bool,
 }
 
 /// What a tool call's context is made from: the `Ctx` it is taken from does not exist inside
@@ -401,6 +465,10 @@ struct CallFacts {
     removed_tools: Arc<[String]>,
     /// How many custom events the transition's calls have emitted: one counter for all of them.
     event_budget: Arc<AtomicUsize>,
+    /// Whether a person can approve a call a hook asks about (ADR 0050, slice H8): the run may ask
+    /// the person ([`Conversation::may_ask_person`]) and somebody answers it (not
+    /// [`is_unattended`]). When not, an `Ask` is recorded as a `deny`.
+    approvable: bool,
 }
 
 /// The runs a call reads, owned: the root run, the step of it a child works under, the plan, the run
@@ -446,6 +514,8 @@ struct EarlyFacts {
     removed_tools: Arc<[String]>,
     /// The transition's counter of custom events ([`CallFacts::event_budget`]).
     event_budget: Arc<AtomicUsize>,
+    /// Whether a person can approve a call of the turn ([`CallFacts::approvable`]).
+    approvable: bool,
     turn: crate::early::Turn,
     /// The committed `repeats` of the run, for the doom-loop decision of the first call.
     repeats: Option<Repeats>,
@@ -599,6 +669,7 @@ impl<'a> Early<'a> {
             loaded: Arc::clone(&self.facts.loaded),
             removed_tools: Arc::clone(&self.facts.removed_tools),
             event_budget: Arc::clone(&self.facts.event_budget),
+            approvable: self.facts.approvable,
         };
         let mut prepared = self.agent.prepare(
             &self.facts.ctx,
@@ -2116,6 +2187,19 @@ struct Absorbed {
     /// The id of the first message the run read, if it read any: what a resume it forwards to a
     /// child parked on the model derives its own id from (ADR 0067 decision 5).
     read: Option<String>,
+    /// The approvals the person answered (ADR 0050, slice H8), in the order they were answered.
+    approvals: Vec<ApprovalAnswer>,
+}
+
+/// A person's answer to an approval, as [`Absorbed`] reports it.
+struct ApprovalAnswer {
+    /// The call the approval was for, and its tool.
+    call_id: String,
+    tool: String,
+    /// The answer was a yes: the call runs next.
+    approved: bool,
+    /// The message that answered: the key of its `approval.answered`.
+    inbound: String,
 }
 
 /// What [`LlmAgent::compact_if_due`] did.
@@ -2285,7 +2369,7 @@ impl LlmAgent {
                         state.prompt_statement = Some(prompt);
                     }
                     let items = admitted.get(&inbound.id).cloned().unwrap_or_default();
-                    texts.push((text, inbound.payload, items));
+                    texts.push((text, inbound.payload, items, inbound.id));
                 }
                 Err(reason) => {
                     tracing::warn!(inbound = %inbound.id, kind = %inbound.kind, %reason, "ignoring unreadable inbound message");
@@ -2301,14 +2385,16 @@ impl LlmAgent {
             state.announced_final = false;
         }
         let mut refusals = Vec::new();
+        let mut approvals = Vec::new();
         // The first message that the tool accepts answers the question; one it refuses leaves the
         // run parked on the question the tool asked in its place, and the next is read against that.
         while let Some(PendingWait::Question(q)) = &state.pending_wait {
-            let Some((answer, payload, items)) = texts.next() else {
+            let Some((answer, payload, items, inbound)) = texts.next() else {
                 return Absorbed {
                     waiting: true,
                     refusals,
                     read,
+                    approvals,
                 };
             };
             let (call_id, tool, ui) = (q.call_id.clone(), q.tool.clone(), q.ui.clone());
@@ -2319,6 +2405,33 @@ impl LlmAgent {
                 }
                 state.messages.push(result);
             };
+            // The question is a hook's approval (ADR 0050, slice H8): a clear yes leaves the call
+            // owed, approved, and the loop runs it next; any other answer refuses it with the
+            // person's words. The tool is not asked to read the answer: it asked nothing.
+            if let Some(approval) = state
+                .approval
+                .as_mut()
+                .filter(|approval| approval.call_id == call_id && !approval.approved)
+            {
+                let approved = approves(&answer);
+                if approved {
+                    approval.approved = true;
+                    state.pending_wait = None;
+                } else {
+                    state.approval = None;
+                    given(
+                        state,
+                        Message::tool_error(call_id.clone(), not_approved(&answer)),
+                    );
+                }
+                approvals.push(ApprovalAnswer {
+                    call_id: call_id.clone(),
+                    tool,
+                    approved,
+                    inbound,
+                });
+                continue;
+            }
             match self.read_answer(state, &tool, &call_id, ui.as_ref(), &payload) {
                 AnswerCheck::Refuse(refusal) => {
                     // The new question is other words than the model's, so it has no stream.
@@ -2355,7 +2468,7 @@ impl LlmAgent {
                 }
             }
         }
-        for (text, _, items) in texts {
+        for (text, _, items, _) in texts {
             let message = if items.is_empty() {
                 Message::user_text(text)
             } else {
@@ -2373,6 +2486,7 @@ impl LlmAgent {
             waiting: false,
             refusals,
             read,
+            approvals,
         }
     }
 
@@ -3023,6 +3137,7 @@ impl LlmAgent {
             loaded: Arc::from(state.loaded.clone()),
             removed_tools: Arc::from(state.removed_tools.clone()),
             event_budget: Arc::clone(&state.event_budget.0),
+            approvable: approvable(ctx, state),
             turn: crate::early::Turn {
                 limit: self.parallel_of(state),
                 closing,
@@ -4450,8 +4565,20 @@ impl LlmAgent {
             if ctx.is_cancelled() {
                 return Ok(Flow::Fail(CANCELLED.into()));
             }
+            // A call a person approved (ADR 0050, slice H8) runs now, alone, with the arguments the
+            // step that asked recorded: it is not scheduled again, and the doom loop judged it before
+            // it asked.
+            let approved = state
+                .approval
+                .as_ref()
+                .filter(|approval| approval.approved && approval.call_id == call.id)
+                .map(|approval| approval.arguments.clone());
             // The calls that run beside this one: none unless the schedule puts several together.
-            let together = self.together(state);
+            let together = if approved.is_some() {
+                1
+            } else {
+                self.together(state)
+            };
             if together >= 2 {
                 match self
                     .run_segment(ctx, state, together, context, early)
@@ -4464,7 +4591,8 @@ impl LlmAgent {
             // `doom_loop`: the third call in a row with the same tool, the same arguments and the
             // same result as the two before it does not run. Decided from the committed state alone.
             let key = call_key(&call);
-            if doom_loop_would_refuse(state.repeats.as_ref(), &key)
+            if approved.is_none()
+                && doom_loop_would_refuse(state.repeats.as_ref(), &key)
                 && let Some(repeats) = &mut state.repeats
             {
                 repeats.refused += 1;
@@ -4526,11 +4654,15 @@ impl LlmAgent {
             let used = files_kept(&state.artifacts);
             // A call that started while the model wrote: its work is done, and its step records it.
             let started = match early.as_mut() {
-                Some(early) => early.take_one(&call).await,
-                None => None,
+                Some(early) if approved.is_none() => early.take_one(&call).await,
+                _ => None,
             };
             let may_ask = state.may_ask_person(ctx.conversation_id());
-            self.observe_tool_started(ctx, state.root_run, &call);
+            // An approved call's `tool.started` was told before it asked (its key is the same).
+            if approved.is_none() {
+                self.observe_tool_started(ctx, state.root_run, &call);
+            }
+            let approving = approved.is_some();
             let (result, reported) = self
                 .run_tool(
                     ctx,
@@ -4555,11 +4687,18 @@ impl LlmAgent {
                         loaded: Arc::from(state.loaded.clone()),
                         removed_tools: Arc::from(state.removed_tools.clone()),
                         event_budget: Arc::clone(&state.event_budget.0),
+                        approvable: approvable(ctx, state),
                     },
                     started,
                     may_ask,
+                    approved,
                 )
                 .await?;
+            // The approved call has run: its approval is spent, in the state its step's result is
+            // committed with.
+            if approving {
+                state.approval = None;
+            }
             state.sandbox_usage.merge(&reported);
             let (message, artifacts) = match result {
                 ToolResult::Answered {
@@ -4611,6 +4750,49 @@ impl LlmAgent {
                         ui,
                         stream: None,
                     }));
+                    return Ok(Flow::Park);
+                }
+                // A hook asked a person to approve the call (ADR 0050, decision 12, slice H8): the
+                // run parks on a question, the one every question takes, and the call stays owed.
+                // The step that asked is recorded, so a replay parks on the same question and asks
+                // no hook again.
+                ToolResult::NeedsApproval {
+                    question,
+                    arguments,
+                } => {
+                    state.repeats = None;
+                    let asked = approval_question(&call.name, &question);
+                    ctx.emit(RunEvent::Custom {
+                        kind: "input_required".into(),
+                        payload: json!({
+                            "question": asked,
+                            "call_id": call.id,
+                            "approval": true,
+                        }),
+                    })
+                    .await;
+                    self.observe_approval(
+                        ctx,
+                        state.root_run,
+                        adam_plugin::EventKind::ApprovalAsked,
+                        &format!("tool:{}", call.id),
+                        (&call.name, &call.id),
+                        |event, scrub| event.text("question", &question, scrub),
+                    );
+                    state.pending_wait = Some(PendingWait::Question(PendingQuestion {
+                        call_id: call.id.clone(),
+                        tool: call.name.clone(),
+                        question: asked,
+                        ui: None,
+                        stream: None,
+                    }));
+                    state.approval = Some(crate::conversation::Approval {
+                        call_id: call.id.clone(),
+                        tool: call.name.clone(),
+                        question,
+                        arguments,
+                        approved: false,
+                    });
                     return Ok(Flow::Park);
                 }
                 ToolResult::AwaitRun(run) => {
@@ -4856,6 +5038,7 @@ impl LlmAgent {
                 loaded: Arc::from(state.loaded.clone()),
                 removed_tools: Arc::from(state.removed_tools.clone()),
                 event_budget: Arc::clone(&state.event_budget.0),
+                approvable: approvable(ctx, state),
             };
             let mut one = self.prepare(&facts_of_ctx, context, root, &notes, call, facts);
             match &first {
@@ -4980,6 +5163,7 @@ impl LlmAgent {
                         Some(live),
                         is_unattended(ctx.conversation_id(), Some(&state.context)),
                         state.may_ask_person(ctx.conversation_id()),
+                        false,
                     )
                     .await?
                 }
@@ -5181,7 +5365,7 @@ impl LlmAgent {
         // Held until the call's work is done: the process's tool pool, one share per call.
         let _seat = self.seat_tool(conversation).await;
         let unjournaled = prepared.unjournaled.clone();
-        let work = self.step_work(call, self.source_note(notes, &call.name), prepared);
+        let work = self.step_work(call, self.source_note(notes, &call.name), prepared, None);
         let outcome: Result<HookedOutput, ToolError> = step.run(move || work).await?;
         // How it ended, said now; `conclude` says it again only if applying the result changes it.
         let live = self.say_outcome(call, notes, emitter, &outcome).await;
@@ -5209,6 +5393,9 @@ impl LlmAgent {
             .source_note(notes, &call.name)
             .is_some_and(|n| n.reports_step);
         match outcome {
+            // A call that waits for a person's approval (slice H8) has no end to say yet: `conclude`
+            // says it waits, or, beside other calls, that it was not run.
+            Ok(hooked) if hooked.awaits_approval().is_some() => Live { said: None },
             // Rounds are reported only by a call that runs alone (the loop reads them in a step of
             // its own, which a segment cannot place between the calls).
             Ok(hooked) if reports_rounds(&hooked.output) => {
@@ -5320,7 +5507,7 @@ impl LlmAgent {
         async move {
             let unjournaled = prepared.unjournaled.clone();
             let note = agent.source_note(&notes, &call.name).cloned();
-            let work = agent.step_work(&call, note.as_ref(), prepared);
+            let work = agent.step_work(&call, note.as_ref(), prepared, None);
             let outcome = work.await;
             let live = agent.say_outcome(&call, &notes, &emitter, &outcome).await;
             (
@@ -5386,6 +5573,7 @@ impl LlmAgent {
             loaded,
             removed_tools,
             event_budget,
+            approvable,
             ..
         } = facts;
         let note = self.source_note(notes, &call.name);
@@ -5427,6 +5615,7 @@ impl LlmAgent {
             // What the call reported as sandbox usage rides in its result, which the step journals; a
             // call that ends in an error has no result to carry it, and leaves it here.
             unjournaled: Arc::new(Mutex::new(SandboxUsage::new())),
+            approvable,
         }
     }
 
@@ -5438,16 +5627,23 @@ impl LlmAgent {
     /// runs with, a `tool.after` rewrite changes the text the model reads, and the decisions are
     /// returned beside the output ([`HookedOutput`]) so the one journal write records both. A replay
     /// that finds the step recorded runs none of this, so no hook is asked twice.
+    ///
+    /// `approved` is the work of the step `tool:<call id>:approved` (slice H8): the call a person
+    /// approved runs with those arguments, the ones the step that asked recorded, and no
+    /// `before_tool` hook is asked again (the hooks decided, the person approved). What a source
+    /// holds back is still refused, and `after_tool` still reads what the call answered.
     fn step_work(
         &self,
         call: &ToolCall,
         note: Option<&ToolNote>,
         prepared: Prepared,
+        approved: Option<Value>,
     ) -> BoxFuture<'static, Result<HookedOutput, ToolError>> {
         let Prepared {
             tool_ctx,
             holding,
             unjournaled,
+            approvable,
         } = prepared;
         let call = call.clone();
         let name = call.name.clone();
@@ -5471,20 +5667,28 @@ impl LlmAgent {
                     ToolOutput::error(held.reason).sanitized(),
                 ));
             }
-            let mut args = call.arguments.clone();
             let mut hooks_run: Vec<HookDecision> = Vec::new();
-            // `tool.before`: the arguments a rewrite made, or a verdict that ends the call here.
-            let refusal = decide_before(
-                &hooks,
-                &call,
-                &mut args,
-                own.as_ref(),
-                &sources,
-                &mut hooks_run,
-            )?;
-            if let Some(refusal) = refusal {
-                return Ok(refusal);
-            }
+            let args = match approved {
+                // Approved: the arguments the asking step recorded, and no hook asked again.
+                Some(args) => args,
+                None => {
+                    let mut args = call.arguments.clone();
+                    // `tool.before`: the arguments a rewrite made, or a verdict that ends the call
+                    // here (an ask among them: the run parks, and the call runs once approved).
+                    let refusal = decide_before(
+                        &hooks,
+                        &call,
+                        &mut args,
+                        (own.as_ref(), &sources),
+                        approvable,
+                        &mut hooks_run,
+                    )?;
+                    if let Some(refusal) = refusal {
+                        return Ok(refusal);
+                    }
+                    args
+                }
+            };
             let rewritten = args != call.arguments;
             // The arguments the tool ran with, for the two `within` closures: each would otherwise
             // take `args` from this scope, and the after hook reads them again below.
@@ -5522,6 +5726,7 @@ impl LlmAgent {
                 hooks: hooks_run,
                 args: rewritten.then_some(args),
                 events,
+                approval: None,
             })
         }
         .boxed()
@@ -5539,6 +5744,7 @@ impl LlmAgent {
         facts: CallFacts,
         started: Option<Finished>,
         may_ask: bool,
+        approved: Option<Value>,
     ) -> Result<(ToolResult, SandboxUsage), AgentError> {
         let files_used = facts.files_used;
         // A call that started while the model wrote: its work is done, so the step records what it
@@ -5572,6 +5778,7 @@ impl LlmAgent {
                     Some(live),
                     is_unattended(ctx.conversation_id(), context.map(|c| c.as_ref())),
                     may_ask,
+                    true,
                 )
                 .await;
         }
@@ -5583,7 +5790,10 @@ impl LlmAgent {
 
         // Arguments that were not JSON, or a tool nobody has: nothing runs, and the model is told
         // why. The answer comes from the recorded model turn alone, so a replay gives the same one.
-        if let Some(said) = self.shortcut(call, facts.output_cut) {
+        // A call a person approved took its first step already, so it has none.
+        if approved.is_none()
+            && let Some(said) = self.shortcut(call, facts.output_cut)
+        {
             say(
                 ctx,
                 silent,
@@ -5600,9 +5810,20 @@ impl LlmAgent {
         }
         let prepared = self.prepare(&CtxFacts::of(ctx), context, root, notes, call, facts);
         let unjournaled = prepared.unjournaled.clone();
-        let work = self.step_work(call, self.source_note(notes, &call.name), prepared);
-        let outcome: Result<HookedOutput, ToolError> =
-            ctx.step(&format!("tool:{}", call.id), move || work).await?;
+        // A call a person approved runs in a step of its own (ADR 0050, slice H8): the step that
+        // asked is recorded, and this one is taken only after the yes, so a replay that finds it
+        // recorded runs the call no second time.
+        let step = match approved {
+            Some(_) => approval_step(&call.id),
+            None => format!("tool:{}", call.id),
+        };
+        let work = self.step_work(
+            call,
+            self.source_note(notes, &call.name),
+            prepared,
+            approved,
+        );
+        let outcome: Result<HookedOutput, ToolError> = ctx.step(&step, move || work).await?;
         let unattended = is_unattended(ctx.conversation_id(), context.map(|c| c.as_ref()));
         self.conclude(
             ctx,
@@ -5615,6 +5836,7 @@ impl LlmAgent {
             None,
             unattended,
             may_ask,
+            true,
         )
         .await
     }
@@ -5622,7 +5844,9 @@ impl LlmAgent {
     /// What the call's recorded outcome means for the run: the message that answers it, its artifacts
     /// and what it asks the run to keep, or a wait. The step's end is said here, unless `live` says
     /// the call's end was already said as it happened and applying the result did not change it.
-    /// `live` is `Some` for a call of a segment of several, which cannot ask or wait.
+    /// `live` is `Some` for a call of a segment of several, which cannot ask or wait, and for a call
+    /// that started while the model wrote. `alone` is `true` for a call the loop runs by itself (one
+    /// that started early included): only such a call parks for a person's approval (slice H8).
     #[allow(clippy::too_many_arguments)] // the call's pieces, handed over once
     async fn conclude(
         &self,
@@ -5636,6 +5860,7 @@ impl LlmAgent {
         live: Option<Live>,
         unattended: bool,
         may_ask: bool,
+        alone: bool,
     ) -> Result<(ToolResult, SandboxUsage), AgentError> {
         let silent = self
             .source_note(notes, &call.name)
@@ -5648,7 +5873,12 @@ impl LlmAgent {
             None => false,
         };
         let end = |state: StepState| self.step_event(&call.name, &call.id, state, notes);
-        self.observe_tool_ended(ctx, root, &call.name, &call.id, &outcome);
+        // A call that waits for a person's approval has no end yet (slice H8): its end is the step
+        // that runs it, or the refusal, after the answer.
+        let awaits_approval = matches!(&outcome, Ok(hooked) if hooked.awaits_approval().is_some());
+        if !awaits_approval {
+            self.observe_tool_ended(ctx, root, &call.name, &call.id, &outcome);
+        }
         // The custom events the step recorded (ADR 0050, decision 6), after `tool.completed` and in
         // the order the call emitted them: read from the record, so a replay says them again.
         if let Ok(hooked) = &outcome {
@@ -5688,6 +5918,32 @@ impl LlmAgent {
                 .clone(),
         };
         let answered = match outcome {
+            // A hook asked a person to approve the call (ADR 0050, decision 12, slice H8). A call
+            // that ran beside others cannot wait: the model is told to call it alone. Alone, the run
+            // parks on the question, and the call runs once the person says yes.
+            Ok(hooked) if hooked.awaits_approval().is_some() => {
+                if live.is_some() && !alone {
+                    say(
+                        ctx,
+                        silent,
+                        self.step_end(
+                            &call.name,
+                            &call.id,
+                            StepState::Failed,
+                            Some((APPROVAL_NOT_ALONGSIDE, true)),
+                            notes,
+                        ),
+                    )
+                    .await;
+                    ToolResult::error(&call.id, APPROVAL_NOT_ALONGSIDE.to_owned())
+                } else {
+                    say(ctx, silent, end(StepState::Waiting)).await;
+                    ToolResult::NeedsApproval {
+                        question: hooked.approval.unwrap_or_default(),
+                        arguments: hooked.args.unwrap_or_else(|| call.arguments.clone()),
+                    }
+                }
+            }
             Ok(hooked) if live.is_some() && reports_rounds(&hooked.output) => {
                 ToolResult::error(&call.id, NOT_ALONGSIDE.to_owned())
             }
@@ -6096,6 +6352,30 @@ impl LlmAgent {
             event = event.text("status", word, &scrub);
         }
         self.flush_events(vec![event]);
+    }
+
+    /// `approval.asked` or `approval.answered` (ADR 0050, decision 5, slice H8) for the call
+    /// `call_id` of `tool`, keyed under `step`: the asking call's step for the ask (so a replay of the
+    /// transition that parked tells it again with the same key), and the id of the message that
+    /// answered for the answer. `more` adds the event's own fields.
+    fn observe_approval(
+        &self,
+        ctx: &Ctx,
+        root: Option<RunId>,
+        kind: adam_plugin::EventKind,
+        step: &str,
+        (tool, call_id): (&str, &str),
+        more: impl FnOnce(adam_plugin::HookEvent, &dyn Fn(&str) -> String) -> adam_plugin::HookEvent,
+    ) {
+        if self.hooks.is_empty() {
+            return;
+        }
+        let scrub = |s: &str| self.step_io.scrub(s);
+        let header = self.event_header(ctx, root, step, kind);
+        let event = adam_plugin::HookEvent::new(kind, header)
+            .text("tool", tool, &scrub)
+            .text("call_id", call_id, &scrub);
+        self.flush_events(vec![more(event, &scrub)]);
     }
 
     /// The note the listing that offered tool `name` made about it, if the tool is a source's (the
@@ -6981,12 +7261,18 @@ fn access_of(own: Option<&DynTool>, sources: &[DynToolSource], call: &ToolCall) 
 /// other failure denies the call. A rewrite that would change what the call touches
 /// ([`ToolAccess`]) is refused the same way, because the schedule of the turn was made from the
 /// model's arguments (ADR 0049).
+///
+/// An `Ask` (slice H8) is recorded with its question in [`HookedOutput::approval`] and the arguments
+/// the hooks left, and the call is not run in this step: the run parks for the person's approval,
+/// and on yes the call runs in its own step. When `approvable` is `false` (a child run that may not
+/// ask the person, or a firing of a schedule) the ask is recorded as a `deny` and answered with
+/// [`NOT_APPROVABLE`]: nobody would answer it.
 fn decide_before(
     hooks: &HookSet,
     call: &ToolCall,
     args: &mut Value,
-    own: Option<&DynTool>,
-    sources: &[DynToolSource],
+    (own, sources): (Option<&DynTool>, &[DynToolSource]),
+    approvable: bool,
     recorded: &mut Vec<HookDecision>,
 ) -> Result<Option<HookedOutput>, ToolError> {
     if hooks.is_empty() {
@@ -6997,6 +7283,24 @@ fn decide_before(
         tool,
         arguments: &mut *args,
     });
+    // The schedule of the turn was made from the model's arguments (ADR 0049): a rewrite that would
+    // change what the call touches is refused, because two calls the loop started together were
+    // ordered from the arguments it has. A call a person approves runs with the arguments the hooks
+    // left, so the rule holds for an ask too.
+    let changes_access = |args: &Value| {
+        if *args == call.arguments {
+            return false;
+        }
+        let mut rewritten = call.clone();
+        rewritten.arguments = args.clone();
+        access_of(own, sources, &rewritten) != access_of(own, sources, call)
+    };
+    let changed_access = || {
+        format!(
+            "a hook rewrote the arguments of `{tool}` so that the call would touch what the \
+             schedule of the turn was not made from: the call is not run"
+        )
+    };
     let mut refuse = |verdict: &str, reason: String, plugin: Option<&str>| {
         let decision = match plugin {
             Some(plugin) => {
@@ -7010,38 +7314,44 @@ fn decide_before(
             hooks: recorded.clone(),
             args: None,
             events: Vec::new(),
+            approval: None,
         }
     };
     match verdict {
         Ok(Verdict::Continue) => {
-            if *args == call.arguments {
+            if !changes_access(args) {
                 return Ok(None);
             }
-            let mut rewritten = call.clone();
-            rewritten.arguments = args.clone();
-            // The schedule of the turn was made from the model's arguments (ADR 0049): a rewrite that
-            // would change what the call touches is refused, because two calls the loop started
-            // together were ordered from the arguments it has.
-            if access_of(own, sources, &rewritten) == access_of(own, sources, call) {
-                return Ok(None);
-            }
-            Ok(Some(refuse(
-                HookDecision::FAILED,
-                format!(
-                    "a hook rewrote the arguments of `{tool}` so that the call would touch what the \
-                     schedule of the turn was not made from: the call is not run"
-                ),
-                None,
-            )))
+            Ok(Some(refuse(HookDecision::FAILED, changed_access(), None)))
         }
         Ok(Verdict::Deny(reason)) => Ok(Some(refuse(HookDecision::DENY, reason, None))),
-        // Approval (ADR 0050, slice H8) is not built yet: an ask parks nothing, and the call is not
-        // run, exactly as a denial.
-        Ok(Verdict::Ask(question)) => Ok(Some(refuse(
-            HookDecision::ASK,
-            format!("awaiting approval: {question}"),
-            None,
-        ))),
+        Ok(Verdict::Ask(question)) => {
+            if changes_access(args) {
+                return Ok(Some(refuse(HookDecision::FAILED, changed_access(), None)));
+            }
+            // Nobody can answer this run (ADR 0045 decision 9): the ask is read as a denial.
+            if !approvable {
+                return Ok(Some(refuse(
+                    HookDecision::DENY,
+                    format!("{NOT_APPROVABLE}. The question was: {question}"),
+                    None,
+                )));
+            }
+            // The run parks for the person's approval (slice H8). The output is what a build that
+            // predates the slice reads: an error, so the call stays unrun there too.
+            recorded.push(HookDecision::new(
+                HookDecision::TOOL_BEFORE,
+                HookDecision::ASK,
+                Some(&question),
+            ));
+            Ok(Some(HookedOutput {
+                output: ToolOutput::error(format!("awaiting approval: {question}")).sanitized(),
+                hooks: recorded.clone(),
+                args: (*args != call.arguments).then(|| args.clone()),
+                events: Vec::new(),
+                approval: Some(question),
+            }))
+        }
         Ok(Verdict::Stop(reason)) => Ok(Some(refuse(HookDecision::STOP, reason, None))),
         Err(error) if error.is_retryable() => Err(ToolError::Transient(error.to_string())),
         Err(error) => Ok(Some(refuse(
@@ -7205,6 +7515,12 @@ enum ToolResult {
     NeedsInput {
         question: String,
         ui: Option<Value>,
+    },
+    /// A hook asked a person to approve the call (ADR 0050, slice H8): the run parks on the
+    /// question, and on yes runs the call with `arguments`.
+    NeedsApproval {
+        question: String,
+        arguments: Value,
     },
     AwaitRun(RunId),
     AwaitSession(RunId),
@@ -7903,12 +8219,39 @@ impl LlmAgent {
         // A copy of a message the run has read, delivered again while this step runs, is not a
         // reason for another turn.
         ctx.read_already(&state.read_ids);
+        // The person answered an approval (ADR 0050, slice H8): observers are told, keyed by the
+        // message that answered, so a replay of this transition tells them again with the same key.
+        for answer in &absorbed.approvals {
+            self.observe_approval(
+                ctx,
+                state.root_run,
+                adam_plugin::EventKind::ApprovalAnswered,
+                &answer.inbound,
+                (&answer.tool, &answer.call_id),
+                |event, _| event.plain("approved", answer.approved),
+            );
+        }
         // The person answered: the step of the call that asked, which has been `waiting` since, ends.
+        // An approved call's step ends when it has run; a refused one ends failed, with the refusal.
         if let Some((tool, call_id)) = asked
             && state.pending_wait.is_none()
         {
-            ctx.emit(self.step_end_with_result(&state, &tool, &call_id, StepState::Completed))
-                .await;
+            match absorbed.approvals.iter().find(|a| a.call_id == call_id) {
+                Some(answer) if answer.approved => {}
+                Some(_) => {
+                    ctx.emit(self.step_end_with_result(&state, &tool, &call_id, StepState::Failed))
+                        .await;
+                }
+                None => {
+                    ctx.emit(self.step_end_with_result(
+                        &state,
+                        &tool,
+                        &call_id,
+                        StepState::Completed,
+                    ))
+                    .await;
+                }
+            }
         }
         // A credential in the context does not outlive its expiry in the store.
         let expired = state.drop_expired_context(ctx.now());

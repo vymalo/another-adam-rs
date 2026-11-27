@@ -20,10 +20,10 @@ neither the loop nor the runtime.
 | Item | What it is |
 |---|---|
 | `Plugin` | `name`, `message_received`, `model_request` (inside the `model:<turn>` step: it sees `kind` — `Turn` or `Compaction` — and may rewrite `temperature`, `top_p`, `max_output_tokens`, `metadata`, `headers` and an `extra_body` of the call, or `Stop` the run; a header whose name looks like a credential or a body member the client owns fails the run; a replay asks none), `compaction_before` (inside the `compact:` step: it may add `context` to the summary request, or `Deny` it and the history is shortened instead), `run_ending` (`Deny` keeps the run going with the reason), `before_tool` and `after_tool`, each with a do-nothing default, so a plugin that cares about one point implements one method |
-| `Verdict` | `Continue`, `Deny(reason)`, `Ask(reason)`, `Stop(reason)`: the first verdict other than `Continue` is the set's, and a later plugin is not asked |
+| `Verdict` | `Continue`, `Deny(reason)`, `Ask(reason)`, `Stop(reason)`: the first verdict other than `Continue` is the set's, and a later plugin is not asked; **except `Ask` at `before_tool`** (slice H8): the plugins after it are still asked, a later `Deny`, `Stop` or failure wins, and of two asks the first question stands |
 | `HookError` | the plugin's name, an `adam-error` class and a reason (never an argument or a tool's answer); `is_retryable` follows the class |
 | `HookLimits` | the deadline of one hook (1 s by default) and how many times a retryable failure is tried again (1) |
-| `HookSet` | the ordered plugins and their limits; `message_received`, `before_tool` and `after_tool` run them, `catch_unwind` each call, and stop at the first decision |
+| `HookSet` | the ordered plugins and their limits; `message_received`, `before_tool` and `after_tool` run them, `catch_unwind` each call, and stop at the first decision (at `before_tool`, the first `Deny` or `Stop`: an `Ask` lets the rest decide) |
 | `HookedCall`, `HookedText` | what a hook sees: the tool's name and its arguments (rewritable), and the text the model will read (rewritable) |
 | `HookedModelRequest`, `ModelCallKind`, `HookedCompaction` | what a `model.request` hook sees (the call's kind, temperature, output bound and metadata) and what a `compaction.before` hook sees (the `context` it may add to the summary request). `HookedModelRequest` gained the public field `kind` (2026-11-26), so a hand-built literal needs it |
 | `EventSpec`, `Visibility` (H5) | a custom event as it is declared: `EventSpec::new("demo.published")` is version 1, any data, `Visibility::Hooks`; `.published()` makes it `Visibility::Clients` (it also goes out as a `RunEvent::Custom`), `.with_version(n)`, `.with_schema(json)`. The name is `^[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*){1,4}$` and its first segment, the namespace, is not one of `RESERVED_NAMESPACES` (`run`, `message`, `turn`, `model`, `tool`, `permission`, `question`, `approval`, `compaction`, `child`, `session`, `usage`, `artifact`, `exec`, `hook`, `adam`; compared without regard to case). `EventSpec::validate`, `check_event_name`, `declared` (every declaration valid, two of a name equal) and `DeclarationError` (class `Invalid`) are the checks the agent's build runs. `DATA_MAX` (4 KiB), `STEP_EVENTS_MAX` (16) and `TRANSITION_EVENTS_MAX` (256) are the bounds `adam-llm-agent` holds an emit to |
@@ -37,13 +37,16 @@ neither the loop nor the runtime.
   through: the set answers a `HookError` and the caller refuses. A panic is `Invalid` (a buggy plugin is
   not unlucky); a deadline is `Transient`.
 - **A transient failure is retried** `HookLimits::retries` times in the same step, then refused.
-- **Order is declaration order**, and a decision short-circuits the rest of the set.
+- **Order is declaration order**, and a decision short-circuits the rest of the set. The one exception is
+  an `Ask` at `before_tool` (slice H8): a call a person approves runs, so every plugin after the one that
+  asked has its say, and a refusal among them wins. `adam-llm-agent` parks the run on the question;
+  `approval.asked` and `approval.answered` are the two `EventKind`s an observer reads about it.
 
 ## Tests
 
-`tests/conformance.rs` runs `adam_plugin_testkit::plugin_conformance!` (11 cases) against a set with a
+`tests/conformance.rs` runs `adam_plugin_testkit::plugin_conformance!` (12 cases) against a set with a
 20 ms deadline and one retry: an empty set continues, plugins run in order and the first verdict
-decides, `Ask` and `Stop` are verdicts, a rewrite is visible, a panic is `Invalid`, an `Invalid` hook
+decides, `Ask` and `Stop` are verdicts, an `Ask` lets the plugins after it refuse (H8), a rewrite is visible, a panic is `Invalid`, an `Invalid` hook
 denies, a transient failure is retried once then continues, one that keeps failing denies, a hook past
 its deadline is retryable, `after_tool` runs its plugins, and `message_received` runs its plugins and a
 refusal decides. The panic case was **seen red** with `catch_unwind` removed (the panic escaped into

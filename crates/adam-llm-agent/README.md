@@ -25,7 +25,7 @@ instructions + a model + a toolset. It is served over A2A by
 | `Limits` | `max_turns`, `max_tool_calls`, `max_output_tokens` (the cap a call asks for; `0` leaves it to the model, and `Limits::default()` is 4,096 for a hand-built agent: the 128,000 fallback and the model's profile are resolved and clamped by the assembly, ADR 0064), `max_history_tokens`; `max_turns` and `max_tool_calls` end the run with a closing turn (below), history shortens old tool output **in the stored history** (below), and a history that reaches its budget is **compacted** (*Compaction*, below) |
 | `HookSet`, `Plugin`, `Verdict`, `HookError`, `HookLimits`, `HookedCall`, `HookedText`, `HookedMessage`, `HookedEnd`, `MessageFile`, `HookedModelRequest`, `ModelCallKind`, `HookedCompaction` | ADR 0050 slices H1, H1b, H1c, H3 and H9 (`run_ending`, step `end:<turn>`, `LlmAgentBuilder::max_run_continuations`; `model_request`; `compaction_before`), re-exported from `adam-plugin`: `HookSet::new().with(Arc::new(plugin)).with_limits(HookLimits { deadline, retries })`, and `Plugin` with `name`, `message_received(&mut HookedMessage { text, files })`, `before_tool(&mut HookedCall { tool, arguments })` and `after_tool(&HookedCall, &mut HookedText { text })`. `model_request` sees `HookedModelRequest { kind, temperature, max_output_tokens, metadata }` (`kind` is `Turn` or `Compaction`); `compaction_before` sees `HookedCompaction { context }` and may add context to the summary request or veto it with `Deny`, and the history is shortened instead. Installed with `LlmAgentBuilder::hooks`/`.plugin`; see *Hooks around a tool call* and *A hook may refuse a person's message* |
 | `EventSpec`, `Visibility`, `Subscriptions`, `DeclarationError`, `EmitError`, `RecordedEvent` | ADR 0050 slice H5, custom events (see *Custom events a tool emits*): `Tool::events()` (defaulted: none) and `LlmAgentBuilder::event(EventSpec)` declare them, `ToolCtx::emit_event(name, data)` emits, `ToolCtx::with_events(specs)` and `emitted_events()` are for a test of a tool; `BuildError::Event` is a refused declaration; `HookedOutput::events` is what the step records |
-| `HookedOutput`, `HookDecision`, `MessageDecision` | what the journaled `tool:<call id>` step records: `output` (a flattened `ToolOutput`), `hooks` (the decisions that were not `Continue`, each with `point`, `verdict`, `reason` and the failing `plugin`) and `args` (the arguments that ran, when a rewrite changed them) and `events` (the custom events the call emitted, slice H5); `MessageDecision` is what a message's step records: `text` (when a hook rewrote the message) and `hook` (the refusal). A record written before hooks existed is a bare `ToolOutput` and decodes; an older build reads a new one as its output |
+| `HookedOutput`, `HookDecision`, `MessageDecision` | what the journaled `tool:<call id>` step records: `output` (a flattened `ToolOutput`), `hooks` (the decisions that were not `Continue`, each with `point`, `verdict`, `reason` and the failing `plugin`) and `args` (the arguments that ran, when a rewrite changed them) and `events` (the custom events the call emitted, slice H5) and `approval` (the question a hook asked a person to approve, slice H8: the run parks on it; `awaits_approval()` reads it); `MessageDecision` is what a message's step records: `text` (when a hook rewrote the message) and `hook` (the refusal). A record written before hooks existed is a bare `ToolOutput` and decodes; an older build reads a new one as its output |
 | `Tool` (trait), `DynTool` | `spec() -> ToolSpec`, `async call(&ToolCtx, Value) -> Result<ToolOutput, ToolError>` and the default methods `required_state() -> Vec<StateKey>` (none) and `asks_user() -> bool` (`false`: says the tool can end a call with `NeedsInput`, so the loop runs such a call alone; whether the person can be asked is decided per run, see *Child sessions*; `#[tool(asks_user)]` and `FnTool::asking_user()` set it) and `step_style() -> StepStyle` (how a call is drawn as a step: the default is a plain `tool` labelled with the tool's name; `#[tool(step = "subagent", label = "Hand to the helper", icon = "agent")]` sets it; a tool that wraps another must forward it, as `required_state` and `asks_user`; see *Steps*) and `read_answer(call_id, args, ui, payload) -> AnswerCheck` (`Accept`, `Read(text)`, `Refuse(Refusal)` or `End(Refusal)`; the default accepts: reads the answer to the tool's own question before the model does; see *The answer is read by the tool that asked*) |
 | `ToolOutput` | `text`, `error`, `with_artifact`, `pinned()` (a compaction that drops the result copies it into its marker, see *Compaction*), `with_loaded` (a loader's whole list, journaled with the result, see `Loaded` below). A tool can return a **file** (`with_artifact(Artifact::file(..))`, [ADR 0012](../../docs/decisions/0012-files-as-a2a-artifacts.md)): the model is told only the tool's `content` (a line such as `Shared chart.svg (1.2 KiB, image/svg+xml).`), the bytes go to the run's artifacts and never into the history, the step's output or the run's final output. The loop keeps at most `MAX_RUN_FILE_BYTES` (6 MiB) of files per run: a file that would go over is not emitted and the result, marked as an error, says so. That check comes after the result is journaled, so a tool that may return several files it did not choose keeps its result within `ToolCtx::files_left()` (`adam_runtime::ReceivedFiles` does). `ArtifactRef` (what the state and the final output list) has `bytes: Option<u64>` for a file, absent otherwise and in state written before it existed. `announcing(text)` (the member `answer`) makes `text` **the run's answer**, see *Announced answers*. `sandbox: SandboxUsage` is what the call reported with `ToolCtx::report_sandbox`, put there by the loop and journaled with the result (absent from a journal from before, not written while empty), see *Sandbox time* |
 | `StepStyle`, `StepEvent`, `StepKind`, `StepState`, `StepIcon`, `StepOutput` | `StepStyle::new(kind).with_label(..).with_icon(..)`; the others are `adam-runtime`'s, re-exported (see *Steps*) |
@@ -50,6 +50,7 @@ instructions + a model + a toolset. It is served over A2A by
 | `Conversation::context`, `merge_context`, `drop_expired_context`, `MAX_CONTEXT_BYTES` | what the messages of the run say about their sender, merged key by key (`null` deletes), bounded, with expiring entries; see *Context and tool sources* |
 | `SessionTools`, `SessionAgent`, `SESSION_TOOLS`, `SUBAGENT_START` .. `SUBAGENT_LIST`, `MAX_OPEN_SESSIONS`, `MAX_SESSION_ROUNDS`, `LlmAgentBuilder::session_agents` | the five tools that run a subagent in the background as a session (ADR 0045), and the wait a turn makes for the sessions it started: see *Child sessions*. Each `SessionAgent` carries the `SessionBounds` of a session on it ([ADR 0054](../../docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md) slice 1 part 2: the assembly computes them from the subagent's folder and the deployment), which `SessionTools::bounds()` answers by name; `SessionBounds::admit` holds a `subagent_start`'s `config` to them |
 | `Conversation`, `PendingWait`, `PendingQuestion`, `PendingRun`, `PendingRemote`, `PendingSession`, `ArtifactRef` | what `Runtime::state(run)` deserializes into (the whole state); `Runtime::view(run).state` is its **head** — the same shape with `messages` empty (ADR 0055); `Conversation::split`/`join` are the `Agent` hook that keeps `messages` in the body and everything else in the head (see the runtime's *The head and the body*); `PendingQuestion::ui` is the interface that came with the question (absent when there is none, and in state stored before it existed); `Conversation::pending_wait` is the question, the child run or the remote task the parked run waits for (it was `pending_question`, and state stored under that name still loads); `Conversation::continued_from` is the run a continued run carries on, and `Conversation::omitted_turns` how many turns of earlier conversation were left out to meet the cap (both absent otherwise, and in state stored before they existed), `Conversation::root_run` the top of a child run's parent chain (absent for a run that is nobody's child, and in state stored before it existed), `Conversation::model_run` the run its model calls name when its parent said one (ADR 0067; absent otherwise and in older state); `Conversation::loaded`, `loaders`, `removed_tools` and `carried_tools` are ADR 0066's loaded set (see `Loaded` above); a continuation carries them, except that `carried_tools` (the last request's loaded tools) starts empty, because a continuation's first request has no request before it |
+| `Approval`, `Conversation::approval`, `approval_step`, `approves`, `NOT_APPROVABLE` | ADR 0050 slice H8, see *`Ask` parks for the person's approval*: the call a hook asked a person to approve (`call_id`, `tool`, `question`, `arguments`, `approved`), the name of the step that runs it once approved (`tool:<call id>:approved`), the rule that reads a yes, and what a run nobody can approve answers the call with |
 | `Conversation::continued(&self, text, from: RunId)`, `LlmAgent::init_continuing`, `LlmStarter::init_continuing` | the conversation of a new run that carries on this one with one more user message; what is carried, dropped and reset is in *Continuing a conversation* |
 | `Conversation::is_omission_marker(message, part)` | whether that text part is the marker (the second part of the first message while `omitted_turns` is not zero), so a rule that reads what the user said skips exactly it: the coder's `person_texts` |
 | `MAX_CARRIED_BYTES`, `OMITTED_MARKER_PREFIX` | the cap on the history a continuation carries (256 KiB of JSON), and the prefix of the marker text part that stands in for the turns dropped to fit it |
@@ -874,9 +875,9 @@ they are added in is the order their hooks run in. `adam-plugin` holds the vocab
   step is added and no step name or seq changes, whatever a plugin decides, so adding or removing one
   leaves every journal replayable.
 * **What a hook may do.** Rewrite the arguments (before) or the text the model reads (after); `Deny`
-  answers the call with the reason and the run goes on; `Ask` answers `awaiting approval: <question>`
-  and the call does not run — approval is ADR 0050's slice H8; `Stop` answers the call with the
-  reason and fails the run `stopped by a plugin: <reason>`.
+  answers the call with the reason and the run goes on; `Ask` parks the run for the person's approval
+  (slice H8, below); `Stop` answers the call with the reason and fails the run
+  `stopped by a plugin: <reason>`.
 * **Fail closed.** A hook that errors, panics or misses its deadline never lets the call through. A
   `Transient`/`RateLimited` failure is the step's own: the transition is retried and the call runs
   afresh. Anything else denies the call (before) or turns the result into an error (after).
@@ -894,6 +895,55 @@ they are added in is the order their hooks run in. `adam-plugin` holds the vocab
 * **A call that starts while the model writes** (ADR 0049) runs its hooks when it starts, and its
   step is written once the stream ends: a stream that fails runs its hooks again with the call, and
   the recorded step is the one no later replay asks about.
+
+## `Ask` parks for the person's approval (ADR 0050, decision 12, slice H8)
+
+A `before_tool` hook that returns `Verdict::Ask(question)` parks the run on a question, and the call
+runs only if the person says yes.
+
+* **Every plugin still has its say.** `HookSet::before_tool` keeps asking the plugins after the one
+  that asked; a later `Deny`, `Stop` or failure wins, and of two asks the first question stands. A
+  rewrite made before or after the ask is in the arguments that run, and one that would change
+  `Tool::access` is refused as for `Continue`.
+* **The step that asks records it.** `tool:<call id>` records `HookedOutput` with the `ask` decision,
+  the arguments the hooks left (`args`) and the new member **`approval`** (the question). Its output is
+  the error `awaiting approval: <question>`, so a build that predates H8 reads the call as unrun, and
+  a record written before H8 (no `approval`) still replays as an unrun call. A replay of the
+  transition that parked finds the step recorded: it parks on the same question and asks no hook.
+* **The question is the one every question takes.** The run parks with a `PendingQuestion` (the
+  hook's words, then "Approve the call to `<tool>`? Answer yes to run it; any other answer refuses
+  it.", no `ui`) at `/pending_wait/question`, which the A2A front reads for `input-required` as it
+  does for `ask_user` (no A2A test drives an approval yet, and `adam-engine`'s builder takes no
+  `HookSet`: ADR 0047 slice 5); the `input_required` event says `"approval": true`. The call is kept
+  in `Conversation::approval` (`Approval { call_id, tool, question, arguments, approved }`).
+* **Yes runs the call once.** A clear yes (`approves`: `yes`, `y`, `approve`, `approved`, `allow`,
+  `ok`, `okay`, any case, a final `.` or `!`) sets `approved`, and the loop runs the call next, alone,
+  in the journaled step **`tool:<call id>:approved`** (`approval_step`) with the recorded arguments:
+  no `before_tool` hook is asked again, a source's `withhold` and `after_tool` still apply. A replay
+  past that step's journal write finds it recorded and runs nothing. The approval is cleared in the
+  state that commits the call's result.
+* **Anything else is a no.** The call is answered with `not run: the person did not approve the call.
+  They answered: <words>` and the run goes on; no step is taken.
+* **A run nobody can approve reads `Ask` as `Deny`.** A child run that may not ask the person (ADR 0045
+  decision 9, `Conversation::may_ask_person`) or a firing of a schedule (`is_unattended`) records the
+  ask as a `deny` and answers the call with `NOT_APPROVABLE` and the question; nothing parks.
+* **Beside other calls** (a segment of ADR 0049) an asked call cannot wait: it is answered "call the
+  tool alone to have it approved" and not run. A single call that started while the model wrote
+  parks as one that did not.
+* **Observers** read `approval.asked` (key `<run>/tool:<call id>/approval.asked/0`, the `tool`, the
+  `call_id` and the `question`) when the run parks, and `approval.answered` (key
+  `<run>/<inbound id>/approval.answered/0`, with `approved`) when the answer is taken in; the asking
+  call has no `tool.completed` or `tool.denied` until it runs or is refused.
+* **Breaking:** `HookedOutput` and `Conversation` gain public fields (`approval`), so a struct literal
+  outside the crate names them; `HookSet::before_tool` no longer stops at an `Ask`. `tool:<call id>:approved`
+  is a new step name: roll every worker before a deployment whose plugins ask uses this build.
+
+Tests: `tests/approval.rs` — an approved call runs once across a crash (the worker dies in the next
+call after `tool:c1:approved` was journaled; the side effect stays at 1), a replay never asks twice
+(the park's commit is lost, and the replay parks on the recorded ask with the hook asked once), a
+child reads `Ask` as `Deny`, a no refuses the call with the person's words, only a clear yes approves,
+and an ask written before H8 still reads as an unrun call. `tests/hooks.rs`
+`an_ask_parks_the_run_and_observers_read_the_approval` holds the observer events and their keys.
 
 ## A hook may refuse a person's message (ADR 0050, slice H1b)
 
@@ -921,7 +971,7 @@ Tests: `tests/hooks.rs` — a replay past the step's journal write asks no hook 
 stays at 1 while the unrecorded call's reaches 2), a rewrite that changes `Tool::access` is denied (the
 tool never runs, the record says `failed`), old and new records decode both ways, each of four calls of
 one turn runs its own hooks, a rewrite at each point is what runs and what the model reads, and deny,
-ask, stop and a panicking plugin.
+an ask that parks, stop and a panicking plugin.
 
 ## Custom events a tool emits (ADR 0050, slice H5)
 

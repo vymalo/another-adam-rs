@@ -189,15 +189,16 @@ pub use adam_runtime::{Artifact, StepEvent, StepIcon, StepKind, StepOutput, Step
 pub use agent::{
     BuildError, CLOSING_TURN, DEFAULT_MAX_PARALLEL, DEFAULT_WAIT_POLL, Limits, LlmAgent,
     LlmAgentBuilder, LlmStarter, MAX_INTERFACE_LANGUAGE_BYTES, MAX_PARALLEL_LIMIT,
-    MAX_THINKING_CUTS, ModelBinding, NOT_ASKABLE, THINKING_CUT_TURN, UNATTENDED,
-    interface_language, interface_language_turn, is_unattended, tool_retry_key,
+    MAX_THINKING_CUTS, ModelBinding, NOT_APPROVABLE, NOT_ASKABLE, THINKING_CUT_TURN, UNATTENDED,
+    approval_step, approves, interface_language, interface_language_turn, is_unattended,
+    tool_retry_key,
 };
 pub use compaction::{
     COMPACTION_TURN, Compaction, CompactionReason, MAX_COMPACTIONS, PromptSize,
     WINDOW_MARGIN_TOKENS, summary_output_tokens,
 };
 pub use conversation::{
-    ACCESS_TIER_CONTEXT_KEY, ArtifactRef, CALLER_CONTEXT_KEY, CHILD_SESSIONS_CONTEXT_KEY,
+    ACCESS_TIER_CONTEXT_KEY, Approval, ArtifactRef, CALLER_CONTEXT_KEY, CHILD_SESSIONS_CONTEXT_KEY,
     Conversation, LOCALE_CONTEXT_KEY, LimitHit, LimitKind, Loaded, Loader, MAX_CARRIED_BYTES,
     MAX_CONTEXT_BYTES, MAX_LOADED_NOTE_BYTES, MAX_PROTECTED_VALUE_BYTES, MAX_READ_IDS,
     MAX_REPORTED_ROUNDS, MESSAGE_KIND, MODEL_CONTEXT_KEY, ModelSwitch, OMITTED_MARKER_PREFIX,

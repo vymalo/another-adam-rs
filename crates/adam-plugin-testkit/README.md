@@ -21,7 +21,9 @@ slice H1). Test code, not a product.
 functions a hook set must pass — invoke it at **module level** in the crate's own `tests/`, not inside
 a test function (a test declared inside a function is not collected, and `cargo test` says so). Every
 case above is covered; the set under test supplies its own limits, so the deadline case is asserted
-against whatever it chose.
+against whatever it chose. Since slice H8, `an_ask_lets_the_plugins_after_it_refuse` holds that a `before_tool`
+`Ask` does not end the set: the plugin after it is asked, a `Deny` after it wins, and of two asks the first
+question stands.
 
 ## `events_conformance!` (slice H5)
 

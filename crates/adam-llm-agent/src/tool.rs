@@ -757,7 +757,9 @@ impl HookDecision {
     pub const MESSAGE_RECEIVED: &str = adam_plugin::MESSAGE_RECEIVED;
     /// The call is refused, and the reason is its result.
     pub const DENY: &str = "deny";
-    /// A person is asked first. Until approval exists (ADR 0050, slice H8) the call is not run.
+    /// A person is asked first (ADR 0050, decision 12, slice H8). A record written since H8 says
+    /// so in [`HookedOutput::approval`] too, and the run parks on the question; a record written
+    /// before it (no `approval`) left the call unrun, and a replay reads it the same way.
     pub const ASK: &str = "ask";
     /// The run ends after this call, with the reason.
     pub const STOP: &str = "stop";
@@ -809,6 +811,18 @@ pub struct HookedOutput {
     /// written before custom events existed.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub events: Vec<RecordedEvent>,
+    /// The question a `before_tool` hook asked a person to approve, when the call waits for that
+    /// approval (ADR 0050, decision 12, slice H8): the run parks on it, and on yes the call runs in
+    /// the step `tool:<call id>:approved` with the arguments recorded here ([`args`](Self::args),
+    /// or the model's own). Absent when no hook asked, from a record written before H8 (whose `ask`
+    /// left the call unrun) and from a run that cannot ask a person (its `ask` is recorded as a
+    /// `deny`). The [`output`](Self::output) beside it is the error `awaiting approval: <question>`,
+    /// so a build that predates H8 reads the call as unrun.
+    ///
+    /// **Breaking:** a new public field of a struct that is not `#[non_exhaustive]`: a literal
+    /// outside the crate names it (`approval: None`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval: Option<String>,
 }
 
 impl HookedOutput {
@@ -820,7 +834,14 @@ impl HookedOutput {
             hooks: Vec::new(),
             args: None,
             events: Vec::new(),
+            approval: None,
         }
+    }
+
+    /// The question the call waits on, when a hook asked a person to approve it (slice H8).
+    #[must_use]
+    pub fn awaits_approval(&self) -> Option<&str> {
+        self.approval.as_deref()
     }
 
     /// The reason a hook stopped the run, when one did; `None` otherwise.
