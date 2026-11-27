@@ -1,0 +1,46 @@
+[package]
+name = "adam-hook-exec"
+description = "The adam-hooks/1 adapter: a program on stdio behind the Plugin trait (ADR 0050, slice P1)"
+readme = "README.md"
+# The protocol's test program lives in `tests/program/`, which cargo would also discover as an
+# integration test: the targets are declared here instead.
+autotests = false
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+adam-error.workspace = true
+adam-plugin.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+adam-core.workspace = true
+async-trait.workspace = true
+adam-llm-agent.workspace = true
+adam-model.workspace = true
+adam-runtime.workspace = true
+tempfile.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
+
+# The protocol's test program (ADR 0050, slice P1): a bin, so an integration test can run it as the
+# child the adapter starts (`env!("CARGO_BIN_EXE_adam-hook-exec-test-program")`).
+[[bin]]
+name = "adam-hook-exec-test-program"
+path = "tests/program/main.rs"
+
+[[test]]
+name = "exec"
+path = "tests/exec.rs"
+
+[[test]]
+name = "replay"
+path = "tests/replay.rs"
+
+[lints]
+workspace = true

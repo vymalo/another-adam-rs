@@ -655,6 +655,11 @@ pub const CONTEXT_WINDOW_PROMPT_TOKENS: u32 = 20_000;
 /// [ADR 0054]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md
 pub const CONTEXT_WINDOW_HEADROOM_TOKENS: u32 = 8_000;
 
+/// The most bytes of a session's `report_schema` as compact JSON: 16 KiB ([ADR 0054], decision 4).
+///
+/// [ADR 0054]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md
+pub const MAX_REPORT_SCHEMA_BYTES: usize = 16 * 1024;
+
 /// The configuration a session runs with ([ADR 0054]): every option optional, and each one only
 /// ever **narrows** what the subagent's folder and the deployment allow ([`SessionBounds::admit`]).
 ///
@@ -697,7 +702,26 @@ pub struct SessionConfig {
     /// The most rounds the session may have, 1 to the root's effective `max_session_rounds`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_rounds: Option<u32>,
+    /// A JSON Schema (draft 2020-12) the round's final answer must match: one JSON value, checked
+    /// by the loop at the final answer ([ADR 0054], slice 9). At most [`MAX_REPORT_SCHEMA_BYTES`],
+    /// no `$ref` outside itself, and it must compile ([`SessionBounds::admit`]). Local subagents
+    /// only.
+    ///
+    /// [ADR 0054]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub report_schema: Option<Value>,
+    /// Text the parent agent (or the person) adds to this session, **after** the folder's own
+    /// instructions and never replacing them: at most [`MAX_SESSION_INSTRUCTIONS_CHARS`] characters,
+    /// rendered under a fixed heading that says where it comes from and that the text above wins
+    /// ([ADR 0054], decision 4).
+    ///
+    /// [ADR 0054]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instructions: Option<String>,
 }
+
+/// The most characters a session's `instructions` may hold ([ADR 0054], decision 4).
+pub const MAX_SESSION_INSTRUCTIONS_CHARS: usize = 4_000;
 
 impl SessionConfig {
     /// Whether no option is asked for: the folder's own settings, exactly as no `config` at all.
@@ -709,6 +733,8 @@ impl SessionConfig {
             && self.max_parallel_tool_calls.is_none()
             && self.time_limit.is_none()
             && self.max_rounds.is_none()
+            && self.report_schema.is_none()
+            && self.instructions.is_none()
     }
 
     /// Read a `config` object ([ADR 0054], decision 1). **An unknown member is refused**, unlike the
@@ -906,6 +932,21 @@ impl SessionBounds {
         if let Some(v) = requested.max_rounds {
             within("max_rounds", v, 1, self.max_rounds)?;
         }
+        if let Some(text) = &requested.instructions {
+            let chars = text.chars().count();
+            if chars > MAX_SESSION_INSTRUCTIONS_CHARS {
+                return Err(Refusal::new(
+                    Some("instructions"),
+                    format!(
+                        "config.instructions is {chars} characters; at most \
+                         {MAX_SESSION_INSTRUCTIONS_CHARS}"
+                    ),
+                ));
+            }
+        }
+        if let Some(schema) = &requested.report_schema {
+            report_schema_admissible(schema)?;
+        }
         Ok(requested)
     }
 }
@@ -958,8 +999,66 @@ impl SessionBounds {
             max_rounds: config
                 .max_rounds
                 .map(|v| v.clamp(1, self.max_rounds.max(1))),
+            report_schema: config.report_schema.clone(),
+            // Text has no bound to clamp to: `admit` already refused one that is too long, and a
+            // later round keeps what the session was started with.
+            instructions: config.instructions.clone(),
         }
     }
+}
+
+/// The first `$ref` or `$dynamicRef` of `schema` that does not point inside it (its text does not
+/// start with `#`), at any depth.
+fn outside_ref(schema: &Value) -> Option<&str> {
+    match schema {
+        Value::Object(members) => members.iter().find_map(|(key, value)| match value {
+            Value::String(target)
+                if (key == "$ref" || key == "$dynamicRef") && !target.starts_with('#') =>
+            {
+                Some(target.as_str())
+            }
+            _ => outside_ref(value),
+        }),
+        Value::Array(items) => items.iter().find_map(outside_ref),
+        _ => None,
+    }
+}
+
+/// Whether `schema` may be a session's `report_schema` ([ADR 0054], decision 4): a JSON object, at
+/// most [`MAX_REPORT_SCHEMA_BYTES`], no reference outside itself, and a schema of draft 2020-12 that
+/// compiles with nothing fetched.
+///
+/// [ADR 0054]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md
+fn report_schema_admissible(schema: &Value) -> Result<(), Refusal> {
+    let refuse = |message: String| Refusal::new(Some("report_schema"), message);
+    if !schema.is_object() {
+        return Err(refuse(
+            "config.report_schema must be a JSON Schema, an object".to_owned(),
+        ));
+    }
+    let bytes = serde_json::to_vec(schema).map_or(usize::MAX, |b| b.len());
+    if bytes > MAX_REPORT_SCHEMA_BYTES {
+        return Err(refuse(format!(
+            "config.report_schema is {bytes} bytes; at most {MAX_REPORT_SCHEMA_BYTES} (16 KiB)"
+        )));
+    }
+    if let Some(target) = outside_ref(schema) {
+        let shown: String = target.chars().take(80).collect();
+        return Err(refuse(format!(
+            "config.report_schema has a reference to {shown:?}; a report_schema may refer only to \
+             itself (a `$ref` that starts with `#`), never to another document"
+        )));
+    }
+    jsonschema::draft202012::options()
+        .offline()
+        .build(schema)
+        .map(|_| ())
+        .map_err(|why| {
+            let why: String = why.to_string().chars().take(300).collect();
+            refuse(format!(
+                "config.report_schema is not a JSON Schema of draft 2020-12 that compiles: {why}"
+            ))
+        })
 }
 
 /// `value` between `min` and `max`, or the sentence that says the option and the range.
@@ -1355,6 +1454,7 @@ mod tests {
             keep_open: true,
             closed: false,
             closing: false,
+            deleted: false,
             round: 1,
             root: Some(root),
             workspace: Some(workspace),
@@ -1392,6 +1492,7 @@ mod tests {
             keep_open: true,
             closed: true,
             closing: true,
+            deleted: false,
             round: 3,
             root: None,
             workspace: None,
@@ -1570,6 +1671,7 @@ mod tests {
             keep_open,
             closed,
             closing: false,
+            deleted: false,
             round: 1,
             root: None,
             workspace: None,
@@ -2276,6 +2378,7 @@ mod tests {
             max_parallel_tool_calls: Some(2),
             time_limit: Some(3),
             max_rounds: Some(4),
+            report_schema: Some(serde_json::json!({"type": "object"})),
         };
         let admitted = bounds().admit(requested.clone()).expect("all lowered");
         assert_eq!(
@@ -2319,6 +2422,106 @@ mod tests {
         }
     }
 
+    fn reporting(schema: Value) -> SessionConfig {
+        SessionConfig {
+            report_schema: Some(schema),
+            ..SessionConfig::default()
+        }
+    }
+
+    #[test]
+    fn a_report_schema_of_draft_2020_12_is_admitted_as_asked() {
+        let schema = serde_json::json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {"node": {"$ref": "#/$defs/node"}},
+            "$defs": {"node": {"type": "object", "properties": {"next": {"$ref": "#/$defs/node"}}}},
+        });
+        let asked = reporting(schema);
+        assert_eq!(bounds().admit(asked.clone()).expect("admitted"), asked);
+        assert!(!asked.is_empty());
+    }
+
+    #[test]
+    fn a_report_schema_with_a_reference_outside_itself_is_refused_by_name() {
+        for outside in [
+            serde_json::json!({"$ref": "https://example.com/other.json"}),
+            serde_json::json!({"$ref": "other.json"}),
+            serde_json::json!({"properties": {"a": {"items": [{"$ref": "file:///etc/x.json"}]}}}),
+            serde_json::json!({"$dynamicRef": "https://example.com/meta"}),
+        ] {
+            let why = bounds()
+                .admit(reporting(outside.clone()))
+                .expect_err("a reference to another document");
+            assert_eq!(why.option(), Some("report_schema"), "{outside}");
+            assert!(
+                why.message().contains("config.report_schema")
+                    && why.message().contains("refer only to itself"),
+                "{}",
+                why.message()
+            );
+        }
+    }
+
+    #[test]
+    fn a_report_schema_over_16_kib_is_refused_and_one_at_the_limit_is_not() {
+        let padded = |len: usize| serde_json::json!({"description": "x".repeat(len)});
+        let overhead = serde_json::to_vec(&padded(0)).unwrap().len();
+        let at = padded(MAX_REPORT_SCHEMA_BYTES - overhead);
+        assert_eq!(
+            serde_json::to_vec(&at).unwrap().len(),
+            MAX_REPORT_SCHEMA_BYTES
+        );
+        bounds().admit(reporting(at)).expect("exactly 16 KiB");
+        let why = bounds()
+            .admit(reporting(padded(MAX_REPORT_SCHEMA_BYTES - overhead + 1)))
+            .expect_err("one byte over");
+        assert_eq!(why.option(), Some("report_schema"));
+        assert!(
+            why.message().contains("at most 16384 (16 KiB)"),
+            "{}",
+            why.message()
+        );
+    }
+
+    #[test]
+    fn a_report_schema_that_does_not_compile_or_is_not_an_object_is_refused() {
+        let broken = bounds()
+            .admit(reporting(serde_json::json!({"type": "no-such-type"})))
+            .expect_err("not a schema");
+        assert_eq!(broken.option(), Some("report_schema"));
+        assert!(
+            broken.message().contains("draft 2020-12 that compiles"),
+            "{}",
+            broken.message()
+        );
+        let scalar = bounds()
+            .admit(reporting(serde_json::json!("string")))
+            .expect_err("not an object");
+        assert!(
+            scalar.message().contains("an object"),
+            "{}",
+            scalar.message()
+        );
+    }
+
+    #[test]
+    fn a_report_schema_crosses_the_wire_camel_case_and_survives_a_clamp() {
+        let config = SessionConfig::from_value(serde_json::json!({
+            "reportSchema": {"type": "string"},
+        }))
+        .expect("an option");
+        assert_eq!(
+            config.report_schema,
+            Some(serde_json::json!({"type": "string"}))
+        );
+        assert_eq!(
+            serde_json::to_value(&config).unwrap(),
+            serde_json::json!({"reportSchema": {"type": "string"}})
+        );
+        assert_eq!(bounds().clamp(&config), config);
+    }
+
     #[test]
     fn clamp_brings_every_option_down_to_the_bounds_of_now_and_never_raises_one() {
         let ask = SessionConfig {
@@ -2329,6 +2532,7 @@ mod tests {
             max_parallel_tool_calls: Some(8),
             time_limit: Some(25),
             max_rounds: Some(10),
+            report_schema: Some(serde_json::json!({"type": "object"})),
         };
         // A deployment that lowered every limit since the session started.
         let lowered = SessionBounds {
