@@ -38,10 +38,10 @@ brew install "$tap/adam-agent"
 brew test "$tap/adam-agent"
 out=$(adam-agent --version)
 echo "$out"
-case "$out" in
-  "adam-agent $version"*) ;;
-  *) echo "adam-agent --version says '$out', want 'adam-agent $version...'" >&2; exit 1 ;;
-esac
+if [ "$out" != "adam-agent $version" ]; then
+  echo "adam-agent --version says '$out', want 'adam-agent $version'" >&2
+  exit 1
+fi
 # Startup, not just the version: no configuration is a configuration error (78), not a crash or a hang.
 code=0
 env -i PATH="$PATH" adam-agent >/dev/null 2>&1 || code=$?

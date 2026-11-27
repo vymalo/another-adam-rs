@@ -13,7 +13,7 @@ A2A_BEARER_TOKENS=dev-token PUBLIC_URL=http://127.0.0.1:8080/ \
 ```
 
 Installed with Homebrew (`brew install vymalo/tap/adam-agent`, one binary for Linux (static) and macOS, arm64 and x86_64,
-built from each release) it is the same process: `adam-agent --version` and `adam-agent --help` answer before any
+built from each release) it is the same process: `adam-agent --version` (`adam-agent X.Y.Z`, no build revision) and `adam-agent --help` answer before any
 configuration is read; every other invocation is configured by its environment alone, and no configuration is exit 78.
 A laptop needs the folder, a model endpoint, a bearer token, a `PUBLIC_URL` and `DATABASE_URL=sqlite://<file>` (no
 database server): [the quick start](../../README.md#install-adam-agent).
@@ -373,8 +373,6 @@ model, `tini` as PID 1, SIGTERM exits 0), then the compose scenarios.
   `crates/adam-ui/tests/fixtures`), the prompt carries the instruction to show, and the model read the screen's
   five components; on a screen of catalog version 2 (no `Cards`) or with no catalog, `show` is refused to the
   model as an error result, the run goes on in words, and there is no artifact.
-* `tests/cli.rs` (the binary with an empty environment): `--version` / `-V` print `adam-agent <version>` on one line and `--help` / `-h`
-  name what a laptop needs, all before any configuration is read (the Homebrew formula's `test do` runs `--version`).
 * `tests/binary.rs` (the binary as a process; the cases that need a database use `ADAM_TEST_POSTGRES_URL` and are
   skipped without it): no `ADAM_AGENT_DIR` (exit 78, every other problem listed with it), a missing, invalid or
   two-agent folder (78 with `path:line`, before anything connects), Postgres unreachable (69, no password in

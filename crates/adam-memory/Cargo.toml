@@ -1,0 +1,24 @@
+[package]
+name = "adam-memory"
+description = "The L1 self-improvement memory port of adam-rs: problems and their attempts, keyed by deployment, caller, agent and kind, and the in-folder adapter L1 is stored in"
+readme = "README.md"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+adam-core.workspace = true
+adam-error.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+adam-memory-testkit.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true

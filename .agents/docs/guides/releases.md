@@ -67,10 +67,10 @@ Written at `ce99d98` plus this change on 2026-11-27, amended the same day for AN
 9. **The archives are named `adam-agent_<version>_<os>_<arch>.tar.gz`**, os `linux`/`darwin`, arch `amd64`/`arm64`, and hold
    `adam-agent`, `LICENSE-MIT` and `LICENSE-APACHE` at the top level. `adam-agent-build` checks the Linux binaries with `file`
    (`statically linked` or `static-pie linked`), the macOS ones with `otool -L` (only `/usr/lib` and `/System/Library`),
-   and runs each: `--version` matches `^adam-agent X.Y.Z(\+|$)` and no configuration exits 78. The Linux targets are native
+   and runs each: `--version` prints exactly `adam-agent X.Y.Z` (main's `bin/adam-agent/src/main.rs`, no `+<revision>`) and no configuration exits 78. The Linux targets are native
    (`ubuntu-24.04`, `ubuntu-24.04-arm`; 90 minutes, no build cache: a signed artifact is built from a clean checkout) with `CC_<target>=musl-gcc`; macOS cannot be linked from Linux, so `macos-26` and
-   `macos-26-intel` build natively. `adam-agent --version` exists only since this change (`bin/adam-agent/src/main.rs`,
-   `tests/cli.rs`): before it, `--version` started the server and exited 78. The macOS `tar` runs with `COPYFILE_DISABLE=1`.
+   `macos-26-intel` build natively. `adam-agent --version` exists since #496 (`bin/adam-agent/src/main.rs`,
+   `tests/binary.rs`): before it, `--version` started the server and exited 78. The macOS `tar` runs with `COPYFILE_DISABLE=1`.
    **A published asset is never replaced**: `adam-agent-publish` uploads without `--clobber` and runs only when `assets` is
    `none`; `adam-agent-build` likewise. With `complete`, `adam-agent-smoke` (which verifies the signature itself) and
    `adam-agent-tap` run on what is published, so a re-run cannot move a checksum under a merged formula. If GitHub's

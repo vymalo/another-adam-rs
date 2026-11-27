@@ -70,6 +70,9 @@ flowchart LR
         subgraph llm_e["adam-llm-agent"]
             ToolError
         end
+        subgraph memory_e["adam-memory"]
+            MemoryError
+        end
         subgraph coder_e["adam-coder"]
             ConfigError
             StoppedUnexpectedly
@@ -167,6 +170,12 @@ flowchart LR
     ToolError -->|"Retryable, a conflict"| Conflict
     ToolError -->|Permanent| Invalid
     ToolError -->|NeedsInput| Rejected
+
+    MemoryError -->|"Redacted, TooManyBytes, TooManyChars, NamesAddress, EmptyScope, EmptyField, TooManyAnchors"| Invalid
+    MemoryError -->|"ScopeFull, ProblemFull"| Rejected
+    MemoryError -->|"ProblemNotFound, AttemptNotFound"| NotFound
+    MemoryError -->|Corrupt| Corrupt
+    MemoryError -->|Backend| Transient
 
     ConfigError --> Invalid
     StoppedUnexpectedly --> Internal

@@ -1,6 +1,6 @@
 # Architecture
 
-adam-rs is a Rust workspace of 29 crates for **durable AI agents**. An agent is a state machine: the
+adam-rs is a Rust workspace of 48 crates for **durable AI agents**. An agent is a state machine: the
 runtime saves its state after every step, so a worker that dies loses nothing and another resumes from
 the last saved step. Every piece of infrastructure (database, model, code host, A2A backend) sits
 behind a trait, chosen at build time.
@@ -205,6 +205,9 @@ classDiagram
     Confine <|.. NoConfine
     Confine <|.. Rlimits
     Confine <|.. SystemdScope
+    class SiMemory { <<interface>> }
+    SiMemory <|.. FolderSiMemory
+    SiMemory <|.. InProcessSiMemory
 ```
 
 | Port | Defined in | Real implementations | Doubles |
@@ -226,6 +229,7 @@ classDiagram
 | `Admission` | `adam-budget` | `LocalAdmission` (`adam-admission-local`): semaphores per pool and per conversation, one token bucket | the conformance suite `admission_conformance!` is the reference |
 | `Confine` | `adam-workspace` | `Rlimits`, `SystemdScope` (`adam-confine`, Unix); `best_effort()` picks | `NoConfine`; the suite `confine_conformance!` (`adam-confine-testkit`) is the reference |
 | `DeviceState` | `adam-device-state` | none yet: the host pushes its readings, and `adam_budget::Throttled` lowers the admission by them ([ADR 0065](decisions/0065-resource-governance-admission-pools-and-os-limits.md) decision 8) | `FakeDevice`, the reference of `device_state_conformance!` |
+| `SiMemory` (L1) | `adam-memory` | `FolderSiMemory`, the in-folder store and L1's only one ([ADR 0081](decisions/0081-an-agent-keeps-a-self-improvement-memory-near-it-and-what-holds-becomes-the-deployments-memory.md) decision 2) | `InProcessSiMemory` (reference); `ScopeBlindSiMemory` and `DoubleWritingSiMemory` (testkit, which the suite rejects) |
 | `PermissionPrompt` | `adam-acp` | none (the default policy needs no prompt) | `StaticPrompt` |
 
 `AgentStarter` is the start-only half of `Agent` (`name`, `init`, `init_continuing`): a process that

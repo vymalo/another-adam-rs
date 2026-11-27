@@ -479,7 +479,7 @@ jobs:
             fi
           fi
           "$bin" --version | tee version.txt
-          grep -Eq "^adam-agent $VERSION(\+|$)" version.txt
+          grep -Fxq "adam-agent $VERSION" version.txt
           # No configuration is a configuration error (exit 78), not a crash.
           code=0
           env -i PATH="$PATH" "$bin" > /dev/null 2>&1 || code=$?
