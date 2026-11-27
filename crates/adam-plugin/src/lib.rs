@@ -23,9 +23,14 @@
 #![warn(missing_docs)]
 
 mod audit;
+mod custom;
 mod events;
 
 pub use audit::Audit;
+pub use custom::{
+    DATA_MAX, DeclarationError, EventSpec, RESERVED_NAMESPACES, STEP_EVENTS_MAX, Subscriptions,
+    TRANSITION_EVENTS_MAX, Visibility, check_event_name, declared, has_event_name_shape,
+};
 pub use events::{
     EVENT_MAX, EventHeader, EventKind, EventQueue, FIELD_MAX, FlushReport, HookEvent, JSON_MAX,
     ObserveLimits,
@@ -258,6 +263,22 @@ pub trait Plugin: Send + Sync {
     /// After the tool answered: rewrite what the model will read, or refuse it.
     fn after_tool(&self, _call: &HookedCall<'_>, _output: &mut HookedText<'_>) -> HookResult {
         Ok(Verdict::Continue)
+    }
+
+    /// What the plugin is offered by [`observe`](Self::observe). The default is the core catalogue
+    /// ([`Subscriptions::core`]), which is what an observer received before custom events existed;
+    /// a custom event reaches only a plugin that names it (`Subscriptions::core().with("demo.*")`).
+    /// A pattern whose namespace is neither core nor declared is refused when the agent is built.
+    fn subscriptions(&self) -> Subscriptions {
+        Subscriptions::core()
+    }
+
+    /// The custom events this plugin declares (ADR 0050, slice H5). The name rules, the core
+    /// namespaces and the "declared twice, differently" check are the same as for a tool's
+    /// ([`EventSpec`]); a declaration makes the namespace known to every subscription of the agent.
+    /// The default declares none.
+    fn events(&self) -> Vec<EventSpec> {
+        Vec::new()
     }
 
     /// An event of the catalogue happened (ADR 0050, slice H2). An observer only reads: it runs

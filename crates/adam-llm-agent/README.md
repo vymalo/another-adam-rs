@@ -24,7 +24,8 @@ instructions + a model + a toolset. It is served over A2A by
 | `LlmStarter` | the start-only half: `LlmStarter::new(name)` implements `adam_runtime::AgentStarter` with `State = Conversation`, needs no model or tools, and inits exactly like `LlmAgent` (same accepted payloads, same `unusable start message` rejection), and continues a prior run exactly like `LlmAgent` (see *Continuing a conversation*); it also splits and joins the conversation exactly like `LlmAgent` (`AgentStarter::split`/`join`), so a run it starts is written with a head and a body, not left in the v4 format |
 | `Limits` | `max_turns`, `max_tool_calls`, `max_output_tokens` (the cap a call asks for; `0` leaves it to the model, and `Limits::default()` is 4,096 for a hand-built agent: the 128,000 fallback and the model's profile are resolved and clamped by the assembly, ADR 0064), `max_history_tokens`; `max_turns` and `max_tool_calls` end the run with a closing turn (below), history shortens old tool output **in the stored history** (below), and a history that reaches its budget is **compacted** (*Compaction*, below) |
 | `HookSet`, `Plugin`, `Verdict`, `HookError`, `HookLimits`, `HookedCall`, `HookedText`, `HookedMessage`, `HookedEnd`, `MessageFile`, `HookedModelRequest`, `ModelCallKind`, `HookedCompaction` | ADR 0050 slices H1, H1b, H1c, H3 and H9 (`run_ending`, step `end:<turn>`, `LlmAgentBuilder::max_run_continuations`; `model_request`; `compaction_before`), re-exported from `adam-plugin`: `HookSet::new().with(Arc::new(plugin)).with_limits(HookLimits { deadline, retries })`, and `Plugin` with `name`, `message_received(&mut HookedMessage { text, files })`, `before_tool(&mut HookedCall { tool, arguments })` and `after_tool(&HookedCall, &mut HookedText { text })`. `model_request` sees `HookedModelRequest { kind, temperature, max_output_tokens, metadata }` (`kind` is `Turn` or `Compaction`); `compaction_before` sees `HookedCompaction { context }` and may add context to the summary request or veto it with `Deny`, and the history is shortened instead. Installed with `LlmAgentBuilder::hooks`/`.plugin`; see *Hooks around a tool call* and *A hook may refuse a person's message* |
-| `HookedOutput`, `HookDecision`, `MessageDecision` | what the journaled `tool:<call id>` step records: `output` (a flattened `ToolOutput`), `hooks` (the decisions that were not `Continue`, each with `point`, `verdict`, `reason` and the failing `plugin`) and `args` (the arguments that ran, when a rewrite changed them); `MessageDecision` is what a message's step records: `text` (when a hook rewrote the message) and `hook` (the refusal). A record written before hooks existed is a bare `ToolOutput` and decodes; an older build reads a new one as its output |
+| `EventSpec`, `Visibility`, `Subscriptions`, `DeclarationError`, `EmitError`, `RecordedEvent` | ADR 0050 slice H5, custom events (see *Custom events a tool emits*): `Tool::events()` (defaulted: none) and `LlmAgentBuilder::event(EventSpec)` declare them, `ToolCtx::emit_event(name, data)` emits, `ToolCtx::with_events(specs)` and `emitted_events()` are for a test of a tool; `BuildError::Event` is a refused declaration; `HookedOutput::events` is what the step records |
+| `HookedOutput`, `HookDecision`, `MessageDecision` | what the journaled `tool:<call id>` step records: `output` (a flattened `ToolOutput`), `hooks` (the decisions that were not `Continue`, each with `point`, `verdict`, `reason` and the failing `plugin`) and `args` (the arguments that ran, when a rewrite changed them) and `events` (the custom events the call emitted, slice H5); `MessageDecision` is what a message's step records: `text` (when a hook rewrote the message) and `hook` (the refusal). A record written before hooks existed is a bare `ToolOutput` and decodes; an older build reads a new one as its output |
 | `Tool` (trait), `DynTool` | `spec() -> ToolSpec`, `async call(&ToolCtx, Value) -> Result<ToolOutput, ToolError>` and the default methods `required_state() -> Vec<StateKey>` (none) and `asks_user() -> bool` (`false`: says the tool can end a call with `NeedsInput`, so the loop runs such a call alone; whether the person can be asked is decided per run, see *Child sessions*; `#[tool(asks_user)]` and `FnTool::asking_user()` set it) and `step_style() -> StepStyle` (how a call is drawn as a step: the default is a plain `tool` labelled with the tool's name; `#[tool(step = "subagent", label = "Hand to the helper", icon = "agent")]` sets it; a tool that wraps another must forward it, as `required_state` and `asks_user`; see *Steps*) and `read_answer(call_id, args, ui, payload) -> AnswerCheck` (`Accept`, `Read(text)`, `Refuse(Refusal)` or `End(Refusal)`; the default accepts: reads the answer to the tool's own question before the model does; see *The answer is read by the tool that asked*) |
 | `ToolOutput` | `text`, `error`, `with_artifact`, `pinned()` (a compaction that drops the result copies it into its marker, see *Compaction*), `with_loaded` (a loader's whole list, journaled with the result, see `Loaded` below). A tool can return a **file** (`with_artifact(Artifact::file(..))`, [ADR 0012](../../docs/decisions/0012-files-as-a2a-artifacts.md)): the model is told only the tool's `content` (a line such as `Shared chart.svg (1.2 KiB, image/svg+xml).`), the bytes go to the run's artifacts and never into the history, the step's output or the run's final output. The loop keeps at most `MAX_RUN_FILE_BYTES` (6 MiB) of files per run: a file that would go over is not emitted and the result, marked as an error, says so. That check comes after the result is journaled, so a tool that may return several files it did not choose keeps its result within `ToolCtx::files_left()` (`adam_runtime::ReceivedFiles` does). `ArtifactRef` (what the state and the final output list) has `bytes: Option<u64>` for a file, absent otherwise and in state written before it existed. `announcing(text)` (the member `answer`) makes `text` **the run's answer**, see *Announced answers*. `sandbox: SandboxUsage` is what the call reported with `ToolCtx::report_sandbox`, put there by the loop and journaled with the result (absent from a journal from before, not written while empty), see *Sandbox time* |
 | `StepStyle`, `StepEvent`, `StepKind`, `StepState`, `StepIcon`, `StepOutput` | `StepStyle::new(kind).with_label(..).with_icon(..)`; the others are `adam-runtime`'s, re-exported (see *Steps*) |
@@ -921,6 +922,48 @@ stays at 1 while the unrecorded call's reaches 2), a rewrite that changes `Tool:
 tool never runs, the record says `failed`), old and new records decode both ways, each of four calls of
 one turn runs its own hooks, a rewrite at each point is what runs and what the model reads, and deny,
 ask, stop and a panicking plugin.
+
+## Custom events a tool emits (ADR 0050, slice H5)
+
+A tool declares the events it emits, and a call emits them:
+
+```rust
+fn events(&self) -> Vec<EventSpec> {
+    vec![
+        EventSpec::new("demo.published").published(), // clients read it too
+        EventSpec::new("demo.kept"),                  // observers only
+    ]
+}
+// in `call`:
+ctx.emit_event("demo.published", serde_json::json!({"title": "release"}))?;
+```
+
+* **Declared first.** `Tool::events` (and `LlmAgentBuilder::event` for every tool of the agent) names each event with a
+  version, a schema and a visibility. `try_build` refuses a name outside `ns.name`, a name in a core namespace
+  (`tool`, `run`, `adam`, ...), two declarations of one name that differ, and a plugin subscription to a namespace nobody
+  declares (`BuildError::Event`). A tool emits only what it or the agent declared. **A tool that wraps another must forward
+  `Tool::events`**, as it forwards `required_state` (the scrub, the coder's `Gated` and `Redacting` do); one that does not
+  makes every emit of the wrapped tool refused as undeclared.
+* **Recorded, then delivered.** An emit is held with the call and recorded in `HookedOutput::events`, in the call's own
+  journaled step. The loop delivers from the record after the step, in call order and after `tool.completed`, so a replay
+  that finds the step recorded delivers the events again, with the same keys, and does not run the tool.
+  The key is `<run>/tool:<call id>/<name>/<index>` (the index is the event's place among the call's).
+* **Who sees it.** Every event goes to the observers whose `Plugin::subscriptions` match it: an exact name, `ns.*` or `*`.
+  The default, `Subscriptions::core()`, is the core catalogue and no custom event, so an observer written before this slice
+  is unchanged. An event declared `Clients` also goes out as `RunEvent::Custom { kind: <name>, payload: { version, key,
+  data } }` (and without a hook set), which `adam-a2a-runtime` serves as a data part; one declared `Hooks` never leaves the
+  process. A recorded name this build no longer declares is delivered to nobody.
+* **Bounds, checked at the emit** (`EmitError`, class `Invalid`; a refused event is not recorded and takes no budget): data
+  is scrubbed with the call's scrubber and then at most 4 KiB serialized, a call emits at most 16, and one **transition**
+  at most 256 across all its calls (one counter on the loaded `Conversation`, skipped when serialized, shared by early and
+  segment calls alike).
+
+Tests: `tests/custom_events.rs` — an undeclared name and a name in a core namespace are refused (and not recorded or
+sent), a replay after a crash delivers the event again under the same key while the tool ran once, a `Clients` event
+reaches the sink and a `Hooks` one does not (with and without a plugin), observers get custom events only by
+subscription and keep their core ones, a tool emits only its own and the agent's, the 4 KiB and 16 bounds, and 17 calls of
+16 events give exactly 256. Seen red: with the declaration check removed, with the record dropped, with the index left out
+of the key, with the visibility test removed, and with a counter per call.
 
 ## Parallel tool calls
 

@@ -604,6 +604,15 @@ not activate it, any payload shape, and the key's identity with `adam_llm_agent:
 and `tests/vymalo.rs` (a real `Runtime` and `LlmAgent`: the tag reaches the run, a request that did not activate it leaves it, and an
 activated message that names none takes it away from the next job of the thread).
 
+## Custom events
+
+A tool of an `LlmAgent` may emit custom events ([ADR 0050](../../docs/decisions/0050-hooks-around-the-agent-loop-compiled-first-and-programs-second.md),
+slice H5). One declared for clients is a `RunEvent::Custom { kind: <name>, payload: { version, key, data } }`, which this
+crate already maps to a `working` status whose message holds one data part, `{"kind": <name>, "payload": ...}`; no
+extension is activated and nothing here changed. `key` (`<run>/tool:<call id>/<name>/<index>`) is the same when a replay says
+the event again, so a client that must not act twice dedupes on it. One declared for hooks only never reaches this layer:
+the filter is the emitter's, in `adam-llm-agent`, and `subscribe` does not look at the kind. Test: `tests/custom_events.rs`.
+
 ## Commands
 
 `commands/v1` (ADR 0044, decision 9; the consumer's contract page is [`commands-v1`](https://vymalo.github.io/another-agentic-system/api/commands-v1)). With `with_commands(commands)`, for an agent whose card lists the extension (`ExtensionConfig::commands`), `submit` reads every message right after the inbound function, once, and the expansion is what is stored:

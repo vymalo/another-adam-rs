@@ -780,6 +780,12 @@ sequenceDiagram
   arrives while the run works is left out and the task goes on), rewrite the arguments or the text, deny the call, ask a
   person (not built: the call is not run) or stop the run; one that fails never lets the call or the message through. A
   rewrite that would change `Tool::access` is refused, because the schedule above was made from the model's arguments.
+* **A tool may emit custom events** (ADR 0050, slice H5). It declares each (`Tool::events`: a name `ns.name`, a version, a
+  schema, and who may see it) and emits with `ToolCtx::emit_event`. The emit is recorded with the call's result, in the
+  same step, and delivered from the record after it, so a replay says it again with the same key. An event declared for
+  `Hooks` (the default) reaches only observers that subscribe to it; one declared for `Clients` also goes out as a
+  `RunEvent::Custom`, which an A2A client reads as a data part. A name outside the declared ones, in a core namespace
+  (`tool`, `run`, `adam`, ...), over 4 KiB, or past 16 in a step or 256 in a transition is refused.
 * **The calls of a turn run at the same time** ([ADR 0049](decisions/0049-the-tool-calls-of-a-turn-run-at-the-same-time.md)),
   up to `max_parallel` (10 by default). A tool says what a call shares (`Tool::access`); calls that conflict keep the
   model's order, and a call that is `Alone`, repeats the call before it, or follows a limit of 1 runs by itself, after

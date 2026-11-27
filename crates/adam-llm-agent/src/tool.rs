@@ -7,6 +7,7 @@ use std::time::Duration;
 use adam_core::RunId;
 use adam_error::{Classify, ErrorClass};
 use adam_model::{ImageRef, ToolSpec};
+use adam_plugin::EventSpec;
 use adam_runtime::{
     Artifact, CancelToken, ChildStarter, DynEventSink, Emitter, Inbound, MAX_RUN_FILE_BYTES,
     RetryPolicy, RunEvent, SandboxUsage, StepEvent, StepIcon, StepKind, StepState,
@@ -20,6 +21,7 @@ use crate::conversation::{
     Loaded, MODEL_RUN_KEY, PROMPT_STATEMENT_KEY, PROTECTED_CONTEXT_KEYS, ROOT_RUN_KEY,
     ROOT_STEP_KEY, user_message,
 };
+use crate::events::{EmitError, EventScope, RecordedEvent};
 use crate::images::{ImageGate, ImageOutcome, ImagePolicy, ImageStore, KeptImage};
 use crate::kept::KeptOutput;
 use crate::plan::Plan;
@@ -78,6 +80,18 @@ pub trait Tool: Send + Sync + 'static {
     /// The default is none, which is what a tool written before this method
     /// existed declares.
     fn required_state(&self) -> Vec<StateKey> {
+        Vec::new()
+    }
+
+    /// The custom events this tool emits with [`ToolCtx::emit_event`] (ADR 0050, slice H5): each
+    /// is declared here, with its name, version, schema and who may see it, before the tool can emit
+    /// it. A name outside `ns.name`, or in a core namespace (`tool`, `run`, `adam`, ...), is a build
+    /// error, as is a second declaration of a name that differs; a tool may emit only what it (or the
+    /// agent) declared. The default declares none, which is what a tool written before custom events
+    /// existed declares. A tool that wraps another (see [`ToolSet::wrap`](crate::ToolSet::wrap)) must
+    /// forward it, as it forwards [`required_state`](Self::required_state): one that does not hides
+    /// the events of the tool it wraps, and the wrapped tool's emits are refused as undeclared.
+    fn events(&self) -> Vec<EventSpec> {
         Vec::new()
     }
 
@@ -789,6 +803,12 @@ pub struct HookedOutput {
     /// arguments are the ones that ran, and from a record written before hooks existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub args: Option<Value>,
+    /// The custom events the call emitted, in the order it emitted them (ADR 0050, decision 6).
+    /// Delivery reads them from here, after the step, so a replay that finds the step recorded
+    /// delivers them again with the same keys. Absent when the call emitted none, and from a record
+    /// written before custom events existed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub events: Vec<RecordedEvent>,
 }
 
 impl HookedOutput {
@@ -799,6 +819,7 @@ impl HookedOutput {
             output,
             hooks: Vec::new(),
             args: None,
+            events: Vec::new(),
         }
     }
 
@@ -1107,6 +1128,9 @@ pub struct ToolCtx {
     /// What the call needs to admit images ([`keep_image`](crate::keep_image)); `None` for a
     /// detached context, which admits none.
     images: Option<Arc<ImagePolicy>>,
+    /// What the call may emit with [`emit_event`](Self::emit_event), and what it has emitted;
+    /// `None` for a context that declares no event.
+    events: Option<EventScope>,
 }
 
 /// A function from a text to the same text with its secrets replaced.
@@ -1167,7 +1191,57 @@ impl ToolCtx {
             kept_left: Arc::default(),
             kept: Arc::default(),
             images: None,
+            events: None,
         }
+    }
+
+    /// Say what the call may emit: its tool's declarations and the agent's, and the transition's
+    /// counter, which every call of the transition spends from. The loop does it for every call.
+    #[must_use]
+    pub(crate) fn with_event_scope(mut self, scope: Option<EventScope>) -> Self {
+        self.events = scope;
+        self
+    }
+
+    /// Declare `events` on this context, with a budget of its own: for a context made outside a run
+    /// (a test of a tool that emits). The agent loop declares what the tool's own
+    /// [`Tool::events`] and the agent say. Read what the call emitted with
+    /// [`emitted_events`](Self::emitted_events).
+    #[must_use]
+    pub fn with_events(mut self, events: impl IntoIterator<Item = EventSpec>) -> Self {
+        let allowed = events
+            .into_iter()
+            .map(|spec| (spec.name.clone(), spec))
+            .collect();
+        self.events = Some(EventScope::new(Arc::new(allowed), Arc::default()));
+        self
+    }
+
+    /// Emit the custom event `name` with `data` (ADR 0050, decision 6).
+    ///
+    /// The event must be declared by this tool ([`Tool::events`]) or by the agent; `data` is scrubbed
+    /// like the rest of the call's output and may serialize to at most 4 KiB; a call emits at most 16
+    /// events and a transition at most 256. An event that is refused is not recorded and is never
+    /// sent. An accepted one is **recorded** with the call's result, and delivered from the record
+    /// after the step: to observers that subscribe to it, and, if it is declared for clients, to
+    /// them as a `RunEvent::Custom`. A replay that finds the step recorded delivers it again with the
+    /// same key and does not run the tool.
+    ///
+    /// # Errors
+    /// [`EmitError`], whose class is `Invalid`.
+    pub fn emit_event(&self, name: &str, data: Value) -> Result<(), EmitError> {
+        match &self.events {
+            Some(scope) => scope.emit(name, data, &|text| self.scrub(text)),
+            None => Err(EmitError::Unavailable),
+        }
+    }
+
+    /// The events the call has emitted so far, in order (what the step will record).
+    pub fn emitted_events(&self) -> Vec<RecordedEvent> {
+        self.events
+            .as_ref()
+            .map(EventScope::emitted)
+            .unwrap_or_default()
     }
 
     /// Say how the run admits images: the gate for the model, the conversation's scope for the

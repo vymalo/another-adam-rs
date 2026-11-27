@@ -2,6 +2,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::pin::Pin;
+use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
@@ -15,8 +16,8 @@ use adam_model::{
     PromptStatement, ReasoningEffort, ToolCall, ToolChoice, ToolSpec,
 };
 use adam_plugin::{
-    HookSet, HookedCall, HookedCompaction, HookedEnd, HookedMessage, HookedModelRequest,
-    HookedText, MessageFile, ModelCallKind, Plugin, Verdict,
+    DeclarationError, EventSpec, HookSet, HookedCall, HookedCompaction, HookedEnd, HookedMessage,
+    HookedModelRequest, HookedText, MessageFile, ModelCallKind, Plugin, Verdict,
 };
 use adam_runtime::{
     AGENT_TEXT_KIND, Agent, AgentError, AgentStarter, CHILD_PARKED_KIND, CHILD_REPORTED_KIND,
@@ -45,6 +46,7 @@ use crate::conversation::{
     parse_model_run, parse_prompt_statement, parse_root_run, parse_root_step, parse_session,
     parse_user_text,
 };
+use crate::events::EventRegistry;
 use crate::history::{RunChars, record_shortenings_from};
 use crate::images::{
     ImageCache, ImageGate, ImageStore, InboundImage, Item, KeptImage,
@@ -397,6 +399,8 @@ struct CallFacts {
     loaded: Arc<[Loaded]>,
     /// The loaded tools a request did not carry (`Conversation::removed_tools`).
     removed_tools: Arc<[String]>,
+    /// How many custom events the transition's calls have emitted: one counter for all of them.
+    event_budget: Arc<AtomicUsize>,
 }
 
 /// The runs a call reads, owned: the root run, the step of it a child works under, the plan, the run
@@ -440,6 +444,8 @@ struct EarlyFacts {
     loaded: Arc<[Loaded]>,
     /// The loaded tools a request did not carry, as the turn starts.
     removed_tools: Arc<[String]>,
+    /// The transition's counter of custom events ([`CallFacts::event_budget`]).
+    event_budget: Arc<AtomicUsize>,
     turn: crate::early::Turn,
     /// The committed `repeats` of the run, for the doom-loop decision of the first call.
     repeats: Option<Repeats>,
@@ -592,6 +598,7 @@ impl<'a> Early<'a> {
             task: self.facts.task.clone(),
             loaded: Arc::clone(&self.facts.loaded),
             removed_tools: Arc::clone(&self.facts.removed_tools),
+            event_budget: Arc::clone(&self.facts.event_budget),
         };
         let mut prepared = self.agent.prepare(
             &self.facts.ctx,
@@ -1345,6 +1352,7 @@ pub struct LlmAgentBuilder {
     hooks: HookSet,
     max_run_continuations: u32,
     turn_keys: Option<DynTurnKeys>,
+    events: Vec<EventSpec>,
 }
 
 /// How long a run waiting for a child run sleeps before it looks at the child itself, unless
@@ -1388,6 +1396,11 @@ pub enum BuildError {
         /// The reserved name.
         argument: String,
     },
+    /// A custom event is declared wrongly (ADR 0050, decision 6): a name that is not `ns.name`, a
+    /// name in a core namespace, two declarations of one name that differ, or a plugin subscription
+    /// that can never match. A binary exits 78 on it.
+    #[error("custom events: {0}")]
+    Event(#[from] DeclarationError),
 }
 
 impl Classify for BuildError {
@@ -1595,6 +1608,16 @@ impl LlmAgentBuilder {
         self
     }
 
+    /// Declare a custom event the agent's tools may emit, beside the ones each tool declares itself
+    /// ([`Tool::events`]) (ADR 0050, decision 6). Every tool of the agent may emit it. A name in a core
+    /// namespace, one that is not `ns.name`, or a second declaration of it that differs is a
+    /// [`BuildError::Event`] from [`try_build`](Self::try_build).
+    #[must_use]
+    pub fn event(mut self, spec: EventSpec) -> Self {
+        self.events.push(spec);
+        self
+    }
+
     /// Append one plugin to the hook set ([`LlmAgentBuilder::hooks`]); the order plugins are added in
     /// is the order their hooks run in.
     #[must_use]
@@ -1717,6 +1740,13 @@ impl LlmAgentBuilder {
                 return Err(BuildError::DuplicateTool { name });
             }
         }
+        // The custom events (ADR 0050, slice H5): every declaration is valid and agrees with the
+        // others, and no plugin subscribes to a namespace nobody declares.
+        EventRegistry::build(&self.tools, &self.events, &self.hooks.declared_events())?;
+        let mut declared_here: Vec<EventSpec> =
+            self.tools.iter().flat_map(|t| t.events()).collect();
+        declared_here.extend(self.events.iter().cloned());
+        self.hooks.check_events(&declared_here)?;
         Ok(self.build())
     }
 
@@ -1740,6 +1770,13 @@ impl LlmAgentBuilder {
                 }
             }
         }
+        // A declaration `build` cannot judge (`try_build` refuses it) leaves the agent with no custom
+        // event at all: an event nobody checked is never sent.
+        let events = EventRegistry::build(&tools, &self.events, &self.hooks.declared_events())
+            .unwrap_or_else(|error| {
+                tracing::error!(%error, "the custom events are refused: the agent emits none");
+                EventRegistry::default()
+            });
         // Above a limit of one the model is told what `after_previous` means.
         let instructions = if self.max_parallel > 1 {
             Some(match self.instructions {
@@ -1788,6 +1825,7 @@ impl LlmAgentBuilder {
             hooks: Arc::new(self.hooks),
             max_run_continuations: self.max_run_continuations.min(MAX_RUN_CONTINUATIONS),
             turn_keys: self.turn_keys,
+            events: Arc::new(events),
         }
     }
 }
@@ -2025,6 +2063,8 @@ pub struct LlmAgent {
     max_run_continuations: u32,
     /// The keys that sign each assistant and tool turn at commit ([`LlmAgentBuilder::turn_keys`]).
     turn_keys: Option<DynTurnKeys>,
+    /// The custom events the agent declares, and what each tool may emit (ADR 0050, slice H5).
+    events: Arc<EventRegistry>,
 }
 
 impl std::fmt::Debug for LlmAgent {
@@ -2137,6 +2177,7 @@ impl LlmAgent {
             hooks: HookSet::new(),
             max_run_continuations: DEFAULT_RUN_CONTINUATIONS,
             turn_keys: None,
+            events: Vec::new(),
         }
     }
 
@@ -2981,6 +3022,7 @@ impl LlmAgent {
             task: state.task().map(Arc::from),
             loaded: Arc::from(state.loaded.clone()),
             removed_tools: Arc::from(state.removed_tools.clone()),
+            event_budget: Arc::clone(&state.event_budget.0),
             turn: crate::early::Turn {
                 limit: self.parallel_of(state),
                 closing,
@@ -4512,6 +4554,7 @@ impl LlmAgent {
                         task: state.task().map(Arc::from),
                         loaded: Arc::from(state.loaded.clone()),
                         removed_tools: Arc::from(state.removed_tools.clone()),
+                        event_budget: Arc::clone(&state.event_budget.0),
                     },
                     started,
                     may_ask,
@@ -4812,6 +4855,7 @@ impl LlmAgent {
                 task: state.task().map(Arc::from),
                 loaded: Arc::from(state.loaded.clone()),
                 removed_tools: Arc::from(state.removed_tools.clone()),
+                event_budget: Arc::clone(&state.event_budget.0),
             };
             let mut one = self.prepare(&facts_of_ctx, context, root, &notes, call, facts);
             match &first {
@@ -5341,6 +5385,7 @@ impl LlmAgent {
             task,
             loaded,
             removed_tools,
+            event_budget,
             ..
         } = facts;
         let note = self.source_note(notes, &call.name);
@@ -5353,6 +5398,7 @@ impl LlmAgent {
             .with_removed_tools(Arc::clone(&removed_tools))
             .with_files_left((MAX_RUN_FILE_BYTES as u64).saturating_sub(files_used))
             .with_kept(kept_left, kept)
+            .with_event_scope(self.events.scope(&call.name, event_budget))
             .with_images(
                 images,
                 image_scope(ctx.conversation_id.as_deref(), &root_run),
@@ -5469,10 +5515,13 @@ impl LlmAgent {
             let answered =
                 with_reported_sandbox(&tool_ctx, &unjournaled, called).map(ToolOutput::sanitized);
             let output = decide_after(&hooks, &name, &args, answered, &mut hooks_run);
+            // What the call emitted is recorded with its result, so delivery reads the record.
+            let events = tool_ctx.emitted_events();
             output.map(|output| HookedOutput {
                 output,
                 hooks: hooks_run,
                 args: rewritten.then_some(args),
+                events,
             })
         }
         .boxed()
@@ -5600,6 +5649,11 @@ impl LlmAgent {
         };
         let end = |state: StepState| self.step_event(&call.name, &call.id, state, notes);
         self.observe_tool_ended(ctx, root, &call.name, &call.id, &outcome);
+        // The custom events the step recorded (ADR 0050, decision 6), after `tool.completed` and in
+        // the order the call emitted them: read from the record, so a replay says them again.
+        if let Ok(hooked) = &outcome {
+            self.deliver_events(ctx, root, call, hooked, silent).await;
+        }
         // A hook that stopped the run (ADR 0050, decision 8): the call's result is its reason, and the
         // run fails after the step that recorded it.
         if let Ok(hooked) = &outcome
@@ -5782,6 +5836,73 @@ impl LlmAgent {
             }
         };
         Ok((answered, reported))
+    }
+
+    /// Delivers the custom events `hooked` records for `call`, in order (ADR 0050, slice H5).
+    ///
+    /// Each has the key `<run>/tool:<call id>/<name>/<index>`, which is the same on a replay. Every
+    /// event goes to the observers that subscribe to it; one declared for clients also goes out as a
+    /// `RunEvent::Custom` (`kind` the name, `payload` the version, the key and the data), which the A2A
+    /// layer serves as a data part. One declared `Hooks` stays here. A name this build no longer
+    /// declares is delivered to nobody: who may see an event is decided by the build that delivers it.
+    async fn deliver_events(
+        &self,
+        ctx: &Ctx,
+        root: Option<RunId>,
+        call: &ToolCall,
+        hooked: &HookedOutput,
+        silent: bool,
+    ) {
+        use adam_plugin::Visibility;
+        if hooked.events.is_empty() {
+            return;
+        }
+        let scrub = |s: &str| self.step_io.scrub(s);
+        let mut observed = Vec::new();
+        for (index, event) in hooked.events.iter().enumerate() {
+            let Some(spec) = self.events.spec(&event.name) else {
+                tracing::warn!(
+                    run = %ctx.run_id(),
+                    event = %event.name,
+                    "a recorded custom event is not declared by this build: not delivered"
+                );
+                continue;
+            };
+            let run = ctx.run_id().to_string();
+            let key = format!("{run}/tool:{}/{}/{index}", call.id, event.name);
+            if !self.hooks.is_empty() {
+                let header = adam_plugin::EventHeader {
+                    key: key.clone(),
+                    root_run: root.map_or_else(|| run.clone(), |r| r.to_string()),
+                    run,
+                    agent: self.name.clone(),
+                    at: jiff::Timestamp::now().to_string(),
+                };
+                observed.push(adam_plugin::HookEvent::custom(
+                    &event.name,
+                    event.version,
+                    header,
+                    &event.data,
+                    &scrub,
+                ));
+            }
+            if spec.visibility == Visibility::Clients {
+                say(
+                    ctx,
+                    silent,
+                    RunEvent::Custom {
+                        kind: event.name.clone(),
+                        payload: json!({
+                            "version": event.version,
+                            "key": key,
+                            "data": event.data,
+                        }),
+                    },
+                )
+                .await;
+            }
+        }
+        self.flush_events(observed);
     }
 
     /// The observers' flush for events of `call`'s step (ADR 0050, slice H2): the events are queued
@@ -6888,6 +7009,7 @@ fn decide_before(
             output: ToolOutput::error(reason).sanitized(),
             hooks: recorded.clone(),
             args: None,
+            events: Vec::new(),
         }
     };
     match verdict {

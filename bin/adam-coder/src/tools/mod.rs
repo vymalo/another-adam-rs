@@ -1041,6 +1041,10 @@ impl Tool for Gated {
         self.inner.required_state()
     }
 
+    fn events(&self) -> Vec<adam_llm_agent::EventSpec> {
+        self.inner.events()
+    }
+
     fn asks_user(&self) -> bool {
         self.inner.asks_user()
     }
@@ -1237,6 +1241,10 @@ impl Tool for Redacting {
 
     fn required_state(&self) -> Vec<StateKey> {
         self.inner.required_state()
+    }
+
+    fn events(&self) -> Vec<adam_llm_agent::EventSpec> {
+        self.inner.events()
     }
 
     fn asks_user(&self) -> bool {
@@ -1917,6 +1925,49 @@ mod access_forwarding_tests {
         async fn call(&self, _ctx: &ToolCtx, _args: Value) -> Result<ToolOutput, ToolError> {
             Ok(ToolOutput::text("x"))
         }
+    }
+
+    /// A tool that declares a custom event (ADR 0050, slice H5).
+    struct Announces;
+
+    #[async_trait::async_trait]
+    impl Tool for Announces {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "announces".into(),
+                description: "x".into(),
+                parameters: serde_json::json!({"type": "object"}),
+            }
+        }
+
+        fn events(&self) -> Vec<adam_llm_agent::EventSpec> {
+            vec![adam_llm_agent::EventSpec::new("demo.published").published()]
+        }
+
+        async fn call(&self, _ctx: &ToolCtx, _args: Value) -> Result<ToolOutput, ToolError> {
+            Ok(ToolOutput::text("x"))
+        }
+    }
+
+    /// Both layers forward what the tool declares, or an emit of a wrapped tool is refused as
+    /// undeclared.
+    #[test]
+    fn gated_and_redacting_forward_the_tools_events() {
+        let root = tempfile::tempdir().unwrap();
+        let workspaces = Workspaces::new(
+            root.path().join("work"),
+            Arc::new(ScopedToken::new("github.com", "t")),
+        );
+        let env = Arc::new(ToolEnv::new(
+            workspaces,
+            Arc::new(MemoryCodeHost::new()),
+            CoderSettings::new(),
+        ));
+        let want = vec![adam_llm_agent::EventSpec::new("demo.published").published()];
+        let gated = Gated::layer(env)(Arc::new(Announces));
+        assert_eq!(gated.events(), want, "Gated");
+        let redacting = Redacting::layer(Redactor::new(["secret-value-0123456789"]))(gated);
+        assert_eq!(redacting.events(), want, "Redacting over Gated");
     }
 
     /// Both layers say what the tool says about its schema: a layer that did not would make an MCP

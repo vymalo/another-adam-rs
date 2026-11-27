@@ -786,6 +786,7 @@ dependencies = [
  "adam-error",
  "adam-plugin-testkit",
  "serde_json",
+ "thiserror",
 ]
 
 [[package]]
