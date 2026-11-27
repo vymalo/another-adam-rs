@@ -3,7 +3,9 @@
 The seam every durable-state backend implements: the `Store` trait, the run
 and journal types, and an in-memory reference store. Also the turn key port
 `TurnKeys` and the turn signature of [ADR 0068](../../docs/decisions/0068-adam-signs-its-own-history.md)
-(slice T1), and RFC 8785 canonical JSON (`jcs`).
+(slice T1), the run-certificate ports of
+[ADR 0086](../../docs/decisions/0086-a-run-signs-its-model-requests-with-a-certificate.md),
+and RFC 8785 canonical JSON (`jcs`).
 
 ## Where it sits
 
@@ -48,6 +50,9 @@ database driver.
 | `head_payload`, `sign_head`, `verify_head` | a run's head signature (`adam-head/v1`, ADR 0068 decision 4, slice T3a-2): the payload `{typ, run, cnv, len, chain, head}`; the runtime decides which members of its state document are `head` |
 | `TurnKeyError`, `TurnKeyConfigError`, `KeySetError`, `TurnSignatureError` | see *Errors* |
 | `turn::testkit`, `turn_keys_conformance!` | the cases every `TurnKeys` passes, and `testkit::Certified`: a key named by a certificate chain, whose signatures carry `x5c` |
+| `RunCertIssuer` (trait), `DynRunCertIssuer`, `CertificateRequest`, `RunCertError` | the run-certificate issuer port ([ADR 0086](../../docs/decisions/0086-a-run-signs-its-model-requests-with-a-certificate.md)): `issue(&CertificateRequest)` answers the `CertificateChain` that vouches for a run key, `kind()` for `Debug`; the request is a bounded PKCS#10 CSR as DER (1 to 8 KiB, `Debug` shows the length), the error carries a class. No driver type is in the trait |
+| `RunKeys` (trait), `DynRunKeys` | a `TurnKeys` that belongs to **one run** ([ADR 0086](../../docs/decisions/0086-a-run-signs-its-model-requests-with-a-certificate.md)): no method of its own, and no blanket implementation, so a process key is never passed as a run key. It signs the run's model requests only; the history keeps the process `TurnKeys` |
+| `turn::run_cert::testkit`, `run_cert_issuer_conformance!` | the cases every `RunCertIssuer` passes (a carryable chain, a `kid` that is the leaf's `x5t#S256`, two requests getting two leaves), and `testkit::FakeRunCertIssuer`, a fake that passes them |
 | `testing` (`#[doc(hidden)]`) | `test_env`, `skipped`, `require_db`: gate for database-backed tests, not part of the supported API |
 
 ```rust
@@ -233,6 +238,15 @@ T2's; `Ed25519TurnKeys::from_files` reads the files they will name).
   2.1 GHz Xeon, 2026-11-25): a signature 20 µs, a verification 49 µs; a 2 KB turn signed with its
   RFC 8785 form 45 µs, verified 67 µs; the chain over 1,000 such turns 7.3 ms.
 
+### Run certificates
+
+[ADR 0086](../../docs/decisions/0086-a-run-signs-its-model-requests-with-a-certificate.md) adds a second key for
+the request path: a run's **model requests** may be signed by a key a certificate authority certified for that
+run, while the history keeps the process `TurnKeys`. A host implements `RunCertIssuer` (a bounded CSR in, the
+`x5c` chain out, a classified error) and gives the run a `RunKeys`; `run_cert_issuer_conformance!` proves the
+issuer, and `testkit::FakeRunCertIssuer` is the reference it runs on. Nothing here issues a certificate and no
+variable is read: the adapter, the renewal clock and the `RUN_CERT_*` wiring are a later slice.
+
 ## Push configurations
 
 A2A push notifications must survive a restart and a second replica, so the webhook a client
@@ -303,6 +317,8 @@ The turn errors carry no key, no signed content and no signature; they name a ke
 | `TurnKeyConfigError` (a key file that cannot be read, is not an Ed25519 PKCS#8 private key, a public key, a revoked signing key, a bad verify set) | `Invalid`; `NoRandomness` is `Internal` |
 | `KeySetError`, `BadKeyId`, `BadCertificateChain` | `Invalid` |
 | `TurnSignatureError` (unsigned, too long, malformed, another type, an unknown or revoked key, does not verify; for a request signature, a member that is not the request's, an `iat` outside the window) | `Corrupt` |
+| `RunCertError` (the CA refuses the request as written, cannot be reached, refuses to issue, or answers a chain that is not one) | `Invalid`, `Transient`, `Unauthenticated`, `Internal` |
+| `BadCertificateRequest` (a CSR that is empty or over 8 KiB) | `Invalid` |
 
 `InvalidInput` is data the store cannot hold (an integer above `i64::MAX`, a
 bad table prefix); `Corrupt` is data read back that
