@@ -1530,6 +1530,7 @@ mod tests {
             keep_open: true,
             closed: false,
             closing: false,
+            deleted: false,
             round: 1,
             root: Some(root),
             workspace: Some(workspace),
@@ -1567,6 +1568,7 @@ mod tests {
             keep_open: true,
             closed: true,
             closing: true,
+            deleted: false,
             round: 3,
             root: None,
             workspace: None,
@@ -2516,6 +2518,8 @@ mod tests {
             max_parallel_tool_calls: 3,
             time_limit: 10,
             max_rounds: 5,
+            tools: Vec::new(),
+            tools_complete: false,
         };
         let clamped = lowered.clamp(&ask);
         assert_eq!(clamped.max_turns, Some(40));
