@@ -72,12 +72,14 @@ sequenceDiagram
 | `DEVCONTAINER_RUNTIME=podman` in `config.extraEnv` | remove it and `CONTAINER_HOST`: the coder exits 78 otherwise ([the devcontainer variables](deploy-the-coder.md#upgrading-from-the-devcontainer-variables)) |
 | run pods on | the coder rolls once. Run pods made before the egress proxy have no way out until the idle sweep replaces them: [The egress proxy](egress-and-run-pod-network.md#upgrading) |
 | run pods on, from a chart that gave run pods the model key | move the pod template and the coder pin together ([the git sandbox](../../deploy/coder/README.md#the-git-sandbox)) |
-| a release installed with chart 0.4.x or earlier | delete the StatefulSet once, keeping its pods ([workspace placement](../../deploy/coder/README.md#workspace-placement)) |
+| a release installed with chart 0.4.x or earlier | delete the StatefulSet once, keeping its pods: `kubectl delete statefulset <release>-coder --cascade=orphan`, then `helm upgrade`. Without `--cascade=orphan` the pods stop ([workspace placement](../../deploy/coder/README.md#workspace-placement)) |
 | the expand release of the run-state change ([ADR 0055](../decisions/0055-a-runs-state-is-a-head-and-an-append-only-transcript.md)) | the contract release is a deploy boundary, not an ordinary upgrade: [the contract release](deploy-the-coder.md#the-contract-release-a-one-time-window) |
 | `topology: split` | one `helm upgrade` rolls the front and the worker together. [Deploy the coder](deploy-the-coder.md) asks, for the release that added `child-sessions/v1`, for the workers before the control plane; whether one upgrade meets that is *unverified* |
 | a value the chart no longer reads (`config.opencodeModel`) | left in your file it changes nothing, and `NOTES.txt` says so: delete it |
 
 ## What the database does
+
+Finished runs older than 90 days are deleted by default (`RUN_RETENTION_DAYS`; [environment](../reference/environment.md)): an upgrade does not change that, and a run you want to keep needs the variable set to `off` first.
 
 Every process runs the store's `migrate` at start, whatever its role, so the first new pod migrates and the others find nothing to do. A migration is
 idempotent and takes a lock, so several replicas starting together are safe. It writes a `schema_version` row and **only raises

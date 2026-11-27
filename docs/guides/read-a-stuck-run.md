@@ -16,7 +16,8 @@ asks "is it stuck, or is it waiting?". It tells you what to look at and why; it 
 |---|---|---|
 | `submitted` | runnable, version 1, no worker has a lease | nobody has taken it yet |
 | `working` | runnable, or parked with a timer | a worker has it, or it waits for a time |
-| `input-required` | parked with **no** timer | it waits for a person's message or an approval: **not stuck** |
+| `input-required` | parked and waiting (the run's wake bookkeeping says no timer will wake it; usually no `wake_at`, *unverified* as a rule of thumb) | it waits for a person's message or an approval: **not stuck** |
+| `auth-required` | parked on the model after a refusal of HTTP 401 or 403 | **the model key or the gateway credential is refused:** check it. Waiting will not help |
 | `completed` | done | finished |
 | `failed` | failed | finished with an error; the error text is in the run |
 | `canceled` | failed, with an error that starts `cancelled:` | someone cancelled it |
@@ -83,7 +84,7 @@ a message and never becomes due by itself.
 | In `adam_runs` | It means | What to do |
 |---|---|---|
 | `parked`, no `wake_at` | waiting for a person's answer or an approval | answer it. Nothing is wrong |
-| `parked`, `wake_at` ahead | a timer, a wait for a child or a remote task, or a model refusal the run waits out | wait. A model that keeps refusing fails the run when `MODEL_PARK_LIMIT` is up ([environment](../reference/environment.md)) |
+| `parked`, `wake_at` ahead | a timer, a wait for a child or a remote task, or a model refusal the run waits out. A refusal with 401 or 403 shows the client `auth-required` | wait, unless the client sees `auth-required`: then check the model key or the gateway credential. A model that keeps refusing fails the run when `MODEL_PARK_LIMIT` is up ([environment](../reference/environment.md)) |
 | `runnable`, `wake_at` ahead | a transient failure, retrying after its backoff | wait; read the last journal entry and the logs for the cause. The run fails when the retries are used up |
 | `runnable`, `wake_at` empty or past, no lease or an expired one, for long | no worker is taking it | see [nobody takes it](#nobody-takes-it) |
 | `runnable`, lease ahead, `lease_owner` is a pod that is gone | the worker died holding it | wait for the lease (30 seconds by default): any worker then takes the step over |
@@ -105,7 +106,7 @@ a message and never becomes due by itself.
 A lease that keeps renewing while nothing is committed means a worker is inside one step. Which step is the last journal entry. The usual ones:
 
 * **A command** that has not ended. A tool has a time limit (300 seconds unless it says otherwise), and a cancel kills the command.
-* **A run pod that is not there yet.** With run pods, a command waits for a slot of the quota, up to `RUN_POD_WAIT_SECS` (1020 seconds), or for a node to pull the
+* **A run pod that is not there yet.** With run pods, a command waits for a slot of the quota, up to `RUN_POD_WAIT_SECS` (1020 seconds in the chart; the binary's own default is 600), or for a node to pull the
   image on first use. [Run pods](deploy-the-coder.md#run-pods) says what is rendered. A pod that is refused in words in the log is the deployment's mistake, not the run's.
 * **The git sandbox** that cannot be reached: the step is retried, never run in the coder's own container.
 * **A model that is slow.** The coder waits for the gateway; a gateway that refuses parks the run on a timer instead.

@@ -55,6 +55,8 @@ commands and the evidence. Checked at `257175c` on 2026-11-26. The skill for a r
 | the worker pod gets 120 s to finish | `deploy/coder/values.yaml:746` (`terminationGracePeriodSeconds`); the front's is `:28` (30) |
 | SIGTERM stops the control plane first, then the workers | `docs/architecture.md` "Processes and roles" |
 | App without run pods: the render fails | `deploy/coder/templates/_validate.tpl`; `docs/guides/deploy-the-coder.md` "Upgrading an App deployment" |
+| a release from chart 0.4.x or earlier: `kubectl delete statefulset <release>-coder --cascade=orphan`, then `helm upgrade`; without `--cascade=orphan` the delete removes the pods | `deploy/coder/README.md:455-457` ("Upgrading from chart 0.4.x or earlier needs one extra step"); `podManagementPolicy` is immutable |
+| finished runs older than 90 days are deleted by default | `docs/reference/environment.md:58` (`RUN_RETENTION_DAYS`) |
 | no database backups | `docs/guides/deploy-the-coder.md` "Known risks" |
 
 ## Unverified
