@@ -57,7 +57,12 @@ pub async fn serve(
         folder.def = def;
     }
     // The deployment's session limits for every role (SESSION_*); the root's file may only lower them.
-    folder.def = folder.def.session_limits(config.service.sessions.limits);
+    // `MAX_PARALLEL_TOOL_CALLS` too, so a control plane, which binds no agent, holds a person's
+    // `start.config` to the bounds a worker's session tools use (ADR 0054 decision 2).
+    folder.def = folder
+        .def
+        .session_limits(config.service.sessions.limits)
+        .session_max_parallel(config.service.sessions.max_parallel_tool_calls);
     if !folder.def.manifest().subagents.is_empty() {
         let limits = folder.def.effective_session_limits();
         tracing::info!(

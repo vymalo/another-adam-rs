@@ -274,6 +274,26 @@ where a store is involved (`crates/adam-llm-agent/tests/sessions.rs` holds the s
   show it: a `subagent_list` row ends with `config: max_turns 20, time_limit 10`, and `subagent_read` has a `config:` line after its
   head; a session with none shows nothing. No tool description changed, so the coder's tool-size golden is untouched. The contract
   `child-sessions-v1.md` (in another repository) needs a `start.config` member and a `config` member of the session object.
+* *2026-11-27 (ANR-1093):* **the control plane of a split deployment admits a `start.config` too**; the "fails closed" limit of the
+  ANR-203 note above no longer holds for the shipped agents. The bounds never needed the bound agent: they are the helper's folder
+  (`limits`), the deployment's `MAX_PARALLEL_TOOL_CALLS` and the root's effective `max_session_rounds`; only the model's window is a
+  fact of the model (decision 11), and **no role has it when it admits**, because `context_window` is `None` in the bounds of a
+  worker as well (`admit` applies the floor, the run takes the minimum with the model's window). So there was nothing to refuse
+  only on a control plane. `crates/adam-assembly/src/bounds.rs` holds **one pure function**, `bounds_of`, that `Assembly` (the
+  workers' session tools, and the front of `all` and `worker`) and the new `AgentDef::session_bounds()` (the control plane, which
+  binds nothing) both call, so the two cannot disagree; the clamping rule of decision 3 is one function too (`parallel_limit`, used
+  by the agent's build and by the bounds). The deployment's `MAX_PARALLEL_TOOL_CALLS` reaches a definition by
+  `AgentDef::session_max_parallel(n)`, which `bind` also takes as the agents' limit unless `BoundDef::max_parallel` says another.
+  `adam-service` reads the variable on **every role**, leniently (`SessionSettings::max_parallel_tool_calls`: a bad value is the
+  default there and no problem, since the roles that run workers still refuse it and a control plane starts as before), and
+  `adam-coder` and `adam-agent` give it to the definition beside `session_limits`, then call `session_bounds()` in the arm that binds
+  no agent (`ChildSessions::with_bounds` now gets real bounds there). **Operating rule:** give the control plane the same
+  `MAX_PARALLEL_TOOL_CALLS` and `SESSION_MAX_ROUNDS` as the workers (the chart renders `SESSION_MAX_ROUNDS` on every role; it renders `MAX_PARALLEL_TOOL_CALLS` on the workers only, so until `deploy/coder` renders it on the front too, a split deployment that lowers it sets `MAX_PARALLEL_TOOL_CALLS` in `config.extraEnv` instead of `config.maxParallelToolCalls`, which reaches every role, or accepts the default 10 on the front). A control plane with a
+  larger value would admit a config the worker then narrows at run time; it never admits more than the folder's own limits, and a
+  worker never runs a round above its own bound. Tests: `adam-assembly/tests/session_bounds.rs` (the definition's bounds equal a
+  worker's over a table of folders, session limits and parallel limits), `adam-service` `every_role_reads_max_parallel_for_the_session_bounds`
+  and, for the split topology, `adam-agent/tests/agent.rs` (a control plane and a worker over one store: a config within the
+  helper's bounds is admitted and recorded in the header, one above a bound is refused naming `start.config.<member>`).
 
 **2. The system prompt section** (decision 9). Depends on 1.
 * Files: `sessions.rs` (the table, `SessionTools::guide`), `crates/adam-assembly/src/def.rs` or `assembly.rs` (append at bind),

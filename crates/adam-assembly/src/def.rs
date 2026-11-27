@@ -168,6 +168,9 @@ pub struct AgentDef {
     /// What the deployment allows of the sessions of one conversation
     /// ([`session_limits`](Self::session_limits)).
     session_limits: SessionLimits,
+    /// The deployment's `MAX_PARALLEL_TOOL_CALLS`, as the sessions' bounds need it on a process that
+    /// binds no agent ([`session_max_parallel`](Self::session_max_parallel)).
+    max_parallel: Option<usize>,
     /// The root's reasoning level when its file sets none
     /// ([`reasoning_effort`](Self::reasoning_effort)).
     reasoning_effort: Option<ReasoningEffort>,
@@ -208,6 +211,7 @@ impl AgentDef {
             mcp: McpBinding::default(),
             run_skills: None,
             session_limits: SessionLimits::default(),
+            max_parallel: None,
             reasoning_effort: None,
             plugins: BTreeMap::new(),
         })
@@ -410,6 +414,18 @@ impl AgentDef {
         self
     }
 
+    /// The deployment's `MAX_PARALLEL_TOOL_CALLS` (1 to 32), for the bounds of the sessions
+    /// ([`session_bounds`](Self::session_bounds), ADR 0054 decision 2). Every role that serves A2A
+    /// gives it, so the control plane of a split deployment, which binds no agent, admits the same
+    /// `start.config` the workers' session tools do. [`bind`](Self::bind) takes it as the agents'
+    /// own limit too, unless [`BoundDef::max_parallel`](crate::BoundDef::max_parallel) says another:
+    /// a worker sets the one value in both places. Unset: the loop's default, 10.
+    #[must_use]
+    pub fn session_max_parallel(mut self, n: usize) -> Self {
+        self.max_parallel = Some(n);
+        self
+    }
+
     /// The root's reasoning level when its file sets none (ADR 0063 decision 8): an embedded
     /// engine's host gives the level its folder would, and the root's own `reasoning_effort` wins
     /// over it. It is the **root's only**: it never applies to a subagent, which has its own file.
@@ -436,6 +452,40 @@ impl AgentDef {
             self.manifest.frontmatter.limits.as_ref(),
             None,
         )
+    }
+
+    /// What a person's `start.config` on a helper of the root is held to ([ADR 0054] decision 2),
+    /// as `(name, bounds)` in the order the card lists the helpers: the very bounds
+    /// [`Assembly::session_bounds`](crate::Assembly::session_bounds) gives the session tools of a
+    /// worker, **without binding the agent**. `max_parallel_tool_calls` is the deployment's
+    /// `MAX_PARALLEL_TOOL_CALLS` ([`session_max_parallel`](Self::session_max_parallel); the loop's
+    /// 10 when unset), lowered by the helper's file; the rounds are
+    /// [`effective_session_limits`](Self::effective_session_limits)'s. Give the definition the
+    /// deployment's [`session_limits`](Self::session_limits) and `session_max_parallel` first, as a
+    /// worker does.
+    ///
+    /// Both roles call one function (`bounds_of`), so a control plane that answers A2A and a worker
+    /// that runs the rounds admit the same `start.config`. **Give both roles the same
+    /// `MAX_PARALLEL_TOOL_CALLS` and `SESSION_MAX_ROUNDS`**: a control plane with a larger value
+    /// would admit what a worker then narrows at run time, never the reverse. The model's window is
+    /// a fact of the model, which neither role knows here: `context_window` is `None`, `admit`
+    /// applies only its floor and the run takes the minimum with the model's window.
+    ///
+    /// [ADR 0054]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md
+    pub fn session_bounds(&self) -> Vec<(String, adam_runtime::SessionBounds)> {
+        let max_rounds = self.effective_session_limits().max_rounds();
+        session_targets(&self.manifest, &self.manifest.name, &self.remote)
+            .into_iter()
+            .map(|target| {
+                let bounds = crate::bounds::bounds_of(
+                    &self.manifest,
+                    &target,
+                    self.max_parallel,
+                    max_rounds,
+                );
+                (target.name, bounds)
+            })
+            .collect()
     }
 
     /// What the root's A2A front serves `child-sessions/v1` for: each subagent of the root, local
@@ -741,7 +791,8 @@ impl AgentDef {
             }
         }
         let root = self.manifest.name.clone();
-        let bound = BoundDef::new(self.manifest, nodes, remotes, session_limits);
+        let bound = BoundDef::new(self.manifest, nodes, remotes, session_limits)
+            .with_default_max_parallel(self.max_parallel);
         #[cfg(feature = "sessions")]
         let bound = bound.with_child_sessions(child_sessions);
         #[cfg(feature = "mcp")]
@@ -1472,7 +1523,7 @@ fn run_limit(file: Option<&FileLimits>) -> Option<Duration> {
 }
 
 /// The loop's limits: what the frontmatter sets, the loop's default for the rest.
-fn limits(file: Option<&FileLimits>) -> Limits {
+pub(crate) fn limits(file: Option<&FileLimits>) -> Limits {
     let default = Limits::default();
     let Some(file) = file else {
         return default;

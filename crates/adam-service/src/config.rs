@@ -17,7 +17,7 @@
 //! | `A2A_DOCS` | Swagger UI at `/docs` and the OpenAPI document at `/openapi.json`, both public (the calls still need a token); `false` turns them off ([`A2aSettings::docs`]) | `true` |
 //! | `LISTEN_ADDR` | bind address: the A2A server, or for `worker` its `/healthz` listener | `0.0.0.0:8080` |
 //! | `WORKERS` | runs advanced concurrently by this process | `4` |
-//! | `MAX_PARALLEL_TOOL_CALLS` | the most tool calls of one model turn that run at the same time, 1 to 32 (`1` is one at a time); an agent file's `limits.max_parallel` may lower it for that agent; read by the roles that run workers ([`WorkerSettings::max_parallel_tool_calls`]) | `10` |
+//! | `MAX_PARALLEL_TOOL_CALLS` | the most tool calls of one model turn that run at the same time, 1 to 32 (`1` is one at a time); an agent file's `limits.max_parallel` may lower it for that agent; read by the roles that run workers ([`WorkerSettings::max_parallel_tool_calls`]), which refuse a bad value; **every role also reads it, leniently** (a bad value is the default and no problem), because a control plane holds a person's `start.config` to the same bound ([`SessionSettings::max_parallel_tool_calls`]) | `10` |
 //! | `MAX_TOOL_CALLS_IN_FLIGHT` | the most tool calls of the whole process that run at the same time, 1 to 256: the process's pool, inside which `MAX_PARALLEL_TOOL_CALLS` still bounds one turn (ADR 0065) | `4` |
 //! | `MAX_RUN_CONTINUATIONS` | the most times `run.ending` hooks may keep one run going, 0 to 20 (ADR 0050); anything else is exit 78 | `3` |
 //! | `MAX_MODEL_CALLS` | the most model calls in flight in the process, 1 to 64 (ADR 0065) | `2` |
@@ -424,11 +424,20 @@ pub struct SessionSettings {
     /// How long a kept-open session may sit idle (its latest round ended, nobody wrote to it)
     /// before it reads closed ([`RuntimeOptions::session_idle_ttl`]).
     pub idle_ttl: Duration,
+    /// `MAX_PARALLEL_TOOL_CALLS`, for the bounds of a person's `start.config` on **every role**
+    /// (ADR 0054 decision 2): a control plane binds no agent, and holds a `config` to the same
+    /// numbers the workers' session tools do. 1 to [`MAX_PARALLEL_TOOL_CALLS_LIMIT`], else
+    /// [`DEFAULT_MAX_PARALLEL_TOOL_CALLS`]. Read **leniently**: a value out of range is the
+    /// default here and no problem (the roles that run workers refuse it, with
+    /// [`WorkerSettings::max_parallel_tool_calls`], and no worker runs on it), so a control plane
+    /// still starts as it did.
+    pub max_parallel_tool_calls: usize,
 }
 
 impl Default for SessionSettings {
     fn default() -> Self {
         Self {
+            max_parallel_tool_calls: DEFAULT_MAX_PARALLEL_TOOL_CALLS,
             limits: SessionLimits::default(),
             idle_ttl: Duration::from_secs(DEFAULT_SESSION_IDLE_DAYS * 24 * 3600),
         }
@@ -490,7 +499,11 @@ impl SessionSettings {
         }
         let limits =
             SessionLimits::new(max_open, max_working, max_rounds).unwrap_or(default.limits);
+        // The roles that run workers report a bad value (`WorkerSettings`); here it is the
+        // default, never a second problem and never a reason for a control plane not to start.
+        let max_parallel_tool_calls = parse_max_parallel(&get, &mut Vec::new());
         Self {
+            max_parallel_tool_calls,
             limits,
             idle_ttl: Duration::from_secs(days * 24 * 3600),
         }
@@ -2114,6 +2127,43 @@ mod tests {
         vars.insert("MAX_PARALLEL_TOOL_CALLS", "99");
         let config = parse(&vars).expect("a control plane does not read it");
         assert!(config.worker.is_none());
+    }
+
+    /// Every role reads `MAX_PARALLEL_TOOL_CALLS` for the bounds of a person's `start.config`
+    /// (ADR 0054, ANR-1093), so a control plane holds a `config` to what the workers' session
+    /// tools do. The roles that run workers still refuse a bad value; a control plane takes it as
+    /// the default and starts, as before.
+    #[test]
+    fn every_role_reads_max_parallel_for_the_session_bounds() {
+        for role in ["all", "control-plane", "worker"] {
+            let read = |value: Option<&'static str>| {
+                let mut vars = with_role(role);
+                if let Some(value) = value {
+                    vars.insert("MAX_PARALLEL_TOOL_CALLS", value);
+                }
+                parse(&vars).map(|c| c.sessions.max_parallel_tool_calls)
+            };
+            assert_eq!(read(None).unwrap(), 10, "{role}");
+            assert_eq!(read(Some(" 4 ")).unwrap(), 4, "{role}");
+            assert_eq!(read(Some("32")).unwrap(), 32, "{role}");
+            for bad in ["0", "33", "x"] {
+                match (role, read(Some(bad))) {
+                    ("control-plane", Ok(n)) => {
+                        assert_eq!(n, 10, "{role}: {bad} is the default");
+                    }
+                    (_, Err(error)) => assert_eq!(
+                        error
+                            .problems
+                            .iter()
+                            .filter(|p| p.starts_with("MAX_PARALLEL_TOOL_CALLS"))
+                            .count(),
+                        1,
+                        "{role}: {bad} is one problem, not two: {error:?}"
+                    ),
+                    (_, Ok(n)) => panic!("{role}: {bad} was read as {n}"),
+                }
+            }
+        }
     }
 
     #[test]

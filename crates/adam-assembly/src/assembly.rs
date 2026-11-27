@@ -7,13 +7,13 @@ use std::time::Duration;
 use adam_agent_fs::{AgentManifest, ModelRef, RemoteAgent, ToolsLoading};
 use adam_budget::DynAdmission;
 use adam_llm_agent::{
-    DEFAULT_MAX_PARALLEL, DynTool, DynToolSource, Limits, LlmAgent, LlmAgentBuilder,
-    MAX_PARALLEL_LIMIT, ModelBinding, ModelParking, SESSION_TOOLS, SessionAgent, SessionTools,
-    StepIo, ToolSource, WINDOW_MARGIN_TOKENS,
+    DynTool, DynToolSource, Limits, LlmAgent, LlmAgentBuilder, ModelBinding, ModelParking,
+    SESSION_TOOLS, SessionAgent, SessionTools, StepIo, ToolSource, WINDOW_MARGIN_TOKENS,
 };
 use adam_model::{DEFAULT_MAX_OUTPUT_TOKENS, DynModel, ModelProfiles, Preset, ReasoningEffort};
 use adam_runtime::{RuntimeBuilder, SessionBounds, SessionLimits};
 
+use crate::bounds::parallel_limit;
 use crate::def::{Node, Remote, SessionTarget};
 use crate::error::{AliasProblem, CapSource, EffortSource, Error, Origin};
 #[cfg(feature = "remote")]
@@ -232,9 +232,17 @@ impl BoundDef {
         self
     }
 
+    /// The deployment's `MAX_PARALLEL_TOOL_CALLS` given on the definition
+    /// ([`AgentDef::session_max_parallel`](crate::AgentDef::session_max_parallel)), unless
+    /// [`max_parallel`](Self::max_parallel) already says another.
+    pub(crate) fn with_default_max_parallel(mut self, n: Option<usize>) -> Self {
+        self.max_parallel = self.max_parallel.or(n);
+        self
+    }
+
     /// The limit of the agent `node`: the deployment's (or the loop's default) **lowered by the
     /// agent's own file**. A file above the deployment's is **clamped** to it, 1 to
-    /// [`MAX_PARALLEL_LIMIT`], with a warning naming both values: a folder is portable across
+    /// `MAX_PARALLEL_LIMIT`, with a warning naming both values: a folder is portable across
     /// deployments, so a deployment that lowered the limit narrows the agent rather than refusing
     /// it to start, and the effective setting says what the agent runs at (ADR 0049, ADR 0054
     /// decision 3 — "clamped to the bounds of that time").
@@ -243,23 +251,19 @@ impl BoundDef {
     /// `config` above a bound is the runtime question, and stays a refusal by
     /// [`SessionBounds::admit`], naming the option (ADR 0054 decision 2); see `bounds_of`.
     fn parallel_of(&self, node: &Node) -> usize {
-        let allowed = self
-            .max_parallel
-            .map_or(DEFAULT_MAX_PARALLEL, |n| n.clamp(1, MAX_PARALLEL_LIMIT));
-        match node.max_parallel {
-            Some(asked) if asked > allowed => {
-                tracing::warn!(
-                    agent = %node.name,
-                    asked,
-                    allowed,
-                    "`limits.max_parallel` is more than the deployment allows (MAX_PARALLEL_TOOL_CALLS): \
-                     the agent runs {allowed} tool calls at once (ADR 0049, ADR 0054 decision 3)"
-                );
-                allowed
-            }
-            Some(asked) => asked.clamp(1, MAX_PARALLEL_LIMIT),
-            None => allowed,
+        let allowed = parallel_limit(self.max_parallel, None);
+        if let Some(asked) = node.max_parallel
+            && asked > allowed
+        {
+            tracing::warn!(
+                agent = %node.name,
+                asked,
+                allowed,
+                "`limits.max_parallel` is more than the deployment allows (MAX_PARALLEL_TOOL_CALLS): \
+                 the agent runs {allowed} tool calls at once (ADR 0049, ADR 0054 decision 3)"
+            );
         }
+        parallel_limit(self.max_parallel, node.max_parallel)
     }
 
     /// How the step of a tool call reports its input and output, for every agent:
@@ -790,57 +794,16 @@ impl BoundDef {
         Some(SessionTools::new(agents).with_limits(self.session_limits))
     }
 
-    /// The bounds of one subagent a session may be started on (ADR 0054 decision 2): each option
-    /// as the subagent's folder or the deployment resolves it.
-    ///
-    /// * `max_turns`, `max_tool_calls` and `max_output_tokens` are the folder's (`0` for the cap
-    ///   when it names none, which leaves it to the model: ADR 0064), else the loop's defaults.
-    /// * `context_window` is `None`: the window is a fact of the model alias (ADR 0054 decision
-    ///   11), which the assembly does not have here, and `admit` applies only its floor.
-    ///   So **`admit` never enforces the model-window ceiling**: it is enforced at run time, by
-    ///   `effective_window` in `adam-llm-agent`, which takes the minimum with the model's window.
-    /// * `max_parallel_tool_calls` is the deployment's `MAX_PARALLEL_TOOL_CALLS` lowered by the
-    ///   folder's [`limits.max_parallel`](adam_agent_fs::Limits), which may never raise it: a folder
-    ///   above the deployment's is clamped to it ([`Self::parallel_of`], ADR 0049, ADR 0054
-    ///   decision 3). What a *round asks for* above this bound is what `SessionBounds::admit`
-    ///   refuses, naming the option (decision 2).
-    /// * `time_limit` is the round's own limit (`limits.max_minutes`, or the remote's wait), and
-    ///   `max_rounds` the root's effective `max_session_rounds`: the deployment's, lowered by the
-    ///   root's file.
+    /// The bounds of one subagent a session may be started on (ADR 0054 decision 2): the one
+    /// function of `crate::bounds`, which `AgentDef::session_bounds` calls too, so a worker's tools
+    /// and a control plane's A2A front cannot disagree.
     fn bounds_of(&self, target: &SessionTarget) -> SessionBounds {
-        // A remote subagent's rounds are runs of an agent of its own, and the ADR refuses every
-        // option but `time_limit`, `max_rounds` and `instructions` on one: the loop's defaults
-        // stand for the rest.
-        let local = self.nodes.iter().find(|node| node.name == target.agent);
-        let (max_turns, max_tool_calls, max_output_tokens, parallel) = match local {
-            Some(node) => (
-                node.limits.max_turns,
-                node.limits.max_tool_calls,
-                node.max_output_tokens.unwrap_or(0),
-                self.parallel_of(node),
-            ),
-            None => (
-                Limits::default().max_turns,
-                Limits::default().max_tool_calls,
-                0,
-                DEFAULT_MAX_PARALLEL,
-            ),
-        };
-        SessionBounds {
-            max_turns,
-            max_tool_calls,
-            max_output_tokens,
-            context_window: None,
-            // `parallel_of` never gives more than the loop's own limit (32), so nothing is lost
-            // here. If a hand-made value ever could not be carried, the bound is that limit — the
-            // most the loop runs at once — and never "no bound", which would widen.
-            max_parallel_tool_calls: u32::try_from(parallel).unwrap_or(MAX_PARALLEL_LIMIT as u32),
-            // A round with no limit (`None`) is `0` here, which means the same: no limit.
-            time_limit: target.within.map_or(0, |within| {
-                u32::try_from(within.as_secs() / 60).unwrap_or(u32::MAX)
-            }),
-            max_rounds: self.session_limits.max_rounds(),
-        }
+        crate::bounds::bounds_of(
+            &self.manifest,
+            target,
+            self.max_parallel,
+            self.session_limits.max_rounds(),
+        )
     }
 
     /// The tool as the agent gets it: a session tool is scrubbed when the deployment gave a scrub.

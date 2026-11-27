@@ -407,7 +407,9 @@ pub async fn serve(
         .def()
         .map_err(|e| *e)
         .context("reading the agent definition")?
-        .session_limits(config.service.sessions.limits);
+        .session_limits(config.service.sessions.limits)
+        // The same `MAX_PARALLEL_TOOL_CALLS` every role reads, so the bounds below are a worker's.
+        .session_max_parallel(config.service.sessions.max_parallel_tool_calls);
     let sessions = helpers.child_sessions();
     // The files' schedules (ADR 0060), run by the roles that run workers.
     let schedules = helpers.manifest().schedules.clone();
@@ -429,8 +431,8 @@ pub async fn serve(
             // commands too; the coder's own `github` server has a bearer per call and gives none.
             let prompts = agent.assembly().prompt_commands().to_vec();
             // What a person's `start.config` is held to: the bounds the session tools use, so the
-            // two cannot disagree (ADR 0054 decision 2). A control plane builds no agent and so
-            // knows none: it refuses a `start.config`.
+            // two cannot disagree (ADR 0054 decision 2). A control plane gets the same ones from
+            // the files and the settings (`AgentDef::session_bounds`), without binding the agent.
             let session_bounds = agent.assembly().session_bounds().to_vec();
             // The models a message may pick (`model-pick/v1`): the root's choices, the same list
             // its card advertises.
@@ -468,13 +470,18 @@ pub async fn serve(
         }
         // The starters of the helpers too, so a person's session round can be started here and a
         // worker steps it.
-        None => (
-            Agents::new(AGENT_NAME, move |builder| {
-                helpers.session_starters(builder.starter(CoderStarter))
-            }),
-            Vec::new(),
-            Vec::new(),
-        ),
+        None => {
+            // The bounds of a person's `start.config` on each helper, from the files and the
+            // deployment's settings alone: the very function a worker's assembly calls.
+            let session_bounds = helpers.session_bounds();
+            (
+                Agents::new(AGENT_NAME, move |builder| {
+                    helpers.session_starters(builder.starter(CoderStarter))
+                }),
+                Vec::new(),
+                session_bounds,
+            )
+        }
     };
     // A control plane connects no MCP server, so it cannot expand a prompt: a message that names the
     // prompt of one of the files' servers is refused, not sent to the model as plain text.

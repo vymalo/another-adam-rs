@@ -895,7 +895,7 @@ The card also lists `child-sessions/v1` ([ADR 0045](../../docs/decisions/0045-a-
 slice 6 part c; [`a2a-server.md`](../../docs/reference/a2a-server.md#child-sessions-child-sessionsv1)): `explorer` and `reviewer` are offered
 to a person as sessions they open, talk to and close from their client, with `maxOpen` the effective `SESSION_MAX_OPEN` (16 by default;
 `limits.max_open_sessions` of the folder's root may lower it, never raise it). `serve` reads it from the files alone, with
-`config.service.sessions.limits`, so `all` and `control-plane` list and serve the same; the control plane registers the helpers' starters
+`config.service.sessions.limits`, so `all` and `control-plane` list and serve the same (and, with `config.service.sessions.max_parallel_tool_calls`, the same **bounds** for a person's `start.config`: the control plane gets them from `AgentDef::session_bounds`, a worker from its assembly, one function); the control plane registers the helpers' starters
 (`coder/explorer`, `coder/reviewer`) beside `CoderStarter` and a worker steps the rounds. `app.rs` (`Coder::new_with`, the control-plane
 constructors) is unchanged. The card entry is not in `tests/fixtures/agent/card.json`: that is `agent_card_for`'s card, which `serve` extends.
 

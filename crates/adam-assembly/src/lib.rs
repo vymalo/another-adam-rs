@@ -145,6 +145,7 @@
 #![warn(missing_docs)]
 
 mod assembly;
+mod bounds;
 #[cfg(feature = "a2a")]
 mod card;
 mod def;
