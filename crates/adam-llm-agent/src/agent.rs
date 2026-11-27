@@ -64,7 +64,9 @@ use crate::plan::Plan;
 use crate::schedule::{self, Entry, Ordered, Queue, Segment};
 use crate::session_tools::{SessionNarrowing, narrowing_of};
 use crate::sessions::{
-    DueFacts, SUBAGENT_CLOSE, SUBAGENT_READ, SUBAGENT_SEND, SUBAGENT_START, is_due, report_call_id,
+    DueFacts, MAX_REPORT_CORRECTIONS, REPORT_MISMATCH, ReportVerdict, SUBAGENT_CLOSE,
+    SUBAGENT_READ, SUBAGENT_SEND, SUBAGENT_START, check_report, is_due, report_call_id,
+    report_correction,
 };
 
 /// Whether the history holds a call that started a session or sent to one.
@@ -2422,6 +2424,7 @@ impl LlmAgent {
         // the one before is not the answer of this one.
         if !texts.as_slice().is_empty() {
             state.thinking_cuts = 0;
+            state.report_corrections = 0;
             state.announced = None;
             state.announced_final = false;
         }
@@ -2755,6 +2758,43 @@ impl LlmAgent {
         state: &'a Conversation,
     ) -> Option<&'a adam_runtime::SessionConfig> {
         state.session.as_ref().and_then(|h| h.config.as_ref())
+    }
+
+    /// The check of a final answer against the `report_schema` of its session ([ADR 0054], slice 9):
+    /// `None` when the session has none or the answer matches it, so the answer ends the round as
+    /// it would. A mismatch with a correction left (`retry`) puts the problems to the model as a
+    /// turn and goes on ([`MAX_REPORT_CORRECTIONS`] times, each a model call counted in
+    /// `max_turns`); otherwise the round fails with [`REPORT_MISMATCH`].
+    ///
+    /// [ADR 0054]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md
+    fn report_gate(&self, state: &mut Conversation, answer: &str, retry: bool) -> Option<Flow> {
+        let schema = self.session_config(state)?.report_schema.clone()?;
+        let problems = match check_report(&schema, answer) {
+            ReportVerdict::Matches => return None,
+            ReportVerdict::Unusable(why) => {
+                return Some(Flow::Fail(format!(
+                    "report_schema does not compile, so no report can match it: {why}"
+                )));
+            }
+            ReportVerdict::Mismatch(problems) => problems,
+        };
+        if retry && state.report_corrections < MAX_REPORT_CORRECTIONS {
+            let first = state.report_corrections == 0;
+            state.report_corrections += 1;
+            // The answer that did not match is not the answer any more: a tool's announcement
+            // would otherwise be checked again, and end the round, in place of the corrected words.
+            state.announced = None;
+            state.announced_final = false;
+            state.messages.push(Message::user_text(report_correction(
+                &problems,
+                first.then_some(&schema),
+            )));
+            return Some(Flow::Next);
+        }
+        Some(Flow::Fail(format!(
+            "{REPORT_MISMATCH}: {}",
+            problems.join("; ")
+        )))
     }
 
     /// The agent's [`Limits`] narrowed by its session's `max_turns` and `max_tool_calls`: read at
@@ -3635,6 +3675,10 @@ impl LlmAgent {
             if said.trim().is_empty() {
                 return Ok((Flow::Fail(self.limit_message(state, limit)), early));
             }
+            // No turn is left for a correction: an answer that does not match fails the round.
+            if let Some(flow) = self.report_gate(state, &said, false) {
+                return Ok((flow, early));
+            }
             let output = limited_output(state, limit, said, finish == FinishReason::Length, stream);
             if let Some(hit) = &mut state.limit {
                 hit.answered = true;
@@ -3646,6 +3690,9 @@ impl LlmAgent {
             // What a tool announced as the answer is the run's answer (the last announcement wins);
             // without one, the words that end the turn are.
             if let Some(announced) = state.announced.clone() {
+                if let Some(flow) = self.report_gate(state, &announced, true) {
+                    return Ok((flow, early));
+                }
                 if self.run_ending(ctx, state, &announced).await? {
                     return Ok((Flow::Next, early));
                 }
@@ -3688,6 +3735,9 @@ impl LlmAgent {
                     state.messages.push(Message::user_text(THINKING_CUT_TURN));
                 }
                 return Ok((Flow::Next, early));
+            }
+            if let Some(flow) = self.report_gate(state, &text, true) {
+                return Ok((flow, early));
             }
             if self.run_ending(ctx, state, &text).await? {
                 return Ok((Flow::Next, early));
@@ -8506,6 +8556,16 @@ impl LlmAgent {
                         && state.deferred.is_empty()
                         && ctx.arrived().await? == 0
                     {
+                        // The answer a tool handed over is the round's report: it is held to the
+                        // session's `report_schema` like the words of a turn are.
+                        match self.report_gate(&mut state, &text, true) {
+                            Some(Flow::Fail(error)) => {
+                                self.forget_chars(ctx.run_id());
+                                return Ok(Transition::Fail { state, error });
+                            }
+                            Some(_) => return Ok(Transition::Continue(state)),
+                            None => {}
+                        }
                         if self.run_ending(ctx, &mut state, &text).await? {
                             return Ok(Transition::Continue(state));
                         }

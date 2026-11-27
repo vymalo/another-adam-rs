@@ -161,7 +161,7 @@ starts with the caller's subject too, but its runs are the helper's.
 
 **What a task says.** A task of a parent context (the answer to `SendMessage`, `GetTask`, the snapshot of a stream, each task of
 `ListTasks {contextId}`) carries `metadata[URI] = {sessions: [..]}`, open sessions first, then the 16 most recently closed. A
-round carries `{session, parentContextId, agent, description, keepOpen, round, by, state, closing}` plus `config` (camelCase, only the options set) when the session has one (`keepOpen` is `false` for a session with no header, the contract's default). A task whose sessions cannot be listed carries no sessions object (a warning is logged), never an empty one. `state` is `working`,
+round carries `{session, parentContextId, agent, description, keepOpen, round, by, state, closing}` plus `config` (camelCase, only the options set; a session the model started with a `report_schema` also carries `reportSchema`, the schema its report must match, so it is not only whole numbers) when the session has one (`keepOpen` is `false` for a session with no header, the contract's default). A task whose sessions cannot be listed carries no sessions object (a warning is logged), never an empty one. `state` is `working`,
 `idle` or `closed` (closed also when the latest round is the one that closes it), `closing` is a close waiting for a working
 round, `by` is `person` for a round that is its own parent. The snapshot of a stream, `GetTask`, `ListTasks` and the answers carry these objects; a stream carries the events below.
 

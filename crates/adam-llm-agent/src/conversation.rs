@@ -777,6 +777,12 @@ pub struct Conversation {
     /// Absent from state written before it existed, and not written while `0`.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub thinking_cuts: u32,
+    /// How many corrective turns the round's final answer has been given because it did not match
+    /// the session's `report_schema` (ADR 0054, slice 9): two at most, counted in `max_turns`, then
+    /// the round fails. Reset when a message reaches the run. Absent from state written before it
+    /// existed, and not written while `0`.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub report_corrections: u32,
     /// The latest model turn stopped at the output limit (`FinishReason::Length`): a call of it whose
     /// arguments are not JSON is most likely cut off, and its error says so. Absent from state
     /// written before it existed, and not written while `false`.
