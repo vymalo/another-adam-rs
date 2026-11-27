@@ -94,6 +94,8 @@ amendment is the owner's to make there.
    pattern for the latter); with no name known (a control plane) only the shape is checked. The column "Enforced by" is the loop
    itself, not "a session withhold" of a source: the narrowing is consulted in `agent.rs` first, before every source's holds, at
    both points, and is read from the session header (see the slice 3 note).
+   This is an **interim**: the owner's answer to ANR-Q144 (2026-11-27) is that every source declares its tools (card ANR-1319),
+   which makes the set complete on every agent and the rule of the row above hold as written.
 
    *Amended 2026-11-21 (ADR 0063)*: for `reasoning_effort` only, the declaration is the **model entry** in
    `MODEL_ALIASES_FILE` (the alias's `reasoning` object: its levels and its wire), not a global variable. A folder or
