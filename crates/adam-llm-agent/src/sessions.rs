@@ -212,7 +212,125 @@ impl SessionTools {
             .map(|agent| (agent.name.clone(), agent.bounds.clone()))
             .collect()
     }
+
+    /// The section a model reads about these tools ([ADR 0054] decision 9): the helpers, what each
+    /// tool does and takes, when to keep a session open, and that `config` only narrows. The
+    /// assembly appends it to the instructions of an agent that has the tools. See
+    /// [`guide_for`](Self::guide_for).
+    ///
+    /// [ADR 0054]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md
+    pub fn guide(&self) -> String {
+        Self::guide_for(self.roster.names())
+    }
+
+    /// The section for helpers called `helpers`, which need not be sorted. It names the tools and
+    /// the helpers and nothing per session: no limit and no count, so a deployment that changes a
+    /// limit does not change the prompt, and it is the same bytes for the same helpers. It is
+    /// made from the table the tests hold to the specs, so a tool or an argument cannot be
+    /// documented that the specs lack, or the other way round.
+    pub fn guide_for<'a>(helpers: impl IntoIterator<Item = &'a str>) -> String {
+        let mut helpers: Vec<&str> = helpers.into_iter().collect();
+        helpers.sort_unstable();
+        let helpers: Vec<String> = helpers.iter().map(|h| format!("`{h}`")).collect();
+        let mut out = String::from(
+            "## Child sessions\n\n\
+             A session runs a helper in the background: you keep working while it works. \
+             The helpers you can start a session on: ",
+        );
+        out.push_str(&helpers.join(", "));
+        out.push_str(".\n\nThe session tools (an argument marked `?` is optional):");
+        for tool in &GUIDE {
+            let args: Vec<String> = tool
+                .args
+                .iter()
+                .map(|(name, required)| {
+                    if *required {
+                        format!("`{name}`")
+                    } else {
+                        format!("`{name}?`")
+                    }
+                })
+                .collect();
+            out.push_str(&format!(
+                "\n- `{}` ({}): {}",
+                tool.name,
+                args.join(", "),
+                tool.purpose
+            ));
+        }
+        let options: Vec<String> = CONFIG_OPTIONS
+            .iter()
+            .map(|(own, _)| format!("`{own}`"))
+            .collect();
+        out.push_str(&format!(
+            "\n\nOptions of `config`: {}. They only narrow what a helper allows: a value above \
+             what the helper allows is refused, and the refusal names the option and says what is \
+             allowed. An option you leave out is the helper's own.",
+            options.join(", ")
+        ));
+        out.push_str(&format!(
+            "\n\nA helper does not see this conversation: put everything it needs in `prompt`. \
+             By default a session closes when its round has ended. Keep one open (`keep_open`) \
+             only when you will send it more, and close what you kept open with `{SUBAGENT_CLOSE}` \
+             when you are done."
+        ));
+        out
+    }
 }
+
+/// One session tool as the guide says it: the name, what it does and the arguments it takes (each
+/// with whether it is required). The specs say the same in JSON Schema; a test holds the two to
+/// each other, so a rename in one and not the other fails.
+struct GuideTool {
+    name: &'static str,
+    purpose: &'static str,
+    args: &'static [(&'static str, bool)],
+}
+
+/// The session tools in [`SESSION_TOOLS`] order: the one source of [`SessionTools::guide_for`].
+const GUIDE: [GuideTool; 5] = [
+    GuideTool {
+        name: SUBAGENT_START,
+        purpose: "start a session on a helper and get its session id at once. Give it a \
+                  `config` to narrow its limits, and `keep_open` to keep it for more messages.",
+        args: &[
+            ("agent", true),
+            ("description", true),
+            ("prompt", true),
+            ("keep_open", false),
+            ("config", false),
+        ],
+    },
+    GuideTool {
+        name: SUBAGENT_SEND,
+        purpose: "send a message to a session. It starts the next round of an idle session, \
+                  and is steered into a round that works. A closed session takes none.",
+        args: &[("session", true), ("message", true)],
+    },
+    GuideTool {
+        name: SUBAGENT_READ,
+        purpose: "read the report of a session's latest round, paged by lines. Pass `wait` to \
+                  wait for a working round to end; never poll.",
+        args: &[
+            ("session", true),
+            ("wait", false),
+            ("offset", false),
+            ("limit", false),
+        ],
+    },
+    GuideTool {
+        name: SUBAGENT_CLOSE,
+        purpose: "close a session for good: it takes no more messages. A working round \
+                  finishes unless you pass `cancel`.",
+        args: &[("session", true), ("cancel", false)],
+    },
+    GuideTool {
+        name: SUBAGENT_LIST,
+        purpose: "list the sessions of this conversation and their state, the open ones first, \
+                  paged by sessions.",
+        args: &[("offset", false), ("limit", false)],
+    },
+];
 
 // ---------------------------------------------------------------------------
 // Helpers

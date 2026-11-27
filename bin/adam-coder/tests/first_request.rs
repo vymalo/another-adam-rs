@@ -24,7 +24,9 @@ use common::Fixture;
 
 /// The coder's first request, measured on the commit that pinned it. A kilobyte of growth is
 /// allowed (a tool's description may gain a sentence); anything more is a reviewed decision.
-const BASELINE_PROMPT_BYTES: usize = 30814; // measured 2026-11-21 on the merged head (b16c076a)
+// measured 2026-11-21 on the merged head (b16c076a), plus the 1698 bytes of the session tools' section
+// (ADR 0054 decision 9, "\n\n" and 1696 bytes for the helpers `explorer` and `reviewer`); not remeasured.
+const BASELINE_PROMPT_BYTES: usize = 32512;
 const BASELINE_TOOLS_BYTES: usize = 62293; // measured 2026-11-21 on the merged head (b16c076a)
 const GROWTH_ALLOWED: usize = 1024;
 /// The owner's budget for the coder's tools once S3 makes it lean (ADR 0066).

@@ -15,7 +15,9 @@ use adam_assembly::{
     AgentDef, Assembly, Error, LOAD_SKILL, READ_SKILL_FILE, RunSkills, SkillField,
     run_skills_conformance,
 };
-use adam_llm_agent::{Conversation, ToolCtx, ToolError, ToolOutput, ToolSet, user_message};
+use adam_llm_agent::{
+    Conversation, SessionTools, ToolCtx, ToolError, ToolOutput, ToolSet, user_message,
+};
 use adam_model::{Message, MockModel, ModelRequest, ToolCall};
 use common::{instructions, plain, runtime, spawn_worker, tools, wait_done, write};
 use serde_json::{Value, json};
@@ -89,6 +91,16 @@ fn assemble(def: AgentDef, model: Arc<MockModel>) -> Assembly {
 
 fn info<'a>(assembly: &'a Assembly, name: &str) -> &'a adam_assembly::AgentInfo {
     assembly.info().iter().find(|i| i.name == name).unwrap()
+}
+
+/// The prompt of a root that has `helper` for a subagent, without the section about the session
+/// tools that ends it (asserted whole in `tests/sessions_guide.rs`).
+fn without_sessions(prompt: &str) -> String {
+    let guide = SessionTools::guide_for(["helper"]);
+    prompt
+        .strip_suffix(&format!("\n\n{guide}"))
+        .unwrap_or_else(|| panic!("the prompt ends with the session tools' section: {prompt}"))
+        .to_owned()
 }
 
 fn call(id: &str, tool: &str, args: Value) -> ToolCall {
@@ -171,7 +183,7 @@ fn the_catalog_follows_the_prompt_and_escapes_the_descriptions() {
     let assembly = assemble(def_of(&dir), Arc::new(MockModel::new()));
     let prompt = &info(&assembly, "coder").prompt;
     assert_eq!(
-        prompt,
+        without_sessions(prompt),
         "You are the coder.\n\n\
          The following skills provide specialized instructions for specific tasks.\n\
          When a task matches a skill's description, call the load_skill tool with the skill's name to load its full instructions.\n\
@@ -220,7 +232,7 @@ fn without_a_skill_there_is_no_catalog_and_no_tool() {
     let dir = tree("skills: []");
     let assembly = assemble(def_of(&dir), Arc::new(MockModel::new()));
     let none = info(&assembly, "coder");
-    assert_eq!(none.prompt, "You are the coder.");
+    assert_eq!(without_sessions(&none.prompt), "You are the coder.");
     // No skill tools, and no catalog; the subagent's tool stays.
     assert_eq!(
         none.tools,
@@ -636,7 +648,7 @@ async fn a_preloaded_skill_is_in_the_prompt_and_out_of_the_catalog() {
     assert!(!catalog.contains("<name>alpha</name>"), "{catalog}");
     assert!(catalog.contains("<name>beta</name>") && catalog.contains("<name>gamma</name>"));
     assert_eq!(
-        preloaded,
+        without_sessions(preloaded),
         "\n\nThe following skills are already loaded. Follow them whenever a task matches their \
          description. Files a skill bundles are listed under <skill_resources>; read one with the \
          read_skill_file tool.\n\n\

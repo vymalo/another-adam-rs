@@ -250,7 +250,7 @@ reading it sleeps until its timer.
 
 [ADR 0045](../decisions/0045-a-subagent-can-run-in-the-background-as-a-session.md) lets a subagent run in the
 background as a session that is sent more messages. The runtime half (slice 1) is in `crates/adam-runtime`; the five tools
-(slice 2) are in `crates/adam-llm-agent` (`sessions.rs`) and are given to a root with subagents by `adam-assembly`. A person can start the same sessions over A2A (`child-sessions/v1`, slice 6): the rounds are runs of the same helper agents, started by the front of a `control-plane` process through start-only registrations (`AgentDef::session_starters`) and stepped by a worker; see [the A2A server](a2a-server.md#child-sessions-child-sessionsv1).
+(slice 2) are in `crates/adam-llm-agent` (`sessions.rs`) and are given to a root with subagents by `adam-assembly`, which also ends that root's instructions with a short *Child sessions* section that tells the model what each tool does ([ADR 0054](../decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md) decision 9). A person can start the same sessions over A2A (`child-sessions/v1`, slice 6): the rounds are runs of the same helper agents, started by the front of a `control-plane` process through start-only registrations (`AgentDef::session_starters`) and stepped by a worker; see [the A2A server](a2a-server.md#child-sessions-child-sessionsv1).
 
 **What the runtime has.**
 
