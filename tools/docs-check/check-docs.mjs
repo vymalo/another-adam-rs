@@ -21,6 +21,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { JSDOM } from 'jsdom';
+import { githubSlug } from './slug.mjs';
 
 const root = process.cwd();
 // Build output, dependencies, and the agent skills (checked by rule 5, not as docs). The agent
@@ -57,13 +58,7 @@ function anchors(file) {
   const out = new Set();
   const text = fs.readFileSync(file, 'utf8').replace(/```[\s\S]*?```/g, '');
   for (const m of text.matchAll(/^ {0,3}#{1,6}[ \t]+(.+?)[ \t]*#*[ \t]*$/gm)) {
-    const base = m[1]
-      .replace(/`/g, '')
-      .replace(/\[([^\]]*)\]\([^)]*\)/g, '$1')
-      .toLowerCase()
-      .replace(/[^\p{L}\p{N}\s_-]/gu, '')
-      .trim()
-      .replace(/\s/g, '-');
+    const base = githubSlug(m[1]);
     const n = seen.get(base) ?? 0;
     seen.set(base, n + 1);
     out.add(n === 0 ? base : `${base}-${n}`);

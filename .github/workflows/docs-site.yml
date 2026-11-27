@@ -6,10 +6,10 @@ name: Docs site
 # everything and uploads the artifact (that is its proof) but never deploys; only a push to main does.
 on:
   pull_request:
-    paths: ["docs/**", "crates/**", "bin/**", "Cargo.toml", "Cargo.lock", ".github/workflows/docs-site.yml"]
+    paths: ["docs/**", "tools/docs-check/slug.mjs", "crates/**", "bin/**", "Cargo.toml", "Cargo.lock", ".github/workflows/docs-site.yml"]
   push:
     branches: [main]
-    paths: ["docs/**", "crates/**", "bin/**", "Cargo.toml", "Cargo.lock", ".github/workflows/docs-site.yml"]
+    paths: ["docs/**", "tools/docs-check/slug.mjs", "crates/**", "bin/**", "Cargo.toml", "Cargo.lock", ".github/workflows/docs-site.yml"]
   workflow_dispatch:
 
 permissions:
@@ -56,6 +56,11 @@ jobs:
         run: npm --prefix docs ci --no-fund --no-audit
       - name: Build the site
         run: npm --prefix docs run build
+      # Crawls the built pages: every internal link must reach a page of dist/ and every #fragment an id on it. Before the
+      # rustdoc is copied in below, whose links (and /rust/ hrefs) it skips; the build alone sees neither dead ids nor
+      # links that resolve to nothing on the site.
+      - name: Check the links of the built site
+        run: npm --prefix docs run check-links
       # After the site build, which empties its output. The Pages artifact is uploaded below.
       - name: Publish the rustdoc under /rust/
         run: |

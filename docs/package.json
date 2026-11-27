@@ -5,7 +5,8 @@
   "scripts": {
     "dev": "node gen-a2a-api.mjs && vitepress dev",
     "build": "node gen-a2a-api.mjs && vitepress build",
-    "preview": "vitepress preview"
+    "preview": "vitepress preview",
+    "check-links": "node .vitepress/check-links.mjs"
   },
   "devDependencies": {
     "@vaam-apps/vitepress-md3": "1.0.2",

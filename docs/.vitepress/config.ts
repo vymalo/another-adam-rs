@@ -1,8 +1,10 @@
 import { readdirSync, readFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { dirname, join, posix } from "node:path";
 import { fileURLToPath } from "node:url";
 import { defineMd3Config } from "@vaam-apps/vitepress-md3/config";
 import { withMermaid } from "vitepress-plugin-mermaid";
+// The one slug function of the sources' checker (tools/docs-check) and of this site, so the two cannot drift.
+import { githubSlug } from "../../tools/docs-check/slug.mjs";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -105,6 +107,35 @@ export function escapeUnknownTags(md: any) {
   }
 }
 
+const REPO = "https://github.com/vymalo/another-adam-rs";
+// The folders' README.md files that `rewrites` below serves as index pages.
+const INDEX_PAGES = new Set(["README.md", "decisions/README.md"]);
+
+// A relative link out of docs/, or to a file in docs/ that is not a page (json, yaml, images), is the file on GitHub;
+// a link to a README.md that the site serves as an index lands on that index.
+function leavingDocsLinks(state: any) {
+  const from = posix.dirname(state.env?.relativePath ?? "index.md");
+  for (const block of state.tokens)
+    for (const t of block.children ?? [])
+      if (t.type === "link_open") {
+        const href: string | null = t.attrGet("href");
+        if (!href || href.startsWith("#") || href.startsWith("/") || /^[a-z][a-z0-9+.-]*:/i.test(href)) continue;
+        const [, path, rest = ""] = href.match(/^([^#?]*)(.*)$/)!;
+        const resolved = posix.normalize(posix.join(from, decodeURI(path)));
+        // The rustdoc is copied in after the build; it is a site page, never a GitHub file.
+        if (/^(\.\.\/)*rust\//.test(path)) continue;
+        const outside = resolved === ".." || resolved.startsWith("../");
+        const ext = posix.extname(resolved);
+        if (outside || (ext !== "" && ext !== ".md")) {
+          const repoPath = outside ? posix.normalize(posix.join("docs", resolved)) : `docs/${resolved}`;
+          const dir = path.endsWith("/") || ext === "";
+          t.attrSet("href", `${REPO}/${dir ? "tree" : "blob"}/main/${repoPath.replace(/\/$/, "")}${rest}`);
+        } else if (INDEX_PAGES.has(resolved)) {
+          t.attrSet("href", href.replace(/README\.md(?=#|$)/, "index.md"));
+        }
+      }
+}
+
 export default withMermaid(
   defineMd3Config({
     title: "adam-rs",
@@ -112,9 +143,10 @@ export default withMermaid(
     base: process.env.DOCS_BASE ?? "/another-adam-rs/",
     cleanUrls: true,
     rewrites: { "README.md": "index.md", "decisions/README.md": "decisions/index.md" },
-    // Pages link to source files outside docs/ (checked by tools/docs-check); every other dead link fails the build.
-    // /rust/ is the rustdoc the workflow copies in after this build, so it does not exist yet while links are checked.
-    ignoreDeadLinks: [/^\.\/(\.\.\/)+/, /(^|\/)\.agents\//, /^(\/|(\.\.\/)*)rust\//],
+    // Links that leave docs/ (crate READMEs, deploy/, .agents/, ...) are rewritten to GitHub below, so every dead link
+    // left fails the build. /rust/ is the rustdoc the workflow copies in after this build, so it does not exist yet
+    // while links are checked; docs/.vitepress/check-links.mjs skips it for the same reason.
+    ignoreDeadLinks: [/^(\/|(\.\.\/)*)rust\//],
     srcExclude: ["**/node_modules/**"],
     themeConfig: {
       md3: { style: "expressive", seed: "#0f766e" },
@@ -131,7 +163,13 @@ export default withMermaid(
       editLink: { pattern: "https://github.com/vymalo/another-adam-rs/edit/main/docs/:path" },
     },
     markdown: {
-      config: (md: any) => escapeUnknownTags(md),
+      // GitHub's heading ids, so a `#59a-...` or em-dash anchor written for GitHub lands here too: VitePress would
+      // prefix `_` to an id that starts with a digit and keep the em dash. Repeats get -1, -2 from the anchor plugin.
+      anchor: { slugify: githubSlug },
+      config: (md: any) => {
+        escapeUnknownTags(md);
+        md.core.ruler.push("links-leaving-docs", leavingDocsLinks);
+      },
     },
   }),
 );
