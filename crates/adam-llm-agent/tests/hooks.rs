@@ -527,6 +527,7 @@ fn old_and_new_step_records_decode_both_ways() {
             version: 1,
             data: json!({"n": 1}),
         }],
+        approval: None,
     };
     let new_json = serde_json::to_value(&new).unwrap();
     // A build that predates hooks reads the record as the output it flattened, and ignores the rest.
@@ -731,12 +732,14 @@ async fn a_stop_answers_the_call_and_fails_the_run() {
     );
 }
 
-/// An ask parks nothing until approval is built (ADR 0050, slice H8): the call is not run and its
-/// result says it awaits approval.
+/// An ask parks the run for the person's approval (ADR 0050, slice H8): the call is not run, its
+/// step records the ask and its question, and observers read `approval.asked` and, once the person
+/// answers, `approval.answered`, keyed by the asking step and by the message that answered.
 #[tokio::test]
-async fn an_ask_is_recorded_and_the_call_is_not_run() {
+async fn an_ask_parks_the_run_and_observers_read_the_approval() {
     let h = Harness::new();
     let calls = Arc::new(AtomicUsize::new(0));
+    let watches = Arc::new(Watches::default());
     let agent = h
         .agent()
         .tool(Probe {
@@ -746,6 +749,7 @@ async fn an_ask_is_recorded_and_the_call_is_not_run() {
             verdict: Verdict::Ask,
             reason: "may I?",
         })
+        .plugin(SharedWatches(watches.clone()))
         .build();
     h.mock
         .push_tool_calls(vec![call("c1", "probe", json!({"use": "independent"}))])
@@ -756,14 +760,58 @@ async fn an_ask_is_recorded_and_the_call_is_not_run() {
         .await
         .expect("start");
     let worker = spawn_worker(&rt);
-    let view = wait_done(&rt, run).await;
-    worker.stop().await;
-
-    assert_eq!(calls.load(SeqCst), 0);
-    let messages = conversation(&rt, &view).await.messages;
-    assert_eq!(messages[2].text(), "awaiting approval: may I?");
+    let parked = wait_for(&rt, run, "parked on the approval", |v| {
+        v.status == RunStatus::Parked && v.waiting
+    })
+    .await;
+    assert_eq!(calls.load(SeqCst), 0, "nothing runs before the answer");
+    let state = conversation(&rt, &parked).await;
+    let approval = state.approval.expect("the call waits for approval");
+    assert_eq!(
+        (approval.call_id.as_str(), approval.approved),
+        ("c1", false)
+    );
     let record = step_record(&h.store, run, "tool:c1").await;
     assert_eq!(record.hooks[0].verdict, HookDecision::ASK);
+    assert_eq!(record.awaits_approval(), Some("may I?"));
+
+    let answer = user_message("yes");
+    let answer_id = answer.id.clone();
+    rt.deliver(run, answer).await.expect("deliver");
+    let view = wait_done(&rt, run).await;
+    worker.stop().await;
+    assert_eq!(calls.load(SeqCst), 1, "approved, the call ran once");
+    let messages = conversation(&rt, &view).await.messages;
+    assert!(!is_error(tool_of(&messages, "c1")));
+
+    let seen = watches.0.lock().unwrap().clone();
+    let got: Vec<(String, String)> = seen
+        .iter()
+        .map(|e| (e.kind.name().to_owned(), e.header.key.clone()))
+        .collect();
+    assert_eq!(
+        got,
+        vec![
+            (
+                "tool.started".into(),
+                format!("{run}/tool:c1/tool.started/0")
+            ),
+            (
+                "approval.asked".into(),
+                format!("{run}/tool:c1/approval.asked/0")
+            ),
+            (
+                "approval.answered".into(),
+                format!("{run}/{answer_id}/approval.answered/0")
+            ),
+            (
+                "tool.completed".into(),
+                format!("{run}/tool:c1/tool.completed/0")
+            ),
+        ]
+    );
+    assert_eq!(seen[1].fields["question"], json!("may I?"));
+    assert_eq!(seen[2].fields["approved"], json!(true));
 }
 
 /// A hook that panics never lets the call through: the step records a failure and the call is an

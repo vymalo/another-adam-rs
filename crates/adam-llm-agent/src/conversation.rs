@@ -248,6 +248,30 @@ pub struct PendingQuestion {
     pub stream: Option<String>,
 }
 
+/// A tool call a `before_tool` hook asked a person to approve (ADR 0050, decision 12, slice H8).
+///
+/// Stored in [`Conversation::approval`] beside the [`PendingQuestion`] the run parks on, which is
+/// the question the person reads and answers through the path every question takes. While it is
+/// not [`approved`](Self::approved) the run waits; a yes sets it, and the next call of the loop runs
+/// the call in the journaled step `tool:<call id>:approved` with [`arguments`](Self::arguments),
+/// exactly once; a no answers the call with the person's words and clears it. The step that asked is
+/// recorded, so the hooks are never asked again.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Approval {
+    /// The call that waits.
+    pub call_id: String,
+    /// Its tool.
+    pub tool: String,
+    /// What the hook asked, in its own words.
+    pub question: String,
+    /// The arguments the call runs with when approved: the model's, as the hooks before the ask
+    /// left them (the step `tool:<call id>` recorded them).
+    pub arguments: Value,
+    /// The person said yes: the call runs at the next turn of the loop.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub approved: bool,
+}
+
 /// A tool call that waits for a child run to finish.
 ///
 /// One kind of [`PendingWait`]. The run is parked with a timer, and the call is
@@ -721,6 +745,11 @@ pub struct Conversation {
     /// the deployment's cap. Absent from state written before it existed, and not written at `0`.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub end_continuations: u32,
+    /// The call a hook asked a person to approve, while the run waits for the answer or has it and
+    /// has not yet run the call (ADR 0050, slice H8). Absent from state written before it existed,
+    /// and not written while `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval: Option<Approval>,
     /// The plan of the conversation ([`Plan`]): written by a tool with
     /// [`ToolOutput::with_plan`](crate::ToolOutput::with_plan), applied only from a result that is not
     /// an error, and carried into a run that continues this one. It is never put in the system

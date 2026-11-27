@@ -80,7 +80,7 @@ is read from the store, the notice is only a wake-up). The cases: [session inter
 | S15 | `a_report_read_by_the_model_is_not_appended_again`, `a_run_without_sessions_lists_only_at_its_first_model_call` |
 | S16 | `a_journal_from_before_reports_replays_to_the_same_history`, `a_replay_appends_the_same_reports`, `a_replay_of_a_stale_answer_counts_each_round_once` |
 | S17 | `each_limit_refuses_in_words`, `an_idle_expired_session_refuses_a_send_as_closed`, `an_expired_sessions_report_is_still_told_once` |
-| S18 | `a_persons_round_that_asks_the_person_is_blocked_and_the_answer_resumes_it`, `a_child_run_that_is_no_shown_session_cannot_ask`, `a_shown_round_asks_the_person_who_answers_it_in_the_child_context` |
+| S18 | `a_persons_round_that_asks_the_person_is_blocked_and_the_answer_resumes_it`, `a_child_run_that_is_no_shown_session_cannot_ask`, `a_shown_round_asks_the_person_who_answers_it_in_the_child_context`; a hook's `Ask` in a child: `a_child_reads_ask_as_deny` (`crates/adam-llm-agent/tests/approval.rs`, a run whose start names a `root_run`; the predicate is `Conversation::may_ask_person` and `is_unattended`, read by `approvable` in `crates/adam-llm-agent/src/agent.rs`) |
 
 ## Remote session interleavings
 

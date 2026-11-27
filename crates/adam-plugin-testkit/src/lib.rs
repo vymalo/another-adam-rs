@@ -340,6 +340,44 @@ macro_rules! plugin_conformance {
         }
 
         #[test]
+        fn an_ask_lets_the_plugins_after_it_refuse() {
+            // An ask does not end the set (slice H8): the plugin after it is asked, and its denial wins.
+            let after = std::sync::Arc::new($crate::Allows::default());
+            let set = ($make)()
+                .with(std::sync::Arc::new($crate::Answers(adam_plugin::Verdict::Ask("may I?".into()))))
+                .with(after.clone());
+            let mut arguments = a_call();
+            let mut call = adam_plugin::HookedCall {
+                tool: "ls",
+                arguments: &mut arguments,
+            };
+            assert_eq!(
+                set.before_tool(&mut call).expect("a verdict"),
+                adam_plugin::Verdict::Ask("may I?".into()),
+                "an ask that no plugin after it refuses is the set's"
+            );
+            assert_eq!(after.before.load(std::sync::atomic::Ordering::SeqCst), 1, "the plugin after the ask is asked");
+
+            let set = ($make)()
+                .with(std::sync::Arc::new($crate::Answers(adam_plugin::Verdict::Ask("may I?".into()))))
+                .with(std::sync::Arc::new($crate::Answers(adam_plugin::Verdict::Deny("no".into()))));
+            assert_eq!(
+                set.before_tool(&mut call).expect("a verdict"),
+                adam_plugin::Verdict::Deny("no".into()),
+                "a denial after an ask wins"
+            );
+
+            let set = ($make)()
+                .with(std::sync::Arc::new($crate::Answers(adam_plugin::Verdict::Ask("first?".into()))))
+                .with(std::sync::Arc::new($crate::Answers(adam_plugin::Verdict::Ask("second?".into()))));
+            assert_eq!(
+                set.before_tool(&mut call).expect("a verdict"),
+                adam_plugin::Verdict::Ask("first?".into()),
+                "the first question stands"
+            );
+        }
+
+        #[test]
         fn a_rewrite_is_visible_to_the_next_plugin() {
             let set = ($make)().with(std::sync::Arc::new($crate::Rewrites));
             let mut arguments = a_call();

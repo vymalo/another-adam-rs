@@ -72,8 +72,11 @@ the adam crates pinned in `orchestrator/Cargo.toml`.
      slices H1 and H1b): `LlmAgentBuilder::hooks(HookSet)` or `.plugin(one)` (`adam-plugin`, re-exported
      by `adam-llm-agent`) runs `before_tool` and `after_tool` **inside** the call's journaled step
      `tool:<call id>`, so a hook may rewrite the arguments or the text the model reads, deny the call,
-     ask (not built: the call is not run) or stop the run, and a replay that finds the step recorded
-     asks no hook. `message_received` runs in the step that takes a person's message in
+     ask or stop the run, and a replay that finds the step recorded asks no hook. An `Ask` (H8) parks
+     the run on a plain question (`Conversation::approval` holds the call); a clear yes runs the call
+     once in `tool:<call id>:approved` with the arguments the hooks left, any other answer refuses it
+     with the person's words, and a child run or a schedule's firing reads the ask as a denial
+     (`NOT_APPROVABLE`). `message_received` runs in the step that takes a person's message in
      (`message:start`, `message:<inbound id>`; taken only when a set is installed): a hook may allow
      the message, rewrite its text, or refuse it — a refused start fails the run `Rejected` with the
      reason, and one refused while the task works is left out and the task goes on. `model_request`

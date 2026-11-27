@@ -206,11 +206,13 @@ repository holds is run, a program's environment is empty, and every decision is
       bound of compactions per run), a declared action as `action:<turn>:<i>`, in which the declaring plugin's `perform`
       runs and its result is recorded. A hook never performs an action itself.
 
-12. **`Ask` parks for the person's approval**, after the coder's snapshot plugin is built (the owner's order). The
+12. **`Ask` parks for the person's approval**, ~~after the coder's snapshot plugin is built (the owner's order)~~. The
     approval is a question form; on yes, `tool:<call id>:approved` runs the recorded arguments once; on no, the call is
     answered with the reason. A replay never asks twice. A run whose client cannot show the form (a child run,
     ADR 0045 decision 9) reads `Ask` as `Deny`. Until this is built, `Ask` is recorded as an error result
     `awaiting approval`, so the call is never run.
+    *Amended 2026-11-27, an owner decision: H8 no longer waits for H11; an application already embeds adam-engine and
+    needs approvals.* The words struck out above no longer hold; what was built is in the note of slice H8 at the end.
 
 ### Programs
 
@@ -391,7 +393,7 @@ step that part changes. Hooks are tested with concurrent tool calls from H1 on.
 | H6 | `plugins:` in agent files, `BoundDef::plugin`, inheritance by subagents, `audit` | a missing name exits 78; a secret-looking option is refused; audit lines match a golden | H2 |
 | H10 | `ExecHook`, `HookedEnvironment`, `HidingEnvironment` as one | the coder's hiding tests unchanged; hidden names always win | H1 |
 | H11 | The coder's `snapshot` plugin, `revert_to`, its custom events | steps list their files; a revert restores a slot; a replay takes no snapshot | H1, H5, H6 |
-| H8 | `Ask` parks; `tool:<call id>:approved` | an approved call runs once across a crash; a replay never asks twice; a child reads `Ask` as `Deny` | H1, after H11 |
+| H8 | `Ask` parks; `tool:<call id>:approved` | an approved call runs once across a crash; a replay never asks twice; a child reads `Ask` as `Deny` | H1 (no longer after H11: decision 12, amended 2026-11-27) |
 | H9 | `compaction.before`; `model.request` with `kind: compaction` | the summary request carries the added context; a veto shortens instead; a replay asks no hook | H1, H3 |
 | H7 | Child and session events | a scripted run with a one-shot child and a kept-open session gives the events in order, again on a replay | H2; ADR 0045 slices 3 and 4 |
 | P1 | `adam-hook-exec`, the `adam-hooks/1` adapter, and a test program | messages round-trip; a dead program makes deciding points transient, then the run fails; garbage denies; the child sees only the safe variables; a replay sends no request | H1, H2, H5 |
@@ -516,3 +518,45 @@ schema is carried for a consumer; the loop bounds the size), and `#[tool(events(
 `crates/adam-llm-agent/tests/custom_events.rs` (an undeclared or reserved name is refused, a replay after a crash delivers
 the event again with the same key, the 16 and 256 bounds), `crates/adam-a2a-runtime/tests/custom_events.rs` (an A2A client
 reads `demo.published` and not `demo.kept`) and `events_conformance!` in `adam-plugin-testkit`.
+
+*Amended 2026-11-27 (slice **H8** built):* a `tool.before` verdict `Ask` parks the run for the person's approval, as
+decision 12 says, with three readings to confirm.
+* **The record.** `tool:<call id>` records the `ask` decision with its question, the arguments the hooks left (`args`)
+  and a new member, `HookedOutput::approval` (the question). Its output is the error `awaiting approval: <question>`, so a
+  build that predates H8 reads the call as unrun; a record without `approval` (written before H8) still replays as an
+  unrun call, because the record decides, not the configuration. A replay of the transition that parked finds the step
+  recorded and parks on the same question: no hook is asked again.
+* **The question.** The run parks with a `PendingQuestion` whose text is the hook's question and a line on how to
+  answer, with no form (`ui` absent): the shape every question takes, so the A2A front shows `input-required` as for
+  `ask_user`. The call is kept in `Conversation::approval` (`call_id`, `tool`, `question`, `arguments`, `approved`).
+  **Reading 1: a clear yes approves** (`yes`, `y`, `approve`, `approved`, `allow`, `ok`, `okay`, without regard to case
+  or a final `.` or `!`), **and any other answer is a no**, whose words are the reason the call is answered with:
+  `not run: the person did not approve the call. They answered: <words>`. A form drawn by a client (a `confirm` of
+  `ask_user`) is not offered: the loop has no catalogue of the screen.
+* **Yes.** The yes is taken in outside the journal, as every answer is, and sets `approved`; the loop then runs the call
+  alone in the journaled step `tool:<call id>:approved` with the recorded arguments: no `before_tool` hook is asked again,
+  a source's `withhold` and `after_tool` still apply. A crash past that step's journal write replays the transition, reads
+  the same answer, finds the step recorded and runs nothing; the approval is cleared in the commit of the call's result.
+* **A run nobody can approve.** A child run that may not ask the person (ADR 0045 decision 9) and a firing of a
+  schedule record the ask as a `deny`, answered with `NOT_APPROVABLE` and the question, and nothing parks.
+* **Reading 2: an `Ask` no longer ends the set.** `HookSet::before_tool` asks the plugins after the one that asked, and
+  a later `Deny`, `Stop` or failure wins (the state diagram's "a hook asks and none denies"); of two asks the first
+  question stands. Before H8 the first verdict other than `Continue` ended the set, which let an approval run a call a
+  later plugin would have refused.
+* **Reading 3: beside other calls** (a segment of ADR 0049) an asked call cannot wait: it is answered "call the tool
+  alone to have it approved" and not run. A single call that started while the model wrote parks as one that did not.
+* **Observers.** `approval.asked` (`EventKind::ApprovalAsked`, key `<run>/tool:<call id>/approval.asked/0`, with the
+  tool, the call and the question) when the run parks, again with the same key on a replay of that transition, and
+  `approval.answered` (key `<run>/<inbound id>/approval.answered/0`, with `approved`) when the answer is taken in. The
+  asking call says no `tool.completed` or `tool.denied` until it runs or is refused.
+* **Not built here:** the engine's run state, events and answer path for an embedding host (ADR 0047 slice 5; its
+  builder takes no `HookSet` yet), and an A2A test that drives an approval end to end.
+
+Proof: `crates/adam-llm-agent/tests/approval.rs`: an approved call runs once across a crash (the worker dies in the next
+call after `tool:c1:approved` was journaled; the side effect stays at 1; red with that step run outside the journal), a
+replay never asks twice (the park's commit is lost; the replay parks on the recorded ask with the hook asked once; red
+with `tool:<call id>` run outside the journal), a child reads `Ask` as `Deny` (red with every run approvable: it parks
+for ever), and a no refuses the call with the person's words (red with every answer a yes). `an_ask_parks_the_run_and_observers_read_the_approval`
+in `tests/hooks.rs` holds the two events and their keys, and `an_ask_lets_the_plugins_after_it_refuse` in
+`plugin_conformance!` holds reading 2. `tool:<call id>:approved` is a new step name: roll every worker before the build
+is used (*No mixed versions*, above).

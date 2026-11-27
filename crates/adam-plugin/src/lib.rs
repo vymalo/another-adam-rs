@@ -398,17 +398,36 @@ impl HookSet {
         })
     }
 
-    /// Runs every plugin's `before_tool` in order, until one decides.
+    /// Runs every plugin's `before_tool` in order, until one denies or stops.
+    ///
+    /// An [`Verdict::Ask`] does not end the set (ADR 0050, decision 8 and slice H8): the plugins
+    /// after it are still asked, each seeing the arguments the ones before it left, because a call a
+    /// person approves runs, and a plugin that would have refused it must have had its say. A later
+    /// `Deny` or `Stop`, or a later failure, is the set's answer; a later `Ask` adds nothing (the
+    /// first question stands). The set answers the first `Ask` only when no plugin after it refused.
     ///
     /// # Errors
     /// The first plugin that panics, errors or misses its deadline, after a retryable failure has
     /// been tried again [`HookLimits::retries`] times. The caller denies on an error: a hook that
     /// cannot say `Continue` never lets the call through.
     pub fn before_tool(&self, call: &mut HookedCall<'_>) -> HookResult {
-        self.run("before_tool", |plugin| {
-            guard(plugin.name(), self.limits.deadline, || {
+        let mut asked: Option<Verdict> = None;
+        let decided = self.run_decided("before_tool", |plugin| {
+            let verdict = guard(plugin.name(), self.limits.deadline, || {
                 plugin.before_tool(call)
-            })
+            })?;
+            match verdict {
+                // The first question stands; the plugins after it are asked all the same.
+                Verdict::Ask(_) => {
+                    asked.get_or_insert(verdict);
+                    Ok(Verdict::Continue)
+                }
+                verdict => Ok(verdict),
+            }
+        })?;
+        Ok(match decided {
+            Some(one) => one.verdict,
+            None => asked.unwrap_or(Verdict::Continue),
         })
     }
 

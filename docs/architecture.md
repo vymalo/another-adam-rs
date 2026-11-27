@@ -778,7 +778,8 @@ sequenceDiagram
   (`point`, `verdict`, `reason`, the failing `plugin`) and the arguments that ran when a hook rewrote them. A replay that
   finds the step recorded asks no hook. A hook may refuse a message (a start then fails `Rejected` with the reason; one that
   arrives while the run works is left out and the task goes on), rewrite the arguments or the text, deny the call, ask a
-  person (not built: the call is not run) or stop the run; one that fails never lets the call or the message through. A
+  person (slice H8: the run parks on a question, and on yes the call runs once in the journaled step
+  `tool:<call id>:approved`; a no answers it with the person's words; a child run reads the ask as a denial) or stop the run; one that fails never lets the call or the message through. A
   rewrite that would change `Tool::access` is refused, because the schedule above was made from the model's arguments.
 * **A tool may emit custom events** (ADR 0050, slice H5). It declares each (`Tool::events`: a name `ns.name`, a version, a
   schema, and who may see it) and emits with `ToolCtx::emit_event`. The emit is recorded with the call's result, in the

@@ -68,6 +68,10 @@ pub enum EventKind {
     SessionRoundEnded,
     /// A session was closed: `subagent_close` returned.
     SessionClosed,
+    /// A `tool.before` verdict `Ask` parked the run for a person's approval (slice H8).
+    ApprovalAsked,
+    /// The person answered an approval: the call runs, or it is refused with their answer (H8).
+    ApprovalAnswered,
     /// The runtime committed a park (H4).
     RunParked,
     /// The runtime committed the end of a run, done or failed (H4).
@@ -83,7 +87,7 @@ pub enum EventKind {
 
 impl EventKind {
     /// Every core event of the catalogue: [`EventKind::Custom`] is not one.
-    pub const ALL: [EventKind; 22] = [
+    pub const ALL: [EventKind; 24] = [
         EventKind::RunStarted,
         EventKind::TurnStarted,
         EventKind::ModelResponded,
@@ -102,6 +106,8 @@ impl EventKind {
         EventKind::SessionRoundStarted,
         EventKind::SessionRoundEnded,
         EventKind::SessionClosed,
+        EventKind::ApprovalAsked,
+        EventKind::ApprovalAnswered,
         EventKind::RunParked,
         EventKind::RunEnded,
         EventKind::RunError,
@@ -130,6 +136,8 @@ impl EventKind {
             EventKind::SessionRoundStarted => "session.round.started",
             EventKind::SessionRoundEnded => "session.round.ended",
             EventKind::SessionClosed => "session.closed",
+            EventKind::ApprovalAsked => "approval.asked",
+            EventKind::ApprovalAnswered => "approval.answered",
             EventKind::RunParked => "run.parked",
             EventKind::RunEnded => "run.ended",
             EventKind::RunError => "run.error",
