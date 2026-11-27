@@ -33,6 +33,7 @@ use futures::future::BoxFuture;
 use futures::stream::FuturesUnordered;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
+use tracing::Instrument as _;
 
 use crate::access::ToolAccess;
 use crate::compaction::{
@@ -3398,11 +3399,14 @@ impl LlmAgent {
                 if !stream_text {
                     // The request races the run's cancellation: a cancel drops it, and with it the
                     // connection, instead of letting the provider finish an answer nobody will read.
+                    let span = model_span(&request.model, false);
                     let answer = tokio::select! {
                         biased;
                         () = cancel.cancelled() => return Err(ModelFailure::cancelled()),
-                        answer = model.complete(request) => answer.map_err(ModelFailure::from)?,
+                        answer = model.complete(request).instrument(span.clone()) => answer.map_err(ModelFailure::from)?,
                     };
+                    span.record("input_tokens", answer.usage.input_tokens);
+                    span.record("output_tokens", answer.usage.output_tokens);
                     return Ok(Recorded {
                         response: unthought(&emitter, run, turn, false, answer).await,
                         stream: None,
@@ -4154,11 +4158,14 @@ impl LlmAgent {
                         }
                     }
                 }
+                let span = model_span(&request.model, true);
                 let answer = tokio::select! {
                     biased;
                     () = cancel.cancelled() => return Err(ModelFailure::cancelled()),
-                    answer = model.complete(request) => answer.map_err(ModelFailure::from)?,
+                    answer = model.complete(request).instrument(span.clone()) => answer.map_err(ModelFailure::from)?,
                 };
+                span.record("input_tokens", answer.usage.input_tokens);
+                span.record("output_tokens", answer.usage.output_tokens);
                 let text = answer.message.text();
                 Ok(Summarised {
                     summary: (!text.trim().is_empty()).then_some(text),
@@ -5862,12 +5869,16 @@ impl LlmAgent {
             // The arguments the tool ran with, for the two `within` closures: each would otherwise
             // take `args` from this scope, and the after hook reads them again below.
             let ran = args.clone();
+            // A tool call's span (ANR-1346): the tool's name, from the set the agent offers, and
+            // nothing of what the call read or wrote.
+            let span = tool_span(&name);
             let called = match own {
                 Some(tool) => {
                     let limit = tool.time_limit().unwrap_or(DEFAULT_TOOL_TIME_LIMIT);
                     within(&tool_ctx, &name, limit, |ctx| async move {
                         tool.call(&ctx, ran).await
                     })
+                    .instrument(span.clone())
                     .await
                 }
                 None => {
@@ -5880,6 +5891,7 @@ impl LlmAgent {
                         }
                         Ok(ToolOutput::error(unknown))
                     })
+                    .instrument(span.clone())
                     .await
                 }
             };
@@ -7752,6 +7764,31 @@ fn timed_out(tool: &str, limit: Duration) -> String {
 /// result before that, at the instant of the limit or while it was told to stop. It runs inside the
 /// journaled step, so a replay reads the recorded answer and never waits, and no clock is read in a
 /// transition.
+/// The span of one model call ([ANR-1346]): the alias the request names, whether it is a
+/// compaction's summary, and its token counts once it answers.
+///
+/// **No prompt, no message, no tool spec, no answer** — a model call's content is not telemetry
+/// (pantry `otel-conventions`). A provider is not a field: the loop is not told one.
+///
+/// [ANR-1346]: https://github.com/vymalo/another-adam-rs/issues
+fn model_span(alias: &str, compaction: bool) -> tracing::Span {
+    tracing::info_span!(
+        "adam.model",
+        alias = %alias,
+        compaction,
+        input_tokens = tracing::field::Empty,
+        output_tokens = tracing::field::Empty,
+    )
+}
+
+/// The span of one tool call ([ANR-1346]): the tool's name, from the set the agent offers, and
+/// nothing the call read or wrote.
+///
+/// [ANR-1346]: https://github.com/vymalo/another-adam-rs/issues
+fn tool_span(tool: &str) -> tracing::Span {
+    tracing::info_span!("adam.tool", tool = %tool)
+}
+
 async fn within<F, Fut>(
     tool_ctx: &ToolCtx,
     name: &str,
@@ -9520,5 +9557,83 @@ mod session_instructions_tests {
             with_session_instructions(Some("You are the coder.".into()), Some(&none)),
             Some("You are the coder.".into())
         );
+    }
+}
+
+/// The spans of a model call and a tool call ([ANR-1346]): their fields, and what is never one.
+///
+/// [ANR-1346]: https://github.com/vymalo/another-adam-rs/issues
+#[cfg(test)]
+mod call_span_tests {
+    use super::{model_span, tool_span};
+    use std::sync::{Arc, Mutex};
+    use tracing_subscriber::fmt::MakeWriter;
+
+    /// A writer the test reads back: what the subscriber rendered.
+    #[derive(Clone, Default)]
+    struct Captured(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Captured {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> MakeWriter<'a> for Captured {
+        type Writer = Self;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// What `span` renders, as text.
+    fn rendered(span: tracing::Span) -> String {
+        let sink = Captured::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(sink.clone())
+            .with_span_events(tracing_subscriber::fmt::format::FmtSpan::FULL)
+            .with_max_level(tracing::Level::INFO)
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            span.in_scope(|| {});
+        });
+        let bytes = sink
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        String::from_utf8(bytes).expect("utf-8")
+    }
+
+    #[test]
+    fn a_model_span_names_the_alias_and_holds_no_content() {
+        let text = rendered(model_span("some-alias", false));
+        assert!(text.contains("adam.model"), "{text}");
+        assert!(text.contains("some-alias"), "{text}");
+        // A prompt, a message, a tool spec or an answer is never a field.
+        for forbidden in [
+            "prompt", "system", "messages", "tools=", "answer", "content",
+        ] {
+            assert!(!text.contains(forbidden), "{forbidden} in {text}");
+        }
+    }
+
+    #[test]
+    fn a_tool_span_names_the_tool_and_holds_no_arguments() {
+        let text = rendered(tool_span("read_file"));
+        assert!(text.contains("adam.tool"), "{text}");
+        assert!(text.contains("read_file"), "{text}");
+        for forbidden in ["args", "arguments", "output", "content"] {
+            assert!(!text.contains(forbidden), "{forbidden} in {text}");
+        }
     }
 }
