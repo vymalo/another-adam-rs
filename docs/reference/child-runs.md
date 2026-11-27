@@ -295,15 +295,22 @@ this conversation's is "no session"). At most 16 sessions that are not closed an
 `max_open` and `max_rounds` as constants for now).
 
 **A session's own limits** ([ADR 0054](../decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md),
-slice 1). `subagent_start` takes an optional `config` of seven options: `max_turns`, `max_tool_calls`, `max_output_tokens`,
-`context_window`, `max_parallel_tool_calls`, `time_limit` (minutes) and `max_rounds`. An option chooses within what the
+slice 1). `subagent_start` takes an optional `config` of eight options: `max_turns`, `max_tool_calls`, `max_output_tokens`,
+`context_window`, `max_parallel_tool_calls`, `time_limit` (minutes), `max_rounds` and `report_schema`. An option chooses within what the
 subagent's folder allows and **never widens it**: a value above its bound is refused, in words that name the option
-(`config.max_turns is 51; at most 50`), and nothing starts; an option that is not one of the seven is refused too. What was
+(`config.max_turns is 51; at most 50`), and nothing starts; an option that is not one of the eight is refused too. What was
 admitted is kept in the session's header, and the round reads its limits from it. Five of them apply at the next model call
 (`max_turns`, `max_tool_calls`, `max_output_tokens`, `context_window`, `max_parallel_tool_calls`); `time_limit` and
 `max_rounds` apply to the next round. A later round copies the config and **clamps it to the bounds of that moment**, so a
 deployment that lowered a limit is obeyed and nothing is raised back. `max_output_tokens` is never `0` (that would leave the cap
 to the model) and a `context_window` is never so small that no history fits: it is held to the least that leaves room.
+
+`report_schema` is a JSON Schema (draft 2020-12, at most 16 KiB, no reference outside itself) that the subagent's final answer
+must match, for a helper that runs here (a remote one refuses it). The subagent is not shown the schema unless its first answer
+fails it, so describe the shape in `prompt` too. An answer that is not one JSON value, or does not match, is sent back to the
+model with the first three problems, twice at most, and each of those turns counts in `max_turns`; after that the round fails
+with `report does not match report_schema`. It applies to every round of the session, the first included; a `format`
+is only an annotation under draft 2020-12 and is not enforced.
 
 ```mermaid
 sequenceDiagram

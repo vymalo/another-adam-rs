@@ -508,7 +508,7 @@ parks the run and returns.
 
 | Tool | Arguments | Result |
 |---|---|---|
-| `subagent_start` | `agent` (enum), `description` (at most 80 characters), `prompt`, `keep_open` (default `false`), `config` (optional: `max_turns`, `max_tool_calls`, `max_output_tokens`, `context_window`, `max_parallel_tool_calls`, `time_limit`, `max_rounds`; [ADR 0054](../../docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md)) | `{"session", "agent", "state": "working", "keep_open"}` at once; the parent keeps working; a `config` above the subagent's bounds, or with an option that is not one of the seven, is an error result and starts nothing |
+| `subagent_start` | `agent` (enum), `description` (at most 80 characters), `prompt`, `keep_open` (default `false`), `config` (optional: `max_turns`, `max_tool_calls`, `max_output_tokens`, `context_window`, `max_parallel_tool_calls`, `time_limit`, `max_rounds`, `report_schema`; [ADR 0054](../../docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md)) | `{"session", "agent", "state": "working", "keep_open"}` at once; the parent keeps working; a `config` above the subagent's bounds, or with an option that is not one of the eight, a `report_schema` that is not admissible (not an object, over 16 KiB, a `$ref` outside itself, does not compile) or one on a remote subagent, is an error result and starts nothing |
 | `subagent_send` | `session`, `message` | `{"session", "round", "state", "delivered": "new_round" \| "steered" \| "queued"}` (`queued`: the round's agent says in its state, `queues_messages: true`, that it keeps the message until its remote can take it); an error result when the session is closed |
 | `subagent_read` | `session`, `wait` (default `false`), `offset`, `limit` | a header line (and a `config:` line, `max_turns 20, time_limit 10`, when the session has a config), `report: done` or `failed` and the report as a numbered page (the paging convention), or `report: none yet` while the round works, or `report: blocked` and the question while the round waits for the person (`SessionView::waiting`) |
 | `subagent_close` | `session`, `cancel` (default `false`) | `{"session", "state": "closed"}` |
@@ -528,6 +528,18 @@ parks the run and returns.
   the header's config into round 2 **clamped to the bounds of that moment** (`SessionBounds::clamp`), before it checks the round
   limit, so a lowered deployment limit is obeyed and the session's own `max_rounds` is enforced. Tests:
   `tests/session_limits.rs`, `tests/compaction.rs` and `tests/sessions.rs`.
+* **`report_schema`** (ADR 0054 slice 9, local subagents only). The round's final answer must be one JSON value that matches
+  the schema (draft 2020-12, so a `format` is an annotation and is not enforced; checked with `jsonschema` without its default features: nothing is fetched, so the crate still
+  holds no HTTP client or TLS stack for the embedded set). `LlmAgent::report_gate` checks it where the round would end (the words that end a turn, an announced answer and a tool's `final_answer`): a
+  mismatch (or an answer that is not JSON) is put to the model as a turn with the first three problems (the first also tells the
+  schema), **twice at most**, each a model call counted in `max_turns` (`Conversation::report_corrections`, absent while `0`,
+  reset by a message); then the round fails with `report does not match report_schema` (`REPORT_MISMATCH`) and the last
+  problems. An answer at a closing turn (a limit was reached, no correction left) must match or the round fails the same way.
+  The read's `config:` line says `report_schema set`. Admission is `SessionBounds::admit` (see `adam-runtime`). Tests:
+  `tests/session_limits.rs` (`a_matching_answer_is_the_report_and_costs_no_extra_turn`,
+  `a_mismatch_gets_two_corrective_turns_and_then_fails_the_round_with_the_reason`, `a_tools_final_answer_is_held_to_the_report_schema_and_never_ends_the_round_unchecked`, and the cases beside them) and
+  `tests/sessions.rs` (`a_report_schema_is_refused_at_start_when_it_cannot_be_enforced_and_recorded_when_it_can`,
+  `a_remote_subagent_refuses_a_report_schema`).
 * **Auto-close.** With `keep_open: false` the session is closed as soon as its round has ended (the report can still be read;
   a send is refused, in words that tell the model to start a new one). With `keep_open: true` it stays idle for the next
   `subagent_send`, whose round **continues the session's conversation** (round 2 sees round 1). Closing an idle session starts a

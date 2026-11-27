@@ -353,6 +353,17 @@ where a store is involved (`crates/adam-llm-agent/tests/sessions.rs` holds the s
 * Files: `agent.rs` (the check at the final answer), `crates/adam-llm-agent/Cargo.toml` (`jsonschema`), `sessions.rs`.
 * Accepted when: a matching answer is the report; a mismatch gets two corrective turns and then fails the round with the reason;
   a schema with an outside `$ref` or over 16 KiB is refused.
+* *Built (2026-11-27, ANR-220)*: `SessionConfig::report_schema` (`reportSchema` on the wire) is held by `SessionBounds::admit`
+  (`crates/adam-runtime/src/session.rs`, so the tool and the later A2A front share it): an object, at most 16 KiB
+  (`MAX_REPORT_SCHEMA_BYTES`), no `$ref` or `$dynamicRef` that does not start with `#`, and a draft 2020-12 schema that compiles
+  with nothing fetched (`jsonschema` without its default features, in `adam-runtime` and `adam-llm-agent`). A remote subagent
+  refuses it by name. The loop checks the answer at each place a round can end (`LlmAgent::report_gate`, `agent.rs`: the words that end a turn, an answer a tool announced, a tool's `final_answer`, and a closing turn): not one JSON
+  value, or one that does not match, puts the first three problems to the model as a turn (the first also tells the schema,
+  since the round is not otherwise shown its configuration), twice at most, each a model call counted in `max_turns`; then the
+  round fails with `report does not match report_schema` and the last problems. **A closing turn's answer (a limit was
+  reached, so no correction is left) must match too, or the round fails the same way**: a report that does not match is never
+  a `Done` one. A correction drops the announced answer that failed, so the corrected words are what is checked next. The count is `Conversation::report_corrections`, reset when a message reaches the run. A `format` is an annotation under draft 2020-12 and is not enforced; an answer in a code fence is not accepted (the correction says so). `subagent_start`'s
+  `config` names the option and its description tells the model to describe the shape in `prompt` too.
 
 **10. The A2A front.** Depends on 1, 4, 5 and the contract amendment in `vymalo/another-agentic-system`.
 * Files: `crates/adam-a2a-runtime/src/child_sessions.rs`, `session_events.rs`, `crates/adam-a2a` (the card's `agents[].config`).
