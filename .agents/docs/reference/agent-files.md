@@ -22,3 +22,19 @@ Claude or Copilot keys are accepted with a warning.
 
 Also confirmed: adam-rs domain types are **closed enums** (no `#[non_exhaustive]` unless an existing
 type already sets the pattern).
+
+## `plugins:`: what to check
+
+The key is read (`crates/adam-agent-fs/src/load/agent.rs`, `check_plugins`: a name of `a-z`, `0-9`, `-`,
+`_` and at most 64 characters, no duplicates, scalar options only, and no option name that looks like a
+secret) and bound by the assembly (`AgentDef::plugin` / `plugin_with`,
+`crates/adam-assembly/src/def.rs`; a name nobody registered is `Error::UnknownPlugin`, exit 78 in a
+binary). A subagent's plugins are its parent's and then its own (ADR 0050 decision 8), and `hooks:` stays
+an ignored key: an agent file never names a program.
+
+**Check before documenting a `plugins:` example:** does the binary you are writing about register the
+name? None of `bin/` does today (*verified 2026-11-27*: no `Plugin`, `HookSet` or `.plugin(` anywhere in
+`bin/`), so a folder served by `adam-agent` or `adam-coder` exits 78 on any entry, and the only
+in-tree plugin type, `adam-plugin`'s `Audit`, is registered by a host. When a binary starts registering
+one, this page, `docs/reference/agent-files.md`, `docs/guides/write-an-agent.md`, the
+`adam-agent-folder` skill and `docs/reference/parity.md` row 28 all change together.
