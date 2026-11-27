@@ -6,7 +6,8 @@
     "dev": "vitepress dev",
     "build": "vitepress build",
     "preview": "vitepress preview",
-    "check-links": "node .vitepress/check-links.mjs"
+    "check-links": "node .vitepress/check-links.mjs",
+    "test:in-depth": "node --test .vitepress/theme/in-depth.test.mjs"
   },
   "devDependencies": {
     "@vaam-apps/vitepress-md3": "1.0.2",

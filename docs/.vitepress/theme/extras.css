@@ -1,0 +1,90 @@
+/* The shared pieces of the documentation sites (docs/.vitepress/STRUCTURE.md, "Writing pages"):
+   a wider sidebar, and the `::: in-depth` block. Copy this file and in-depth.ts; nothing else is needed. */
+
+/* ---- Sidebar ------------------------------------------------------------------------------------------
+   VitePress derives every offset of the layout (the content's left padding, the local nav, the fixed
+   sidebar at wide screens) from this one variable, so changing it moves them together.
+   The phone layout (under 960px) is a drawer with its own width and is left alone. */
+@media (min-width: 960px) {
+  :root {
+    --vp-sidebar-width: 320px;
+  }
+}
+
+/* From 1440px the layout is capped (--vp-layout-max-width) and the sidebar takes the space outside the cap too. */
+@media (min-width: 1440px) {
+  :root {
+    --vp-sidebar-width: 360px;
+  }
+}
+
+/* ---- In depth -------------------------------------------------------------------------------------- */
+.vp-doc details.in-depth {
+  margin: 1rem 0;
+  border-radius: var(--md-sys-shape-container, 12px);
+  background-color: var(--md-sys-color-surface-container, var(--vp-c-bg-soft));
+  color: var(--md-sys-color-on-surface, var(--vp-c-text-1));
+  border: 1px solid var(--md-sys-color-outline-variant, var(--vp-c-divider));
+}
+
+.vp-doc details.in-depth > summary {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.75rem 1rem;
+  border-radius: inherit;
+  cursor: pointer;
+  list-style: none;
+  font-weight: 600;
+  color: var(--md-sys-color-primary, var(--vp-c-brand-1));
+}
+
+.vp-doc details.in-depth > summary::-webkit-details-marker {
+  display: none;
+}
+
+/* A chevron drawn with borders: it turns when the block opens. */
+.vp-doc details.in-depth > summary::before {
+  content: "";
+  flex: none;
+  width: 0.5rem;
+  height: 0.5rem;
+  border-right: 2px solid currentColor;
+  border-bottom: 2px solid currentColor;
+  transform: rotate(-45deg);
+  transition: transform 0.15s ease;
+}
+
+.vp-doc details.in-depth[open] > summary::before {
+  transform: rotate(45deg);
+}
+
+.vp-doc details.in-depth > summary:hover {
+  background-color: color-mix(in srgb, currentColor 8%, transparent);
+}
+
+.vp-doc details.in-depth > summary:focus-visible {
+  outline: 2px solid var(--md-sys-color-primary, var(--vp-c-brand-1));
+  outline-offset: -2px;
+}
+
+.vp-doc details.in-depth[open] > summary {
+  border-bottom-left-radius: 0;
+  border-bottom-right-radius: 0;
+}
+
+.vp-doc details.in-depth > .in-depth-body {
+  padding: 0.25rem 1rem 0.5rem;
+  border-top: 1px solid var(--md-sys-color-outline-variant, var(--vp-c-divider));
+}
+
+/* Nested: a step lighter, so the levels read apart. */
+.vp-doc details.in-depth details.in-depth {
+  background-color: var(--md-sys-color-surface-container-high, var(--vp-c-bg-alt));
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .vp-doc details.in-depth > summary::before {
+    transition: none;
+  }
+}
