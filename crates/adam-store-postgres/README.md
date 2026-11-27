@@ -243,7 +243,7 @@ claim). `claim_due` calls it as `SELECT .. FROM <prefix>claim_due($1, .. $7)`. T
 * locks them with `FOR UPDATE SKIP LOCKED`, so a claim never waits for a row another worker holds;
 * sets `lease_owner` and `lease_until`; with `pinned`, only a run no worker owns or the worker owns is
   a candidate and the run is tied to the worker (`COALESCE` keeps an existing owner); without it the
-  owner is neither read nor written;
+  owner is not a candidate filter and keeps its value (the `UPDATE` writes it back unchanged);
 * returns the claimed runs in claim order as the record a reader is served (the `served` column), so the
   Rust side no longer sorts.
 
@@ -320,7 +320,7 @@ serialization failure are `Transient`, a bad statement is `Internal` (needs the
 server), and an unreachable server is `Transient` (offline).
 `tests/fixtures/schema-v5.sql` is the schema exactly as the `sqlx` build emitted it: `tests/fixture.rs`
 applies it with `batch_execute`, opens the store and takes a create/load round trip with **no
-migration**, then migrates to the current version and commits a head and a body. `tests/fixtures/schema-v8.sql` is the
+migration**, then migrates to the current version and commits a head and a body. `tests/fixtures/schema-v9.sql` is the
 current schema; a unit test (`the_statements_equal_the_version_9_fixture`) compares the live
 statements with it whitespace-normalised, so they cannot drift; `ADAM_WRITE_FIXTURE=1` regenerates it.
 The fixture is named for its version: a change to a statement, a function's included, without a bump

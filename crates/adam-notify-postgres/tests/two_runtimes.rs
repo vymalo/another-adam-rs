@@ -138,7 +138,7 @@ impl Env {
 
     async fn cleanup(&self) {
         let p = &self.tables;
-        let drop = format!("DROP TABLE IF EXISTS {p}journal, {p}runs, {p}meta");
+        let drop = format!("DROP TABLE IF EXISTS {p}journal, {p}runs, {p}meta CASCADE");
         if let Ok(client) = self.admin.get().await {
             let _ = client.batch_execute(&drop).await;
         }

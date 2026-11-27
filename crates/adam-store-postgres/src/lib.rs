@@ -1770,7 +1770,10 @@ impl Store for PgStore {
         }
         let now = truncate_ms(now);
         let until = add_ttl(now, ttl);
-        let pinned = matches!(scope, ClaimScope::Pinned);
+        let pinned = match scope {
+            ClaimScope::Any => false,
+            ClaimScope::Pinned => true,
+        };
         let busy: Vec<Uuid> = busy.iter().map(|id| id.0).collect();
         let limit = i64::try_from(limit).unwrap_or(i64::MAX);
         let (now_sql, until_sql) = (sql_time(now), sql_time(until));

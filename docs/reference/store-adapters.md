@@ -141,7 +141,9 @@ cron tick across all replicas. A second message on a conversation that has an op
 that refuses raises one of adam's own SQLSTATEs, `AD001` to `AD004`, each with its error class
 ([`adam-postgres`](../../crates/adam-postgres/README.md#adams-own-sqlstates)). Schema version 8
 makes the served document a virtual column of the runs table, `served`, so the rule of which
-document a read serves is written once, beside the data, and every read selects it.
+document a read serves is written once, beside the data, and every read selects it. Schema version 9
+makes the claim a database function (`claim_due`): the due runs that are not busy and whose lease is free (or
+the pinned owner's), locked with `SKIP LOCKED`, leased and returned in claim order, in one call.
 
 ## SQLite
 
