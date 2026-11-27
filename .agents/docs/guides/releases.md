@@ -23,6 +23,7 @@ Written at `ce99d98` plus this change on 2026-11-27, amended the same day for AN
 | `tools/release/write-homebrew-formula.mjs` | writes `Formula/adam-agent.rb` (four `on_macos`/`on_linux` x `on_arm`/`on_intel` stanzas, a sha256 each from `SHA256SUMS`, `license` from `[workspace.package]`, `bin.install "adam-agent"`, `test do system bin/"adam-agent", "--version" end`) and upserts the tap README's row between `<!-- cli-packages:begin/end -->`; node standard library only |
 | `tools/release/update-homebrew-tap.mjs` | rebuilds `bot/adam-agent` from the tap's default branch, refuses a version older than the base's or the open branch's (`stale`), commits as `release-please[bot]`, pushes with `--force-with-lease`, creates or edits the one pull request |
 | `tools/release/homebrew-smoke.sh` | a throwaway local tap (`brew tap-new --no-git local/adam-smoke`), the formula built from the release's `SHA256SUMS`, `brew install`, `brew test`, `adam-agent --version` says `adam-agent X.Y.Z`, and no configuration exits 78 |
+| `tools/release/check-postgres-pin.sh` | every `image: postgres...` of `.github/workflows/*.yml` and `compose.yaml` is compose.yaml's line (PostgreSQL 18.7 by tag and digest, ADR 0082 decision 11) and there are at least five; `ci.yml` job `fmt` runs it. Broken once in each of coder.yml, release.yml and ci.yml on 2026-11-27 |
 | `tools/release/test/` | `homebrew-formula.test.mjs` and its goldens (`golden/adam-agent.rb`, `golden/README.after.md`; `UPDATE_GOLDEN=1` rewrites them); `ci.yml` job `release-tools` runs it with `ruby -c` on the golden |
 | `.github/actionlint.yaml` | adds the labels `macos-26` and `macos-26-intel`, and ignores one message (`unexpected key "queue"`) for `release.yml` alone: the pinned actionlint 1.7.7 knows neither, and no release of it parses `queue` |
 | `tools/commit-lint.sh`, `.github/workflows/commit-lint.yml`, `.githooks/commit-msg` | Conventional Commits on the title and every commit of a pull request, and locally |
@@ -122,6 +123,13 @@ sh deploy/coder/tests/bump-tag-test.sh                      # bump-tag tests pas
 sh deploy/coder/tests/render-goldens.sh && git diff --exit-code deploy/coder/tests/golden   # byte for byte
 node tools/docs-check/check-docs.mjs
 ```
+
+## v0.6.0 was never published
+
+Its tag exists (run 46041005870, job 140721911064 `build and smoke-test the release image`): `release.yml` had `postgres:17` as the
+container smoke test's service, and `adam-coder` exits 78 on a server older than 18 (ADR 0082 decision 11). `release.yml` has no
+`workflow_dispatch` and runs from the tag's copy, so the tag cannot be re-run green; the next release supersedes it. The pin
+is now the one of coder.yml, ci.yml and compose.yaml, held by `tools/release/check-postgres-pin.sh`.
 
 ## Unverified until a tag is pushed
 

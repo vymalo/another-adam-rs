@@ -148,6 +148,12 @@ the App: a tag made with the workflow's own token starts no workflow.
 
 ## What is not proven yet
 
+The tag `v0.6.0` exists but was never published: its `release.yml` ran the container smoke test against PostgreSQL 17,
+which the store has refused since ADR 0082 (it needs 18), and stopped before anything was pushed. A workflow runs from
+its tag's own copy, so that tag cannot be repaired; the next release, cut from the pull request that fixed the pin,
+supersedes it. `ci.yml` now fails a pull request whose workflows or `compose.yaml` name another PostgreSQL image than
+the one pinned by tag and digest.
+
 No tag has been pushed. The Homebrew path (the four builds, the signing of `SHA256SUMS`, the Homebrew installs and the
 tap pull request) has not run either: it needs the App on the tap and a release with the new `--version`. The App, the release pull request, the build and smoke tests on a tag, the signatures and the
 chart's first push have not run; the release workflow checks each as it goes and stops rather than publish half.

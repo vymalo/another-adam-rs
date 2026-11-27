@@ -57,6 +57,9 @@ jobs:
       # ADR 0084: every version a release moves is marked for release-please, and the Cargo lines agree.
       - name: The release's version lines are marked and agree
         run: sh tools/release/check-versions.sh
+      # ADR 0082 decision 11: every PostgreSQL of CI, the release workflow and compose is one pinned image.
+      - name: Every postgres image is the same pinned one
+        run: sh tools/release/check-postgres-pin.sh
       - run: cargo fmt --all --check
 
   # The two clippy arms: the default features, and the optional ones (or their code never runs in CI).
