@@ -38,6 +38,7 @@ tracing.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+adam-memory.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
 schemars = { workspace = true, features = ["derive"] }
 proptest.workspace = true
