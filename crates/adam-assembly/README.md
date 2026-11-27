@@ -541,9 +541,17 @@ tools and its skills' tools, in the order of the manifest (`AgentInfo::tools` li
 * input `{ "message": string }` (required); description: the subagent's `description`, then "The agent does
   not see this conversation; put everything it needs in `message`.";
 * a call starts the subagent as a child run of the parent's run and parks the parent until it is done
-  (`ToolCtx::start_child` and `ToolError::AwaitRun`, see "Child runs" in `docs/architecture.md`). The
+  (`ToolCtx::start_one_shot_session` and `ToolError::AwaitRun`, see "Child runs" in `docs/architecture.md`). The
   child's final **text** is the tool result; an error result if the child failed, and the parent goes on. A
   blank or missing `message` is an error result and starts nothing;
+* **the child is a one-shot session** of the parent ([ADR 0087](../../docs/decisions/0087-every-child-is-a-session-and-the-one-shot-subagent-tool-goes.md)
+  slice C1): round 1 of a session under the id the call derives, closed from its start. It has a session's conversation
+  id (`<parent escaped>/s/<id>`), so `subagent_list`, `child-sessions/v1` and the exporter see it; the parent's
+  `subagent_send` and a person's message are refused (it is closed); the model gets its answer once, as the call's
+  result. A remote subagent's tool is unchanged (it starts no child run). Tests: `tests/subagents.rs`
+  (`a_subagents_call_is_a_one_shot_session_that_is_closed_after_its_round`,
+  `two_calls_of_one_turn_are_two_sessions_with_their_own_conversations`,
+  `a_child_started_before_it_was_a_session_is_found_by_the_call`);
 * the child's own `limits:` apply to the child (its turns and tool calls are not the parent's);
 * **a root that has a subagent, local or remote, also gets the five session tools** (`subagent_start`, `_send`, `_read`, `_close`,
   `_list` of `adam-llm-agent`, [ADR 0045](../../docs/decisions/0045-a-subagent-can-run-in-the-background-as-a-session.md)), after
@@ -898,6 +906,9 @@ place each:
 * `tests/bind.rs`: unknown tool (the message asserted, the suggestion, the subagent's origin), patterns,
   default tool access, duplicate tools; unknown, unused and unset vars, values for undeclared vars and
   unknown agents, syntax errors with their line, an error in an `instructions/*.md` part.
+* `tests/cap.rs`: the output cap's order and clamps (ADR 0064), and
+  `a_subagent_on_another_alias_has_its_own_profiles_window` (ADR 0086: its profile's `contextWindow` clamps that
+  subagent's cap, not the root's).
 * `tests/model.rs`: alias resolution through three generations, alias errors, a deployment's alias list,
   missing state and state reaching a running tool, manifests by value and by reference, `from_source`
   for one agent, several agents and a directory with errors.
@@ -906,9 +917,6 @@ place each:
   both called `linear`, two tokens, each server called once with its own), patterns select MCP tools in the
   file's order and the model is offered their descriptions and schemas, a clash with a registered tool and
   with a subagent name, unconnected and failing servers name the agent and the `mcp.json` (an unset variable
-* `tests/cap.rs`: the output cap's order and clamps (ADR 0064), and
-  `a_subagent_on_another_alias_has_its_own_profiles_window` (ADR 0086: its profile's `contextWindow` clamps that
-  subagent's cap, not the root's).
   sends no request, a stdio server without the policy, a server that is down), a parent run calls an MCP tool on
   memory and PostgreSQL (the journal has `tool:c1`, the token is in no journal, state, event or `Debug`), a
   committed call is not repeated when a later transition is retried, a transient failure later in the turn calls

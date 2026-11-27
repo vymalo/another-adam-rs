@@ -1789,6 +1789,38 @@ impl ToolCtx {
         Ok(child)
     }
 
+    /// Start `agent` as a **one-shot session** of this run ([ADR 0087] slice C1) and return its
+    /// id, what to put in [`ToolError::AwaitRun`]: what a subagent's own tool does. It is
+    /// [`start_child_within`](Self::start_child_within) for a child that is round 1 of a session of
+    /// this run's conversation instead of a run with no conversation:
+    ///
+    /// * the id is [`child_run_id`](Self::child_run_id), the same as `start_child`'s, so a replay
+    ///   finds the child it started (one started as a plain child before C1 included);
+    /// * the child has a session's conversation id (`<parent escaped>/s/<id>`,
+    ///   [`adam_runtime::session_conversation_id`]), so a session listing shows it (`subagent_list`,
+    ///   `child-sessions/v1`) and the exporter of ADR 0085 reaches it;
+    /// * the session is **closed from the start**: it closes when its round ends, and a message to
+    ///   it, from the parent's `subagent_send` or from a person, is refused while it works;
+    /// * its first message is [`start_child`](Self::start_child)'s, plus the session's header, and
+    ///   no session limit (open, working) is checked, as none was for a subagent's tool before.
+    ///
+    /// The parent's loop counts the round as reported when the wait on it ends, so the end of the
+    /// child is told to the model once, as the call's result, and never again as a session report.
+    ///
+    /// # Errors
+    ///
+    /// As [`start_child`](Self::start_child).
+    ///
+    /// [ADR 0087]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0087-every-child-is-a-session-and-the-one-shot-subagent-tool-goes.md
+    pub async fn start_one_shot_session(
+        &self,
+        agent: &str,
+        message: &str,
+        within: Option<Duration>,
+    ) -> Result<RunId, ToolError> {
+        crate::sessions::start_one_shot(self, agent, message, within).await
+    }
+
     /// The handle for starting children and reading sessions on the runtime that steps this run.
     pub(crate) fn child_starter(&self) -> Result<&ChildStarter, ToolError> {
         self.children.as_ref().ok_or_else(|| {

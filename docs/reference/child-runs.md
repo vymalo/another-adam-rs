@@ -254,6 +254,10 @@ background as a session that is sent more messages. The runtime half (slice 1) i
 
 **What the runtime has.**
 
+* **A subagent's own tool starts a one-shot session** (ADR 0087, slice C1): `ToolCtx::start_one_shot_session`, which
+  `SubagentTool` calls, starts round 1 of a session whose header says it is closed from the start, under
+  `child_run_id(parent, call_id)` as before. The parent parks on it as on any child ([a local child](#a-local-child)).
+  A remote subagent's own tool is unchanged: it calls the remote from the parent's step and starts no child run.
 * `Runtime::start_child_continuing` starts a child run **with a conversation id**: the parent's id (with `%` and
   `/` escaped, so a client's context id cannot spell another session's), then `/s/` and the session id
   (`session_conversation_id`). Round 1's run id, `child_run_id(parent, call_id)`, is the session id. From round 2
@@ -433,6 +437,7 @@ answer has streamed, not before the call.
 | S16 | A journal from before slice 3, or one with reports, is replayed, with a message that arrived since | The same history, no model asked, no child run, no disagreement; the rounds are counted once even when the answer is dropped as stale |
 | S17 | A session has sat idle for `idle_ttl` | It reads closed, frees its place, refuses a send in words; a working round never expires; its unreported report is told once |
 | S18 | A round asks the person, and one that may not asks anyway | A shown kept-open round parks `input-required` and the parent's read says `blocked`; an answer in the child context resumes it; a child that may not ask is told `NOT_ASKABLE` and goes on |
+| S19 | A subagent's own tool is called (ADR 0087, slice C1) | The child is a **one-shot session**: round 1 under the call's derived id, closed from its start. It has a session's conversation id, is listed working and then closed, refuses a send from the parent and a message or a steer from a person, and its answer is the call's result once, never a report; a child a journal started before C1 (no conversation) is found by the call |
 
 **Tokens.** Each round a run started or sent to is counted once in the run's `usage_totals`: a journaled step `usage:<call id>` reads it when a report is given to the model and, at the latest, when the run ends (`sessions_end`), whether or not the report was read; a store error on the read is retried. **Known limit:** the checks scan every round of the conversation, and past 5,000 rounds of one subagent a start **and a send** are refused.
 

@@ -74,8 +74,9 @@ export is always a command someone runs; no worker or schedule exports anything.
 A run's model calls record their system prompt and tools from this version on. A run from before has no system
 message and no tools (`tools_source: "none"`); keep it out of a tool-use dataset.
 
-**A subagent's run is not exported yet** unless it has a conversation (a child session has one, a plain subagent run
-does not): the exporter lists runs by conversation.
+**A subagent's run is a record of its own**, its `parent` the parent's record: since ADR 0087 slice C1 every subagent's
+child is a session and has a conversation, which is what the exporter lists runs by. A subagent run from before C1 has
+none and is not exported. Without `--agent`, the subagents (`coder/reviewer`) are exported with the rest.
 
 ## The pipeline
 

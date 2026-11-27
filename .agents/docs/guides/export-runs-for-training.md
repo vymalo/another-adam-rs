@@ -42,10 +42,14 @@ the function names are the anchors.
    `grep -rn "export_runs" crates bin --include=*.rs`.
 8. **Which runs are reached.** `export_agent` lists with `ConversationScope::Prefix(String::new())`
    (`export.rs:138`), and `ConversationScope::contains` is `false` for a run with no conversation id
-   (`crates/adam-core/src/store/query.rs:23-29`). A child from `Runtime::start_child` has none
-   (`crates/adam-runtime/src/runtime.rs:1536`, "it has no conversation"), so plain subagent runs are not exported;
-   both pages say so. Listing them needs a query by parent, which `RunQuery` does not have: a `Store` change
-   (Rule 2), not an exporter change.
+   (`crates/adam-core/src/store/query.rs:23-29`). Since ADR 0087 slice C1 a subagent's own tool starts its child as a
+   one-shot session (`SubagentTool::call` → `ToolCtx::start_one_shot_session`), so every subagent run has a session's
+   conversation id and is exported, linked by `parent`
+   (`crates/adam-export/tests/export.rs` `a_subagents_run_is_a_record_of_its_own_linked_to_its_parent`). Still not
+   reached: a child a host starts with `Runtime::start_child` (no conversation) and a subagent run from before C1;
+   listing those needs a query by parent, which `RunQuery` does not have: a `Store` change (Rule 2), not an exporter
+   change. `export_runs` lists per agent name, and the `export` subcommand defaults to every registered agent
+   (`agents_to_export`, `crates/adam-service/src/export.rs`), the subagents included.
 9. **The schema is stable.** `SCHEMA` is `adam.export/v1` (`crates/adam-export/src/record.rs:11`). A new optional field
    is fine; a changed meaning is a new schema and an *Amended* note on ADR 0085. Slice E5 added `train_on` (default
    `assistant`, so an older record reads the same) and `sample` (absent from a run record).

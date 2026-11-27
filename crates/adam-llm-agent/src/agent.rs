@@ -2969,6 +2969,17 @@ impl LlmAgent {
         status
     }
 
+    /// A child the run waited on has answered its call ([`Self::answer_run`]): when this agent tells
+    /// the model the reports of sessions, the child is counted as reported, so a child that is a
+    /// session's round (a subagent's one-shot session, ADR 0087 slice C1) is told once, as the
+    /// call's result, and never again as a report of its session. A plain child run is in no
+    /// listing, so counting it changes nothing; an agent that tells no reports keeps no count.
+    fn note_answered_round(&self, state: &mut Conversation, child: RunId) {
+        if !self.session_agents.is_empty() {
+            state.note_reported(&[child]);
+        }
+    }
+
     /// The model wait the head of a child's state says it has (ADR 0067 decision 5): its own, or
     /// the copy it keeps of its own child's — a park is shown through each parent, one level at a
     /// time. `None` for a child that works or waits on something else, and for a wait this build
@@ -4872,6 +4883,7 @@ impl LlmAgent {
                         return Ok(Flow::Wait);
                     };
                     let outcome = Self::answer_run(state, &wait, child);
+                    self.note_answered_round(state, run);
                     self.observe_child(
                         ctx,
                         state.root_run,
@@ -8325,6 +8337,7 @@ impl LlmAgent {
             match finished {
                 Some(child) => {
                     let outcome = Self::answer_run(&mut state, &wait, &child);
+                    self.note_answered_round(&mut state, wait.run);
                     self.observe_child(
                         ctx,
                         state.root_run,

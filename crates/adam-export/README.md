@@ -177,9 +177,14 @@ failed listing or write stops it.
 
 **Only runs that have a conversation id are listed.** The query's scope is
 `ConversationScope::Prefix("")`, and `ConversationScope::contains` is `false` for a run with no
-conversation id. A child started with `Runtime::start_child` has none ("an ordinary run: it has no
-conversation"), so **a subagent's run without a conversation is not reached**; child sessions and
-a session's timer runs, which have one, are.
+conversation id. **Every subagent's run has one** since [ADR 0087](../../docs/decisions/0087-every-child-is-a-session-and-the-one-shot-subagent-tool-goes.md)
+slice C1: a subagent's own tool starts its child as a one-shot session (`<parent escaped>/s/<id>`),
+so it is a record of its own, its `parent` the pseudonym of the parent's record
+(`a_subagents_run_is_a_record_of_its_own_linked_to_its_parent` in `tests/export.rs`). Child sessions
+and a session's timer runs have one too. Still not reached: a child a host starts itself with
+`Runtime::start_child` (it has none), and a subagent's run from before C1. Export the subagents' agent
+names too (`coder/reviewer`): `export_runs` lists by agent, and the `export` subcommand takes every
+registered agent by default.
 
 ## Environment
 

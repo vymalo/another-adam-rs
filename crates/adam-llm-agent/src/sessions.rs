@@ -568,6 +568,91 @@ fn is_busy_or_finished(e: &RuntimeError) -> bool {
     e.is_busy() || matches!(e, RuntimeError::Finished { .. })
 }
 
+/// The header of round 1 of `session`, on `agent`, started by the call of `ctx`: not kept open,
+/// not closed, no config. `subagent_start` and a one-shot session ([`start_one_shot`]) build theirs
+/// from it, so the two cannot disagree on what a session started by a run says.
+fn first_header(ctx: &ToolCtx, session: RunId, agent: &str, description: String) -> SessionHeader {
+    SessionHeader {
+        id: session,
+        agent: agent.to_owned(),
+        description,
+        keep_open: false,
+        closed: false,
+        closing: false,
+        round: 1,
+        // The run this call's model calls name, which the orchestrator bound: the round's
+        // calls name it too (ADR 0067).
+        root: Some(ctx.model_run_id()),
+        // The workspace the round works in: the one of the run that opens the session, so a
+        // helper a task starts reads the repository of that task (ADR 0045 slice 7).
+        workspace: Some(ctx.workspace_run_id()),
+        // A session is one the person sees when their client shows child sessions: only then
+        // may a round of it ask them (ADR 0045 decision 9).
+        visible: ctx.context(crate::CHILD_SESSIONS_CONTEXT_KEY) == Some(&Value::Bool(true)),
+        config: None,
+    }
+}
+
+/// What a one-shot session is for, as a list shows it: the first line of `message`, cut to
+/// [`MAX_DESCRIPTION_CHARS`] (the call has no `description` of its own).
+fn one_shot_description(message: &str) -> String {
+    let first = message
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or_default();
+    let line = one_line(first);
+    if line.chars().count() <= MAX_DESCRIPTION_CHARS {
+        return line;
+    }
+    let mut cut: String = line.chars().take(MAX_DESCRIPTION_CHARS - 1).collect();
+    cut.push('…');
+    cut
+}
+
+/// Start `agent` as a **one-shot session** of the run of `ctx` ([ADR 0087] slice C1): round 1 of a
+/// session whose id is [`ToolCtx::child_run_id`], with `message` as its first user message, a
+/// session's conversation id (`<parent escaped>/s/<session>`), and a header that says it is
+/// **closed from the start**: it is not kept open, so it closes when its round ends, and nobody (the
+/// parent, the person) can send to it meanwhile. It is `subagent_start` with `mode: one_shot` and
+/// `wait: true`, except that the caller waits on it ([`ToolError::AwaitRun`] with the returned id)
+/// and no session limit applies, as none applied to a subagent's own tool before.
+///
+/// Idempotent, keyed by the call: a replay finds the round it started. A child this call started
+/// as a plain child run before C1 (no conversation) is found too: when the runtime refuses the round
+/// as not a session's ([`RuntimeError::InvalidSession`]: a run with the id exists that is not this
+/// round, or the conversation id would pass
+/// [`MAX_SESSION_CONVERSATION_BYTES`](adam_runtime::MAX_SESSION_CONVERSATION_BYTES), as a deeply
+/// nested child's can), the child is started as a plain child run, which finds the existing one.
+///
+/// [ADR 0087]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0087-every-child-is-a-session-and-the-one-shot-subagent-tool-goes.md
+pub(crate) async fn start_one_shot(
+    ctx: &ToolCtx,
+    agent: &str,
+    message: &str,
+    within: Option<Duration>,
+) -> Result<RunId, ToolError> {
+    let starter = ctx.child_starter()?;
+    let session = ctx.child_run_id();
+    let mut header = first_header(ctx, session, agent, one_shot_description(message));
+    header.closed = true;
+    let input = round_message(ctx, message, &header);
+    match starter
+        .start_round(session, session, agent, input, None, within)
+        .await
+    {
+        Ok(_) => Ok(session),
+        Err(RuntimeError::InvalidSession { reason }) => {
+            tracing::debug!(%session, %reason, "a one-shot session could not be started; starting a plain child run");
+            starter
+                .start_within(session, agent, ctx.child_message(message), within)
+                .await
+                .map_err(|e| runtime_error(&e))?;
+            Ok(session)
+        }
+        Err(e) => Err(runtime_error(&e)),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // subagent_start
 // ---------------------------------------------------------------------------
@@ -788,25 +873,9 @@ impl Tool for Start {
                 limits.max_open()
             ));
         }
-        let header = SessionHeader {
-            id: session,
-            agent: agent.agent.clone(),
-            description,
-            keep_open: keep,
-            closed: false,
-            closing: false,
-            round: 1,
-            // The run this call's model calls name, which the orchestrator bound: the round's
-            // calls name it too (ADR 0067).
-            root: Some(ctx.model_run_id()),
-            // The workspace the round works in: the one of the run that opens the session, so a
-            // helper a task starts reads the repository of that task (ADR 0045 slice 7).
-            workspace: Some(ctx.workspace_run_id()),
-            // A session is one the person sees when their client shows child sessions: only then
-            // may a round of it ask them (ADR 0045 decision 9).
-            visible: ctx.context(crate::CHILD_SESSIONS_CONTEXT_KEY) == Some(&Value::Bool(true)),
-            config,
-        };
+        let mut header = first_header(ctx, session, &agent.agent, description);
+        header.keep_open = keep;
+        header.config = config;
         let input = round_message(ctx, prompt, &header);
         let within = round_within(agent, header.config.as_ref());
         starter

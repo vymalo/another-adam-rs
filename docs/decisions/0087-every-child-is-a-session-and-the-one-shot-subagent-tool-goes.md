@@ -16,6 +16,20 @@ one-shot sub-agents while creating them."* Decision 2's `access` and ADR 0045's 
 closes after its round is already sealed), so they are **one option, `mode`**, below; `keep_open` is read for one
 release and mapped onto it. The default `one_shot` is this ADR's choice for the owner to confirm.
 
+*Amended 2026-11-27, slice C1 built:* a local subagent's own tool starts its child as round 1 of a session of the parent
+(`ToolCtx::start_one_shot_session`, which shares `subagent_start`'s header and start path), under the same derived id,
+and the parent parks on it as before: the same tool, schema, description, time limit and result for the model. The
+internal equivalent of `mode: one_shot` is a header **closed from its start**, and of `wait: true` the call's
+`ToolError::AwaitRun`; no tool parameter changed, and `keep_open` is as it was. A person sees the child (decision 3) in
+`subagent_list` and `child-sessions/v1`, working and then closed, and cannot write to it: a message to its context was
+refused already, and a steer naming its round is refused now, for every closed session (an answer to a question and a
+resume still pass). Where C1 differs from decision 6: **a remote subagent's own tool is unchanged**, since it calls the
+remote from the parent's step and has no child run to give a conversation to (C2); no session limit applies to the
+wrapper, as none applied to the tool; a child a journal started before C1 (no conversation) is found by the call; and
+the child reads the workspace of the run that calls it, as a `subagent_start` session does, which differs from before
+only for a child of a person's round. Each such child is a round the session listings scan, which counts towards their
+bound of 5,000 rounds of one subagent in one conversation.
+
 ## Context
 
 An agent has two ways to use a subagent today (*verified 2026-11-27*):

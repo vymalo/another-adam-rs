@@ -1365,6 +1365,20 @@ through itself (`Ctx::resume_child`, ADR 0067 decision 5). A child with a
 conversation (a session round, ADR 0045) reports with `adam.child.reported` instead, and
 `start_child_continuing` starts it ([Child runs](reference/child-runs.md#sessions-adr-0045-slices-1-to-4)).
 
+**A subagent's own tool starts a one-shot session** (ADR 0087, slice C1). The child is round 1 of a session of the
+parent, under the same derived id, and it is **closed from its start**:
+
+| | Before C1 | Since C1 |
+|---|---|---|
+| Conversation id | none | `<parent escaped>/s/<child id>` |
+| Listed by `subagent_list` and `child-sessions/v1` | no | yes: working, then closed |
+| A message to it, from the parent or a person | impossible (nothing addressed it) | refused: the session is closed |
+| Exported (ADR 0085) | no | yes, a record with `parent` set |
+| What the model sees | the call's result | the same: the same tool, the same result, never a second report |
+
+The parent still parks on it as below; its end notice is `adam.child.reported`, which wakes the parent like the other.
+The evidence: [the page for agents](../.agents/docs/architecture.md#child-runs-a-subagents-tool-starts-a-one-shot-session-adr-0087-slice-c1).
+
 ```mermaid
 sequenceDiagram
     autonumber
@@ -1375,7 +1389,7 @@ sequenceDiagram
     participant C as Child run
 
     P->>J: step tool:c1, run the tool
-    J->>R: start_child(parent, child_run_id(parent, c1), agent, input)
+    J->>R: start a one-shot session round under child_run_id(parent, c1)
     R->>DB: create_run with parent_id, or AlreadyExists (a replay)
     J-->>P: Err(AwaitRun { run: child }), journaled
     P->>DB: commit Park, wake_at = now + 60 s, pending_wait = { c1, child }

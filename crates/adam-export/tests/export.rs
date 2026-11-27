@@ -7,9 +7,11 @@ use std::time::{Duration, Instant};
 
 use adam_core::{DynStore, MemoryStore, RunId, RunStatus};
 use adam_export::{ExportOptions, Filter, Pseudonyms, Samples, Summary, export_runs};
-use adam_llm_agent::{LlmAgent, Tool, ToolCtx, ToolError, ToolOutput, user_message};
+use adam_llm_agent::{
+    LlmAgent, LlmAgentBuilder, Tool, ToolCtx, ToolError, ToolOutput, user_message,
+};
 use adam_model::{DynModel, MockModel, ToolCall, ToolSpec};
-use adam_runtime::Runtime;
+use adam_runtime::{Runtime, RuntimeBuilder};
 use async_trait::async_trait;
 use serde_json::{Value, json};
 use tokio::sync::oneshot;
@@ -44,16 +46,63 @@ struct Harness {
     worker: tokio::task::JoinHandle<Result<(), adam_runtime::RuntimeError>>,
 }
 
+/// The subagent `coder/helper` as its parent calls it: a one-shot session whose answer is the
+/// call's result (what `adam_assembly::SubagentTool` does, ADR 0087 slice C1).
+struct Helper;
+
+#[async_trait]
+impl Tool for Helper {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "helper".into(),
+            description: "ask the helper".into(),
+            parameters: json!({"type": "object", "properties": {"message": {"type": "string"}}}),
+        }
+    }
+
+    async fn call(&self, ctx: &ToolCtx, args: Value) -> Result<ToolOutput, ToolError> {
+        let message = args["message"].as_str().unwrap_or_default();
+        let run = ctx.start_one_shot_session(HELPER, message, None).await?;
+        Err(ToolError::AwaitRun { run })
+    }
+}
+
+const HELPER: &str = "coder/helper";
+
 impl Harness {
     fn new() -> Self {
+        Self::on(|coder| coder, |runtime, _| runtime)
+    }
+
+    /// The harness with the subagent `coder/helper` on the same model, and its tool on `coder`.
+    fn with_helper() -> Self {
+        Self::on(
+            |coder| coder.tool(Helper),
+            |runtime, model| {
+                runtime.agent(
+                    LlmAgent::builder(HELPER, model, "test-model")
+                        .instructions("help")
+                        .build(),
+                )
+            },
+        )
+    }
+
+    /// The harness with what `coder` and `runtime` add to the agent `coder` and to the runtime.
+    fn on(
+        coder: impl FnOnce(LlmAgentBuilder) -> LlmAgentBuilder,
+        runtime: impl FnOnce(RuntimeBuilder, DynModel) -> RuntimeBuilder,
+    ) -> Self {
         let store: DynStore = Arc::new(MemoryStore::new());
         let mock = Arc::new(MockModel::new());
         let model: DynModel = mock.clone();
-        let agent = LlmAgent::builder("coder", model, "test-model")
-            .instructions("be brief")
-            .tool(ReadFile)
-            .build();
-        let runtime = Runtime::builder(store)
+        let agent = coder(
+            LlmAgent::builder("coder", model.clone(), "test-model")
+                .instructions("be brief")
+                .tool(ReadFile),
+        )
+        .build();
+        let runtime = runtime(Runtime::builder(store), model)
             .agent(agent)
             .worker_id("w")
             .poll_interval(Duration::from_millis(20))
@@ -322,5 +371,64 @@ async fn a_turn_export_writes_one_sample_per_answer() {
     assert_eq!((summary.written, summary.over_budget), (1, 1));
     assert_eq!(lines[0]["sample"]["turn"], 0);
 
+    h.stop().await;
+}
+
+/// A subagent's one-shot session (ADR 0087 slice C1) has a session's conversation id, so the
+/// exporter reaches it: it is a record of its own, linked to its parent's by `parent`.
+#[tokio::test]
+async fn a_subagents_run_is_a_record_of_its_own_linked_to_its_parent() {
+    let h = Harness::with_helper();
+    h.mock
+        .push_tool_calls(vec![ToolCall::new(
+            "c1",
+            "helper",
+            json!({"message": "summarise the manifest"}),
+        )])
+        .push_text("it uses axum")
+        .push_text("the helper says it uses axum");
+    let parent = h.run_to_done("what does it use?", "conv-help").await;
+
+    let mut out = Vec::new();
+    let agents = ["coder".to_owned(), HELPER.to_owned()];
+    let summary = export_runs(
+        &h.runtime,
+        &agents,
+        &Filter::default(),
+        &options(),
+        &mut out,
+    )
+    .await
+    .expect("export");
+    assert_eq!((summary.seen, summary.written), (2, 2), "{summary:?}");
+    let records: Vec<Value> = String::from_utf8(out)
+        .expect("utf-8")
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("a JSON object"))
+        .collect();
+    let by_agent = |agent: &str| {
+        records
+            .iter()
+            .find(|record| record["agent"] == agent)
+            .unwrap_or_else(|| panic!("a record of {agent}: {records:#?}"))
+    };
+    let (coder, helper) = (by_agent("coder"), by_agent(HELPER));
+    assert_eq!(
+        coder["id"],
+        Pseudonyms::new(b"export key").of("run", &parent.to_string())
+    );
+    assert!(coder.get("parent").is_none(), "{coder}");
+    assert_eq!(helper["parent"], coder["id"]);
+    assert!(helper["conversation"].is_string(), "{helper}");
+    assert_ne!(helper["conversation"], coder["conversation"]);
+    let roles: Vec<&str> = helper["messages"]
+        .as_array()
+        .expect("messages")
+        .iter()
+        .filter_map(|message| message["role"].as_str())
+        .collect();
+    assert_eq!(roles, ["system", "user", "assistant"]);
+    assert_eq!(helper["messages"][1]["content"], "summarise the manifest");
+    assert_eq!(helper["messages"][2]["content"], "it uses axum");
     h.stop().await;
 }

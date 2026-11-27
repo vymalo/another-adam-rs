@@ -16,7 +16,9 @@ use adam_assembly::{AgentDef, Assembly, Error, SubagentTool, ToolClash};
 use adam_core::{DynStore, MemoryStore, RunId, RunStatus, Store};
 use adam_llm_agent::{FnTool, LlmStarter, Tool, ToolError, ToolOutput, ToolSet, user_message};
 use adam_model::{Message, MockModel, ModelRequest, ToolCall};
-use adam_runtime::{Runtime, child_run_id};
+use adam_runtime::{
+    Inbound, RESUME_KIND, Runtime, SessionState, child_run_id, session_conversation_id,
+};
 use common::{
     def, instructions, manifests, plain, runtime_on, spawn_worker, stub, tools, wait_done, wait_for,
 };
@@ -627,7 +629,10 @@ async fn a_parent_restarted_mid_wait_still_gets_the_childs_answer() {
             let kid = store.load_run(child_id).await.unwrap()?;
             (parent.status == RunStatus::Parked
                 && kid.status == RunStatus::Runnable
-                && kid.parent_id == Some(run))
+                && kid.parent_id == Some(run)
+                // A one-shot session of the parent (ADR 0087 slice C1).
+                && kid.conversation_id
+                    == Some(session_conversation_id(&format!("run:{run}"), child_id)))
             .then_some(())
         })
         .await;
@@ -664,6 +669,216 @@ async fn a_parent_restarted_mid_wait_still_gets_the_childs_answer() {
         );
         worker.stop().await;
     }
+}
+
+// --- a subagent's call is a one-shot session (ADR 0087 slice C1) ---------------------------
+
+/// The conversation the sessions of a run that has none belong to (`ChildStarter`).
+fn sessions_of(run: RunId) -> String {
+    format!("run:{run}")
+}
+
+/// Whether a request carries a report the loop told on its own (a `report_*` call).
+fn told_a_report(request: &ModelRequest) -> bool {
+    request
+        .messages
+        .iter()
+        .flat_map(Message::tool_calls)
+        .any(|c| c.id.starts_with("report_"))
+}
+
+#[tokio::test]
+async fn a_subagents_call_is_a_one_shot_session_that_is_closed_after_its_round() {
+    for (backend, store) in stores().await {
+        let root = uniq("root");
+        let agent = format!("{root}/helper");
+        let run = RunId::new();
+        let session = child_run_id(run, "c1");
+        let model = Arc::new(MockModel::new());
+        model
+            .push_tool_calls(vec![call("c1", "helper", json!({"message": "work\nhard"}))])
+            .push_text("the child's answer")
+            // The parent's next turn sends to the session the call started: it is closed.
+            .push_tool_calls(vec![call(
+                "s1",
+                "subagent_send",
+                json!({"session": session.to_string(), "message": "and more"}),
+            )])
+            .push_text("done");
+        let files = with_helper(&root, "tools: []", "");
+        let assembly = assemble(&files, ToolSet::new(), &model);
+        let rt = runtime_on(&assembly, store.clone());
+        let worker = spawn_worker(&rt);
+        rt.start_with_id(run, &root, user_message("go"), None)
+            .await
+            .unwrap();
+        let view = wait_done(&rt, run).await;
+        assert_eq!(view.output.as_ref().unwrap()["text"], "done", "{backend}");
+
+        // The child is round 1 of a session of the parent, under the id the call derives.
+        let conversation = sessions_of(run);
+        let child = store.load_run(session).await.unwrap().unwrap();
+        assert_eq!(child.agent, agent);
+        assert_eq!(child.parent_id, Some(run));
+        assert_eq!(
+            child.conversation_id.as_deref(),
+            Some(session_conversation_id(&conversation, session).as_str()),
+            "{backend}"
+        );
+        // Closed from its start, and closed now that its round has ended.
+        let read = rt
+            .session_view(&conversation, session)
+            .await
+            .unwrap()
+            .expect("the session");
+        assert_eq!(
+            (read.state, read.closed, read.round),
+            (SessionState::Closed, true, 1)
+        );
+        let header = read.header.expect("a header");
+        assert!(header.closed && !header.keep_open && !header.closing);
+        assert_eq!(header.description, "work");
+        // A listing shows it, as it shows any session.
+        let listed = rt
+            .list_sessions(&conversation, &[agent.as_str()], 0, 10)
+            .await
+            .unwrap();
+        assert_eq!(listed.total, 1, "{backend}");
+        assert_eq!(listed.sessions[0].id, session);
+
+        let requests = model.requests();
+        assert_eq!(
+            requests.len(),
+            4,
+            "{backend}: one turn each, no report told"
+        );
+        // The child's answer is the call's result, once: never told again as a report.
+        assert_eq!(
+            last_tool_result(&requests[2], "c1"),
+            ("the child's answer".into(), false)
+        );
+        let (text, is_error) = last_tool_result(&requests[3], "s1");
+        assert!(is_error, "{text}");
+        assert!(
+            text.contains("is closed and takes no more messages"),
+            "{text}"
+        );
+        assert!(!requests.iter().any(told_a_report), "{backend}");
+        worker.stop().await;
+    }
+}
+
+#[tokio::test]
+async fn two_calls_of_one_turn_are_two_sessions_with_their_own_conversations() {
+    let root = uniq("root");
+    let agent = format!("{root}/helper");
+    let model = Arc::new(MockModel::new());
+    model
+        .push_tool_calls(vec![
+            call("c1", "helper", json!({"message": "first"})),
+            call("c2", "helper", json!({"message": "second"})),
+        ])
+        .push_text("one")
+        .push_text("two")
+        .push_text("both done");
+    let files = with_helper(&root, "tools: []", "");
+    let assembly = assemble(&files, ToolSet::new(), &model);
+    let rt = runtime_on(&assembly, Arc::new(MemoryStore::new()));
+    let worker = spawn_worker(&rt);
+    let run = rt.start(&root, user_message("go"), None).await.unwrap();
+    wait_done(&rt, run).await;
+
+    let conversation = sessions_of(run);
+    let (first, second) = (child_run_id(run, "c1"), child_run_id(run, "c2"));
+    let mut conversations = Vec::new();
+    for session in [first, second] {
+        let child = rt.store().load_run(session).await.unwrap().unwrap();
+        assert_eq!(child.status, RunStatus::Done);
+        conversations.push(child.conversation_id.unwrap());
+    }
+    assert_eq!(
+        conversations,
+        [
+            session_conversation_id(&conversation, first),
+            session_conversation_id(&conversation, second),
+        ]
+    );
+    let listed = rt
+        .list_sessions(&conversation, &[agent.as_str()], 0, 10)
+        .await
+        .unwrap();
+    assert_eq!(listed.total, 2);
+    assert!(
+        listed
+            .sessions
+            .iter()
+            .all(|s| s.state == SessionState::Closed)
+    );
+
+    let requests = model.requests();
+    assert_eq!(requests.len(), 4);
+    let last = &requests[3];
+    assert!(!told_a_report(last));
+    let results: Vec<(&str, String)> = last
+        .messages
+        .iter()
+        .filter_map(|m| match m {
+            Message::Tool {
+                call_id, content, ..
+            } => Some((call_id.as_str(), content.clone())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(results, [("c1", "one".into()), ("c2", "two".into())]);
+    worker.stop().await;
+}
+
+#[tokio::test]
+async fn a_child_started_before_it_was_a_session_is_found_by_the_call() {
+    // A parent journaled the call when its child was a plain child run (no conversation): the
+    // call, run again under C1, finds that child and waits for it instead of failing.
+    let root = uniq("root");
+    let agent = format!("{root}/helper");
+    let model = Arc::new(MockModel::new());
+    model
+        .push_text("the old child's answer")
+        .push_tool_calls(vec![call("c1", "helper", json!({"message": "work"}))])
+        .push_text("all done");
+    let files = with_helper(&root, "tools: []", "");
+    let assembly = assemble(&files, ToolSet::new(), &model);
+    let rt = runtime_on(&assembly, Arc::new(MemoryStore::new()));
+    let worker = spawn_worker(&rt);
+    let run = RunId::new();
+    let session = child_run_id(run, "c1");
+    rt.start_child(run, session, &agent, user_message("work"))
+        .await
+        .unwrap();
+    wait_done(&rt, session).await;
+    rt.start_with_id(run, &root, user_message("go"), None)
+        .await
+        .unwrap();
+    // The child ended before its parent existed, so no notice of its end will come: wake the
+    // parent instead of waiting for its poll, and it reads the child from the store.
+    wait_for("the parent to wait on the old child", || async {
+        let parent = rt.store().load_run(run).await.unwrap()?;
+        (parent.status == RunStatus::Parked).then_some(())
+    })
+    .await;
+    rt.deliver(run, Inbound::new(RESUME_KIND, json!({})).with_id("wake"))
+        .await
+        .unwrap();
+    let view = wait_done(&rt, run).await;
+    assert_eq!(view.output.as_ref().unwrap()["text"], "all done");
+    assert_eq!(
+        last_tool_result(&model.requests()[2], "c1"),
+        ("the old child's answer".into(), false)
+    );
+    let child = rt.store().load_run(session).await.unwrap().unwrap();
+    assert_eq!(
+        child.conversation_id, None,
+        "the old child is left as it was"
+    );
+    worker.stop().await;
 }
 
 // --- name clashes --------------------------------------------------------------------------

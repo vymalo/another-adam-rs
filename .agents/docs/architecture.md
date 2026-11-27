@@ -175,3 +175,38 @@ Read 2026-11-26 at the head of PR #453.
 * **Vector.** `crates/adam-llm-agent/tests/vectors/turn_chain_vector.py` regenerates the golden constants of `signing.rs`
   (checked identical 2026-11-26).
 
+## Child runs: a subagent's tool starts a one-shot session (ADR 0087, slice C1)
+
+For people: [Child runs](../../docs/architecture.md#child-runs). *Verified 2026-11-27* by reading the code and running the
+tests named here.
+
+* **Where.** `SubagentTool::call` (`crates/adam-assembly/src/subagent.rs`) calls `ToolCtx::start_one_shot_session`
+  (`crates/adam-llm-agent/src/tool.rs`), which is `sessions::start_one_shot` (`crates/adam-llm-agent/src/sessions.rs`):
+  `first_header` (shared with `subagent_start`'s `Start::call`, so the two cannot disagree on `root`, `workspace`,
+  `visible`) with `closed: true`, then `ChildStarter::start_round(id, id, ..)`, the same path as `subagent_start`. The id is
+  `ToolCtx::child_run_id()`, unchanged, so a replay finds the child.
+* **Closed from the start.** `header.closed` makes `read_latest` (`crates/adam-runtime/src/session.rs`) read the session
+  closed while its round works, so `subagent_send` refuses it (`closed_words`), the A2A front refuses a message to its
+  context (`message_to_session`), and, new in C1, a message naming its round with `steer/v1` is refused too
+  (`submit_child` in `crates/adam-a2a-runtime/src/child_sessions.rs`; the answer to a question and a resume still pass).
+* **Told once.** `LlmAgent::note_answered_round` (`crates/adam-llm-agent/src/agent.rs`) adds the child to
+  `reported_rounds` at both `AwaitRun` answers, when the agent tells session reports (`session_agents` set), so `is_due`
+  never tells it again as a report. The window is 128 rounds (`MAX_REPORTED_ROUNDS`) and a listing one page of 100
+  (`MAX_SESSION_PAGE`), the open ones first, so a child answered long ago falls out of the listing before it falls out of
+  the window.
+* **What is not a session's.** No session limit (`max_open`, `max_working`) is checked, as none was before; the parent
+  is not "has started a session" (`has_started_session` reads `subagent_start` and `subagent_send` only), so
+  `end_sessions` and the turn-end wait do not change; the usage of the child is counted by `count_child`, as before.
+* **A child from before C1.** A journal whose call started a plain child (no conversation) is replayed: `start_round`
+  answers `InvalidSession` ("a run with this id exists and is not this round") and `start_one_shot` starts the plain
+  child again, which finds it. The same fallback covers a conversation id past `MAX_SESSION_CONVERSATION_BYTES` (a deeply
+  nested child).
+* **Not changed.** A remote subagent's own tool (`RemoteSubagentTool`) still calls the remote from the parent's step
+  (`AwaitRemote`): it has no child run to give a conversation to. C2 gives `subagent_start` its options for both.
+* **Tests.** `crates/adam-assembly/tests/subagents.rs`:
+  `a_subagents_call_is_a_one_shot_session_that_is_closed_after_its_round`,
+  `two_calls_of_one_turn_are_two_sessions_with_their_own_conversations`,
+  `a_child_started_before_it_was_a_session_is_found_by_the_call`, and the conversation id in
+  `a_parent_restarted_mid_wait_still_gets_the_childs_answer`; `crates/adam-a2a-runtime/tests/child_sessions.rs`:
+  `a_one_shot_session_is_listed_and_takes_no_message_from_the_person`; `crates/adam-export/tests/export.rs`:
+  `a_subagents_run_is_a_record_of_its_own_linked_to_its_parent`.

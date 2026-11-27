@@ -24,7 +24,7 @@
 //! | a message to `C` with `start` | round 1 of a new session; no turn of the parent |
 //! | a message to `K`, no `taskId` | to a working session: delivered into its round; to an idle one: the next round; to a closed one: `UnsupportedOperation` |
 //! | a message to `K` with `close` | an idle session closes by a round of its own, a working one when its round ends (`cancel` first when asked) |
-//! | `taskId` of a round | the follow-up rules of any task, in context `K` |
+//! | `taskId` of a round | the follow-up rules of any task, in context `K`; a working round of a closed session takes no steer |
 //! | `GetTask`, `SubscribeToTask`, `CancelTask` of a round | the round as a task; cancel is `Runtime::cancel` |
 //! | `ListTasks {contextId: K}` | the rounds of the session; an unknown or foreign `K` is an empty page |
 //!
@@ -1082,6 +1082,23 @@ impl RuntimeTaskBackend {
                 if crate::model_park::is_resume(message) {
                     let task = self.resume(caller, located, message, context_id).await?;
                     return Ok(Some(self.with_sessions(caller, task).await?));
+                }
+                // A round of a closed session takes no message, as the session itself takes none
+                // (a message to `K`, below): a subagent's one-shot session is closed from its start
+                // (ADR 0087 slice C1), so a person cannot steer it. The answer to a round's question
+                // and a round parked on the model still go through: those only unblock it.
+                if !located.1.waiting
+                    && !crate::model_park::parked_on_model(&located.1)
+                    && !task_state(&located.1).is_terminal()
+                    && let Some(view) = self
+                        .session_of(caller, &round.parent_context, round.session)
+                        .await?
+                    && view.closed
+                {
+                    return Err(BackendError::UnsupportedOperation(format!(
+                        "session {} is closed and takes no more messages",
+                        round.session
+                    )));
                 }
                 let mut inbound = (self.inbound)(message).map_err(BackendError::InvalidParams)?;
                 self.named_tier(caller, message, &mut inbound, false)?;
