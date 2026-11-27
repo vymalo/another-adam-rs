@@ -27,7 +27,7 @@ uuid.workspace = true
 [dev-dependencies]
 adam-notify-testkit.workspace = true
 adam-core.workspace = true
-adam-store-postgres = { path = "../adam-store-postgres", version = "0.6.0" } # x-release-please-version
+adam-store-postgres = { path = "../adam-store-postgres", version = "0.7.0" } # x-release-please-version
 async-trait.workspace = true
 serde_json.workspace = true
 uuid.workspace = true
