@@ -97,7 +97,7 @@ jobs:
               --jq '.workflow_runs[] | "\(.id) \(.status) \(.conclusion // "none")"' > "$runs"
             passed=
             pending=
-            while read -r id status conclusion; do
+            while read -r id status _; do
               # The image job decides, not the run: a later job (the bump) may be cancelled or fail.
               job=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$id/jobs?per_page=100" \
                 --jq ".jobs[] | select(.name == \"$JOB\") | .conclusion // \"none\"")
