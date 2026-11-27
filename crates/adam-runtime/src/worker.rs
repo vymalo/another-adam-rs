@@ -556,11 +556,6 @@ enum Plan {
     Leave,
 }
 
-/// Returns whether the lease should be released.
-///
-/// `claimed` is [`RunRecord::state`] of `rec`, decoded and joined by [`advance`]: a transition
-/// reads the state once, and the failure it carries (an unreadable or unjoinable state) is
-/// committed here.
 /// The span of one run's transition ([ANR-1345]): the state the run is in, from a **closed set**
 /// ([`RunStatus::as_str`]), and nothing else.
 ///
@@ -594,6 +589,11 @@ async fn transition(
         .await
 }
 
+/// Returns whether the lease should be released.
+///
+/// `claimed` is [`RunRecord::state`] of `rec`, decoded and joined by [`advance`]: a transition
+/// reads the state once, and the failure it carries (an unreadable or unjoinable state) is
+/// committed here.
 async fn transition_inner(
     inner: &Arc<Inner>,
     rec: RunRecord,
