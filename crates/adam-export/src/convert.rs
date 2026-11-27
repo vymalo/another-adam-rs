@@ -139,10 +139,23 @@ impl RunMeta {
 /// Every string is cleaned ([`ExportOptions::scrub`]); facets are read from the transcript before
 /// it is cleaned, and are names, never values.
 pub fn record_of(run: &RunMeta, conversation: &Conversation, options: &ExportOptions) -> Record {
+    record_with(run, conversation, None, options)
+}
+
+/// [`record_of`], with the system prompt and tools the run's last model call was sent
+/// (`Conversation::request`, read from the store): `recorded` wins over the agent's
+/// [current](ExportOptions::current) ones, and the record says `tools_source: "recorded"`.
+pub fn record_with(
+    run: &RunMeta,
+    conversation: &Conversation,
+    recorded: Option<&RequestShape>,
+    options: &ExportOptions,
+) -> Record {
     let pseudonyms = &options.pseudonyms;
-    let (tools_source, shape) = match options.current.get(&run.agent) {
-        Some(shape) => (ToolsSource::Current, Some(shape)),
-        None => (ToolsSource::None, None),
+    let (tools_source, shape) = match (recorded, options.current.get(&run.agent)) {
+        (Some(shape), _) => (ToolsSource::Recorded, Some(shape)),
+        (None, Some(shape)) => (ToolsSource::Current, Some(shape)),
+        (None, None) => (ToolsSource::None, None),
     };
     let mut messages = Vec::with_capacity(conversation.messages.len() + 1);
     if let Some(system) = shape.and_then(|shape| shape.system.as_deref()) {

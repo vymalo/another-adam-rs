@@ -67,7 +67,8 @@ blocks are not doc-tested.
 | reasoning only when asked | `convert.rs` `reasoning_is_kept_only_when_asked` |
 | `models` are the turns' aliases and both sides of the fallback | `convert.rs` `models_are_the_turns_and_the_fallback` |
 | a summary marks the record `compacted` | `convert.rs` `a_summary_marks_the_record_compacted` |
-| `--current-tools` adds a system message and tools, `tools_source: current` | `convert.rs` `the_current_shape_adds_a_system_message_and_tools` |
+| `ExportOptions::current` adds a system message and tools, `tools_source: current` (the CLI has no flag for it) | `convert.rs` `the_current_shape_adds_a_system_message_and_tools` |
+| a run's recorded request becomes the system message and `tools`, `tools_source: recorded` | `tests/export.rs` `a_stack_filter_keeps_the_run_that_read_the_manifest`; the recording itself: `adam-llm-agent` `tests/recorded_request.rs` |
 | a failed run's error is scrubbed | `convert.rs` `a_failed_run_keeps_its_error_scrubbed` |
 | `lang` from paths and commands, not from a URL | `facets.rs` `a_path_and_a_command_say_the_language` |
 | `dep` from a `Cargo.toml`, with a line-number prefix, target tables and `[dependencies.<name>]` | `facets.rs` `a_cargo_manifest_names_its_dependencies` |

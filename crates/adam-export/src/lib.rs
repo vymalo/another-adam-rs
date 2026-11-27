@@ -19,7 +19,9 @@ mod pseudonym;
 mod record;
 mod scrub;
 
-pub use convert::{ExportOptions, IMAGE_PLACEHOLDER, RequestShape, RunMeta, record_of};
+pub use convert::{
+    ExportOptions, IMAGE_PLACEHOLDER, RequestShape, RunMeta, record_of, record_with,
+};
 pub use export::{ExportError, Summary, export_runs, write_record};
 pub use filter::Filter;
 pub use pseudonym::{NoRandomness, Pseudonyms};

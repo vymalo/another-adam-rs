@@ -17,6 +17,7 @@ the training pipeline around it is the guide
 | Item | Purpose |
 |---|---|
 | `record_of(&RunMeta, &Conversation, &ExportOptions) -> Record` | One run to one record. Pure. |
+| `record_with(&RunMeta, &Conversation, Option<&RequestShape>, &ExportOptions) -> Record` | The same, with the prompt and tools the run recorded (`Conversation::request`, read from the store); they win over the current ones and the record says `recorded`. |
 | `RunMeta`, `RunMeta::of(&RunRecord, error)` | A run's bookkeeping without its state: id, agent, conversation id, parent, status, times, error. |
 | `ExportOptions` | `new(Pseudonyms)`, then `.scrub(..)` (the deployment's secrets), `.include_reasoning(bool)`, `.current(agent, RequestShape)` (the agent's current prompt and tools). |
 | `RequestShape` | A system prompt and a list of `ToolSpec`, as the export passes them. |
@@ -57,7 +58,7 @@ One line per run (wrapped here):
 | `compacted` | a compaction, a shortening, omitted turns or a summary replaced history: `messages` are not what the model saw at every turn |
 | `facets` | `{kind: [values]}`, derived from the transcript (*Facets*) |
 | `outcome` | `status`, the scrubbed `error` of a failed run, and the run's `artifacts` by `name` and `mime_type` |
-| `tools_source` | `none` (no system message, no tools), `current` (the agent's current ones, passed by the export) or `recorded` (the run's own; not produced yet, slice E3) |
+| `tools_source` | `none` (no system message, no tools), `current` (the agent's current ones, passed by the export) or `recorded` (the system prompt and tools the run's last model call was sent, `Conversation::request`, read with `RecordedRequest::load`; `export_runs` uses them when their blobs are still in the store) |
 | `messages` | an optional `system`, then `user`, `assistant` (`content`, `tool_calls` as `{id, type: "function", function: {name, arguments}}` with `arguments` a JSON text, optional `reasoning_content`) and `tool` (`tool_call_id`, `content`) |
 | `tools` | `{type: "function", function: {name, description, parameters}}`; left out when empty |
 

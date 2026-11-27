@@ -20,15 +20,14 @@ EXPORT_PSEUDONYM_KEY=... adam-coder export --require lang=rust --require dep=cra
 | Flag | Default | What it does |
 |---|---|---|
 | `--agent NAME` | the binary's agents | export this agent's runs; repeat it for several |
-| `--status done\|failed\|all` | `done` | which finished state to keep |
+| `--status done\|failed\|all` | `done` | which runs to keep: finished, failed, or every run, unfinished ones included |
 | `--require KIND=VALUE` | none | keep a run only if it has this facet; repeat it: `lang=rust` and `dep=cratestack` are both required |
 | `--since`, `--until` | none | keep runs last updated in this window (RFC 3339) |
 | `--include-compacted` | off | keep runs whose history was summarised: their messages are not what the model saw at every turn |
 | `--include-reasoning` | off | keep the model's reasoning text, when the run kept it |
-| `--current-tools` | off | add the agent's **current** system prompt and tools to each record; they may differ from the ones the run had |
 | `--out PATH` | standard output | write to a file, readable by its owner only |
 
-The summary (runs seen, written, filtered, not a conversation, unreadable) goes to the log on standard error.
+A wrong command line is exit 64, an unknown `--agent` or an empty key exit 78. The summary (runs seen, written, filtered, not a conversation, unreadable) goes to the log on standard error.
 `EXPORT_PSEUDONYM_KEY` is the key of the pseudonymous ids: keep the same one to link two exports; leave it unset and
 each export gets a random key ([environment variables](../reference/environment.md)).
 
@@ -42,9 +41,13 @@ The record, every field and the facets are described in [the crate's README](../
 | the agent, status, times, turns, tool calls, tokens, model aliases | the conversation's context, the caller, the prompt statement, the session header |
 | the facets (`lang`, `dep`) and the outcome (error, artifact names) | image bytes: an image becomes `[image]` |
 | reasoning, only when asked | secrets: every string is scrubbed of the deployment's secrets and of well-known token shapes |
+| the system prompt and tools the run's last model call was sent, when the run recorded them (`tools_source: "recorded"`) | |
 
 The messages a person wrote are exported. Export only threads you may train on: that is your call, not the code's. An
 export is always a command someone runs; no worker or schedule exports anything.
+
+A run's model calls record their system prompt and tools from this version on. A run from before has no system
+message and no tools (`tools_source: "none"`); keep it out of a tool-use dataset.
 
 **A subagent's run is not exported yet** unless it has a conversation (a child session has one, a plain subagent run
 does not): the exporter lists runs by conversation.
@@ -94,6 +97,5 @@ of your own.
 
 | What | Until then |
 |---|---|
-| The system prompt and tools each run was sent, recorded with the run ([ADR 0085](../decisions/0085-runs-are-exported-as-training-records.md) slice E3) | a record has no system message and no tools (`tools_source: "none"`), or the agent's current ones with `--current-tools` (`"current"`) |
 | The coder's outcome: the pull request, whether its head was verified, the checks (slice E4) | the outcome is the run's status, its error and its artifact names (the coder's `pull_request` among them) |
 | One sample per assistant turn, with its exact prefix and tools (slice E5) | one record per run |

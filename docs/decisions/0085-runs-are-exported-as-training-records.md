@@ -6,6 +6,13 @@ I'll want them to understand a specific programming language x framework only, e
 qwen3.5-rust-cratestack-adam-v1-instruct a instruct model very good in rust, and cratestack, good at using adam as
 harness."* Decisions 3, 5 and 6 are this ADR's choices for the owner to confirm.
 
+*Amended 2026-11-27:* slice E2 shipped without `--current-tools`. `LlmAgent` exposes no tool schemas without a model
+client and connected MCP servers, and a record marked `current` with only some tools would mislead a trainer. The
+flag is a usage error; the library keeps `ExportOptions::current`, and slice E3 makes the flag unnecessary.
+Slice E3 is built (2026-11-27): `Conversation::request` names the blobs of the last call's system prompt (its whole
+`system`, not only the agent's instructions) and tools (RFC 8785 JSON); recording is all or nothing and fails open; the
+exporter reads them with `RecordedRequest::load`.
+
 ## Context
 
 adam-rs had no exporter (*verified 2026-11-27*: no export code in `crates/`, `bin/` or `bench/`). The thread exports of

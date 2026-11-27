@@ -7,7 +7,7 @@ use adam_error::{Classify, ErrorClass};
 use adam_llm_agent::Conversation;
 use adam_runtime::{Runtime, RuntimeError, view_from_record};
 
-use crate::{ExportOptions, Filter, Record, RunMeta, record_of};
+use crate::{ExportOptions, Filter, Record, RequestShape, RunMeta, record_with};
 
 /// Runs read per listing.
 const PAGE: usize = 100;
@@ -128,8 +128,8 @@ async fn export_agent(
                 continue;
             }
             match read(runtime, record).await {
-                Ok(Some((meta, conversation))) => {
-                    let exported = record_of(&meta, &conversation, options);
+                Ok(Some((meta, conversation, recorded))) => {
+                    let exported = record_with(&meta, &conversation, recorded.as_ref(), options);
                     if filter.accepts(&exported) {
                         write_record(out, &exported)?;
                         summary.written += 1;
@@ -151,12 +151,16 @@ async fn export_agent(
     Ok(summary)
 }
 
-/// The bookkeeping and the conversation of `record`, or `None` when its state is not a
-/// conversation with messages.
+/// What [`read`] answers: the run's bookkeeping, its conversation, and the prompt and tools its
+/// last model call was sent when the run recorded them.
+type Read = (RunMeta, Conversation, Option<RequestShape>);
+
+/// The bookkeeping, the conversation and the recorded request of `record`, or `None` when its
+/// state is not a conversation with messages.
 async fn read(
     runtime: &Runtime,
     record: RunRecord,
-) -> Result<Option<(RunMeta, Conversation)>, (adam_core::RunId, RuntimeError)> {
+) -> Result<Option<Read>, (adam_core::RunId, RuntimeError)> {
     let run = record.id;
     let state = runtime.state(run).await.map_err(|e| (run, e))?;
     let Some(state) = state else {
@@ -171,5 +175,21 @@ async fn read(
     let error = view_from_record(record.clone(), false)
         .map_err(|e| (run, e))?
         .error;
-    Ok(Some((RunMeta::of(&record, error), conversation)))
+    // A request whose bytes were collected, or that does not read, is not recorded: the record
+    // falls back to the current shape or to none, and says so in `tools_source`.
+    let recorded = match &conversation.request {
+        None => None,
+        Some(request) => match request.load(runtime.store().as_ref()).await {
+            Ok(Some(content)) => Some(RequestShape {
+                system: content.system,
+                tools: content.tools,
+            }),
+            Ok(None) => None,
+            Err(e) => {
+                tracing::warn!(%run, error = %adam_error::report(&e), "a run's recorded request could not be read; its record has no recorded tools");
+                None
+            }
+        },
+    };
+    Ok(Some((RunMeta::of(&record, error), conversation, recorded)))
 }

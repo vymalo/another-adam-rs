@@ -172,10 +172,23 @@ async fn a_stack_filter_keeps_the_run_that_read_the_manifest() {
     assert!(raw.contains("[deployment secret]"), "{raw}");
     assert_eq!(record["facets"]["dep"], json!(["axum"]));
     assert_eq!(record["facets"]["lang"], json!(["toml"]));
-    assert_eq!(record["tools_source"], "none");
+    // The run recorded its last model call (ADR 0085 slice E3): the record carries the system
+    // prompt and the tools that call was sent.
+    assert_eq!(record["tools_source"], "recorded");
     assert_eq!(record["compacted"], false);
+    assert_eq!(record["tools"][0]["type"], "function");
+    assert_eq!(record["tools"][0]["function"]["name"], "read_file");
 
-    let messages = record["messages"].as_array().expect("messages");
+    let all = record["messages"].as_array().expect("messages");
+    assert_eq!(all[0]["role"], "system");
+    assert!(
+        all[0]["content"]
+            .as_str()
+            .is_some_and(|text| text.contains("be brief")),
+        "{}",
+        all[0]
+    );
+    let messages = &all[1..];
     let roles: Vec<&str> = messages
         .iter()
         .map(|message| message["role"].as_str().expect("a role"))
