@@ -164,7 +164,8 @@ Cards of the board epic; each is one pull request, its proof seen failing first.
 |---|---|---|
 | M0 | this ADR and its pages | docs-check |
 | M1 | the L1 port, its testkit and the in-folder adapter, L1's only one | a double that answers another scope or writes twice for one key fails the suite |
-| M2 | the L2 port, its testkit and the PostgreSQL, MongoDB and Redis adapters, each with its configured scope | the suite on each; two scopes on one database never see each other; fails with a URL unset under the CI switch |
+| M2a | the L2 port, its testkit and the in-process reference | `memory_conformance!`; two configured scopes on one store never see each other's lessons |
+| M2b | the PostgreSQL, MongoDB and Redis adapters (ANR-1292, ANR-1293, ANR-1294, unbuilt) | the suite on each; two scopes on one database never see each other; fails with a URL unset under the CI switch |
 | M3 + M4 | `si_memory:` and the deployment's settings; the `si_recall` and `si_record` tools as a lazy group, over L1 | a folder `off` is off; a replay asks the store nothing; a secret in a field is refused |
 | M5 + M6 | the outcome observer; the defaults in `adam-coder` and `adam-agent`, and the chart | a passing check stamps a success; the first request differs by one loader line; the chart renders unchanged by default |
 | M7 + M8 | the promotion pass and rule; the reviewer agent | the same evidence twice is one lesson; one L1 scope alone is never a candidate; a rejected candidate is never served; one scope never reaches every audience |

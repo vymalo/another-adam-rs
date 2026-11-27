@@ -84,6 +84,14 @@ pub enum MemoryError {
         /// The bound.
         limit: usize,
     },
+    /// A lesson carried more L1 sources than it may.
+    #[error("a lesson carries {sources} sources, over the bound of {limit}")]
+    TooManySources {
+        /// How many it carried.
+        sources: usize,
+        /// The bound.
+        limit: usize,
+    },
     /// No problem with this root cause is in the scope.
     #[error("no problem {0:?} in this scope")]
     ProblemNotFound(String),
@@ -126,7 +134,8 @@ impl Classify for MemoryError {
             | Self::NamesAddress { .. }
             | Self::EmptyScope { .. }
             | Self::EmptyField { .. }
-            | Self::TooManyAnchors { .. } => ErrorClass::Invalid,
+            | Self::TooManyAnchors { .. }
+            | Self::TooManySources { .. } => ErrorClass::Invalid,
             Self::ScopeFull { .. } | Self::ProblemFull { .. } | Self::AudienceFull { .. } => {
                 ErrorClass::Rejected
             }
@@ -193,6 +202,13 @@ mod tests {
             (
                 MemoryError::TooManyAnchors {
                     anchors: 2,
+                    limit: 1,
+                },
+                ErrorClass::Invalid,
+            ),
+            (
+                MemoryError::TooManySources {
+                    sources: 2,
                     limit: 1,
                 },
                 ErrorClass::Invalid,

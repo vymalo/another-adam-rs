@@ -1,6 +1,7 @@
-//! The conformance suite of [`adam_memory::SiMemory`], and the [`Plan`] a test writes with.
+//! The conformance suites of [`adam_memory::SiMemory`] and [`adam_memory::Memory`], and the
+//! [`Plan`] and [`LessonPlan`] a test writes with.
 //!
-//! [`si_memory_conformance!`] writes the cases of ADR 0081 decisions 3 to 5 into a module of the
+//! [`si_memory_conformance!`] writes the L1 cases of ADR 0081 decisions 3 to 5 into a module of the
 //! implementing crate:
 //!
 //! * a problem and its attempt round-trip, and attempts with one root cause share a problem;
@@ -14,7 +15,19 @@
 //! * an observation is stamped once and a failed attempt is kept;
 //! * sixteen writers on one scope leave sixteen problems.
 //!
-//! Each case is a function here, so the suite is compiled once and the macro only names it.
+//! [`memory_conformance!`] writes the L2 cases of decisions 4, 5 and 10:
+//!
+//! * a lesson round-trips, and one audience and root cause is one lesson, updated in place;
+//! * an audience answers only its own lessons;
+//! * two configured scopes on one store never read, overwrite or retire each other's lessons;
+//! * a lesson text is scrubbed or the write is refused, and every bound refuses the write it would
+//!   break;
+//! * a lesson refuses a repository, a path, a URL, a host and an e-mail address whatever its
+//!   audience;
+//! * a retired lesson is kept and not served, and `retire` takes the stored, scrubbed root cause;
+//! * sixteen writers on one audience leave sixteen lessons.
+//!
+//! Each case is a function here, so each suite is compiled once and the macro only names it.
 //!
 //! ```ignore
 //! use std::sync::Arc;
@@ -29,8 +42,23 @@
 //! adam_memory_testkit::si_memory_conformance!(crate::make);
 //! ```
 //!
-//! `$make` is a path to a `fn(&Plan) -> DynSiMemory`. The suite also ships two doubles the cases
-//! must reject: [`doubles::ScopeBlindSiMemory`] and [`doubles::DoubleWritingSiMemory`].
+//! ```ignore
+//! use std::sync::Arc;
+//!
+//! use adam_memory::{DynMemory, InProcessMemory, MemoryScope};
+//! use adam_memory_testkit::LessonPlan;
+//!
+//! fn make(plan: &LessonPlan, scope: &MemoryScope) -> DynMemory {
+//!     Arc::new(InProcessMemory::new(plan.settings.clone(), scope.clone()))
+//! }
+//!
+//! adam_memory_testkit::memory_conformance!(crate::make);
+//! ```
+//!
+//! `$make` is a path to a `fn(&Plan) -> DynSiMemory` or a
+//! `fn(&LessonPlan, &MemoryScope) -> DynMemory`. Each suite also ships two doubles the cases must
+//! reject: [`doubles::ScopeBlindSiMemory`] and [`doubles::DoubleWritingSiMemory`] for L1, and
+//! [`doubles::ScopeBlindMemory`] and [`doubles::DoubleWritingMemory`] for L2.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -44,8 +72,8 @@ use adam_core::RunId;
 use adam_core::time::span_of;
 use adam_memory::{
     AttemptDraft, AttemptId, Lesson, LessonDraft, LessonLimits, LessonProvenance, LessonSettings,
-    LessonState, Limits, MemoryError, Observation, Outcome, Problem, Provenance, REDACTION_MARKER,
-    Repository, Scope, Scrubber, Settings, SiMemory,
+    LessonState, Limits, Memory, MemoryError, Observation, Outcome, Problem, Provenance,
+    REDACTION_MARKER, Repository, Scope, Scrubber, Settings, SiMemory,
 };
 
 pub use adam_memory::{Audience, DynMemory, DynSiMemory, MemoryScope};
@@ -128,7 +156,7 @@ pub fn draft(root_cause: &str, id: &str) -> AttemptDraft {
 /// What one L2 conformance run writes with: the injected scrub and the bounds.
 ///
 /// `LessonPlan::default()` injects the same scrubber `Plan::default()` does, with the bounds of
-/// `LessonLimits::default()` (the ADR's).
+/// `LessonLimits::default()` (the ADR's, with this slice's anchor and source counts).
 #[derive(Clone, Debug)]
 #[non_exhaustive]
 pub struct LessonPlan {
@@ -680,6 +708,22 @@ pub mod lesson_cases {
         let recalled = memory.recall(&audience).unwrap();
         assert_eq!(recalled.len(), 1, "an update does not open another lesson");
         assert_eq!(recalled[0].remedy, "stream the input instead");
+
+        // The recall serves the freshest write first, not the most recently opened lesson.
+        record(&memory, lesson_draft(&audience, "a second lesson"));
+        std::thread::sleep(Duration::from_millis(5));
+        record(
+            &memory,
+            lesson_draft(&audience, "the worker dies on a large input")
+                .remedy("cap the input size"),
+        );
+        let recalled = memory.recall(&audience).unwrap();
+        assert_eq!(recalled.len(), 2);
+        assert_eq!(
+            recalled[0].root_cause, "the worker dies on a large input",
+            "the freshest update is served first"
+        );
+        assert_eq!(recalled[0].remedy, "cap the input size");
     }
 
     /// An audience answers only its own lessons.
@@ -821,6 +865,19 @@ pub mod lesson_cases {
             matches!(error, MemoryError::TooManyAnchors { .. }),
             "{error}"
         );
+        let sources = vec!["a source".to_owned(); plan.settings.limits.sources_per_lesson + 1];
+        let draft = LessonDraft::new(
+            audience.clone(),
+            "the output is huge",
+            LessonProvenance::new(sources, "the conformance reviewer"),
+        );
+        let error = memory
+            .record(draft)
+            .expect_err("too many sources are refused");
+        assert!(
+            matches!(error, MemoryError::TooManySources { .. }),
+            "{error}"
+        );
     }
 
     /// A root cause over its character bound is refused, and one under it is accepted even when
@@ -927,6 +984,69 @@ pub mod lesson_cases {
         assert!(revived.retired_at.is_none());
         assert_eq!(revived.created, written.created, "the lesson is the same");
         assert_eq!(memory.recall(&audience).unwrap().len(), 1);
+    }
+
+    /// A full audience refuses to revive a retired lesson: the bound counts what is served.
+    ///
+    /// # Panics
+    ///
+    /// When a retired lesson is revived without a free slot, or a free slot is refused.
+    pub fn a_full_audience_refuses_a_revived_lesson(memory: DynMemory, plan: LessonPlan) {
+        let audience = audience("revive-bound");
+        let limit = plan.settings.limits.lessons_per_audience;
+        for i in 0..limit {
+            record(&memory, lesson_draft(&audience, &format!("lesson {i}")));
+        }
+        memory
+            .retire(&audience, "lesson 0")
+            .expect("the oldest lesson is there to retire");
+        record(&memory, lesson_draft(&audience, "lesson 0"));
+        assert_eq!(
+            memory.recall(&audience).unwrap().len(),
+            limit,
+            "a revived lesson fills the freed slot"
+        );
+
+        memory
+            .retire(&audience, "lesson 1")
+            .expect("lesson 1 is there to retire");
+        record(&memory, lesson_draft(&audience, "one lesson too many"));
+        assert_eq!(
+            memory.recall(&audience).unwrap().len(),
+            limit,
+            "the audience serves the limit again"
+        );
+        let error = memory
+            .record(lesson_draft(&audience, "lesson 1"))
+            .expect_err("reviving at the limit would serve one too many");
+        assert!(matches!(error, MemoryError::AudienceFull { .. }), "{error}");
+        let recalled = memory.recall(&audience).unwrap();
+        assert_eq!(recalled.len(), limit);
+        assert!(
+            recalled
+                .iter()
+                .all(|lesson| lesson.root_cause.as_str() != "lesson 1"),
+            "the refused revival left the lesson retired"
+        );
+    }
+
+    /// `retire` takes the stored, scrubbed root cause; the draft's unscrubbed text is `NotFound`.
+    ///
+    /// # Panics
+    ///
+    /// When an unscrubbed root cause retires a lesson, or the stored one is not found.
+    pub fn retire_takes_the_stored_root_cause(memory: DynMemory, _plan: LessonPlan) {
+        let audience = audience("stored-root-cause");
+        let raw = format!("the lockfile {TOKEN} is stale");
+        let written = record(&memory, lesson_draft(&audience, &raw));
+        assert_eq!(written.root_cause, "the lockfile  is stale");
+        let error = memory
+            .retire(&audience, &raw)
+            .expect_err("an unscrubbed root cause does not find the lesson");
+        assert!(matches!(error, MemoryError::LessonNotFound(_)), "{error}");
+        memory
+            .retire(&audience, &written.root_cause)
+            .expect("the stored root cause finds the lesson");
     }
 
     /// Sixteen writers on one audience leave sixteen lessons: the port is `Send + Sync`.
@@ -1198,6 +1318,24 @@ macro_rules! memory_conformance {
                 let plan = LessonPlan::default();
                 $crate::lesson_cases::a_retired_lesson_is_kept_and_not_served(
                     make(&plan, &$crate::memory_scope("retired")),
+                    plan,
+                );
+            }
+
+            #[test]
+            fn a_full_audience_refuses_a_revived_lesson() {
+                let plan = LessonPlan::default();
+                $crate::lesson_cases::a_full_audience_refuses_a_revived_lesson(
+                    make(&plan, &$crate::memory_scope("revive-bound")),
+                    plan,
+                );
+            }
+
+            #[test]
+            fn retire_takes_the_stored_root_cause() {
+                let plan = LessonPlan::default();
+                $crate::lesson_cases::retire_takes_the_stored_root_cause(
+                    make(&plan, &$crate::memory_scope("stored-root-cause")),
                     plan,
                 );
             }

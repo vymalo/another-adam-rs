@@ -24,7 +24,8 @@
 //! scopes on one database never see each other's lessons (decision 4). A lesson is `Active` when
 //! served, and `Retired` when its evidence turned: kept, and no longer served (decision 10).
 //! [`InProcessMemory`] is the in-process reference; the PostgreSQL, MongoDB and Redis adapters are
-//! features of crates of their own. The suite is `adam-memory-testkit`'s `memory_conformance!`.
+//! features of crates of their own (M2b, not built). The suite is `adam-memory-testkit`'s
+//! `memory_conformance!`.
 //!
 //! ```
 //! use adam_memory::{
@@ -207,11 +208,13 @@ pub trait Memory: Send + Sync + 'static {
     /// Record a lesson the reviewer approved, or update the one its audience already holds under
     /// the same root cause.
     ///
-    /// Every text is scrubbed first. A text that still holds [`REDACTION_MARKER`], a text over a
-    /// bound, a text that names a repository, a path, a URL, a host or an e-mail address, or a new
-    /// root cause in a full audience is refused and nothing is written. A second record for a key
-    /// the audience holds updates it and keeps its creation time, so a retried approval is one
-    /// lesson; a record for a retired lesson serves it again.
+    /// Every lesson text is scrubbed first; the audience and the provenance labels are keys,
+    /// validated and bounded, never scrubbed. A text that still holds [`REDACTION_MARKER`], a text
+    /// over a bound, a text that names a repository, a path, a URL, a host or an e-mail address, or
+    /// a write that would make the audience *serve* more than the limit is refused, and nothing is
+    /// written. A second record for a key the audience holds updates it and keeps its creation
+    /// time, so a retried approval is one lesson; a record for a retired lesson serves it again
+    /// when a free slot remains.
     ///
     /// # Errors
     ///
@@ -229,8 +232,11 @@ pub trait Memory: Send + Sync + 'static {
 
     /// Retire the lesson its audience holds under `root_cause`, and return it as stored.
     ///
-    /// Retiring a retired lesson is a no-op that returns the same record, so a retried step lands
-    /// once. Nothing is deleted: a retired lesson is kept (ADR 0081 decision 10).
+    /// `root_cause` is the lesson's stored root cause, as [`record`](Self::record) returned it —
+    /// the scrubbed text. An unscrubbed root cause does not find the lesson, so the adapter
+    /// answers [`MemoryError::LessonNotFound`]. Retiring a retired lesson is a no-op that returns
+    /// the same record, so a retried step lands once. Nothing is deleted: a retired lesson is kept
+    /// (ADR 0081 decision 10).
     ///
     /// # Errors
     ///

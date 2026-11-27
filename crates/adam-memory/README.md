@@ -124,10 +124,13 @@ A write that would break a bound is **refused**, not evicted, so the caller sees
 the attempts recorded before its cutoff and the problems it leaves empty, which frees the room
 again. Recall serves the freshest problem first.
 
-`LessonLimits::default()` is the ADR's for L2: 128 lessons an audience, 1 KiB a text field, 200
-characters a root cause, and 16 anchors a lesson. The bound counts the lessons an audience **serves**;
-a retired lesson is kept and does not count, so retiring frees a slot. There is no time-based sweep
-at L2: a lesson's evidence turns and it is retired, not deleted.
+`LessonLimits::default()` gives L2 128 lessons an audience, 1 KiB a text field, 200 characters a
+root cause, and 16 anchors and 16 sources an entry. The lesson and field bounds are the ADR's; the
+anchor and source counts are not — the ADR bounds every list but names no count, so this slice's
+value is 16 each. The bound counts the lessons an audience **serves**; a retired lesson is kept and
+does not count, so retiring frees a slot, and a write that would make the audience serve more than
+the limit is refused. There is no time-based sweep at L2: a lesson's evidence turns and it is
+retired, not deleted.
 
 ## Scrubbing and refusal
 
@@ -141,8 +144,9 @@ a drive letter, a token with two or more slashes, and a token with a code extens
 conservative: a false positive refuses a write, which decision 12 makes the safe side.
 
 An L2 lesson's own text (its root cause, remedy, rationale and anchors) may not name any of those
-shapes **whatever its audience** (decision 5); its audience and provenance labels are keys the
-promotion pass chooses, and are scrubbed but not address-checked.
+shapes **whatever its audience** (decision 5). The audience and provenance labels are keys: they
+are validated and bounded, never scrubbed, because `recall` and `retire` look a stored key up by the
+same text.
 
 `adam-memory` does **not** depend on `adam-llm-agent`: `adam-llm-agent` will depend on this crate
 (the `si_recall`/`si_record` tools), and a dependency back would be a cycle. The marker is a

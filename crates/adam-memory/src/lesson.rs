@@ -201,7 +201,8 @@ impl LessonDraft {
 /// A lesson, as stored: the draft's texts after scrubbing, its state and its timestamps.
 ///
 /// A retired lesson is kept, not deleted (ADR 0081 decision 10), so the same root cause can be
-/// recorded again when the reviewer approves a fresh version.
+/// recorded again when the reviewer approves a fresh version. A write that would make the audience
+/// *serve* more than its limit is refused, so reviving a retired lesson needs a free slot.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct Lesson {
@@ -227,22 +228,26 @@ pub struct Lesson {
     pub retired_at: Option<Timestamp>,
 }
 
-/// The bounds an L2 audience keeps. The values are ADR 0081 decision 5's, as its agent page
-/// records them: 128 lessons an audience, 1 KiB a text field, 200 characters a root cause, and 16
-/// anchors a lesson.
+/// The bounds an L2 audience keeps. 128 lessons an audience, 1 KiB a text field and 200 characters
+/// a root cause are ADR 0081 decision 5's, as its agent page records them. The ADR bounds every
+/// list but names no anchor or source count; this slice's values are 16 each.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct LessonLimits {
-    /// Lessons one audience serves at most. A further new root cause is refused, not evicted; a
-    /// retired lesson is kept and does not count, so retirement frees a slot.
+    /// Lessons one audience serves at most. A write that would make the audience serve more than
+    /// this is refused, not evicted; a retired lesson does not count, so retirement frees a slot.
     pub lessons_per_audience: usize,
-    /// Bytes one text field (remedy, rationale, anchor, provenance label) keeps at most, after
-    /// scrubbing.
+    /// Bytes one text field (remedy, rationale, anchor) keeps at most, after scrubbing. A
+    /// provenance label is bounded by it too.
     pub field_bytes: usize,
     /// Characters a root cause keeps at most, after scrubbing.
     pub root_cause_chars: usize,
-    /// Anchors one lesson keeps at most.
+    /// Anchors one lesson keeps at most. The ADR bounds every list but names no anchor count; this
+    /// slice's value is 16.
     pub anchors_per_lesson: usize,
+    /// L1 sources one lesson's provenance keeps at most. The ADR bounds every list but names no
+    /// source count; this slice's value is 16.
+    pub sources_per_lesson: usize,
 }
 
 impl Default for LessonLimits {
@@ -252,6 +257,7 @@ impl Default for LessonLimits {
             field_bytes: 1024,
             root_cause_chars: 200,
             anchors_per_lesson: 16,
+            sources_per_lesson: 16,
         }
     }
 }
@@ -263,14 +269,14 @@ impl Default for LessonLimits {
 #[derive(Clone, Debug)]
 #[non_exhaustive]
 pub struct LessonSettings {
-    /// The scrub every text passes through before it is stored.
+    /// The scrub every lesson text passes through before it is stored; keys are never scrubbed.
     pub scrubber: Scrubber,
     /// The bounds every write respects.
     pub limits: LessonLimits,
 }
 
 impl LessonSettings {
-    /// The ADR's bounds, scrubbed by `scrubber`.
+    /// The default bounds, scrubbed by `scrubber`.
     #[must_use]
     pub fn new(scrubber: Scrubber) -> Self {
         Self {
@@ -287,13 +293,12 @@ impl LessonSettings {
     }
 }
 
-/// Scrub every text of `draft` and check it, then stamp a served lesson at `now`.
+/// Scrub every lesson text of `draft` and check it, then stamp a served lesson at `now`.
 ///
-/// Every text is scrubbed first; a text that still holds [`crate::REDACTION_MARKER`] is refused.
-/// A lesson may not name a repository, a path, a URL, a host or an e-mail address whatever its
-/// audience (ADR 0081 decision 5), so every text goes through the address check too. The audience
-/// and the provenance labels are keys the promotion pass chooses, and are scrubbed but not
-/// checked for addresses.
+/// Every lesson text is scrubbed first; a text that still holds [`crate::REDACTION_MARKER`] is
+/// refused. A lesson may not name a repository, a path, a URL, a host or an e-mail address whatever
+/// its audience (ADR 0081 decision 5), so every lesson text goes through the address check too. The
+/// audience and the provenance labels are keys, validated and bounded, never scrubbed.
 pub(crate) fn prepare(
     scope: &MemoryScope,
     draft: LessonDraft,
@@ -301,10 +306,16 @@ pub(crate) fn prepare(
     now: Timestamp,
 ) -> MemoryResult<Lesson> {
     scope.validate()?;
-    draft.audience.validate()?;
+    key("audience", draft.audience.as_str(), settings)?;
     if draft.provenance.sources.is_empty() {
         return Err(MemoryError::EmptyField {
             field: "lesson sources",
+        });
+    }
+    if draft.provenance.sources.len() > settings.limits.sources_per_lesson {
+        return Err(MemoryError::TooManySources {
+            sources: draft.provenance.sources.len(),
+            limit: settings.limits.sources_per_lesson,
         });
     }
     if draft.provenance.review.trim().is_empty() {
@@ -330,9 +341,9 @@ pub(crate) fn prepare(
         .provenance
         .sources
         .iter()
-        .map(|source| label("lesson source", source, settings))
+        .map(|source| key("lesson source", source, settings))
         .collect::<MemoryResult<Vec<_>>>()?;
-    let review = label("lesson review", &draft.provenance.review, settings)?;
+    let review = key("lesson review", &draft.provenance.review, settings)?;
     Ok(Lesson {
         audience: draft.audience,
         root_cause,
@@ -371,10 +382,14 @@ fn text(field: &'static str, raw: &str, settings: &LessonSettings) -> MemoryResu
     bytes(field, clean, settings.limits.field_bytes)
 }
 
-/// A key or provenance label: scrubbed and bounded, but not address-checked.
-fn label(field: &'static str, raw: &str, settings: &LessonSettings) -> MemoryResult<String> {
-    let clean = scrub_text(field, raw, &settings.scrubber, false)?;
-    bytes(field, clean, settings.limits.field_bytes)
+/// A key or provenance label: validated and bounded, never scrubbed. A key must not be scrubbed:
+/// `recall` and `retire` look a stored key up by the same text, so a scrub would make the lookup
+/// miss.
+fn key(field: &'static str, raw: &str, settings: &LessonSettings) -> MemoryResult<String> {
+    if raw.trim().is_empty() {
+        return Err(MemoryError::EmptyField { field });
+    }
+    bytes(field, raw.to_owned(), settings.limits.field_bytes)
 }
 
 fn bytes(field: &'static str, clean: String, limit: usize) -> MemoryResult<String> {

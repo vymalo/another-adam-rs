@@ -69,10 +69,11 @@ answers recorded on the page for people.
 | Slice | Proof, seen failing first | Depends on |
 |---|---|---|
 | M1 | the L1 port and the in-folder adapter, L1's only one: a double that answers another scope or writes twice for one key fails `si_memory_conformance!`; 16 concurrent writers on one folder; a restart on the same folder reads what was written, on a fresh folder reads nothing | M0 |
-| M2 | the L2 port and the PostgreSQL, MongoDB and Redis adapters: `memory_conformance!` on each; two configured scopes on one database never read each other's lessons; it fails under `ADAM_TEST_REQUIRE_DB=1` with a URL unset (Rule 7) | M1 |
+| M2a | the L2 port, its testkit and the in-process reference: `memory_conformance!`; two configured scopes on one store never read each other's lessons; built | M1 |
+| M2b | the PostgreSQL, MongoDB and Redis adapters (ANR-1292, ANR-1293, ANR-1294, unbuilt): `memory_conformance!` on each; two configured scopes on one database never read each other's lessons; it fails under `ADAM_TEST_REQUIRE_DB=1` with a URL unset (Rule 7) | M2a |
 | M3 + M4 | a folder `off` is off; `SI_MEMORY=off` beats a folder `on`; an unknown option exits 78; `memory:` stays ignored; a replay past `journal_put` asks the store nothing; a secret in a field is refused; a repository entry is not served without its slot | M1 |
 | M5 + M6 | a passing check stamps a success, a failing one a failure; a panicking observer leaves the run unchanged; the coder's first request is byte-identical but for one loader line; `deploy/coder` renders unchanged by default (the chart is read by another repository: say so in the pull request) | M4 |
-| M7 + M8 | `promotion_conformance!`: the same evidence twice is one lesson; evidence from one L1 scope alone is never a candidate; an active lesson is not served outside its audience; a candidate no one approved is served to nobody; a text naming a repository is never sent to L2 | M2, M5 |
+| M7 + M8 | `promotion_conformance!`: the same evidence twice is one lesson; evidence from one L1 scope alone is never a candidate; an active lesson is not served outside its audience; a candidate no one approved is served to nobody; a text naming a repository is never sent to L2 | M2a, M5 |
 | M9 + M10 | a lesson whose evidence turns is retired and no longer served; the study runs with and without memory from one build | M8 |
 | M11 | its own ADR before code | M10 |
 

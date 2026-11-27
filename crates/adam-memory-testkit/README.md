@@ -6,8 +6,8 @@ The conformance suites of [`adam_memory::SiMemory`](../adam-memory/README.md) an
 (`publish = false`): it is test code.
 
 [ADR 0081](https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0081-an-agent-keeps-a-self-improvement-memory-near-it-and-what-holds-becomes-the-deployments-memory.md)
-decisions 4, 5 and 10; slices M1 and M2a: a double that answers another scope, or another audience,
-or writes twice for one key, fails the suite.
+decisions 4, 5 and 10; slices M1 and M2a: a double that answers another scope, or writes twice for
+one key, fails the suite.
 
 ## Using it
 
@@ -49,7 +49,7 @@ fn make(plan: &LessonPlan, scope: &MemoryScope) -> DynMemory {
     Arc::new(InProcessMemory::shared(
         plan.settings.clone(),
         scope.clone(),
-        store().clone(),
+        InProcessLessonStore::clone(store()),
     ))
 }
 
@@ -59,6 +59,10 @@ adam_memory_testkit::memory_conformance!(crate::make);
 `$make` is a path to a `fn(&LessonPlan, &MemoryScope) -> DynMemory`. The macro calls it once per
 case with the case's scope, and twice with two scopes for `two_scopes_never_see_each_other`; an
 adapter whose instances share one database must build both against it.
+
+Both suites assume the store holds nothing under their fixed scopes and audiences. A persistent
+adapter must clear those keys before the run, or prefix every scope the macro hands it with a
+per-run value.
 
 ## `Plan`
 
@@ -100,16 +104,18 @@ with a remedy, a rationale and two sources.
 | Case | What it proves |
 |---|---|
 | `record_then_recall_round_trips` | every field of the lesson, its provenance and its state comes back as written |
-| `a_record_lands_once_for_one_key` | one audience and root cause is one lesson: a retried record is one, an update replaces the text and keeps the creation time |
+| `a_record_lands_once_for_one_key` | one audience and root cause is one lesson: a retried record is one, an update replaces the text and keeps the creation time, and the freshest update is served first |
 | `recall_answers_only_its_audience` | another audience's lessons are never served |
 | `two_scopes_never_see_each_other` | two configured scopes on one store never read, overwrite or retire each other's lessons — the decisive case of M2 |
 | `a_text_is_scrubbed_before_the_write` | the stored text no longer holds what the scrubber removed |
 | `a_text_carrying_the_marker_is_refused` | a text the scrub marked, or one that already holds the marker, is refused and stores nothing |
-| `a_field_over_the_bound_is_refused` | a text over its byte bound, and too many anchors, are refused |
+| `a_field_over_the_bound_is_refused` | a text over its byte bound, too many anchors, and too many provenance sources are refused |
 | `a_root_cause_over_the_bound_is_refused` | the character bound is counted in characters, not bytes |
 | `a_full_audience_refuses_another_lesson` | the audience bound refuses a new root cause, and retiring a lesson frees a slot |
 | `a_lesson_refuses_an_address` | a repository, a path, a URL, a host and an e-mail address are refused whatever the audience |
 | `a_retired_lesson_is_kept_and_not_served` | a retired lesson is kept and not served, retiring twice is one retirement, an unknown lesson is `NotFound`, and a fresh record serves it again |
+| `a_full_audience_refuses_a_revived_lesson` | the bound counts what is served: reviving needs a free slot, and a full audience refuses it |
+| `retire_takes_the_stored_root_cause` | `retire` finds a lesson only by the stored, scrubbed root cause; the raw text is `NotFound` |
 | `sixteen_writers_share_one_audience` | the port is `Send + Sync` and one audience keeps every writer's lesson |
 
 ## The doubles
@@ -124,10 +130,12 @@ exactly what it proves:
 | `doubles::ScopeBlindMemory` | it writes every lesson into one bucket whatever scope its adapters are configured with | `two_scopes_never_see_each_other` |
 | `doubles::DoubleWritingMemory` | it writes every lesson twice, the second under a derived root cause | `a_record_lands_once_for_one_key` |
 
-The testkit's own tests run those cases against the doubles and assert they panic, and run the same
-cases against `InProcessSiMemory` and `InProcessMemory` (two adapters on one
-`InProcessLessonStore`) to assert they pass. This is M1's and M2a's proof: the suites are not ones
-that any implementation passes.
+The testkit's own tests prove them: `ScopeBlindSiMemory` fails
+`recall_answers_only_its_scope`, `DoubleWritingSiMemory` and `DoubleWritingMemory` fail
+`a_record_lands_once_for_one_key`, and `ScopeBlindMemory` fails
+`two_scopes_never_see_each_other`. The same cases pass against `InProcessSiMemory` and against two
+`InProcessMemory` adapters on one `InProcessLessonStore`. This is M1's and M2a's proof: the suites
+are not ones that any implementation passes.
 
 ## Tests
 
