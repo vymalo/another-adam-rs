@@ -24,6 +24,12 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 /// the same logger as everything else.
 #[tokio::main]
 async fn main() -> ExitCode {
+    // Before the logger and the configuration: a package's `test do` runs `adam-agent --version`,
+    // and starting the server there would hang (or exit 78 without `ADAM_AGENT_DIR`).
+    if let Some(code) = early_exit(std::env::args().skip(1)) {
+        return code;
+    }
+
     // `RUST_LOG` when set, else `info` with the MCP client library quiet (`adam_service::logging`).
     tracing_subscriber::fmt()
         .json()
@@ -45,6 +51,43 @@ async fn main() -> ExitCode {
         Err(e) => fail(&anyhow::Error::from(e)),
     }
 }
+
+/// What a bare invocation with `--version` or `--help` answers, before any configuration is read:
+/// a package's `test do` runs `adam-agent --version`, and starting the server there would hang (or
+/// exit 78 without `ADAM_AGENT_DIR`). Any other argument is ignored, as it always was.
+fn early_exit(args: impl Iterator<Item = String>) -> Option<ExitCode> {
+    for arg in args {
+        match arg.as_str() {
+            "--version" | "-V" => {
+                println!("adam-agent {}", env!("CARGO_PKG_VERSION"));
+                return Some(ExitCode::SUCCESS);
+            }
+            "--help" | "-h" => {
+                println!("{}", USAGE);
+                return Some(ExitCode::SUCCESS);
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// What `--help` prints: the binary, its version, and the configuration it reads (the page that
+/// documents every variable is linked, not copied).
+const USAGE: &str = concat!(
+    "adam-agent ",
+    env!("CARGO_PKG_VERSION"),
+    "\n",
+    "Serves any agent folder: the A2A server, the workers, or both (`ROLE`).\n",
+    "\n",
+    "Configuration comes from the environment: `ADAM_AGENT_DIR` names the folder,\n",
+    "`DATABASE_URL` the run store, `TURN_SIGNING_KEY_FILE` the turn key. Every variable is\n",
+    "documented at https://github.com/vymalo/another-adam-rs/blob/main/docs/reference/environment.md\n",
+    "\n",
+    "Options:\n",
+    "  -h, --help     Print this help and exit.\n",
+    "  -V, --version  Print the version and exit.\n",
+);
 
 /// Log `e` once, chain included, and turn it into the process's exit code.
 fn fail(e: &anyhow::Error) -> ExitCode {

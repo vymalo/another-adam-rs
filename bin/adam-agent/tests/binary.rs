@@ -257,6 +257,32 @@ async fn refused(env: &[(String, String)], code: u8) -> String {
 
 // ------------------------------------------------------------------- offline
 
+/// `--version` and `--help` answer before any configuration is read: a package's `test do` runs
+/// `adam-agent --version`, and starting the server there would hang (or exit 78 without
+/// `ADAM_AGENT_DIR`). Nothing else is on the command line, and the process is not left running.
+#[tokio::test]
+async fn version_and_help_answer_without_any_configuration() {
+    for (flag, expected) in [
+        ("--version", env!("CARGO_PKG_VERSION")),
+        ("--help", "--version"),
+    ] {
+        let out = Command::new(env!("CARGO_BIN_EXE_adam-agent"))
+            .arg(flag)
+            .env_clear()
+            .output()
+            .await
+            .expect("the binary runs");
+        assert!(out.status.success(), "{flag}: {:?}", out.status);
+        let text = String::from_utf8_lossy(&out.stdout);
+        assert!(text.contains(expected), "{flag} printed {text:?}");
+        assert!(
+            out.stderr.is_empty(),
+            "{flag} wrote to stderr: {:?}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
+
 /// `ADAM_AGENT_DIR` has no default and the binary has no embedded agent: without it no role starts
 /// (exit 78), the message says what to set, and every other problem is listed with it, so one round
 /// trip fixes them all.
