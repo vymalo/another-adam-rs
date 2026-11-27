@@ -190,7 +190,7 @@ jobs:
           helm template coder deploy/coder --namespace another-agentic-system --set image.tag=sha-abc1234 \
             --set cache.create=true --set cache.storageClass=rwx --set runPods.enabled=true \
             --set topology=split --set front.replicas=2 > "$RUNNER_TEMP/rendered-cache-run-pods.yaml"
-          # GET /internal/activity on a port of its own (activity.*, ADR 0081): the container port, its Service
+          # GET /internal/activity on a port of its own (activity.*, ADR 0083): the container port, its Service
           # port, the tokens from a Secret and the policy's second rule, in the combined pod and on the split front.
           helm template coder deploy/coder --namespace another-agentic-system --set image.tag=sha-abc1234 \
             --set activity.enabled=true --set activity.tokensSecret.name=coder-activity \

@@ -22,7 +22,7 @@ spec:
       targetPort: http
       protocol: TCP
     {{- if include "coder.activity" . }}
-    {{- /* activity.*: GET /internal/activity alone, behind its own tokens (ADR 0081). */}}
+    {{- /* activity.*: GET /internal/activity alone, behind its own tokens (ADR 0083). */}}
     - name: activity
       port: {{ int64 .Values.activity.port }}
       targetPort: activity

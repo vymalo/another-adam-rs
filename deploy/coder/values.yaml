@@ -285,7 +285,7 @@ a2a:
     # example https://<public host>/.well-known/jwks.json. Empty: none.
     jku: ""
 
-# GET /internal/activity on a port of its own, with tokens of its own (adam ADR 0081): what the run
+# GET /internal/activity on a port of its own, with tokens of its own (adam ADR 0083): what the run
 # store says about the agent's work ({"busy": N, "nextDueAt": ...}, no run content), for a caller
 # that scales the service and must hold no A2A token. Off by default, and then nothing of it is
 # rendered: the route stays on the A2A port behind the A2A tokens (deprecated). On, the pods that

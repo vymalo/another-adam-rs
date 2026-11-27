@@ -93,7 +93,7 @@ from service.yaml, which every render contains, so they always run.
 {{- fail (printf "config.extraEnv.%s is set while the a2a.* value that sets it is on: the chart sets it itself" $path) -}}
 {{- end -}}
 {{- end -}}
-{{- /* GET /internal/activity on a port of its own (values `activity`, adam ADR 0081). */ -}}
+{{- /* GET /internal/activity on a port of its own (values `activity`, adam ADR 0083). */ -}}
 {{- if not (kindIs "bool" .Values.activity.enabled) -}}
 {{- fail (printf "activity.enabled must be true or false, got %q" (toString .Values.activity.enabled)) -}}
 {{- end -}}

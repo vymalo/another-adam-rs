@@ -418,7 +418,7 @@ impl ServiceConfig {
 }
 
 /// `ACTIVITY_LISTEN_ADDR` and `ACTIVITY_BEARER_TOKENS`: `GET /internal/activity` on a listener of
-/// its own, with tokens of its own (ADR 0081).
+/// its own, with tokens of its own (ADR 0083).
 ///
 /// The caller of the route (an operator that scales the service) then holds no A2A token and needs
 /// no path to the A2A port: a token of this list is refused on the A2A listener, and an A2A token

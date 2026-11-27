@@ -16,7 +16,7 @@
 //! With [`ServiceConfig::activity`] set (`ACTIVITY_LISTEN_ADDR`), every role also runs `activity`:
 //! `GET /internal/activity` alone on a listener of its own, behind `ACTIVITY_BEARER_TOKENS`, and
 //! the route is then gone from [`ServiceConfig::listen_addr`]. Unset, the route stays there behind
-//! the A2A tokens (deprecated; ADR 0081).
+//! the A2A tokens (deprecated; ADR 0083).
 //!
 //! `notify` is the [`adam_notify_postgres::PgNotify`] listener and publisher: live events and
 //! wake-up/cancel signals cross processes over Postgres `LISTEN`/`NOTIFY`, so a worker takes a
@@ -574,7 +574,7 @@ fn a2a_features(
     service: &Service,
 ) -> Result<(ServerOptions, Option<PushDeliverer>), ServeError> {
     let mut options = ServerOptions::default().with_docs(config.a2a.docs);
-    // With a listener of its own the route is there only (ADR 0081): an A2A token never reads it.
+    // With a listener of its own the route is there only (ADR 0083): an A2A token never reads it.
     if config.activity.is_none() {
         options = options.with_protected_routes(crate::activity::router(
             service.runtime.store().clone(),
@@ -963,7 +963,7 @@ async fn run(
     // acknowledged, which a client that is not sending delays by up to 40 ms.
     let listener = no_delay(listener);
     tracing::info!(%addr, %role, workers, worker_id = worker_id.as_deref(), "listening");
-    // The activity listener (ADR 0081), bound before anything runs too.
+    // The activity listener (ADR 0083), bound before anything runs too.
     let activity = match (&config.activity, activity_listener) {
         (Some(settings), given) => {
             let listener = match given {
@@ -982,7 +982,7 @@ async fn run(
         (None, _) => {
             tracing::info!(
                 "GET /internal/activity is served on LISTEN_ADDR behind A2A_BEARER_TOKENS: \
-                 deprecated, set ACTIVITY_LISTEN_ADDR and ACTIVITY_BEARER_TOKENS (ADR 0081)"
+                 deprecated, set ACTIVITY_LISTEN_ADDR and ACTIVITY_BEARER_TOKENS (ADR 0083)"
             );
             None
         }

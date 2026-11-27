@@ -2252,7 +2252,7 @@ check "a key id without a key is refused" \
 check "a verify set without a key is refused" \
   fails helm template coder "$chart" --set image.tag=sha-abc1234 --set externalSecrets.properties.turnVerifyKeys=k
 
-# GET /internal/activity on a port of its own, with tokens of its own (activity.*, adam ADR 0081). Off by
+# GET /internal/activity on a port of its own, with tokens of its own (activity.*, adam ADR 0083). Off by
 # default and then invisible (the goldens, byte for byte); on, on the pods the Service selects, the tokens from
 # the Secret that was named and never a value, and the NetworkPolicy lets its caller reach that port only.
 helm_act() { helm template coder "$chart" --namespace coder-ns --set image.tag=sha-abc1234 "$@"; }

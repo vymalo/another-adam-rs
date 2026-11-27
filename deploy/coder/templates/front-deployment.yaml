@@ -43,7 +43,7 @@ spec:
             - name: http
               containerPort: 8080
               protocol: TCP
-            {{- /* activity.*: GET /internal/activity on a port of its own; the Service selects the front (ADR 0081). */}}
+            {{- /* activity.*: GET /internal/activity on a port of its own; the Service selects the front (ADR 0083). */}}
             {{- with (include "coder.activityPort" . | trim) }}
             {{- . | nindent 12 }}
             {{- end }}

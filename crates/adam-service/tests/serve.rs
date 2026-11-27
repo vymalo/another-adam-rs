@@ -446,7 +446,7 @@ async fn serve_runs_the_whole_agent_on_a_sqlite_file() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Without `ACTIVITY_LISTEN_ADDR` (the compatible form, deprecated by ADR 0081), `GET
+/// Without `ACTIVITY_LISTEN_ADDR` (the compatible form, deprecated by ADR 0083), `GET
 /// /internal/activity` is on the A2A listener: it needs the A2A bearer, and on an idle store answers
 /// `busy: 0` with no `nextDueAt` and nothing of any run.
 #[tokio::test]
@@ -492,7 +492,7 @@ fn activity_vars() -> [(&'static str, String); 2] {
     ]
 }
 
-/// With `ACTIVITY_LISTEN_ADDR` (ADR 0081): the activity listener answers its own token only and
+/// With `ACTIVITY_LISTEN_ADDR` (ADR 0083): the activity listener answers its own token only and
 /// serves `GET /internal/activity` only (every other path is a 404, `/healthz` and the card
 /// included); the A2A listener refuses the activity token, and no longer serves the route even to
 /// an A2A token.
