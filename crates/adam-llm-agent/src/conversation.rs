@@ -154,6 +154,12 @@ pub const REASONING_EFFORT_CONTEXT_KEY: &str = "vymalo.reasoningEffort";
 /// [`LlmAgentBuilder::model_choices`]: crate::LlmAgentBuilder::model_choices
 pub const MODEL_CONTEXT_KEY: &str = "vymalo.model";
 
+/// The context key under which a message picks the mode its run works in (`agent-mode/v1`, ADR
+/// 0039 decision 3): `{"mode": "<name>"}`, one of the modes the agent's folder declares. It holds
+/// for the run until a later message picks another, and a mode only narrows: the tools it does not
+/// list are withheld, and the access tier still caps every one it does.
+pub const MODE_CONTEXT_KEY: &str = "vymalo.mode";
+
 /// The context key under which a message says **who it was sent for** (`thread-tools/v1`): the
 /// thread's addressed agent, `{"caller": "main"}`, or an agent another agent asked, `{"caller":
 /// "ask:<n>", ..}`, read from the claims of the grant's token. A run of an asked agent has no person
@@ -177,8 +183,9 @@ pub const LOCALE_CONTEXT_KEY: &str = "vymalo.locale";
 pub const CHILD_SESSIONS_CONTEXT_KEY: &str = "vymalo.childSessions";
 
 /// The context keys that must survive a context the run drops: the **limits on the agent** (the
-/// access tier the person picked, who the message was sent for, the reasoning effort it activated,
-/// and that nobody answers the run, `adam_runtime::UNATTENDED_CONTEXT_KEY`) and the **interface
+/// access tier the person picked, the mode it works in, who the message was sent for, the reasoning
+/// effort it activated, and that nobody answers the run,
+/// `adam_runtime::UNATTENDED_CONTEXT_KEY`) and the **interface
 /// language** the person is speaking ([`LOCALE_CONTEXT_KEY`]). A message always sets them, even
 /// when the rest of its context is over [`MAX_CONTEXT_BYTES`] and dropped (otherwise a large
 /// catalog next to a `plan` tier would lift the limit, or the agent would answer in a language it
@@ -187,6 +194,7 @@ pub const CHILD_SESSIONS_CONTEXT_KEY: &str = "vymalo.childSessions";
 /// [`MAX_PROTECTED_VALUE_BYTES`]; a larger one is ignored.
 pub const PROTECTED_CONTEXT_KEYS: &[&str] = &[
     ACCESS_TIER_CONTEXT_KEY,
+    MODE_CONTEXT_KEY,
     CALLER_CONTEXT_KEY,
     REASONING_EFFORT_CONTEXT_KEY,
     LOCALE_CONTEXT_KEY,

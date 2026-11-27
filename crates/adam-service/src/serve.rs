@@ -229,6 +229,11 @@ pub struct Agents {
     /// expands a message that names one. `None`: the extension is never read. Only the roles that
     /// serve A2A use it.
     pub commands: Option<adam_a2a_runtime::Commands>,
+    /// The modes the agent declares (`agent-mode/v1`, ADR 0039 decision 3), when its folder has
+    /// `modes/`: the backend then reads the mode of a message that activated the extension and
+    /// refuses one it does not declare. `None`: the extension is never read, and a card that lists
+    /// it stops the process ([`ServeError::AgentModes`]). Only the roles that serve A2A use it.
+    pub agent_modes: Option<adam_a2a::AgentModes>,
     /// The helpers the agent serves `child-sessions/v1` for, when it has any
     /// (`AgentDef::child_sessions`): the backend then starts, continues and closes a person's
     /// sessions on them, and [`serve`] adds the extension to the card **only when the backend
@@ -262,6 +267,7 @@ impl Agents {
             model_choices: None,
             reasoning_efforts: None,
             commands: None,
+            agent_modes: None,
             child_sessions: None,
             uploads_inline_max_bytes: None,
             components: Vec::new(),
@@ -376,6 +382,17 @@ impl Agents {
     #[must_use]
     pub fn commands(mut self, commands: adam_a2a_runtime::Commands) -> Self {
         self.commands = Some(commands);
+        self
+    }
+}
+
+impl Agents {
+    /// The agent declares `modes` (`agent-mode/v1`): declare them on the card
+    /// ([`ExtensionConfig::agent_mode`](adam_a2a::ExtensionConfig::agent_mode)) and the backend
+    /// reads and refuses them. See [`Agents::agent_modes`](struct@Agents#structfield.agent_modes).
+    #[must_use]
+    pub fn agent_modes(mut self, modes: adam_a2a::AgentModes) -> Self {
+        self.agent_modes = Some(modes);
         self
     }
 }
@@ -498,6 +515,13 @@ pub enum ServeError {
         /// The registered name of the first helper that is missing.
         agent: String,
     },
+    /// The agent's card lists `agent-mode/v1` while the backend was given no modes: a mistake of
+    /// the binary, found at start, so the card never promises a choice nothing keeps.
+    #[error(
+        "the agent card lists agent-mode/v1 but the backend was given no modes: pass \
+         `Agents::agent_modes` what the folder declares"
+    )]
+    AgentModes,
     /// A listener cannot be bound: `LISTEN_ADDR`'s, or the activity listener's.
     #[error("binding {addr}")]
     Bind {
@@ -847,6 +871,7 @@ async fn run(
         model_choices,
         reasoning_efforts,
         commands,
+        agent_modes,
         child_sessions,
         uploads_inline_max_bytes,
         components,
@@ -876,6 +901,7 @@ async fn run(
     .with_model_choices(model_choices)
     .with_reasoning_efforts(reasoning_efforts)
     .with_commands(commands)
+    .with_agent_modes(agent_modes)
     .with_child_sessions(child_sessions.clone());
     // The card lists the extension if and only if this process serves it.
     let mut card = card;
@@ -915,6 +941,25 @@ async fn run(
         && let Some(extension) = adam_a2a::ExtensionConfig::model_pick(choices)
     {
         card.extensions.push(extension);
+    }
+    // The modes of `agent-mode/v1`. A card that lists the extension while the backend reads no mode
+    // would promise a choice nothing keeps: the process stops instead (fail closed).
+    if let (Some(card), Some(modes)) = (card.as_mut(), service.agent_modes()) {
+        if !card
+            .extensions
+            .iter()
+            .any(|listed| listed.uri == adam_a2a::AGENT_MODE_EXTENSION)
+        {
+            card.extensions
+                .push(adam_a2a::ExtensionConfig::agent_mode(modes));
+        }
+    } else if let Some(card) = card.as_ref()
+        && card
+            .extensions
+            .iter()
+            .any(|listed| listed.uri == adam_a2a::AGENT_MODE_EXTENSION)
+    {
+        return Err(ServeError::AgentModes);
     }
     // The levels of `reasoning/v1`, the root agent's model's: `None` when it takes none, and the
     // card keeps whatever it already says (a composition of its own listed the entry).

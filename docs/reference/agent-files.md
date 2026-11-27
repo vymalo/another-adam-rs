@@ -61,6 +61,8 @@ my-agent/                       # a normal Cargo package
 │   │   ├── researcher/instructions.md   # directory form: own skills/, mcp.json, subagents/
 │   │   └── billing.md                   # `a2a: <agent-card URL>` makes it a remote subagent
 │   ├── commands/review.md      # a prompt template a message invokes by name (`/review ...`)
+│   ├── modes/build.md          # a mode a person picks per message (`agent-mode/v1`, ADR 0039)
+│   ├── modes/plan.md           # its own prompt and `tools:`; the tier still caps it
 │   ├── mcp.json                # {"mcpServers": {...}}; secrets only as ${VAR}
 │   └── schedules/daily.md      # frontmatter `cron:`, `at:` or `after:`; body = prompt (ADR 0060)
 └── src/
@@ -80,7 +82,8 @@ both `agent/` and `agents/` is a **build error** (eve silently prefers `agent/`)
 * Ignored: dotfiles, `*.test.md`, `__tests__/`, and a directory under `skills/` without `SKILL.md`.
 * Names come from paths: `skills/<name>/SKILL.md` or `skills/<name>.md` is skill `<name>`;
   `subagents/<name>.md`, `subagents/<name>.agent.md` or `subagents/<name>/instructions.md` is subagent
-  `<name>`; `schedules/a/b.md` is schedule `a/b`; `commands/<name>.md` is command `<name>`. For a subagent file, the name is the file name minus
+  `<name>`; `schedules/a/b.md` is schedule `a/b`; `commands/<name>.md` is command `<name>`; `modes/<name>.md`
+  is mode `<name>`. For a subagent file, the name is the file name minus
   `.md` or `.agent.md` (as Copilot does), unless the frontmatter sets `name`.
 * Subagents nest through `subagents/<name>/subagents/...`. Cycles are impossible by construction.
 
@@ -309,6 +312,43 @@ message that invokes one. [The coder's](../../bin/adam-coder/agent/commands) are
 
 The prompts of an agent's MCP servers are commands too, named `<server>__<prompt>`
 ([below](#prompts-as-commands)); a folder's own command of that name wins.
+
+### Modes (`modes/<name>.md`)
+
+A mode is a way of working the **person picks for one message**, as they pick the access tier: a
+prompt of its own and its own `tools:`, over the agent's (ADR 0039, decision 3). The card lists the
+modes (`agent-mode/v1`) and a message names one; the choice holds until another message names
+another. It is root-agent only: `subagents/<n>/modes/` is a warning and ignored.
+
+```markdown
+---
+title: Plan                        # optional, at most 60 characters; default: the mode's name
+description: Reads, searches and answers with a plan.   # required, at most 200 characters
+default: true                      # on exactly one mode: the one a message that names none works in
+tools: [read_file, list_files]     # the tools this mode offers; absent: the agent's own list
+---
+You are in the plan mode: read, propose, change nothing.
+```
+
+| | |
+|---|---|
+| Name | the file stem, the agent-name rule (`a-z0-9_-`, 1 to 64, not starting with `_` or `-`) |
+| `default` | **exactly one** mode of a folder says `default: true`: a message that names none works in it. None, or two, is a load error naming the files |
+| `tools:` | the **allowlist** of the mode: every tool the model is shown while it is in force, written as an agent's `tools:` (a list, a comma-separated string, `*`, a pattern). A plain name the agent does not have is left out with a warning (a deployment's setting decides some tools, and the agent's own `tools:` may narrow them); a pattern that matches nothing is a bind error |
+| The body | words added to the agent's instructions while the mode is in force. Empty for a mode that only narrows, or for the default mode that is the agent as it is (it then adds nothing at all, and the prompt is byte for byte the agent's) |
+| `permission:` | **refused at load**, with the file and the line: the rules of ADR 0039 decision 4 are not built, and a deny nothing reads would let through what the file forbids. Narrow the mode with `tools:` |
+| Limits | 16 modes per agent; a file of at most 40 KiB; a title of 60 characters and a description of 200 |
+| Digest | a folder without `modes/` has the digest it had before modes existed; a mode's words, `tools:` and `default` are in it |
+
+**A mode only narrows.** The agent applies the mode's holds beside the access tier's, so a tool the
+mode offers is still held back by a tier that is too low, and a mode can neither raise the tier nor
+offer a tool the agent does not have. A mode that names no `tools:` narrows nothing. A subagent
+starts in the mode of the run that started it (the key is one of the run's protected context keys),
+so a mode's narrowing reaches the helpers too.
+
+[The coder's](../../bin/adam-coder/agent/modes) are `build` (the default: the agent as it is) and
+`plan` (read-only tools and a plan as the answer). What the agent does with the message is
+[the A2A server](a2a-server.md#modes-agent-modev1).
 
 ### `mcp.json`
 

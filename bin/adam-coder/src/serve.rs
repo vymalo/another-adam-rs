@@ -527,6 +527,12 @@ pub async fn serve(
         // The card lists the commands of the files and the prompts of the MCP servers (`commands/v1`);
         // the backend expands a message that names one before it is stored.
         .commands(commands);
+    // The modes of the files (`agent-mode/v1`): the card lists them and the backend refuses a
+    // message that names another; the agent narrows to the one a message picks.
+    let agents = match files.agent_modes() {
+        Some(modes) => agents.agent_modes(modes),
+        None => agents,
+    };
     let agents = match sessions {
         Some(sessions) => agents.child_sessions(sessions.with_bounds(session_bounds)),
         None => agents,

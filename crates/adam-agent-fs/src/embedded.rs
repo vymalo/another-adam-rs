@@ -17,7 +17,7 @@ use std::path::PathBuf;
 use crate::digest::{Digest, digest_with};
 use crate::load::parse_mcp;
 use crate::manifest::{
-    AgentManifest, Command, InstructionPart, Instructions, Layout, Package, RemoteAgent,
+    AgentManifest, Command, InstructionPart, Instructions, Layout, Mode, Package, RemoteAgent,
     RemoteAuth, Report, Schedule, Skill, SkillLayout, Subagent,
 };
 use crate::schema::{AgentFrontmatter, McpConfig};
@@ -103,6 +103,8 @@ pub struct EmbeddedAgent {
     pub schedules: &'static [EmbeddedSchedule],
     /// The agent's commands, sorted by name.
     pub commands: &'static [EmbeddedCommand],
+    /// The agent's modes, sorted by name.
+    pub modes: &'static [EmbeddedMode],
 }
 
 impl EmbeddedAgent {
@@ -167,6 +169,12 @@ impl EmbeddedAgent {
                 .copied()
                 .map(EmbeddedCommand::to_command)
                 .collect(),
+            modes: self
+                .modes
+                .iter()
+                .copied()
+                .map(EmbeddedMode::to_mode)
+                .collect::<Result<_, _>>()?,
         })
     }
 
@@ -457,6 +465,39 @@ impl EmbeddedCommand {
     }
 }
 
+/// A mode (`modes/<name>.md`), as the text of the file: the same parser and the same schema as a
+/// directory's, so there is no second one.
+#[derive(Debug, Clone, Copy)]
+pub struct EmbeddedMode {
+    /// The file stem.
+    pub name: &'static str,
+    /// The file, relative to the source root.
+    pub path: &'static str,
+    /// The file's content.
+    pub text: &'static str,
+}
+
+impl EmbeddedMode {
+    /// The parsed mode.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Invalid`] when the text has an error (it had none when it was embedded).
+    fn to_mode(self) -> Result<Mode, Error> {
+        let mut diagnostics: Vec<Diagnostic> = Vec::new();
+        let mode = crate::load::parse_mode_text(
+            std::path::Path::new(self.path),
+            self.text,
+            self.name,
+            &mut diagnostics,
+        );
+        match mode {
+            Some(mode) if !diagnostics.iter().any(Diagnostic::is_error) => Ok(mode),
+            _ => Err(Error::Invalid { diagnostics }),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -476,6 +517,7 @@ mod tests {
         mcp: None,
         schedules: &[],
         commands: &[],
+        modes: &[],
     };
 
     static WITH_SKILL: EmbeddedAgent = EmbeddedAgent {
@@ -627,6 +669,43 @@ mod tests {
         };
         assert_eq!(diagnostics[0].severity, Severity::Error);
         assert_eq!(diagnostics[0].path, PathBuf::from("agent/mcp.json"));
+    }
+
+    #[test]
+    fn a_mode_is_parsed_from_its_embedded_text_by_the_one_parser() {
+        static AGENTS: [EmbeddedAgent; 1] = [EmbeddedAgent {
+            modes: &[EmbeddedMode {
+                name: "plan",
+                path: "agent/modes/plan.md",
+                text: "---\ndescription: Read and propose.\ndefault: true\n\
+                       tools: [read_file]\n---\nChange nothing.\n",
+            }],
+            ..BARE
+        }];
+        let manifest = EmbeddedPackage {
+            layout: Layout::Single,
+            agents: &AGENTS,
+        }
+        .load()
+        .unwrap()
+        .package
+        .agents
+        .remove(0);
+        assert_eq!(manifest.modes.len(), 1);
+        assert_eq!(manifest.modes[0].name, "plan");
+        assert_eq!(manifest.modes[0].prompt, "Change nothing.");
+        assert!(manifest.modes[0].default);
+        assert_eq!(
+            manifest.modes[0].tools,
+            Some(crate::ToolList::Named(vec!["read_file".to_owned()]))
+        );
+        // A text the loader refuses is an `Invalid`, not a silent empty mode.
+        let bad = EmbeddedMode {
+            name: "plan",
+            path: "agent/modes/plan.md",
+            text: "---\ndefault: true\n---\n",
+        };
+        assert!(matches!(bad.to_mode(), Err(Error::Invalid { .. })));
     }
 
     #[test]

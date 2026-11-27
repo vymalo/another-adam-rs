@@ -187,6 +187,15 @@ impl AgentFiles {
         }
     }
 
+    /// The modes these files declare (`modes/`, `agent-mode/v1`, ADR 0039 decision 3), as the card
+    /// lists them and the A2A front refuses a message for. `None` when the folder has no `modes/`.
+    ///
+    /// Read from the definition rather than from the assembly so that a control plane, which
+    /// assembles no agent, lists and serves the same modes as the workers.
+    pub fn agent_modes(&self) -> Option<adam_a2a::AgentModes> {
+        adam::assembly::agent_modes_of(self.def().ok()?.manifest())
+    }
+
     /// What a load warned about (always empty for the embedded copy, which the build checked
     /// strictly).
     pub fn warnings(&self) -> &[Diagnostic] {

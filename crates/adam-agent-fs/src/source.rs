@@ -13,8 +13,8 @@ use crate::diagnostic::{Diagnostic, Sink};
 use crate::frontmatter::clean_body;
 use crate::load::{self, AgentFile, FileKind, RemoteSpec};
 use crate::manifest::{
-    AgentManifest, Command, InstructionPart, Instructions, Layout, MAX_COMMANDS, Package,
-    RemoteAgent, Report, Schedule, Skill, SkillLayout, Subagent,
+    AgentManifest, Command, InstructionPart, Instructions, Layout, MAX_COMMANDS, MAX_MODES, Mode,
+    Package, RemoteAgent, Report, Schedule, Skill, SkillLayout, Subagent,
 };
 
 /// Something that can produce a [`Report`]: the agents it holds and every finding about them.
@@ -422,13 +422,27 @@ impl Loader<'_> {
             }
             (None, _) => Vec::new(),
         };
+        let modes = match (find("modes", EntryKind::Dir), kind) {
+            (Some(d), FileKind::Root | FileKind::Named) => self.modes(&d)?,
+            (Some(d), FileKind::Sub) => {
+                let rel = self.rel(&d);
+                self.warn(&rel, "ignored: modes belong to the root agent");
+                Vec::new()
+            }
+            (None, _) => Vec::new(),
+        };
 
         for entry in &entries {
             let known = matches!(
                 (entry.name.as_str(), entry.kind),
                 ("instructions.md" | "mcp.json", EntryKind::File)
                     | (
-                        "instructions" | "skills" | "subagents" | "schedules" | "commands",
+                        "instructions"
+                            | "skills"
+                            | "subagents"
+                            | "schedules"
+                            | "commands"
+                            | "modes",
                         EntryKind::Dir
                     )
             );
@@ -455,6 +469,7 @@ impl Loader<'_> {
             mcp,
             schedules,
             commands,
+            modes,
         }))
     }
 
@@ -638,6 +653,7 @@ impl Loader<'_> {
             mcp: None,
             schedules: Vec::new(),
             commands: Vec::new(),
+            modes: Vec::new(),
         }))))
     }
 
@@ -718,6 +734,98 @@ impl Loader<'_> {
                     "{} commands; an agent takes at most {MAX_COMMANDS}",
                     out.len()
                 ),
+            );
+        }
+        out.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(out)
+    }
+
+    /// `modes/<name>.md`, flat: a directory inside is not a mode and is warned about. Exactly one
+    /// mode of the folder says `default: true`; a folder with modes and none, or with two, is an
+    /// error (a run always works in one mode, and never guesses which).
+    fn modes(&mut self, dir: &Path) -> Result<Vec<Mode>, Error> {
+        let mut out: Vec<Mode> = Vec::new();
+        for entry in self.list(dir)? {
+            if ignored(&entry.name) || is_readme(&entry.name) {
+                continue;
+            }
+            match entry.kind {
+                EntryKind::File if is_markdown(&entry.name) => {
+                    let rel = self.rel(&entry.path);
+                    let name = entry.name.strip_suffix(".md").unwrap_or(&entry.name);
+                    match fs::metadata(&entry.path) {
+                        Ok(meta) if !meta.is_file() => {
+                            self.error(&rel, None, "a mode is a regular file");
+                            continue;
+                        }
+                        Ok(meta) if meta.len() > COMMAND_FILE_MAX => {
+                            self.error(
+                                &rel,
+                                None,
+                                format!(
+                                    "the file has {} bytes; a mode file takes at most \
+                                     {COMMAND_FILE_MAX}",
+                                    meta.len()
+                                ),
+                            );
+                            continue;
+                        }
+                        Ok(_) => {}
+                        Err(e) => return Err(Error::io(&entry.path, e)),
+                    }
+                    let Some(text) = self.read(&entry.path)? else {
+                        continue;
+                    };
+                    let mut sink = self.sink(&rel);
+                    let Some(mode) = load::parse_mode(&mut sink, &rel, &text, name) else {
+                        continue;
+                    };
+                    if let Some(first) = out.iter().find(|m| m.name == mode.name) {
+                        let first = first.path.display().to_string();
+                        self.error(
+                            &rel,
+                            None,
+                            format!("the mode `{}` is already defined by `{first}`", mode.name),
+                        );
+                        continue;
+                    }
+                    out.push(mode);
+                }
+                EntryKind::Dir => {
+                    let rel = self.rel(&entry.path);
+                    self.warn(&rel, "ignored: modes are flat files, `modes/<name>.md`");
+                }
+                EntryKind::File => {
+                    let rel = self.rel(&entry.path);
+                    self.warn(&rel, "ignored: a mode is `modes/<name>.md`");
+                }
+            }
+        }
+        if out.len() > MAX_MODES {
+            let rel = self.rel(dir);
+            self.error(
+                &rel,
+                None,
+                format!("{} modes; an agent takes at most {MAX_MODES}", out.len()),
+            );
+        }
+        let defaults: Vec<&Mode> = out.iter().filter(|m| m.default).collect();
+        if !out.is_empty() && defaults.len() != 1 {
+            let rel = self.rel(dir);
+            let named: Vec<&str> = defaults.iter().map(|m| m.name.as_str()).collect();
+            self.error(
+                &rel,
+                None,
+                if named.is_empty() {
+                    "one mode says `default: true`: a message that names none works in it"
+                        .to_owned()
+                } else {
+                    format!(
+                        "{} modes say `default: true` ({}): exactly one may",
+                        named.len(),
+                        named.join(", ")
+                    )
+                },
             );
         }
         out.sort_by(|a, b| a.name.cmp(&b.name));

@@ -14,6 +14,11 @@ same behaviour). Builds on [ADR 0007](0007-progress-as-steps-and-streamed-text.m
 
 *Amended 2026-11-18 ([ADR 0050](0050-hooks-around-the-agent-loop-compiled-first-and-programs-second.md)), the owner's decision:* *"Both, and for all events around the loop, and with the possibility of custom events too. Compiled first."* `Plugin` (decisions 7 to 9) is built first as Rust and extended by ADR 0050: hooks reach every event of the loop, not only a tool call; tools, agents and plugins declare and emit events of their own; `message.received` and `run.ending` are deciding points; hooks may ask the loop for actions (a compaction, and actions a plugin declares), never write a summary. Then programs: one adapter runs programs the deployment names, over JSON lines on stdio, each call with a deadline, failing closed. This reverses the owner's answer 4. Slice 3 no longer waits for ADR 0037 slices 1 and 2; its slices are ADR 0050's H1 to H3, slice 6 is H6, the `compacting` hook of slice 8 is H9, slice 9 is H11 and slice 10 is H10.
 
+*Amended 2026-11-27 (decision 3 built as `agent-mode/v1`, in `adam-a2a`, `adam-a2a-runtime`, `adam-agent-fs`, `adam-assembly` and the coder's `build` and `plan`):* two choices the implementation had to make.
+* A mode file's `permission:` is **refused at load**, not ignored: decision 4's rule layer is not built, and a deny nothing reads would let through what the file forbids. Narrow the mode with `tools:`, which is what the model is shown.
+* A mode's `tools:` that names a tool the agent does not have is a **warning, and the name is left out**, not a bind error: a deployment's setting decides some tools and the agent's own `tools:` may narrow them. An unmatched *pattern* is still a bind error. This is not fail closed, and it is what lets the coder's `plan` mode list tools a deployment may not offer.
+* Not echoed: the backend writes the mode into the run's context but does not add it to a task's metadata, as it does the access tier. The contract page (`docs/api/agent-mode-v1.md` of the orchestration layer, ANR-979) is not written, so the refusal code `mode_not_offered` and this choice are unconfirmed against it.
+
 ## Context
 
 OpenCode leaves the coder (ADR 0038), but its loop is well shaped, and the owner wants that shape and a plugin system in

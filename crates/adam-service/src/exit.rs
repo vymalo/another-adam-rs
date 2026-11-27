@@ -82,6 +82,7 @@ fn code_of(
             ServeError::Host(_) => return Some(EX_SOFTWARE),
             ServeError::NoCard
             | ServeError::ChildSessions { .. }
+            | ServeError::AgentModes
             | ServeError::Push(_)
             | ServeError::ActivityWithoutTokens => {
                 return Some(EX_CONFIG);

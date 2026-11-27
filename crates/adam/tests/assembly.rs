@@ -66,6 +66,7 @@ fn manifest(tools: &[&str]) -> AgentManifest {
         mcp: None,
         schedules: vec![],
         commands: vec![],
+        modes: vec![],
     }
 }
 

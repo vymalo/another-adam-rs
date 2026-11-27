@@ -4,6 +4,7 @@
 mod agent;
 mod command;
 mod mcp;
+mod mode;
 mod schedule;
 mod skill;
 
@@ -17,6 +18,7 @@ pub use skill::parse_skill;
 
 pub(crate) use agent::{AgentFile, FileKind, RemoteSpec, check_prompt_length, parse_agent_file};
 pub(crate) use command::parse_command;
+pub(crate) use mode::{parse_mode, parse_mode_text};
 pub(crate) use schedule::parse_schedule;
 
 /// A file's frontmatter, read, next to how the file was split.

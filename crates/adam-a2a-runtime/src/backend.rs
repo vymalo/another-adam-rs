@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use a2a::{Message, Task, TaskState};
 use adam_a2a::{
-    ACCESS_TIER_EXTENSION, AccessTiers, BackendError, COMMANDS_EXTENSION, Caller,
+    ACCESS_TIER_EXTENSION, AccessTiers, AgentModes, BackendError, COMMANDS_EXTENSION, Caller,
     MODEL_PICK_EXTENSION, ModelChoices, REASONING_EXTENSION, ReasoningEfforts, STEER_EXTENSION,
     TaskBackend, TaskEvent, TaskPage, TaskQuery,
 };
@@ -23,6 +23,7 @@ use crate::convert::{
     task_from_view,
 };
 use crate::ids::task_id_for;
+use crate::mode;
 use crate::model_pick;
 use crate::reasoning;
 use crate::subscribe;
@@ -191,6 +192,18 @@ pub const MAX_REFERENCES: usize = 8;
 /// pick is a request, not an authorisation: the model call goes through the deployment's gateway,
 /// which still refuses a locked model (`model_locked`, ADR 0067).
 ///
+/// # The mode a message picks (`agent-mode/v1`)
+///
+/// With [`with_agent_modes`](Self::with_agent_modes), a message whose request **activated**
+/// [`AGENT_MODE_EXTENSION`](adam_a2a::AGENT_MODE_EXTENSION) must name one of the modes the card declares in its metadata under that
+/// URI, or it is refused (`InvalidParams`, whose sentence begins `mode_not_offered`, before
+/// anything is written). The mode reaches the run as the context key [`CONTEXT_MODE`](crate::CONTEXT_MODE),
+/// which the agent's mode source reads on every model turn and every call: it withholds the tools
+/// the mode does not list and adds the mode's words. It holds until a later message names another,
+/// and a child run starts in its parent's (the key is protected). A message that does not activate
+/// the extension carries no mode, and the run works in the agent's default mode. **A mode only
+/// narrows**: the access tier still caps every tool it allows (ADR 0039, decision 3).
+///
 /// # The reasoning effort (`reasoning/v1`)
 ///
 /// With [`with_reasoning_efforts`](Self::with_reasoning_efforts), a message whose request
@@ -262,6 +275,8 @@ pub struct RuntimeTaskBackend {
     /// The models of `model-pick/v1` this agent offers a message to pick, when its card lists
     /// them.
     pub(crate) model_choices: Option<ModelChoices>,
+    /// The modes of `agent-mode/v1` this agent declares, when its card lists them.
+    pub(crate) agent_modes: Option<AgentModes>,
     /// The levels of `reasoning/v1` the model of each agent takes, when the root's card lists
     /// them.
     pub(crate) reasoning_efforts: Option<ReasoningEfforts>,
@@ -292,6 +307,7 @@ impl RuntimeTaskBackend {
             inbound: Arc::new(default_inbound),
             access_tiers: None,
             model_choices: None,
+            agent_modes: None,
             reasoning_efforts: None,
             commands: None,
             child_sessions: None,
@@ -365,6 +381,21 @@ impl RuntimeTaskBackend {
     /// The models this backend offers a message to pick, when it serves `model-pick/v1`.
     pub fn model_choices(&self) -> Option<&ModelChoices> {
         self.model_choices.as_ref()
+    }
+
+    /// Serve `agent-mode/v1` for an agent whose card declares `modes`
+    /// ([`ExtensionConfig::agent_mode`](adam_a2a::ExtensionConfig::agent_mode)): see "The mode a
+    /// message picks" in the type's documentation. Without it the extension is never read, whatever
+    /// a request names.
+    #[must_use]
+    pub fn with_agent_modes(mut self, modes: AgentModes) -> Self {
+        self.agent_modes = Some(modes);
+        self
+    }
+
+    /// The modes this backend declares, when it serves `agent-mode/v1`.
+    pub fn agent_modes(&self) -> Option<&AgentModes> {
+        self.agent_modes.as_ref()
     }
 
     /// Serve `reasoning/v1` for an agent whose card lists `efforts`
@@ -915,6 +946,14 @@ impl RuntimeTaskBackend {
                 .requested(&message)
                 .map_err(BackendError::InvalidParams)?;
             model_pick::put(&mut inbound, &alias).map_err(BackendError::InvalidParams)?;
+        }
+        // A message that activated `agent-mode/v1` names the mode its run works in, one the agent
+        // declares; anything else is refused before anything is written, and the mode rides the
+        // run's context to the loop. A mode only narrows: the tier above still caps it.
+        if let Some(mode) = mode::named(caller, &message, self.agent_modes.as_ref())
+            .map_err(BackendError::InvalidParams)?
+        {
+            mode::put(&mut inbound, &mode).map_err(BackendError::InvalidParams)?;
         }
         // A message that activated `reasoning/v1` names an effort the model of this run takes, or
         // nothing is written; the level rides the context to the loop, which asks for it from its

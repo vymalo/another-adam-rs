@@ -1085,6 +1085,7 @@ impl RuntimeTaskBackend {
                 }
                 let mut inbound = (self.inbound)(message).map_err(BackendError::InvalidParams)?;
                 self.named_tier(caller, message, &mut inbound, false)?;
+                self.named_mode(caller, message, &mut inbound)?;
                 crate::prompt_statement::put(caller, message, &mut inbound)
                     .map_err(BackendError::InvalidParams)?;
                 let context = context_id.map(str::to_owned);
@@ -1110,6 +1111,7 @@ impl RuntimeTaskBackend {
                         let mut inbound =
                             (self.inbound)(message).map_err(BackendError::InvalidParams)?;
                         self.named_tier(caller, message, &mut inbound, true)?;
+                        self.named_mode(caller, message, &mut inbound)?;
                         crate::prompt_statement::put(caller, message, &mut inbound)
                             .map_err(BackendError::InvalidParams)?;
                         Some(inbound)
@@ -1152,6 +1154,7 @@ impl RuntimeTaskBackend {
                 }
                 let mut inbound = (self.inbound)(message).map_err(BackendError::InvalidParams)?;
                 self.named_tier(caller, message, &mut inbound, true)?;
+                self.named_mode(caller, message, &mut inbound)?;
                 crate::prompt_statement::put(caller, message, &mut inbound)
                     .map_err(BackendError::InvalidParams)?;
                 let task = self
@@ -1189,6 +1192,23 @@ impl RuntimeTaskBackend {
             return Ok(());
         };
         crate::tier::put(inbound, tier).map_err(BackendError::InvalidParams)
+    }
+
+    /// The mode of a message to a child context: a request that activated `agent-mode/v1` names
+    /// one the agent declares, as for any message. A message that names none leaves the round in
+    /// the agent's default mode, which is where it would run anyway.
+    fn named_mode(
+        &self,
+        caller: &Caller,
+        message: &Message,
+        inbound: &mut Inbound,
+    ) -> Result<(), BackendError> {
+        if let Some(mode) = crate::mode::named(caller, message, self.agent_modes.as_ref())
+            .map_err(BackendError::InvalidParams)?
+        {
+            crate::mode::put(inbound, &mode).map_err(BackendError::InvalidParams)?;
+        }
+        Ok(())
     }
 
     // -----------------------------------------------------------------------

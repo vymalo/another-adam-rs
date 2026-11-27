@@ -769,6 +769,7 @@ impl AgentDef {
             root_effort: self
                 .reasoning_effort
                 .map(|effort| effort.as_str().to_owned()),
+            root_modes: None,
             nodes: Vec::new(),
             remotes: Vec::new(),
         };
@@ -870,6 +871,9 @@ pub(crate) struct Node {
     /// Sources this agent alone has, added at [`BoundDef::build`](crate::BoundDef): the
     /// `mcp.json` servers whose `when` loads them only when a run's task matches.
     pub(crate) sources: Vec<DynToolSource>,
+    /// The modes of `agent-mode/v1` the **root** declares (ADR 0039, decision 3), on every agent:
+    /// a child starts in its parent's mode, so its tools are narrowed by the same set.
+    pub(crate) modes: Option<std::sync::Arc<crate::modes::Modes>>,
 }
 
 /// One subagent a session may be started on, as `bind` found it ([ADR 0054] slice 1 part 2). What
@@ -953,6 +957,9 @@ struct Walk<'a> {
     /// The root's reasoning level when its file sets none ([`AgentDef::reasoning_effort`]),
     /// as its wire word; it never applies to a subagent, which has its own file.
     root_effort: Option<String>,
+    /// The root's modes (`modes/<name>.md`), once the root's tools are known: every agent of the
+    /// assembly narrows by them, because a child run starts in its parent's mode.
+    root_modes: Option<std::sync::Arc<crate::modes::Modes>>,
     nodes: Vec<Node>,
     remotes: Vec<Remote>,
 }
@@ -1137,6 +1144,11 @@ impl Walk<'_> {
         )?;
         let retry = retry_policies(&origin, manifest, &tools)?;
         let plugins = self.plugins_of(&origin, manifest, parent)?;
+        // The root's modes: a name in a mode's `tools:` is one of the agent's tools (fail closed),
+        // and every agent narrows by the same set (a child starts in its parent's mode).
+        if parent.is_none() {
+            self.root_modes = resolve_modes(&origin, manifest, &tools)?;
+        }
         let index = self.nodes.len();
         self.nodes.push(Node {
             name: name.clone(),
@@ -1179,6 +1191,7 @@ impl Walk<'_> {
             when: triggers,
             tools_loading: manifest.frontmatter.tools_loading,
             sources,
+            modes: self.root_modes.clone(),
         });
         for sub in &manifest.subagents {
             match sub {
@@ -1536,6 +1549,82 @@ pub(crate) fn limits(file: Option<&FileLimits>) -> Limits {
             .max_history_tokens
             .unwrap_or(default.max_history_tokens),
     }
+}
+
+/// The root's modes, resolved against the tools the agent ends up with (ADR 0039, decision 3): a
+/// pattern is expanded (one that matches nothing is an error), a plain name the agent does not have
+/// is dropped with a warning (a deployment's environment decides some tools, and a folder's `tools:`
+/// may narrow them: a mode only narrows what exists, so it can never widen anything by it), and
+/// exactly one mode is the default (the loader checked it). `None` for a folder without `modes/`.
+fn resolve_modes(
+    origin: &Origin,
+    manifest: &AgentManifest,
+    tools: &[(String, DynTool)],
+) -> Result<Option<std::sync::Arc<crate::modes::Modes>>, Error> {
+    use crate::modes::{Modes, ResolvedMode};
+
+    if manifest.modes.is_empty() {
+        return Ok(None);
+    }
+    let available: Vec<String> = tools.iter().map(|(name, _)| name.clone()).collect();
+    let mut resolved = Vec::with_capacity(manifest.modes.len());
+    for mode in &manifest.modes {
+        let at = origin.in_file(mode.path.clone());
+        let allowed = match &mode.tools {
+            None => None,
+            Some(ToolList::All) => Some(available.clone()),
+            Some(ToolList::Named(names)) => {
+                let mut chosen: Vec<String> = Vec::new();
+                for wanted in names {
+                    if wanted.contains('*') {
+                        let mut any = false;
+                        for name in available.iter().filter(|name| glob(wanted, name)) {
+                            any = true;
+                            if !chosen.contains(name) {
+                                chosen.push(name.clone());
+                            }
+                        }
+                        if !any {
+                            return Err(Error::NoToolMatches {
+                                origin: at.clone(),
+                                pattern: wanted.clone(),
+                                available: available.clone(),
+                            });
+                        }
+                    } else if available.contains(wanted) {
+                        if !chosen.contains(wanted) {
+                            chosen.push(wanted.clone());
+                        }
+                    } else {
+                        // A tool the deployment does not offer (one a setting adds), or one the
+                        // agent's own `tools:` left out: the mode cannot offer it either, and a
+                        // warning says the list is not what its author thought.
+                        tracing::warn!(
+                            agent = %at.agent,
+                            mode = %mode.name,
+                            tool = %wanted,
+                            suggestion = closest(wanted, available.iter().map(String::as_str)),
+                            "a mode's `tools` names a tool the agent does not have; it is left out"
+                        );
+                    }
+                }
+                Some(chosen)
+            }
+        };
+        resolved.push(ResolvedMode {
+            name: mode.name.clone(),
+            title: mode.title.clone(),
+            description: mode.description.clone(),
+            tools: allowed,
+            prompt: mode.prompt.clone(),
+        });
+    }
+    let default = manifest
+        .modes
+        .iter()
+        .find(|mode| mode.default)
+        .map_or_else(|| manifest.modes[0].name.clone(), |mode| mode.name.clone());
+    Ok(Modes::new(resolved, default).map(std::sync::Arc::new))
 }
 
 /// The tools an agent gets, by name, in the order its `tools:` lists them.

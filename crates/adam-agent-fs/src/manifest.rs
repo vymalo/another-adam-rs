@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Serialize, Serializer};
 
-use crate::schema::{AgentFrontmatter, McpConfig, SkillFrontmatter};
+use crate::schema::{AgentFrontmatter, McpConfig, SkillFrontmatter, ToolList};
 use crate::{Diagnostic, Error};
 
 /// The most bytes of resources (`scripts/`, `references/`, `assets/`) one skill may bundle: 1 MiB.
@@ -21,6 +21,13 @@ pub const COMMAND_DESCRIPTION_MAX: usize = 200;
 pub const COMMAND_HINT_MAX: usize = 100;
 /// The most bytes of a command's template: the same cap as the text it expands to.
 pub const COMMAND_TEMPLATE_MAX: usize = 32 * 1024;
+
+/// The most modes one agent may declare.
+pub const MAX_MODES: usize = 16;
+/// The most characters of a mode's `title`.
+pub const MODE_TITLE_MAX: usize = 60;
+/// The most characters of a mode's `description`.
+pub const MODE_DESCRIPTION_MAX: usize = 200;
 
 /// How a skill is laid out on disk.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -233,6 +240,35 @@ pub struct Command {
     pub path: PathBuf,
 }
 
+/// A mode (`modes/<name>.md`): a prompt, its own `tools:`, and the name a person picks for a
+/// message (`agent-mode/v1`, ADR 0039 decision 3).
+///
+/// A mode only narrows: its `tools:` is the allowlist of the tools the model is shown while it is
+/// in force, and its prompt is added to the agent's instructions. The access tier still caps what
+/// those tools may do, and a mode never widens it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Mode {
+    /// The file stem; the agent-name rule.
+    pub name: String,
+    /// What a client shows.
+    pub title: String,
+    /// One line on what the mode does.
+    pub description: String,
+    /// The tools the model is shown in this mode, when the file narrows them. `None`: the agent's
+    /// own list, unchanged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tools: Option<ToolList>,
+    /// `true` on the one mode a run works in when its message names none.
+    #[serde(skip_serializing_if = "is_false")]
+    pub default: bool,
+    /// The body: words added to the agent's instructions while the mode is in force. Empty for a
+    /// mode that only narrows.
+    pub prompt: String,
+    /// The file, relative to the source root.
+    #[serde(serialize_with = "portable_path")]
+    pub path: PathBuf,
+}
+
 /// One agent with everything that belongs to it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct AgentManifest {
@@ -258,6 +294,11 @@ pub struct AgentManifest {
     /// was before commands existed.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub commands: Vec<Command>,
+    /// The agent's modes (root agents only), sorted by name (ADR 0039 decision 3). Left out of the
+    /// JSON (and so of the digest) when there are none, so the digest of a folder without `modes/`
+    /// is what it was before modes existed.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub modes: Vec<Mode>,
 }
 
 /// How the agents of a package are laid out.

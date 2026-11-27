@@ -60,6 +60,26 @@
   ],
   "extensions": [
     {
+      "uri": "https://agents.vymalo.com/a2a/extensions/agent-mode/v1",
+      "description": "Works in the mode the person picks for each message.",
+      "required": false,
+      "params": {
+        "modes": [
+          {
+            "name": "build",
+            "title": "Build",
+            "description": "Changes the repository, commits, pushes and opens a pull request."
+          },
+          {
+            "name": "plan",
+            "title": "Plan",
+            "description": "Reads, searches and answers with a plan; changes nothing."
+          }
+        ],
+        "default": "build"
+      }
+    },
+    {
       "uri": "https://agents.vymalo.com/a2a/extensions/commands/v1",
       "description": "Serves prompt templates a message can invoke by name.",
       "required": false,

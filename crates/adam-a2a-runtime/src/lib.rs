@@ -39,6 +39,7 @@ mod convert;
 mod files_in;
 mod ids;
 mod list;
+mod mode;
 mod model_park;
 mod model_pick;
 mod person;
@@ -72,6 +73,7 @@ pub use convert::{
 pub use files_in::{MAX_INBOUND_IMAGE_BYTES, MAX_INBOUND_IMAGES};
 pub use ids::task_id_for;
 pub use list::MAX_SCAN;
+pub use mode::CONTEXT_MODE;
 pub use model_park::NOT_PARKED;
 pub use model_pick::CONTEXT_MODEL;
 pub use person::{CONTEXT_PERSON, person_said};

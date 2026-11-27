@@ -531,6 +531,25 @@ neither carries no metadata, and a task with tokens only carries the object it a
 
 Unit tests in `src/tier.rs` (the validation sentences, the context) and `tests/access_tier.rs` (a real `Runtime` and `LlmAgent`: the tier reaches the run and the task, the first frame and `GetTask` say it, a caller that did not activate it reads none, every kind of bad tier is `InvalidParams` and writes no run, a message that did not activate it carries no tier and an activated reader is told the default, a backend with no tiers reads none, and a tier changed by a message sent while the task works is said once on the stream).
 
+## Modes (`agent-mode/v1`)
+
+`agent-mode/v1` ([ADR 0039](../../docs/decisions/0039-the-agent-loop-takes-opencodes-structure-and-agents-get-plugins.md), decision 3). With
+`with_agent_modes(modes)`, for an agent whose card lists the extension (`ExtensionConfig::agent_mode`), `submit` reads every message
+right after the inbound function and beside the tier:
+
+| | |
+|---|---|
+| A message whose request **activated** the extension (`Caller::extensions`) | must carry `metadata[URI] = {"mode": "<name>"}`, a mode the agent declares (`adam_a2a::AgentModes`). Anything else — no entry, an entry that is not an object, a `mode` that is missing, blank or not a string, or a name the agent does not declare — is **`InvalidParams`** (A2A `-32602`) whose sentence begins `mode_not_offered` and names the modes, **before anything is written**: no task, no run |
+| the mode of an accepted message | the run's inbound context key `vymalo.mode` = `{"mode": ..}` (`CONTEXT_MODE`, `adam_llm_agent::MODE_CONTEXT_KEY` and one of its `PROTECTED_CONTEXT_KEYS`), merged like any key: the **newest message that names one wins** from the agent's next step, and a message that names none leaves it. The assembly's mode source reads it on every model turn and every call, and a child run starts in its parent's mode |
+| a message that did **not** activate it | no mode is read, whatever its metadata says; the context is untouched, and the run works in the agent's default mode |
+| a backend with no `with_agent_modes` | never reads one. A card that lists the extension while the service was given no modes stops the process at start (`adam-service`'s `ServeError::AgentModes`, exit 78), so the card never promises a choice nothing keeps |
+| only narrowing | a mode withholds the tools it does not list and adds its words; the tier still caps every tool it allows, and a mode can neither raise the tier nor grant a tool the agent does not have |
+
+Unit tests in `src/mode.rs` (the key's identity and protection, any payload shape, an activated message with a mode the agent does not
+declare) and `tests/mode.rs` (a real `Runtime` and `LlmAgent`: a declared mode reaches the run's context, it holds until another
+message names another, every refusal is `InvalidParams` and writes no run, a message that did not activate the extension carries no
+mode, and a backend that declares none reads none).
+
 ## The model a message picks
 
 `model-pick/v1` ([ADR 0064](../../docs/decisions/0064-model-profiles-reasoning-effort-and-output-cap-follow-the-model.md), amended

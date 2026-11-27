@@ -216,6 +216,16 @@ impl Service {
         self
     }
 
+    /// Serve `agent-mode/v1` for an agent whose card declares `modes`
+    /// ([`RuntimeTaskBackend::with_agent_modes`]); `None` changes nothing.
+    #[must_use]
+    pub fn with_agent_modes(mut self, modes: Option<adam_a2a::AgentModes>) -> Self {
+        if let Some(modes) = modes {
+            self.backend = self.backend.with_agent_modes(modes);
+        }
+        self
+    }
+
     /// Serve `child-sessions/v1` for an agent whose card lists `sessions`
     /// ([`RuntimeTaskBackend::with_child_sessions`]); `None` changes nothing. A helper that is not
     /// registered on the runtime is refused by the backend: check
@@ -239,6 +249,11 @@ impl Service {
     /// The models the backend serves `model-pick/v1` for, if it does.
     pub fn model_choices(&self) -> Option<&adam_a2a::ModelChoices> {
         self.backend.model_choices()
+    }
+
+    /// The modes the backend serves `agent-mode/v1` for, if it does.
+    pub fn agent_modes(&self) -> Option<&adam_a2a::AgentModes> {
+        self.backend.agent_modes()
     }
 
     /// The levels the backend serves `reasoning/v1` for, if it does.
