@@ -1016,7 +1016,10 @@ of the loop is covered, and the chain is folded once, in order, over the message
 * **A compaction or a shortening clears signatures.** Both move rows or change their bytes, so the turn signature of every
   assistant and tool row from the first changed position on is removed (`signing::unsign_from`; the summary row leads a
   compacted transcript, so every kept row after it) and the next commit signs those rows again at their new positions.
-  Rows a continued run copies from another run keep their old signatures until the carry slice.
+* **A carry signs again** (slice T3a-3). A history carried into a new run (`Conversation::continued`, a new task, a session
+  round, a close round) is cleared of its signatures (`continue_conversation`) and the new run's first commit signs every
+  row under its own id, with the chain of its own transcript; the runtime verified the rows under the old run before the
+  agent saw them. `answer_owed_calls`' synthetic results are signed in the same pass.
 * **A signing failure fails the step** with the keys' own class (`Refused` is `Unauthenticated`, `Unavailable` is
   `Transient`, retried by the runtime); a row that cannot be written, or an index past `u32::MAX`, is `Internal`. Nothing
   is committed unsigned.
@@ -1024,8 +1027,10 @@ of the loop is covered, and the chain is folded once, in order, over the message
 * **No keys, no change**: without `turn_keys` (the default, until the host configures them) the transcript is the bytes it
   was. A host sets the keys itself; no variable is read here.
 * A signature is never sent to a model: the wire sends no `extra_content` of a message (`adam-model-openai`).
-* **Nothing verifies yet.** Re-entry checks (a resume, a new task, the engine reopening its file) are slice T3a-3; the head's
-  signature, the journal's, re-signing a carried row, and adopting a run that predates the keys are later slices of T3.
+* **The agent does not verify; the runtime does** (`adam-runtime`, `Sealer::check_turns`, slice T3a-3): a run whose head is
+  signed is refused `Corrupt` before a step if any assistant or tool row does not verify. So a runtime given keys needs an
+  `LlmAgent` given the same keys. A run that predates the keys is adopted and signed at its next commit. The journal's
+  signature is a later slice.
 * Cost: the chain is folded over the whole transcript each time a step commits a new turn (one RFC 8785 form and one
   SHA-256 per message), and not at all when no turn is new.
 * Tests: `src/signing.rs` (a vector made independently in Python, `tests/vectors/turn_chain_vector.py`: the chain and both

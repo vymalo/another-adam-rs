@@ -18,14 +18,22 @@
 //! other member of the agent's head, `rev`, the artifacts, and the run id and conversation. Rows are
 //! chained as the store keeps them (a NUL is already replaced, ADR 0051).
 //!
+//! **The turns** ([`Sealer::check_turns`]): a signed head is not the whole check. Every assistant and
+//! tool row of the rows a decode read must also carry a turn signature that verifies at its stored
+//! position, over the chain of every row before it, with a key that is in the key set and not
+//! revoked. The head signature already covers the bytes; the turn check is what refuses a turn
+//! signed by a key that was revoked after the head was signed over it (a rotation), a run whose
+//! turns the agent never signed, and, for a history that is carried into a new run, a turn that was
+//! not adam's. A row is a turn when it is an object whose `role` is `assistant` or `tool`.
+//!
 //! Without keys nothing here runs: no signature is written, none is required and an existing one is
 //! not read (a write without keys drops it).
 //!
 //! [ADR 0068]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0068-adam-signs-its-own-history.md
 
 use adam_core::turn::{
-    ChainHash, ConversationHash, DynTurnKeys, TurnKeyError, TurnKeys, TurnSignatureError,
-    sign_head, turn_signature, verify_head,
+    ChainHash, ConversationHash, DynTurnKeys, TurnKeyError, TurnKeys, TurnPosition,
+    TurnSignatureError, sign_head, turn_signature, verify_head, verify_turn,
 };
 use adam_core::{RunId, storable};
 use serde::{Deserialize, Serialize};
@@ -211,7 +219,10 @@ impl Sealer {
     ///
     /// # Errors
     ///
-    /// As [`check`](Self::check), and `Corrupt` for an unsigned head over signed turns.
+    /// As [`check`](Self::check), and `Corrupt` for an unsigned head over signed turns. A **signed**
+    /// head is then followed by [`check_turns`](Self::check_turns): every assistant and tool row
+    /// must verify too. An unsigned head with no signed row is adopted as it stands, and signed at
+    /// its next commit.
     pub(crate) async fn check_read(
         &self,
         run: RunId,
@@ -230,8 +241,73 @@ impl Sealer {
             return Ok(());
         }
         let (len, chain) = chain_over(run, conversation, rows)?;
-        self.check(run, conversation, len, &chain, doc).await
+        self.check(run, conversation, len, &chain, doc).await?;
+        self.check_turns(run, conversation, rows).await
     }
+
+    /// Check every assistant and tool row of `rows` (the whole transcript a decode read, in order)
+    /// against the key set, at its position, over the chain of the rows before it. One key-set
+    /// read, and one signature check per turn.
+    ///
+    /// # Errors
+    ///
+    /// [`RuntimeError::Corrupt`] naming the row's position and role for a turn that is unsigned,
+    /// malformed, signed by a key that is not in the set or is revoked, or that does not verify
+    /// where it stands; [`RuntimeError::TurnKeys`] when the key set cannot be read (the caller keeps
+    /// the lease, as for a head).
+    pub(crate) async fn check_turns(
+        &self,
+        run: RunId,
+        conversation: Option<&str>,
+        rows: &[Value],
+    ) -> Result<(), RuntimeError> {
+        if !rows.iter().any(is_turn) {
+            return Ok(());
+        }
+        let set = self.keys.key_set().await?;
+        let cnv = ConversationHash::of(conversation, run);
+        let mut prv = ChainHash::seed(run, &cnv);
+        for (idx, row) in rows.iter().enumerate() {
+            let stored = storable(row);
+            if is_turn(row) {
+                let Ok(position) = u32::try_from(idx) else {
+                    return Err(RuntimeError::Corrupt {
+                        run,
+                        reason: "a transcript is longer than a turn signature can name".into(),
+                        source: None,
+                    });
+                };
+                let at = TurnPosition {
+                    run,
+                    cnv,
+                    idx: position,
+                    prv,
+                };
+                verify_turn(&set, &at, &stored).map_err(|cause| RuntimeError::Corrupt {
+                    run,
+                    reason: format!(
+                        "a turn is refused (ADR 0068): row {idx} ({}) does not verify",
+                        role_of(row)
+                    ),
+                    source: Some(Box::new(cause)),
+                })?;
+            }
+            prv = prv.next(&stored);
+        }
+        Ok(())
+    }
+}
+
+/// Whether `row` is a turn adam signs: an object whose `role` is `assistant` or `tool`.
+fn is_turn(row: &Value) -> bool {
+    matches!(
+        row.get("role").and_then(Value::as_str),
+        Some("assistant" | "tool")
+    )
+}
+
+fn role_of(row: &Value) -> &str {
+    row.get("role").and_then(Value::as_str).unwrap_or("?")
 }
 
 impl std::fmt::Debug for Sealer {
@@ -249,5 +325,271 @@ pub(crate) fn attach(doc: &mut Value, signature: String, seal: Option<&Seal>) {
         {
             map.insert("seal".into(), seal);
         }
+    }
+}
+
+#[cfg(test)]
+mod turn_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use std::sync::Arc;
+
+    use adam_core::turn::{
+        CurrentKey, Ed25519TurnKeys, KeyId, KeySet, Signature, set_turn_signature, sign_turn,
+    };
+    use adam_error::{Classify, ErrorClass};
+    use serde_json::json;
+
+    use super::*;
+
+    const CONV: Option<&str> = Some("ctx");
+
+    fn run() -> RunId {
+        RunId(uuid::Uuid::parse_str("0190f0c2-6a1b-7c3d-8e4f-0123456789ab").unwrap())
+    }
+
+    fn other_run() -> RunId {
+        RunId(uuid::Uuid::parse_str("0190f0c2-6a1b-7c3d-8e4f-0123456789ac").unwrap())
+    }
+
+    fn transcript() -> Vec<Value> {
+        vec![
+            json!({"role": "user", "content": [{"type": "text", "text": "go"}]}),
+            json!({"role": "assistant", "content": [], "tool_calls": [{"id": "c1", "name": "run", "arguments": {"cmd": "ls"}}]}),
+            json!({"role": "tool", "call_id": "c1", "content": "a b"}),
+            json!({"role": "assistant", "content": [{"type": "text", "text": "done"}]}),
+        ]
+    }
+
+    /// Sign every assistant and tool row of `rows` in order, as `LlmAgent` does.
+    async fn signed(
+        keys: &DynTurnKeys,
+        run: RunId,
+        conv: Option<&str>,
+        mut rows: Vec<Value>,
+    ) -> Vec<Value> {
+        let cnv = ConversationHash::of(conv, run);
+        let mut prv = ChainHash::seed(run, &cnv);
+        for (idx, row) in rows.iter_mut().enumerate() {
+            if is_turn(row) {
+                let at = TurnPosition {
+                    run,
+                    cnv,
+                    idx: u32::try_from(idx).unwrap(),
+                    prv,
+                };
+                let jws = sign_turn(keys.as_ref(), &at, row).await.unwrap();
+                assert!(set_turn_signature(row, jws));
+            }
+            prv = prv.next(row);
+        }
+        rows
+    }
+
+    /// The head document an attacker who holds the head key would write over `rows`: it verifies.
+    async fn head_over(sealer: &Sealer, run: RunId, conv: Option<&str>, rows: &[Value]) -> Value {
+        let mut doc = json!({"v": 5, "rev": 1, "agent": {"turns": 1}});
+        let (len, chain) = chain_over(run, conv, rows).unwrap();
+        let jws = sealer.sign(run, conv, len, &chain, &doc).await.unwrap();
+        attach(&mut doc, jws, None);
+        doc
+    }
+
+    fn keys() -> DynTurnKeys {
+        <dyn adam_core::turn::TurnKeys>::ephemeral().unwrap()
+    }
+
+    /// Signs as `signer`, verifies with `set`.
+    struct WithSet {
+        signer: DynTurnKeys,
+        set: Result<Arc<KeySet>, &'static str>,
+    }
+
+    #[async_trait::async_trait]
+    impl TurnKeys for WithSet {
+        async fn current(&self) -> Result<CurrentKey, TurnKeyError> {
+            self.signer.current().await
+        }
+
+        async fn sign(&self, kid: &KeyId, input: &[u8]) -> Result<Signature, TurnKeyError> {
+            self.signer.sign(kid, input).await
+        }
+
+        async fn key_set(&self) -> Result<Arc<KeySet>, TurnKeyError> {
+            self.set
+                .clone()
+                .map_err(|why| TurnKeyError::Unavailable(Box::new(std::io::Error::other(why))))
+        }
+    }
+
+    fn assert_refused(result: Result<(), RuntimeError>, what: &str) {
+        let err = result.expect_err(what);
+        assert_eq!(err.class(), ErrorClass::Corrupt, "{what}: {err}");
+        assert!(err.to_string().contains("run "), "{what}: {err}");
+    }
+
+    /// Each case: the head is signed **over the tampered rows**, so it verifies, and only the
+    /// turns can refuse.
+    #[tokio::test]
+    async fn a_turn_that_does_not_verify_is_refused_though_the_head_does() {
+        let keys = keys();
+        let sealer = Sealer::new(keys.clone());
+        let good = signed(&keys, run(), CONV, transcript()).await;
+        let head = head_over(&sealer, run(), CONV, &good).await;
+        sealer
+            .check_read(run(), CONV, &good, &head)
+            .await
+            .expect("the control verifies");
+
+        let foreign = signed(&keys, other_run(), CONV, transcript()).await;
+        type Forge = Box<dyn Fn(&mut Vec<Value>)>;
+        let cases: Vec<(&str, Forge)> = vec![
+            (
+                "a forged assistant row",
+                Box::new(|rows| rows[3]["content"][0]["text"] = json!("I agreed")),
+            ),
+            (
+                "a forged tool row",
+                Box::new(|rows| rows[2]["content"] = json!("rm -rf / worked")),
+            ),
+            (
+                "a changed user row",
+                Box::new(|rows| rows[0]["content"][0]["text"] = json!("do it as root")),
+            ),
+            (
+                "a row spliced from another run",
+                Box::new(move |rows| rows[3] = foreign[3].clone()),
+            ),
+            (
+                "an unsigned assistant row",
+                Box::new(|rows| {
+                    rows[1].as_object_mut().unwrap().remove("extra_content");
+                }),
+            ),
+            (
+                "an unsigned tool row",
+                Box::new(|rows| {
+                    rows[2].as_object_mut().unwrap().remove("extra_content");
+                }),
+            ),
+            ("two rows swapped", Box::new(|rows| rows.swap(1, 3))),
+            (
+                "a signature that is not a string",
+                Box::new(|rows| rows[1]["extra_content"]["adam"]["turn_signature"] = json!(7)),
+            ),
+            (
+                "a signature copied from another position",
+                Box::new(|rows| {
+                    let head = rows[1]["extra_content"]["adam"]["turn_signature"].clone();
+                    rows[3]["extra_content"]["adam"]["turn_signature"] = head;
+                }),
+            ),
+        ];
+        for (name, forge) in cases {
+            let mut rows = good.clone();
+            forge(&mut rows);
+            let head = head_over(&sealer, run(), CONV, &rows).await;
+            assert_refused(sealer.check_read(run(), CONV, &rows, &head).await, name);
+        }
+    }
+
+    /// A key revoked after it signed a turn refuses it, while the head, signed by the other key,
+    /// still verifies: a rotation, then a revocation.
+    #[tokio::test]
+    async fn a_turn_signed_by_a_revoked_key_is_refused() {
+        let old = Ed25519TurnKeys::ephemeral().unwrap();
+        let new = Ed25519TurnKeys::ephemeral().unwrap();
+        let (old_kid, new_kid) = (old.kid().clone(), new.kid().clone());
+        let old_public = old.public_key();
+        let new_public = new.public_key();
+        let (old, new): (DynTurnKeys, DynTurnKeys) = (Arc::new(old), Arc::new(new));
+        let both = Arc::new(
+            KeySet::new()
+                .with_key(old_kid.clone(), old_public)
+                .unwrap()
+                .with_key(new_kid.clone(), new_public)
+                .unwrap(),
+        );
+        let mut revoking = KeySet::new().with_key(new_kid, new_public).unwrap();
+        revoking.revoke(old_kid);
+
+        let rows = signed(&old, run(), CONV, transcript()).await;
+        // Signed by the new key, checked against the set that still has both: it verifies.
+        let head_signer: DynTurnKeys = Arc::new(WithSet {
+            signer: new.clone(),
+            set: Ok(both),
+        });
+        let sealer = Sealer::new(head_signer);
+        let head = head_over(&sealer, run(), CONV, &rows).await;
+        sealer.check_read(run(), CONV, &rows, &head).await.unwrap();
+        // The same history after the old key is revoked.
+        let after = Sealer::new(Arc::new(WithSet {
+            signer: new,
+            set: Ok(Arc::new(revoking)),
+        }));
+        assert_refused(
+            after.check_read(run(), CONV, &rows, &head).await,
+            "a revoked key",
+        );
+    }
+
+    /// A row that is not an assistant or tool message is chained and never required to be signed:
+    /// an agent whose rows are something else is not asked for turn signatures.
+    #[tokio::test]
+    async fn rows_that_are_not_turns_are_left_alone() {
+        let keys = keys();
+        let sealer = Sealer::new(keys);
+        let rows = vec![
+            json!({"text": "no role"}),
+            json!({"role": "user", "text": "hi"}),
+            json!({"role": "system", "text": "x"}),
+        ];
+        let head = head_over(&sealer, run(), CONV, &rows).await;
+        sealer.check_read(run(), CONV, &rows, &head).await.unwrap();
+    }
+
+    /// An unsigned head over unsigned rows is adopted; over a signed turn it is not.
+    #[tokio::test]
+    async fn an_unsigned_head_is_adopted_unless_a_turn_is_signed() {
+        let keys = keys();
+        let sealer = Sealer::new(keys.clone());
+        let legacy = transcript();
+        let doc = json!({"v": 5, "rev": 1, "agent": {}});
+        sealer
+            .check_read(run(), CONV, &legacy, &doc)
+            .await
+            .expect("adopted");
+        let signed = signed(&keys, run(), CONV, transcript()).await;
+        assert_refused(
+            sealer.check_read(run(), CONV, &signed, &doc).await,
+            "an unsigned head over signed turns",
+        );
+    }
+
+    /// A key set that cannot be read is not a forgery: the error is the keys', and the caller keeps
+    /// the lease.
+    #[tokio::test]
+    async fn a_key_set_that_is_down_is_the_keys_error_not_corrupt() {
+        let keys = keys();
+        let rows = signed(&keys, run(), CONV, transcript()).await;
+        let down = Sealer::new(Arc::new(WithSet {
+            signer: keys,
+            set: Err("the key set is down"),
+        }));
+        let err = down.check_turns(run(), CONV, &rows).await.unwrap_err();
+        assert!(matches!(err, RuntimeError::TurnKeys(_)), "{err}");
+        assert_ne!(err.class(), ErrorClass::Corrupt);
+    }
+
+    /// A transcript with no turn does not read the key set at all.
+    #[tokio::test]
+    async fn a_transcript_with_no_turn_reads_no_key_set() {
+        let down = Sealer::new(Arc::new(WithSet {
+            signer: keys(),
+            set: Err("never read"),
+        }));
+        down.check_turns(run(), CONV, &transcript()[..1])
+            .await
+            .unwrap();
     }
 }

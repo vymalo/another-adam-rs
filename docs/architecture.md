@@ -876,8 +876,7 @@ has compacted into a `NonDeterminism` error.
 An `LlmAgent` given turn keys signs every assistant message and tool result in the step that commits it
 ([ADR 0068](decisions/0068-adam-signs-its-own-history.md), slice T3a-1). The signature names the run, the
 conversation, the row's position and a hash of every row before it, so a changed, moved or reordered row no longer
-verifies. A person's message is hashed but never signed. Without keys nothing changes. **Nothing verifies on re-entry
-yet** (T3a-3): a forged row is not refused today.
+verifies. A person's message is hashed but never signed. Without keys nothing changes.
 
 Two rules keep a signature true. What is signed is the row **as the store keeps it** (a NUL is already the replacement
 character, [ADR 0051](decisions/0051-a-nul-is-stored-as-the-replacement-character.md)). And a compaction or a
@@ -890,6 +889,14 @@ state (the inbox, the owed calls, the summary, the counters). When it reads a ru
 that one signature before the agent runs. Change a field, add or drop a row, or move the run to another conversation and
 the run fails as corrupt, with no model call. This is on only when the runtime is given keys; without them nothing
 changes. A run with no signature at all, from before the keys, is accepted and signed at its next commit. If the keys cannot be reached when a run is picked up, the run waits and is tried again; it is not failed for it. A parent that reads a finished child's result checks the child first, and a child that does not check out is reported as failed, never as its forged output.
+
+Every turn is checked too ([slice T3a-3](decisions/0068-adam-signs-its-own-history.md)). Whenever a run's history comes back
+from outside the process (a worker picks the run up after a restart, a new task continues the conversation, a session
+starts its next round, the embedded engine reopens its file), each assistant and tool row of a signed run must carry a
+signature that verifies where the row stands, over everything before it, with a key that is still in the key set. A forged,
+unsigned, moved or revoked-key row fails the run before any model call. A history that is carried into a new run is signed
+again under the new run, so no signature names a run it does not belong to; a compaction and a shortening do the same for the
+rows they change. A run with no signature at all is still accepted once and signed at its next commit.
 
 ### The access tier: which tools a step may use
 

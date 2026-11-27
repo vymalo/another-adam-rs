@@ -31,6 +31,38 @@ bindings ([ADR 0031](../../docs/decisions/0031-swagger-ui-and-the-a2a-rest-bindi
 * The chart was rendered, not applied to a cluster; how it reaches the cluster after the tag bump is
   outside this repository.
 
+## Signed turns on re-entry (ADR 0068, slice T3a-3)
+
+For people: [Signed turns](../../docs/architecture.md#signed-turns-each-assistant-and-tool-turn-is-signed-when-it-is-committed).
+
+* **Where.** `Sealer::check_read` (`crates/adam-runtime/src/seal.rs`) is the one function every row-reading decode calls
+  (`join_head`, `check_full`, `verify_child`'s unsigned path, `worker.rs` `verify_reloaded`). After the head check it calls
+  `Sealer::check_turns`: one `key_set()` read, then one `verify_turn` per row whose `role` is `assistant` or `tool`, at its
+  index, `prv` folded over the rows as stored (`storable`). A row that is not a turn is chained, not checked. So the re-entries
+  are covered by what already reads rows: a claim (resume, restart, another worker), `prior_state` (a new task that continues
+  a conversation; `start_child_continuing`, a session round), `Runtime::state`, and `Engine` over any store, since the engine
+  only runs a `Runtime`. `check_sealed` (a head by its own `seal`, no rows read) does not check turns, by design.
+* **Strict when signed.** A head with a signature makes every turn row mandatory: an unsigned one is `Corrupt`
+  (`TurnSignatureError::Unsigned` as the source). A runtime with keys therefore needs agents that sign: give the
+  `LlmAgent` the same `turn_keys` (the engine and service wiring is T2). A test agent with role-shaped rows must sign them.
+* **Adoption (decision 11).** Unchanged from T3a-2: an unsigned head with no signed row is adopted, nothing is checked; the
+  next commit that writes rows signs the head, and the `LlmAgent` signs every unsigned turn. An unsigned head over a signed row
+  is `Corrupt`. Test: `tests/turn_reentry.rs` `a_legacy_run_is_adopted_once_and_checked_in_full_after`.
+* **Errors.** `RuntimeError::Corrupt` with the position and role in `reason`, the `TurnSignatureError` as source (no row
+  content); a key set that cannot be read is `RuntimeError::TurnKeys`, so a claimed run keeps its lease (T3a-2 point 1).
+* **Re-signing.** `continue_conversation` (`crates/adam-llm-agent/src/agent.rs`) calls `signing::unsign_from(messages, 0)`
+  on the carried rows, so `answer_owed_calls`' synthetic results, the cut tail and every old signature go together and
+  `sign_transition` signs them under the new run at its first commit. The carried rows were verified under their own run by
+  `prior_state` before they got there. A compaction and a shortening already `unsign_from` the changed rows (T3a-1).
+  A starter has no keys, so the strip is unconditional: a keyless process carries rows unsigned, as a legacy run.
+* **Cost.** One Ed25519 verify and one canonical-JSON form per turn on every decode that reads the rows, beside the one
+  SHA-256 pass the head already needed. Decision 4 said one check for the newest turn would do; this checks all of them
+  (a rotation could revoke a key that signed an early turn).
+* **Tests.** `crates/adam-runtime/src/seal.rs` `turn_tests` (the head verifies, the turn does not: forged assistant, forged tool,
+  changed user, spliced, unsigned, reordered, revoked key, a non-turn row left alone, key set down); `crates/adam-llm-agent/tests/turn_reentry.rs`
+  (resume, new task, session round, each with four forgeries and no model call; a carry signed again under the new run; adoption once;
+  revoked key).
+
 ## Signed heads (ADR 0068, slice T3a-2)
 
 For people: [Signed turns](../../docs/architecture.md#signed-turns-each-assistant-and-tool-turn-is-signed-when-it-is-committed).

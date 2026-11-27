@@ -546,10 +546,17 @@ slice T3a-2) makes the runtime sign what it commits as a run's state and check i
 * **Mixed fleets.** A worker without keys drops head signatures when it writes, so a signed turn later makes that head
   refused; and release N gives an agent that does not sign its turns no downgrade resistance (stripping `signature` passes
   adoption).
-* **Not done** (T3a-3 and T2): the turns' own signatures are not verified on re-entry, the journal is not signed, and no
-  host sets the keys yet (the engine and the service), so only an embedder that calls `turn_keys` is affected.
+* **The turns** (slice T3a-3). After the head, every row that is a turn (`role` `assistant` or `tool`) of a **signed** run is
+  verified at its position over the rows before it (`Sealer::check_turns`, in `check_read`): it must carry a turn signature
+  whose key is in the key set and not revoked. Unsigned, forged, moved, spliced or revoked-key: `RuntimeError::Corrupt`,
+  before the agent steps; a key set that cannot be read is `RuntimeError::TurnKeys` and keeps the lease. This is every read of
+  the rows: a claim (resume), the prior state of a new task or a session round, `Runtime::state`. **A runtime with keys needs
+  an agent that signs its turns** (`LlmAgent::turn_keys`): a row-shaped agent whose assistant rows are unsigned is refused as
+  soon as the head is signed. An unsigned head with no signed row is still adopted.
+* **Not done** (T2 and later): the journal is not signed, and no host sets the keys yet (the engine and the service), so
+  only an embedder that calls `turn_keys` is affected.
 
-Tests: `tests/head_signature.rs`.
+Tests: `tests/head_signature.rs`; `src/seal.rs` (`turn_tests`); and, with a real `LlmAgent`, `adam-llm-agent`'s `tests/turn_reentry.rs`.
 
 ## Several processes
 
