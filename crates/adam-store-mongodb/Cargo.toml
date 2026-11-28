@@ -8,19 +8,27 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
+[features]
+# The L2 `Memory` port over MongoDB (ADR 0081 decisions 4, 5 and 10). Off by default: a run store
+# does not need it.
+memory = ["dep:adam-memory"]
+
 [dependencies]
 adam-core.workspace = true
+adam-memory = { workspace = true, optional = true }
 adam-error.workspace = true
 async-trait.workspace = true
 futures.workspace = true
 jiff.workspace = true
-mongodb = "3.9"
+mongodb = { version = "3.9", features = ["sync"] }
 serde_json.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
 adam-store-testkit.workspace = true
+# The L2 conformance suite of `tests/memory.rs` (feature `memory`).
+adam-memory-testkit.workspace = true
 tokio.workspace = true
 
 [lints]

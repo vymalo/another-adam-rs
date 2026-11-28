@@ -1,0 +1,103 @@
+# adam-otel
+
+The **OpenTelemetry layer** of adam-rs: OTLP/HTTP spans, **off unless an endpoint is set**
+([ADR 0075](../../docs/decisions/0075-metrics-and-traces-are-off-by-default-and-say-nothing-about-a-person.md)).
+
+This is the foundation of ADR 0075's trace slices, and the decision's exporter clause is
+[amended](../../docs/decisions/0075-metrics-and-traces-are-off-by-default-and-say-nothing-about-a-person.md):
+the exporter is built on the `opentelemetry` crates, not by hand. The binaries compose the layer and
+the configuration reaches them in later cards (ANR-1385, ANR-1386); nothing reads this crate yet.
+
+## What it does
+
+```mermaid
+sequenceDiagram
+    participant H as host
+    participant S as Settings
+    participant O as Otel
+    participant T as tracing
+    participant X as OTLP/HTTP collector
+    H->>S: from_env() (OTEL_EXPORTER_OTLP_ENDPOINT, OTEL_SERVICE_NAME)
+    S-->>H: Settings
+    alt no endpoint
+        H->>O: start(&settings)
+        O-->>H: None (no exporter, no thread)
+    else endpoint set
+        H->>O: start(&settings)
+        O->>O: one reqwest client, one bounded batch queue on the Tokio runtime
+        O-->>H: Some(Otel)
+        H->>T: Registry::default().with(otel.layer()).with(fmt())
+        T->>O: span adam.run { state }
+        O->>X: POST /v1/traces (protobuf)
+    end
+```
+
+* **Off means off.** `OTEL_EXPORTER_OTLP_ENDPOINT` unset or blank: [`Otel::start`] answers `None`
+  before it builds an exporter, a provider or a thread. The test proves it by handing in a factory
+  that records whether it was ever called.
+* **The endpoint is checked, and no value is echoed.** A relative endpoint, a scheme other than
+  `http`/`https`, a userinfo (a credential in a URL), a query or a fragment is
+  [`SettingsError`], class `Invalid`. The message names the variable and the reason, never the value.
+  The variable is the **base** URL: traces are posted to `{endpoint}/v1/traces`, and a base that
+  already ends in `/v1/traces` is not doubled.
+* **OTLP over HTTP, protobuf, no gRPC.** `opentelemetry-otlp` is resolved with
+  `default-features = false, features = ["http-proto", "reqwest-client", "trace", "internal-logs"]`.
+  `reqwest-client` is the async client over the **workspace's `reqwest` 0.13** (`rustls-no-provider`,
+  the provider chosen by the crate's `aws-lc` feature, exactly as `adam-model-openai` does).
+  `reqwest-blocking-client` is refused: it adds the blocking client (and its own thread) and pulls
+  reqwest's defaults, which is the TLS trap the `tls-provider` gate exists for. `grpc-tonic` is not
+  a feature of this crate's build.
+* **Bounded, and never a run's failure.** One `BatchSpanProcessor` on the process's Tokio runtime
+  (`runtime::Tokio`) with a queue of [`MAX_QUEUE_SIZE`] (2048) spans, batches of
+  [`MAX_EXPORT_BATCH_SIZE`] (512) every [`EXPORT_INTERVAL`] (5 s). A full queue drops; an export
+  failure is the SDK's `internal-logs` line through `tracing`, and nothing propagates to the caller.
+  [`Otel::shutdown`] flushes for [`SHUTDOWN_TIMEOUT`] (5 s). The exporter is the **async** reqwest
+  client, so [`Otel::start`] is called from an async `main`; outside a Tokio runtime it answers
+  `StartError::NoRuntime` instead of panicking.
+* **The closed attribute set holds.** The bridge's own attributes are off (`with_location(false)`,
+  `with_tracked_inactivity(false)`, `with_threads(false)`), so a span exports the fields its
+  `tracing` macro wrote. [`SpansOnly`] keeps events out, so no log line becomes a span event. The
+  run span is ANR-1345's `adam.run { state }`, and the test asserts the exported attribute set is
+  exactly `state`.
+* **The resource names the service.** `service.name` is `OTEL_SERVICE_NAME`, `adam` when unset.
+
+## API
+
+| Item | What |
+|---|---|
+| `Settings::from_env()` | reads `OTEL_EXPORTER_OTLP_ENDPOINT` and `OTEL_SERVICE_NAME`; a non-UTF-8 value is `NotUnicode`, a blank one is unset |
+| `Settings::from_pairs(iter)` | the same from pairs, ignoring every other name (the tests use it) |
+| `Settings::disabled()`, `Settings::enabled(endpoint)` | no endpoint, or one endpoint; `with_service_name(name)` |
+| `Settings::endpoint()`, `service_name()`, `is_enabled()` | what was read |
+| `Otel::start(&settings)` | `Ok(None)` when off; otherwise the provider, the bounded queue and the batch task, built inside the process's Tokio runtime |
+| `Otel::layer()` | the layer to compose beside `tracing_subscriber::fmt()` |
+| `Otel::shutdown()` | flush and stop, bounded by `SHUTDOWN_TIMEOUT` |
+| `SettingsError`, `StartError` | `Classify`: `SettingsError` is `Invalid`; `StartError` is `Invalid`, or `Internal` for `NoRuntime` |
+
+## Composing it
+
+```rust,no_run
+use tracing_subscriber::layer::SubscriberExt;
+
+let settings = adam_otel::Settings::from_env()?;
+if let Some(otel) = adam_otel::Otel::start(&settings)? {
+    let subscriber = tracing_subscriber::registry()
+        .with(tracing_subscriber::fmt::layer())
+        .with(otel.layer());
+    let _ = tracing::subscriber::set_global_default(subscriber);
+}
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+The subscriber is the host's; this crate never installs one. That is what lets a binary keep its
+`fmt()` output unchanged when tracing is off. The block runs inside the process's async `main`
+(Tokio): `Otel::start` builds a task on that runtime and answers `StartError::NoRuntime` elsewhere.
+
+## Versions
+
+`opentelemetry` 0.33.1, `opentelemetry_sdk` 0.33.1, `opentelemetry-otlp` 0.33.1 and
+`tracing-opentelemetry` 0.34.0 (*verified 2026-11-28* in the local cargo registry and against the
+versions the card measured on 2026-11-27). `opentelemetry-otlp` depends on `reqwest` 0.13.1 with
+`default-features = false`, so the workspace's `reqwest` is the one in the tree (*verified
+2026-11-28* in its normalized `Cargo.toml`). The crate adds no `-sys` package beyond the
+`aws-lc-sys` the workspace already links through `rustls`.

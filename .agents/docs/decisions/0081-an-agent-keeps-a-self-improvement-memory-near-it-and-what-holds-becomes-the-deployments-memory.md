@@ -11,7 +11,7 @@ the agent (SIMemory and a code index), L2 every remote one, and L2's scope is it
 **Amended 2026-11-28 (ANR-1292), the PostgreSQL adapter.** `PgMemory` (`crates/adam-store-postgres/src/memory.rs`,
 feature `memory`): `connect`, `from_pool`, `with_table_prefix`, `pool`, `scope`, `migrate`, and the port's `record`,
 `recall` and `retire` with the in-process reference's semantics (`crates/adam-memory/src/lesson_memory.rs`). The
-adapter uses the port's own write path, exported for it: `prepare_lesson`, `MemoryError::backend`,
+adapter uses the port's own write path, exported for it: `prepare`, `MemoryError::backend`,
 `MemoryScope::validate`, `Audience::validate` (`crates/adam-memory/src/lesson.rs`, `error.rs`). The table
 `<prefix>memory_lesson` and its recall index are in `Sql::migrate` **unconditionally** — schema version 10
 (`memory_lesson_ddl`, `crates/adam-store-postgres/src/lib.rs`; `tests/fixtures/schema-v10.sql`) — so a binary built
@@ -23,8 +23,8 @@ current-thread one). The suite is `crates/adam-store-postgres/tests/memory.rs`
 (`memory_conformance!(crate::make)`, a per-process table prefix and scope suffix; `ADAM_TEST_REQUIRE_DB=1` turns a
 missing URL into a failure) plus one explicit two-scope test on one pool. Broken on purpose (*verified 2026-11-28*):
 a constant scope in the adapter's SQL makes `memory_conformance::two_scopes_never_see_each_other` fail on "the second
-scope saw the first scope's lesson" (and the explicit test with it); restored, the suite is 140/140 green. MongoDB
-(ANR-1293) and Redis (ANR-1294) remain unbuilt.
+scope saw the first scope's lesson" (and the explicit test with it); restored, the suite is 140/140 green. The MongoDB adapter
+(ANR-1293) is built too, recorded in the M2c row; Redis (ANR-1294) remains unbuilt.
 
 ## The paper
 
@@ -88,8 +88,9 @@ answers recorded on the page for people.
 |---|---|---|
 | M1 | the L1 port and the in-folder adapter, L1's only one: a double that answers another scope or writes twice for one key fails `si_memory_conformance!`; 16 concurrent writers on one folder; a restart on the same folder reads what was written, on a fresh folder reads nothing | M0 |
 | M2a | the L2 port, its testkit and the in-process reference: `memory_conformance!`; two configured scopes on one store never read each other's lessons; built | M1 |
-| M2b | the PostgreSQL, MongoDB and Redis adapters (ANR-1292 built — the amending note above records its evidence — ANR-1293, ANR-1294 unbuilt): `memory_conformance!` on each; two configured scopes on one database never read each other's lessons; it fails under `ADAM_TEST_REQUIRE_DB=1` with a URL unset (Rule 7) | M2a |
+| M2b | the PostgreSQL, MongoDB and Redis adapters (ANR-1292 and ANR-1293 built — the amending note above and the M2c row record their evidence — ANR-1294 unbuilt): `memory_conformance!` on each; two configured scopes on one database never read each other's lessons; it fails under `ADAM_TEST_REQUIRE_DB=1` with a URL unset (Rule 7) | M2a |
 | M3 + M4 | a folder `off` is off; `SI_MEMORY=off` beats a folder `on`; an unknown option exits 78; `memory:` stays ignored; a replay past `journal_put` asks the store nothing; a secret in a field is refused; a repository entry is not served without its slot | M1 |
+| M2c | `adam-store-mongodb`'s `memory` feature: `MongoMemory`, one document per lesson keyed by scope, audience and root cause; the rules are `adam_memory::prepare`'s; the L2 conformance suite's fifteen cases pass against a real MongoDB, including two scopes never seeing each other. The audience limit is a read-then-write check, not an index | M2a |
 | M4 tools (part) | `crates/adam-llm-agent/src/si_memory.rs`: `SiMemoryHandle` + `SiRecall`/`SiRecord` as ordinary `Tool`s, the attempt id being the call's (a retry writes one attempt) and a secret refused with a permanent error; unit tests over `InProcessSiMemory`. **Not wired**: nothing registers the pair or declares the `memory` group until the L1 directory is decided (ANR-Q150) | M1, M3 |
 | M5 + M6 | a passing check stamps a success, a failing one a failure; a panicking observer leaves the run unchanged; the coder's first request is byte-identical but for one loader line; `deploy/coder` renders unchanged by default (the chart is read by another repository: say so in the pull request) | M4 |
 | M7 + M8 | `promotion_conformance!`: the same evidence twice is one lesson; evidence from one L1 scope alone is never a candidate; an active lesson is not served outside its audience; a candidate no one approved is served to nobody; a text naming a repository is never sent to L2 | M2a, M5 |

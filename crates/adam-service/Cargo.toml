@@ -36,6 +36,7 @@ adam-model-oauth = { workspace = true, features = ["aws-lc"] }
 adam-model-openai = { workspace = true, features = ["aws-lc"] }
 adam-notify-postgres = { workspace = true, optional = true }
 adam-postgres = { workspace = true, optional = true }
+adam-run-cert-broker = { workspace = true, features = ["aws-lc"] }
 adam-runtime.workspace = true
 adam-store-mongodb = { workspace = true, optional = true }
 adam-store-postgres = { workspace = true, optional = true }

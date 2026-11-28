@@ -7,7 +7,7 @@
 //! read, overwrite or retire each other's lessons, because every key and every query carries the
 //! configured scope. Its semantics are the in-process reference's
 //! ([`InProcessMemory`](adam_memory::InProcessMemory)) exactly: a draft is prepared by the port's
-//! own [`prepare_lesson`], one transaction takes a `pg_advisory_xact_lock` over the scope and the
+//! own [`prepare`], one transaction takes a `pg_advisory_xact_lock` over the scope and the
 //! audience, refuses `AudienceFull` when a new or revived served lesson would exceed the bound, and
 //! upserts keeping the stored creation time; `recall` serves only `active` lessons, the freshest
 //! first; `retire` keeps the lesson and stops serving it.
@@ -31,7 +31,7 @@ use std::sync::Arc;
 use adam_core::time::Timestamp;
 use adam_memory::{
     Audience, Lesson, LessonDraft, LessonSettings, LessonState, Memory, MemoryError, MemoryResult,
-    MemoryScope, prepare_lesson,
+    MemoryScope, prepare,
 };
 use adam_postgres::PgConfig;
 use deadpool_postgres::Pool;
@@ -400,7 +400,7 @@ impl PgMemory {
 impl Memory for PgMemory {
     fn record(&self, draft: LessonDraft) -> MemoryResult<Lesson> {
         self.scope.validate()?;
-        let prepared = prepare_lesson(&self.scope, draft, &self.settings, Timestamp::now())?;
+        let prepared = prepare(&self.scope, draft, &self.settings, Timestamp::now())?;
         self.block_on(self.record_stored(&prepared))
     }
 

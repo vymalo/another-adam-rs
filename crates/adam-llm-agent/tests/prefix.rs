@@ -1079,6 +1079,88 @@ async fn the_tools_that_survive_the_cap_do_not_depend_on_the_listing_order() {
     }
 }
 
+/// A tool of a name, for the tools of a group and its loader: a session's `tools` selects among
+/// them, and the loader is an own tool named `load__group__<server>` (ADR 0066).
+struct Named(&'static str);
+
+#[async_trait]
+impl Tool for Named {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: self.0.into(),
+            description: format!("the {} tool", self.0),
+            parameters: json!({"type": "object"}),
+        }
+    }
+    async fn call(&self, _ctx: &ToolCtx, _args: Value) -> Result<ToolOutput, ToolError> {
+        Ok(ToolOutput::text(format!("{}-out", self.0)))
+    }
+}
+
+/// A round's session header, as `subagent_start` writes one (ADR 0054, slice 3), narrowed to
+/// `tools`.
+fn narrowed_session(tools: &[&str]) -> adam_runtime::SessionHeader {
+    // `SessionConfig` is `#[non_exhaustive]`: another crate sets its fields one by one.
+    #[allow(clippy::field_reassign_with_default)]
+    let mut config = adam_runtime::SessionConfig::default();
+    config.tools = Some(tools.iter().map(|tool| (*tool).to_owned()).collect());
+    adam_runtime::SessionHeader {
+        id: RunId::new(),
+        agent: "llm".into(),
+        description: "a narrowed round".into(),
+        keep_open: false,
+        closed: false,
+        closing: false,
+        deleted: false,
+        round: 1,
+        root: None,
+        workspace: None,
+        visible: false,
+        config: Some(config),
+        spent: 0,
+    }
+}
+
+/// A session narrowed by `tools` keeps the same head on every turn, and the loader of the group
+/// whose tools it selects stays offered: the narrowing is read from the session's config, never
+/// from a turn's state, so the tools array does not move between turns (ANR-1304, ADR 0044).
+#[tokio::test]
+async fn a_narrowed_sessions_prefix_holds_and_its_group_loader_stays() {
+    let rig = Rig::new(0, |b| {
+        b.tool(Named("docs__search"))
+            .tool(Named("load__group__docs"))
+    });
+    rig.mock
+        .push_tool_calls(vec![call("c0", "docs__search", json!({}))])
+        .push_tool_calls(vec![call("c1", "docs__search", json!({}))])
+        .push_text("done");
+    let run = rig
+        .rt
+        .start(
+            "llm",
+            adam_runtime::Inbound::new(
+                adam_llm_agent::MESSAGE_KIND,
+                json!({"text": "go", "session": narrowed_session(&["docs__*"])}),
+            ),
+            None,
+        )
+        .await
+        .expect("start");
+    *rig.arm.run.lock().unwrap() = Some(run);
+    let (requests, state) = rig.finish(run).await;
+    assert_eq!(requests.len(), 3, "two calls and the answer");
+    assert_eq!(
+        names_of(&requests[0]),
+        ["docs__search", "load__group__docs"],
+        "the list leaves `big` and `handle` out, and keeps the loader of the server it names"
+    );
+    assert_eq!(
+        breaks(&requests, &state.tools_appended),
+        Vec::<u32>::new(),
+        "the head is the same bytes at every request"
+    );
+}
+
 /// Four results of 1,200 letters in a budget of 1,200 tokens (4,800 characters): the history is
 /// under it at the third request and over it at the fifth, where the run is compacted, and the
 /// request that follows is the first of a new prefix.

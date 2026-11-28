@@ -35,15 +35,16 @@ decisions 2 to 5 and 10; slices M1 and M2a (the L2 port and its kit; the L2 adap
 | `LessonProvenance` | The L1 scopes (opaque labels) whose evidence made the lesson, and the review that approved it. |
 | `LessonState` | `Proposed`, `Active`, `Retired`. A closed set; a recall serves `Active` only. |
 | `LessonSettings`, `LessonLimits` | The injected scrub and the bounds an L2 adapter is built with. |
-| `prepare_lesson` | Public preparation **for adapters**: scrub, check and stamp a draft into a served lesson with the port's own rules. `InProcessMemory` uses this same function; a database adapter prepares a draft with it and stores the stamped lesson. |
+| `prepare` | Public preparation **for adapters**: scrub, check and stamp a draft into a served lesson with the port's own rules. `InProcessMemory` uses this same function; a database adapter prepares a draft with it and stores the stamped lesson. |
 | `InProcessMemory` | The in-process L2 reference the suite and a test use. |
 | `InProcessLessonStore` | The storage several `InProcessMemory` adapters share, so a test can put two scopes on one store. |
 
 The crate is the two ports, the values, L1's in-folder adapter and the two in-process references.
-The PostgreSQL L2 adapter is [`adam-store-postgres`](../adam-store-postgres/README.md)'s `memory`
-feature (M2b, built); the MongoDB and Redis adapters remain unbuilt. A store reached over the
+The PostgreSQL and MongoDB L2 adapters are [`adam-store-postgres`](../adam-store-postgres/README.md)'s
+and [`adam-store-mongodb`](../adam-store-mongodb/README.md)'s `memory` features (M2b and M2c, built);
+the Redis adapter remains unbuilt. A store reached over the
 network is L2 (ADR 0081 decision 2). Adapters in other crates use this crate's public
-write-path pieces: `prepare_lesson`, `MemoryScope::validate`, `Audience::validate` and
+write-path pieces: `prepare`, `MemoryScope::validate`, `Audience::validate` and
 `MemoryError::backend`.
 
 ```rust

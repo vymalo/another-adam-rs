@@ -36,14 +36,13 @@ impl MemoryScope {
         &self.0
     }
 
-    /// Check the key a call needs; an empty scope is refused with [`MemoryError::EmptyField`].
+    /// Check the scope before a call uses it: an empty one is refused.
     ///
-    /// **For adapters**: run it in every call, as [`InProcessMemory`](crate::InProcessMemory) does,
-    /// so an adapter refuses an empty key exactly as the port's reference does.
+    /// Public for an adapter, which calls it first, exactly as the reference one does.
     ///
     /// # Errors
     ///
-    /// [`MemoryError::EmptyField`] when the scope is empty or only whitespace.
+    /// [`MemoryError::EmptyField`] for an empty scope.
     pub fn validate(&self) -> MemoryResult<()> {
         if self.0.trim().is_empty() {
             return Err(MemoryError::EmptyField {
@@ -82,15 +81,7 @@ impl Audience {
         &self.0
     }
 
-    /// Check the key a call needs; an empty audience is refused with [`MemoryError::EmptyField`].
-    ///
-    /// **For adapters**: run it in `recall` and `retire`, as
-    /// [`InProcessMemory`](crate::InProcessMemory) does, so an adapter refuses an empty key exactly
-    /// as the port's reference does.
-    ///
-    /// # Errors
-    ///
-    /// [`MemoryError::EmptyField`] when the audience is empty or only whitespace.
+    /// Check the audience before a call uses it: an empty one is refused. Public for an adapter.
     pub fn validate(&self) -> MemoryResult<()> {
         if self.0.trim().is_empty() {
             return Err(MemoryError::EmptyField { field: "audience" });
@@ -317,17 +308,16 @@ impl LessonSettings {
 /// refused. A lesson may not name a repository, a path, a URL, a host or an e-mail address whatever
 /// its audience (ADR 0081 decision 5), so every lesson text goes through the address check too. The
 /// audience is a key, validated and bounded, never scrubbed; the provenance labels are scrubbed and
-/// bounded. The scope is checked first: an empty one is refused.
+/// bounded.
+/// Validate a draft and turn it into the lesson an adapter stores.
 ///
-/// **For adapters**: this is the port's own write path — every adapter prepares a draft through it
-/// (re-exported as [`prepare_lesson`](crate::prepare_lesson)), so the scrub, the marker, the
-/// bounds and the address check are the port's rules wherever a lesson is stored. It stamps
-/// `state = Active` and both timestamps with `now`; a store keeps the creation time of the lesson a
-/// key already holds and returns its stored row.
+/// This is the half of [`Memory::record`] that is the **rules** rather than the storage: the scrub,
+/// the redaction marker, the bounds and the address check. Every adapter calls it first, so the
+/// rules cannot drift between them. `now` is the adapter's clock.
 ///
 /// # Errors
 ///
-/// [`MemoryError`], whose class says whether to retry (a backend failure) or not (a refusal).
+/// [`MemoryError`] for a draft the rules refuse; nothing is stored.
 pub fn prepare(
     scope: &MemoryScope,
     draft: LessonDraft,
@@ -440,7 +430,9 @@ fn bytes(field: &'static str, clean: String, limit: usize) -> MemoryResult<Strin
 
 /// The order a recall serves: the freshest lesson first, then by root cause so the answer is
 /// stable.
-pub(crate) fn sort_newest_first(lessons: &mut [Lesson]) {
+/// Order lessons the way every recall serves them: the freshest first, then by root cause, so two
+/// adapters over one data set answer the same list.
+pub fn sort_newest_first(lessons: &mut [Lesson]) {
     lessons.sort_by(|a, b| {
         b.updated
             .cmp(&a.updated)

@@ -120,6 +120,39 @@ the key required. The turn key is not the card's key.
 | `TURN_SIGNING_KEY_ID` | the `kid` of its signatures: the vault reference `vault:<name>#v<n>`, or the id a registry knows the key by (printable ASCII, at most 256 bytes); without the key file: exit 78 | the key's RFC 7638 thumbprint |
 | `TURN_VERIFY_KEYS_FILE` | a JWKS of the public keys of earlier versions, each with its `kid` (`kty` `OKP`, `crv` `Ed25519`; a private member `d` is refused), and `revoked`, a list of the ids no longer accepted; not secret (a ConfigMap). Read and checked with the key; used to verify a history (T3); without the key file: exit 78 | the signing key's own public key only |
 
+## Run certificates (`adam-service`)
+
+A run can sign its model requests with a certificate of its own instead of the process turn key
+([ADR 0086](../decisions/0086-a-run-signs-its-model-requests-with-a-certificate.md) decision 6, A3). The
+variables are read with the model's configuration (`ModelConfig::run_cert`, `RunCertSettings`), so by the roles
+that call a model (`all`, `worker`). **Nothing is on unless every required variable is set**: all unset is off,
+and a half-set configuration is exit 78 naming the variable, because a half-set run certificate would silently
+sign with the process turn key.
+
+| Variable | Meaning | Default |
+|---|---|---|
+| `RUN_CERT_ISSUER` | which adapter issues the chain: `broker` (built), or `openbao` once A6 lands; anything else is exit 78 | required with the others |
+| `RUN_CERT_ISSUER_URL` | the broker's base URL; adam posts to `{URL}/internal/runs/{run}/certificate` (a path prefix on the URL is kept) | required |
+| `RUN_CERT_TOKEN_FILE` | the projected service-account token, **re-read on every call**, never from the environment's value; never in a log, `Debug` or an error | required |
+| `RUN_CERT_CA_FILE` | a PEM bundle trusted for the broker beside the system roots; a file that cannot be read or holds no certificate is exit 78 | unset: the system roots |
+| `RUN_CERT_RENEW_FRACTION` | when the run's key is replaced: `n/d`, strictly between 0 and 1 | `2/3` |
+
+The adapter and its configuration are built; the request path does not choose a run key from them yet (R3), so a
+run's calls are still signed by the process turn key. The broker's contract is v1: `{"v":1,"csr":"<base64 DER>"}`
+in, `{"v":1,"chain":["<base64 DER>", …]}` out, and the refusals `400` (`Invalid`), `401`/`403`
+(`Unauthenticated`), `429`/`5xx` (`Transient`). Source: [`adam-run-cert-broker`](../../crates/adam-run-cert-broker/README.md).
+
+## Traces (`adam-otel`, not wired yet)
+
+The OTel layer of [ADR 0075](../decisions/0075-metrics-and-traces-are-off-by-default-and-say-nothing-about-a-person.md)
+reads two variables, and **no binary composes the layer yet** (ANR-1385) and `adam-service` does not pass them
+(ANR-1386), so setting either changes nothing today. Source: [`adam-otel`](../../crates/adam-otel/README.md).
+
+| Variable | Meaning | Default |
+|---|---|---|
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | the OTLP/HTTP collector, an absolute `http` or `https` URL with no user, password, query or fragment; unset or blank means no exporter and no thread | unset: off |
+| `OTEL_SERVICE_NAME` | `service.name` of every exported span's resource | `adam` |
+
 ## Cross-process notifications (`adam-notify-postgres`)
 
 `adam-coder`, in every role (`all`, `control-plane`, `worker`): the `notify` component. Both binaries'
@@ -142,7 +175,7 @@ cross-process listener: SQLite's notifier is always in-process, and MongoDB has 
 | `ADAM_EXTRA_MCP_FILE` | a file of extra MCP servers in the shape of `mcp.json`, **added** to the agent's own (a name clash is exit 78) | unset |
 | `ADAM_REFERENCES_FILE` | `adam-coder`, roles that run workers: a file `{"references": [{"name", "url", "branch"?, "description"}]}` of repositories the coder may **read** beside the one it works on and never write, **added** to the `references:` of the agent's files; it must be an existing file of valid references whose addresses the workspaces' policy accepts (an allowed host, an owner a GitHub App acts for), and a name the agent already declares is exit 78. See [References](workspace-and-environments.md#references) | unset |
 | `A2A_ALLOW_INSECURE_REMOTES` | `adam-agent`, roles that run workers: let a remote subagent (`a2a:`) be at plain `http` on another machine, such as a service of the same cluster; without it such a URL is exit 78. **The messages and the bearer then cross the pod network in clear text**: protect it with a NetworkPolicy that admits only the caller, or mesh mTLS. Plain `http` goes only to the card's own host, and never from an `https` card. Its token is the environment's too: `auth: bearer:VAR` names the variable ([remote subagents](agent-files.md#remote-subagents-a2a)) | `false` |
-| `SI_MEMORY` | the deployment's ceiling on the self-improvement memory (ADR 0081 decision 11), `on` or `off`; anything else is exit 78. It only **narrows** a folder's `si_memory:` key: `off` here is off whatever the folder says, and a folder's `off` is off whatever this says ([the key](agent-files.md#the-self-improvement-memory-si_memory)). Read by the roles that run workers | `on` |
+| `SI_MEMORY` | the deployment's ceiling on the self-improvement memory (ADR 0081 decision 11), `on` or `off`; anything else is exit 78. It only **narrows** a folder's `si_memory:` key: `off` here is off whatever the folder says, and a folder's `off` is off whatever this says ([the key](agent-files.md#the-self-improvement-memory-si_memory)). Read by `adam-agent`'s worker roles; **`adam-coder` does not read it yet** — it serves an embedded agent whose `si_memory` key nothing wires, so `on`/`off` there has no effect until that wiring lands (ANR-1370) | `on` |
 
 ## The coder (`adam-coder`)
 

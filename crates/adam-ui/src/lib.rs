@@ -11,7 +11,7 @@
 //! | [`Show`] (`show { blocks, title? }`) | draws blocks of the screen's components, each checked against the catalog's schema; the A2UI surface goes out as a run artifact |
 //! | [`UiCatalogTool`] (`ui_catalog {}`) | the components, what they are for, and their schemas |
 //! | [`PlanWork`], [`PlanCheck`], [`PlanAdd`] (`plan_work { title?, items }`, `plan_check { id, status, note? }`, `plan_add { items, after? }`) | the conversation's plan: a checklist the agent keeps and the person sees; each call returns the whole plan and draws it as one `Checklist` (or lines of `Text`) when the screen can |
-//! | [`ThreadTools`] (a [`ToolSource`](adam_llm_agent::ToolSource)) | every tool the thread-tools endpoint lists, under its listed name, read once per grant (a turn reuses the listing; a new grant, a refused call or [`LISTING_TTL`] lists again); a successful `turn_output { text }` makes `text` the run's answer; a tool the orchestrator reports as a step (`reportsStep`) gets no step of the agent's, a call waits as long as the tool's `timeoutSecs` (capped by `THREAD_TOOLS_MAX_CALL_SECS`) and carries a stable `callId`; with mentions in the run's context it adds a "Mentioned agents" block to the instructions |
+//! | [`ThreadTools`] (a [`ToolSource`](adam_llm_agent::ToolSource)) | every tool the thread-tools endpoint lists, under its listed name, read once per grant (a turn reuses the listing; a new grant, a refused call or [`LISTING_TTL`] lists again); a successful `turn_output { text }` makes `text` the run's answer; a tool the orchestrator reports as a step (`reportsStep`) gets no step of the agent's, a call waits as long as the tool's `timeoutSecs` (capped by `THREAD_TOOLS_MAX_CALL_SECS`) and carries a stable `callId`; with mentions in the run's context it adds a "Mentioned agents" block to the instructions; it declares **the whole set** it can offer: the contract's tools it knows by name and does not hide (`turn_output`, `ask_agent`, `request_upload`, `get_ui_catalog`) and the shape `*__*` of the `<server>__<tool>` tools it relays, so a session's `tools` is complete and `github__*` is admitted (ADR 0054 decision 4, amended 2026-11-28) |
 //! | [`card_extensions`] | the card entries that announce all this (A2UI v1.0, `ui-catalog/v2`, `thread-tools/v1`, `mentions/v1`, `steer/v1`) |
 //!
 //! A binary wires it in a few lines (the inbound function is `adam-a2a-runtime`'s `vymalo_inbound`):
@@ -83,8 +83,8 @@ pub use surface::{
 };
 #[cfg(feature = "thread-tools")]
 pub use thread_tools::{
-    Clock, GET_UI_CATALOG, LISTING_TTL, META_KEY, TURN_OUTPUT, TURN_OUTPUT_DELIVERED, ThreadTools,
-    ThreadToolsClient, UploadAccess,
+    ASK_AGENT, Clock, GET_UI_CATALOG, LISTING_TTL, META_KEY, RELAYED_SHAPE, REQUEST_UPLOAD,
+    TURN_OUTPUT, TURN_OUTPUT_DELIVERED, ThreadTools, ThreadToolsClient, UploadAccess,
 };
 
 pub use adam_a2a_runtime::{comparable, is_format_or_control};

@@ -20,7 +20,7 @@ use adam_agent::{
 use adam_core::{DynStore, MemoryStore};
 use adam_mcp_testkit::TestHttpServer;
 use adam_model::{DynModel, MockModel, ReasoningEffort, ToolCall};
-use adam_runtime::Runtime;
+use adam_runtime::{Runtime, SessionBounds};
 use adam_service::{Agents, RuntimeOptions, ServeError, Service};
 use common::{
     PersonaModel, SEARCH_RESULT, SearchServer, assistant, chat, edit_instructions, folder_with,
@@ -1655,6 +1655,7 @@ async fn each_failure_maps_to_the_exit_code_of_its_cause() {
         injected_run: false,
         ca_roots: None,
         turn_keys: None,
+        run_cert: None,
         park_limit: std::time::Duration::from_secs(24 * 60 * 60),
         alias: "m".into(),
         model_aliases_file: None,
@@ -2639,6 +2640,11 @@ fn activated() -> Caller {
 /// ADR 0054, ANR-1093: the control plane of a split deployment (no model, no bound agent) knows
 /// the bounds of every helper, and they are the ones a worker binds, so a person's `start.config`
 /// is admitted there and not refused outright. Both are asked of the same folder and settings.
+///
+/// The **numbers** are the same on both roles; the **tool names** are not: a control plane binds no
+/// agent and cannot read a source's declaration, so its set is empty and incomplete, while the
+/// worker's is what every source declares (ANR-1390: the folder agent's thread-tools source
+/// declares the contract's tools and the shape `*__*`, so the worker's set is complete).
 #[tokio::test]
 async fn a_control_plane_knows_the_bounds_a_worker_binds() {
     let folder = config_folder();
@@ -2661,7 +2667,30 @@ async fn a_control_plane_knows_the_bounds_a_worker_binds() {
             .collect::<Vec<_>>()
     };
     let front_bounds = bounds(&front);
-    assert_eq!(front_bounds, bounds(&back));
+    let worker_bounds = bounds(&back);
+    assert_eq!(front_bounds.len(), worker_bounds.len());
+    for ((front_name, front), (worker_name, worker)) in front_bounds.iter().zip(&worker_bounds) {
+        assert_eq!(front_name, worker_name);
+        let front = front.as_ref().expect("a control plane knows them");
+        let worker = worker.as_ref().expect("a worker knows them");
+        assert!(
+            front.tools.is_empty() && !front.tools_complete,
+            "{front_name}: a control plane knows no tool name"
+        );
+        assert!(
+            worker.tools_complete,
+            "{worker_name}: every source of the folder agent declares its tools"
+        );
+        assert_eq!(
+            SessionBounds {
+                tools: Vec::new(),
+                tools_complete: false,
+                ..worker.clone()
+            },
+            *front,
+            "{worker_name}: every number is a worker's, only the tool names are not"
+        );
+    }
     let helper = front_bounds[0]
         .1
         .as_ref()
@@ -2670,6 +2699,67 @@ async fn a_control_plane_knows_the_bounds_a_worker_binds() {
         (helper.max_turns, helper.max_parallel_tool_calls),
         (5, 2),
         "the folder narrows the deployment's 8"
+    );
+}
+
+/// ADR 0054 decision 4, amended 2026-11-28 (ANR-1390): the folder agent adds the thread-tools
+/// source, which declares the contract tools it knows by name and the shape `*__*` of the tools it
+/// relays from a server a person attached. A helper's set is therefore **complete**, so a `tools`
+/// entry that selects nothing is refused with the list (the shape among the names) and one naming a
+/// relayed server's tools is admitted. This is the check ANR-1319 could not turn on for this agent.
+#[tokio::test]
+async fn a_helpers_bounds_are_complete_and_admit_a_relayed_servers_tools() {
+    let folder = config_folder();
+    let def = def_of(&folder).session_max_parallel(8);
+    let model: DynModel = PersonaModel::new();
+    let parts = WorkerParts {
+        max_parallel: 8,
+        ..worker_parts(model)
+    };
+    let worker = build(def, None, Some(parts)).await.unwrap();
+    let helper = worker
+        .child_sessions
+        .as_ref()
+        .expect("the root has a helper")
+        .agents()
+        .first()
+        .expect("a helper")
+        .bounds
+        .clone()
+        .expect("a worker knows the bounds");
+    assert!(
+        helper.tools_complete,
+        "every source of the folder agent declares its tools: {helper:?}"
+    );
+    assert!(
+        helper
+            .tools
+            .iter()
+            .any(|tool| tool.as_str() == adam_ui::RELAYED_SHAPE),
+        "the shape of a relayed tool is declared: {helper:?}"
+    );
+    let asked = |value| adam_runtime::SessionConfig::from_value(value).expect("a config");
+    let why = helper
+        .admit(asked(json!({"tools": ["a_typo"]})))
+        .expect_err("an allow entry selecting nothing");
+    assert_eq!(why.option(), Some("tools"));
+    assert!(
+        why.message().contains("matches none of its tools:"),
+        "{why}"
+    );
+    assert!(
+        why.message().contains(adam_ui::RELAYED_SHAPE),
+        "the shape is listed as itself: {why}"
+    );
+    assert!(
+        helper.admit(asked(json!({"tools": ["github__*"]}))).is_ok(),
+        "a relayed server's tools are what the shape declares"
+    );
+    assert!(
+        helper
+            .admit(asked(json!({"tools": ["github__search"]})))
+            .is_ok(),
+        "a relayed tool's name too"
     );
 }
 
