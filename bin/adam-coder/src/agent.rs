@@ -307,6 +307,34 @@ impl CoderAgent {
         env: Arc<ToolEnv>,
         tools: impl IntoIterator<Item = DynTool>,
     ) -> Result<Self, Box<AssemblyError>> {
+        Self::try_from_def_with_hooks(
+            def,
+            model,
+            model_alias,
+            profiles,
+            env,
+            tools,
+            adam_llm_agent::HookSet::new(),
+        )
+    }
+
+    /// [`try_from_def_with_profiles`](Self::try_from_def_with_profiles) with the deployment's hook
+    /// programs (`ADAM_HOOKS_FILE`, ADR 0050 slice P2b): `hooks` run first, before the plugins a
+    /// file names, for the coder and every subagent of its folder. Empty is no hook program, which
+    /// is what a deployment without `ADAM_HOOKS_FILE` has.
+    ///
+    /// # Errors
+    ///
+    /// As [`try_from_def_with_profiles`](Self::try_from_def_with_profiles).
+    pub fn try_from_def_with_hooks(
+        def: AgentDef,
+        model: DynModel,
+        model_alias: impl Into<String>,
+        profiles: adam_model::ModelProfiles,
+        env: Arc<ToolEnv>,
+        tools: impl IntoIterator<Item = DynTool>,
+        hooks: adam_llm_agent::HookSet,
+    ) -> Result<Self, Box<AssemblyError>> {
         // The budget of scratch work is told to the model when the folder's prompt has a place for
         // it (the shipped one does). A folder written before it existed does not, and a var the
         // folder does not declare is an error: it keeps working, and the tool says the limit when
@@ -398,6 +426,14 @@ impl CoderAgent {
         let bound = match repo_skills {
             Some(found) => bound.state(found),
             None => bound,
+        };
+        // The deployment's hook programs (ADR 0050, slice P2b): every agent, the coder and each
+        // subagent of its folder, runs them first, before the plugins a file names. Empty adds
+        // nothing, so a deployment without `ADAM_HOOKS_FILE` binds exactly as before.
+        let bound = if hooks.is_empty() {
+            bound
+        } else {
+            bound.hooks(hooks)
         };
         let profiles_of = profiles.clone();
         let assembly = bound

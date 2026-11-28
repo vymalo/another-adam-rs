@@ -1,0 +1,17 @@
+# The dev stack's hook programs (ADR 0050, slices P1 and P2): the coder reads a deployment's file
+# (`ADAM_HOOKS_FILE`) and may run what it names (`HOOKS_ALLOW_PROGRAMS=true`). Used by
+# `dev/hooks-e2e.sh`:
+#
+#   docker compose -f compose.yaml -f dev/compose.hooks.yaml --profile app up -d --build --wait \
+#     postgres mock-openai mock-github mock-github-mcp git-server coder
+#
+# `dev/hooks/` is mounted read-only at `/etc/adam/hooks`. It is the deployment's directory, not the
+# agent's: a file inside the agent's own folder or workspace is where a repository could plant one,
+# which is why an embedding host refuses those (`HooksSettings::parse_in`).
+services:
+  coder:
+    environment:
+      ADAM_HOOKS_FILE: /etc/adam/hooks/hooks.json
+      HOOKS_ALLOW_PROGRAMS: "true"
+    volumes:
+      - ./dev/hooks:/etc/adam/hooks:ro

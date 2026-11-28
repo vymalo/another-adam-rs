@@ -182,6 +182,11 @@ https://github.com/vymalo/another-adam-rs/blob/main/deploy/coder/README.md.
      A repository may bring its own `devcontainer.json`: with `runPods.repositoryImages.allowedPrefixes` (empty by
      default) the coder offers `use_repository_environment` and the policy admits an image under a prefix for the `run`
      container alone (ADR 0052, `docs/decisions/0052-no-podman-a-repositorys-own-environment-is-a-run-pod-of-its-image.md`).
+   * The deployment's hook programs are **not** a chart value yet (ADR 0050, slice P3): the binaries
+     already read `ADAM_HOOKS_FILE` (a mounted JSON file of `programs`) and `HOOKS_ALLOW_PROGRAMS=true`,
+     start the programs that apply to the agent they serve, and exit 78 when one cannot start. Until
+     the chart renders a `hooks.file`, mount the file and its program outside the agent's folder and
+     workspace and set both variables by hand (`docs/reference/environment.md`).
 6. **Change the chart with its guards.** Render-time validation is in
    `deploy/coder/templates/_validate.tpl`; the default render is pinned by
    `deploy/coder/tests/golden/combined.yaml`; `deploy/coder/tests/render-check.sh` asserts the

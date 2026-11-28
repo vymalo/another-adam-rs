@@ -397,6 +397,16 @@ impl HookSet {
         self.plugins.iter().map(|p| p.name()).collect()
     }
 
+    /// The set's limits: how long one plugin's hook may run before it is a `Transient` failure,
+    /// and how many times a retryable failure is tried again. The set runs every plugin under
+    /// these, so a host with hooks slower than [`HookLimits::default`] must give them here
+    /// (`with_limits`): a plugin that misses the set's deadline is refused even when it kept its
+    /// own.
+    #[must_use]
+    pub fn limits(&self) -> HookLimits {
+        self.limits
+    }
+
     /// Whether the set holds no plugin, so the caller may skip it.
     #[must_use]
     pub fn is_empty(&self) -> bool {
