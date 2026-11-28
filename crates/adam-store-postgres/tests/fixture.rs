@@ -1,6 +1,6 @@
 //! A database built by the previous (`sqlx`) release opens with no migration, and the upgrade to
-//! the current schema adds the head and the body (version 6), the functions step (version 7) and
-//! the `served` column (version 8).
+//! the current schema adds the head and the body (version 6), the functions step (version 7), the
+//! `served` column (version 8) and the L2 memory table (version 10).
 //!
 //! `tests/fixtures/schema-v5.sql` is the schema exactly as that release emitted it. This applies it
 //! with `batch_execute` into a database of its own, opens the store **without calling `migrate`**
@@ -93,7 +93,7 @@ async fn a_sqlx_migrated_database_opens_and_upgrades_to_the_head_and_body() {
             .get(0)
     };
     assert_eq!(version, SCHEMA_VERSION.to_string());
-    assert_eq!(version, "9");
+    assert_eq!(version, "10");
 
     // The old run reads as it was written: no head, so the whole state is served.
     let loaded = store
