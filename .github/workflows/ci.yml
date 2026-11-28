@@ -70,6 +70,15 @@ jobs:
       # ADR 0082 decision 11: every PostgreSQL of CI, the release workflow and compose is one pinned image.
       - name: Every postgres image is the same pinned one
         run: sh tools/release/check-postgres-pin.sh
+      # ANR-1349: `deploy/dashboards/*.json` is generated from `tools/dashboards/*.py`, so a hand edit
+      # is a difference. Regenerating writes the files the scripts produce; a diff is a dashboard that
+      # no longer matches its script, and the untracked check catches a dashboard a script writes that
+      # nobody committed. The scripts need nothing but python3's standard library.
+      - name: The generated dashboards are up to date
+        run: |
+          sh tools/dashboards/regenerate.sh
+          git diff --exit-code -- deploy/dashboards
+          test -z "$(git ls-files --others --exclude-standard -- deploy/dashboards)"
       - run: cargo fmt --all --check
 
   # The two clippy arms: the default features, and the optional ones (or their code never runs in CI).

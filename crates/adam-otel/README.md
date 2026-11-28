@@ -74,6 +74,7 @@ sequenceDiagram
 | `Otel::layer()` | the layer to compose beside `tracing_subscriber::fmt()` |
 | `Otel::meter()` | the meter a run's instruments are created from; its labels come from `labels` |
 | `labels::RunState`, `labels::Name` | the closed label sets: a value outside a set cannot be built |
+| `catalogue::EMITTED`, `catalogue::emitted(name)` | the instruments the workspace records — name, kind, unit, labels — and the list a dashboard panel is held to |
 | `init(filter)` | installs the process's subscriber — JSON `fmt()` and, when an endpoint is set, the OTel layer
   beside it — and returns the running `Otel` (or `None` when off); every adam binary calls it |
 | `Otel::shutdown()` | flush and stop, bounded by `SHUTDOWN_TIMEOUT` |
@@ -131,6 +132,20 @@ model alias, a pool), which accepts only `[a-z0-9._-]`, at most 64 bytes. A valu
 backend's cardinality is what the deployment planned for, and no id, token or amount can travel as a label by
 accident. The shape check is not a secret filter — a token can have a name's shape — so what keeps a secret out is the
 set, never a value at hand.
+
+## Dashboards
+
+[`catalogue`](src/catalogue.rs) is the list of instruments this workspace actually records — today
+`adam.runs`, with its kind, its unit and the labels it may carry. It is data, not a doc comment, so
+`crates/adam-otel/tests/dashboards.rs` can read it: the test loads `deploy/dashboards/*.json` and
+fails when a panel queries a metric that is not in the list, or groups or matches on a label the
+instrument does not declare. A metric a deployment cannot scrape cannot become a graph that quietly
+draws nothing.
+
+The dashboards are generated, not hand-written: `tools/dashboards/<name>.py` (standard library only)
+writes `deploy/dashboards/<name>.json`, `sh tools/dashboards/regenerate.sh` runs them all, and CI
+regenerates and fails on a difference. `deploy/dashboards/README.md` says what each one shows and how
+a deployment imports it.
 
 ## Versions
 
