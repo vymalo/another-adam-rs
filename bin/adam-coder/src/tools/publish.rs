@@ -299,6 +299,7 @@ fn checks_for_pushed(
                 environment: None,
                 preexisting: record.preexisting,
                 base_commit: record.base_commit.clone(),
+                reused: false,
                 summary: Some(format!(
                     "`{}` {}; checked on the identical tree before it was committed",
                     record.command,

@@ -58,9 +58,8 @@ impl Plugin for AsksBeforeWritingOrCommand {
                 .filter(|p| !p.is_empty())
             {
                 Some(path) => format!("Write the file `{path}` in the person's directory?"),
-                None => format!(
-                    "Write a file in the person's directory? The model did not name a path."
-                ),
+                None => "Write a file in the person's directory? The model did not name a path."
+                    .to_owned(),
             },
             "edit_file" => match call
                 .arguments
@@ -69,9 +68,8 @@ impl Plugin for AsksBeforeWritingOrCommand {
                 .filter(|p| !p.is_empty())
             {
                 Some(path) => format!("Edit the file `{path}` in the person's directory?"),
-                None => {
-                    format!("Edit a file in the person's directory? The model did not name a path.")
-                }
+                None => "Edit a file in the person's directory? The model did not name a path."
+                    .to_owned(),
             },
             "apply_patch" => {
                 // A patch may touch several paths; name the ones it names, the path after `+++`,
@@ -86,7 +84,7 @@ impl Plugin for AsksBeforeWritingOrCommand {
                 if let Some(named) = listed_paths(&names) {
                     named
                 } else {
-                    format!("Apply a patch in the person's directory? The patch names no file.")
+                    "Apply a patch in the person's directory? The patch names no file.".to_owned()
                 }
             }
             // Commands — the shell line, so the person reads what the run would run, and the cwd
@@ -185,13 +183,11 @@ fn listed_paths(names: &[String]) -> Option<String> {
     Some(line)
 }
 
-/// The local agent's tools, over `State<PersonDir>`. The bodies are
-/// [`adam-code-tools`](https://github.com/vymalo/another-adam-rs/blob/main/crates/adam-code-tools)',
-/// with the coder's `repo` argument dropped (`PersonDir` has one place).
-///
-/// A tool that names `State<PersonDir>` declares the type in its generated `required_state`, so
-/// [`crate::EngineBuilder::local_agent`] failing to register the directory is a build error, not a
-/// run error.
+// The local agent's tools, over `State<PersonDir>`. The bodies are `adam-code-tools`', with the
+// coder's `repo` argument dropped (`PersonDir` has one place).
+//
+// A tool that names `State<PersonDir>` declares the type in its generated `required_state`, so
+// `EngineBuilder::local_agent` failing to register the directory is a build error, not a run error.
 
 /// Read a text file of the person's directory, one page at a time (at most 2000 lines). Each line
 /// starts with its number. If the last line says `[more: ... offset=N]`, call again with offset N.

@@ -23,6 +23,12 @@
 /// wake, and a run failed for an unreadable state.
 pub const RUNS: &str = "adam.runs";
 
+/// The histogram of a tool call's latency, labelled by the tool's name (ANR-1454).
+///
+/// Recorded by `adam-llm-agent` where it dispatches a call, and only when a tool answered: a name no
+/// tool or source resolves is not measured, so a model cannot invent a series.
+pub const TOOL_DURATION: &str = "adam.tool.duration";
+
 /// The kind of an instrument, the three [ADR 0075] uses.
 ///
 /// [ADR 0075]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0075-metrics-and-traces-are-off-by-default-and-say-nothing-about-a-person.md
@@ -56,12 +62,13 @@ impl Instrument {
     /// The name a Prometheus-compatible backend stores the instrument under.
     ///
     /// The OTel Prometheus exporter and the Prometheus OTLP receiver both turn the dotted name into
-    /// an underscored one and append `_total` to a counter, so `adam.runs` is scraped as
-    /// `adam_runs_total` (*verified 2026-11-28*: OpenMetrics 1.0, a `# TYPE foo counter` family
-    /// exposes `foo_total`). A unit suffix is added only when the instrument declares a unit, and
-    /// none does today.
+    /// an underscored one, append the unit (`s` becomes `_seconds`), and append `_total` to a
+    /// counter, so `adam.runs` is scraped as `adam_runs_total` and `adam.tool.duration` as
+    /// `adam_tool_duration_seconds` (*verified 2026-11-28*: OpenMetrics 1.0, a `# TYPE foo counter`
+    /// family exposes `foo_total`; OTel's Prometheus exporter maps the unit to a suffix).
     pub fn prometheus_name(&self) -> String {
         let base = self.name.replace('.', "_");
+        let base = format!("{base}{}", unit_suffix(self.unit));
         match self.kind {
             Kind::Counter if !base.ends_with("_total") => format!("{base}_total"),
             _ => base,
@@ -70,13 +77,32 @@ impl Instrument {
 }
 
 /// Every instrument the service emits, in the order a dashboard should list them.
-pub const EMITTED: &[Instrument] = &[Instrument {
-    name: RUNS,
-    kind: Kind::Counter,
-    unit: "",
-    labels: &["state"],
-    emitted_by: "adam-runtime",
-}];
+pub const EMITTED: &[Instrument] = &[
+    Instrument {
+        name: RUNS,
+        kind: Kind::Counter,
+        unit: "",
+        labels: &["state"],
+        emitted_by: "adam-runtime",
+    },
+    Instrument {
+        name: TOOL_DURATION,
+        kind: Kind::Histogram,
+        unit: "s",
+        labels: &["tool"],
+        emitted_by: "adam-llm-agent",
+    },
+];
+
+/// The suffix a Prometheus-compatible backend appends for an OTel unit.
+///
+/// Only the units this catalogue declares: seconds, and nothing else (an empty unit adds none).
+fn unit_suffix(unit: &str) -> &'static str {
+    match unit {
+        "s" => "_seconds",
+        _ => "",
+    }
+}
 
 /// The instrument `name` names, or `None` when the service does not emit it.
 pub fn emitted(name: &str) -> Option<&'static Instrument> {
@@ -87,6 +113,16 @@ pub fn emitted(name: &str) -> Option<&'static Instrument> {
 mod tests {
     use super::*;
     use crate::labels::RunState;
+
+    /// A backend adds the unit and, for a counter, `_total`: the name a dashboard queries is this
+    /// one, not the dotted name.
+    #[test]
+    fn the_prometheus_name_carries_the_unit_and_the_counter_suffix() {
+        let runs = emitted(RUNS).expect("adam.runs is emitted");
+        assert_eq!(runs.prometheus_name(), "adam_runs_total");
+        let tool = emitted(TOOL_DURATION).expect("adam.tool.duration is emitted");
+        assert_eq!(tool.prometheus_name(), "adam_tool_duration_seconds");
+    }
 
     /// A duplicate name would make [`emitted`] answer one of two instruments, and a name outside
     /// the `adam.` prefix would be a series nobody can find beside the rest.
@@ -145,8 +181,10 @@ mod tests {
             emitted_by: "adam-runtime",
         };
         assert_eq!(gauge.prometheus_name(), "adam_leases_held");
+        // The name does not carry the unit (OTel's rule: the unit is a field), and the exporter
+        // appends it: `s` is `_seconds`.
         let histogram = Instrument {
-            name: "adam.step_duration_seconds",
+            name: "adam.step.duration",
             kind: Kind::Histogram,
             unit: "s",
             labels: &["kind", "outcome"],
@@ -155,7 +193,7 @@ mod tests {
         assert_eq!(
             histogram.prometheus_name(),
             "adam_step_duration_seconds",
-            "a histogram keeps its unit in its name and takes no _total"
+            "a histogram takes its unit as a suffix and no _total"
         );
     }
 }

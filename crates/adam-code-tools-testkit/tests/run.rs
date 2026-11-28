@@ -1,8 +1,8 @@
 //! `adam_code_tools::make::run` over a scripted workspace: for each verdict of the guard, what the
 //! tool answers and the progress line it adds; the guard's refusal (nothing runs); the refusal note
-//! on refusals only; `after_run` called once, after the command and **before** the guard is
+//! on refusals only; `after_run` called once, after the command and **after** the guard is
 //! settled, and not at all for a `run` refused before its command; its text appended only when
-//! files changed; and a failing `after_run`, whose error is returned once the guard is settled.
+//! files changed; and a failing `after_run`, whose error is returned with the guard already settled.
 #![allow(clippy::unwrap_used, clippy::expect_used)] // integration tests assert by unwrapping
 
 use std::path::Path;
@@ -193,8 +193,9 @@ async fn make(
     (out, progress(&sink), ws)
 }
 
-/// What a command that ran asked, in order: the guard, `after_run`, then the guard settled.
-const RAN: [Call; 3] = [Call::Guard(Guarding::Make), Call::AfterRun, Call::Settle];
+/// What a command that ran asked, in order: the guard, the guard settled, then `after_run` (ANR-1455:
+/// the report `after_run` reads is what `settle` records).
+const RAN: [Call; 3] = [Call::Guard(Guarding::Make), Call::Settle, Call::AfterRun];
 
 const RENDERED: &str = "$ echo hi\nexit code 0\n--- output ---\nhi\n";
 const NOT_LISTED: &str = "--- the worktree now differs from HEAD in (git status; files the \
@@ -432,8 +433,8 @@ async fn a_refusal_before_the_guard_has_no_note_and_no_after_run() {
     assert!(progress(&sink).is_empty());
 }
 
-/// A failing `after_run` is the tool's error, and the guard is settled first, so a change to git the
-/// command made is undone all the same.
+/// A failing `after_run` is the tool's error, and the guard is already settled, so a change to git
+/// the command made is undone all the same.
 #[tokio::test]
 async fn a_failing_after_run_is_the_error_once_the_guard_is_settled() {
     let dir = tempfile::tempdir().unwrap();

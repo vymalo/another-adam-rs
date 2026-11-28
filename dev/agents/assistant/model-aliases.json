@@ -1,0 +1,9 @@
+{
+  "profiles": {
+    "mock-assistant": {
+      "reasoningEfforts": ["none", "low", "medium", "high"],
+      "reasoningWire": "reasoning_effort",
+      "maxOutputTokensLimit": 32768
+    }
+  }
+}

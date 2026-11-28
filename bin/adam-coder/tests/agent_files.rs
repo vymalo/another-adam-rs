@@ -551,7 +551,8 @@ async fn the_helpers_bounds_are_complete_and_admit_a_relayed_servers_tools() {
             .expect_err("an allow entry selecting nothing");
         assert_eq!(why.option(), Some("tools"), "{name}");
         assert!(
-            why.message().contains("matches none of its tools:"),
+            why.message()
+                .contains("matches none of the names this agent declares:"),
             "{name}: {why}"
         );
         assert!(

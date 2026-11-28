@@ -234,8 +234,15 @@ async fn a_run_fails_when_its_program_never_answers() {
         .tool(a)
         .hooks(HookSet::new().with(Arc::new(exec)))
         .build();
-    mock.push_tool_calls(vec![call("c1", "a", json!({}))])
-        .push_text("done");
+    // The same call on every try (ANR-1466): a transient hook failure fails the step and the runtime
+    // tries the transition again at a **fresh seq**, which asks the model again (ADR 0050:29).
+    // Scripting a bare text as the next answer let the model "surrender" on the first retry, so the
+    // run ended `Done` and never reached the failure this test is about.
+    // `RetryPolicy::new(2)` counts **every** try, the first included (`adam_runtime::retry`), so it is
+    // two tries: the first and one retry, and two scripted answers is exactly what it consumes.
+    for _ in 0..2 {
+        mock.push_tool_calls(vec![call("c1", "a", json!({}))]);
+    }
 
     let rt = Runtime::builder(store.clone())
         .agent(agent.clone())
