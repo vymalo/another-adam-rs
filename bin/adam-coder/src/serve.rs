@@ -148,7 +148,7 @@ async fn build_agent(
             .with_extra_mcp_file(file)
             .context("adding the extra MCP servers (ADAM_EXTRA_MCP_FILE)")?;
         for warning in &warnings {
-            tracing::warn!("{warning}");
+            tracing::warn!(warning = %warning, "a warning while adding the extra MCP servers");
         }
         tracing::info!(file = %file.display(), "extra MCP servers added to the agent's own");
         def = extended;

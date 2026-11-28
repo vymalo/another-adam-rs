@@ -810,7 +810,7 @@ async fn kill_group(_pid: Option<u32>) {}
 fn to_rpc_error(e: FsError) -> agent_client_protocol::Error {
     match e {
         FsError::Denied(msg) => {
-            tracing::warn!("{msg}");
+            tracing::warn!(problem = %msg, "a filesystem request was refused");
             agent_client_protocol::Error::new(-32602, msg)
         }
         FsError::NotFound(path) => agent_client_protocol::Error::resource_not_found(Some(path)),
