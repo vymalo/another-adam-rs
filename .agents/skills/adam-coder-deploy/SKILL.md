@@ -34,7 +34,7 @@ https://github.com/vymalo/another-adam-rs/blob/main/deploy/coder/README.md.
 
 1. **The image.** `docker/coder/Dockerfile` builds from the **repository root**
    (`docker buildx build -f docker/coder/Dockerfile .`): stage 1 compiles the seven binaries for
-   `x86_64-unknown-linux-musl` on a pinned `rust:1.94-trixie` (tag and digest, plus `musl-tools` and the
+   `x86_64-unknown-linux-musl` on a pinned `rust:1.98-trixie` (tag and digest, plus `musl-tools` and the
    target), statically linked with `mimalloc` as the global allocator, so they start in any x86-64 Linux
    image whatever its C library (ADR 0053 decision 11); stage 2 is the workspace image
    `ghcr.io/vymalo/another-agentic-images/workspace:${WORKSPACE_TAG}` (the `ARG WORKSPACE_TAG` is

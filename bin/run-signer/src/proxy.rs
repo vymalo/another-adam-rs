@@ -206,10 +206,11 @@ async fn handle(State(state): State<Arc<Shared>>, request: Request) -> Response 
     let keyring = match state.keyrings.keyring(run, &identity.person).await {
         Ok(keyring) => keyring,
         Err(refusal) => {
-            // The class, never the content: `Refusal::Issuer`'s cause is the factory's own opaque
-            // error and may hold anything, and no header value or statement is ever logged.
+            // The class and the chain: `Refusal::Issuer`'s cause is the factory's own error, which
+            // by the port's contract holds no secret. No header value and no statement is logged.
             tracing::warn!(
                 class = ?refusal.class(),
+                error = %adam_error::report(&refusal),
                 "the run's keyring was refused"
             );
             return answer(refusal.status(), refusal.detail());
@@ -228,8 +229,8 @@ async fn handle(State(state): State<Arc<Shared>>, request: Request) -> Response 
     let signature = match sign_with_retry(&*keyring, &call).await {
         Ok(signature) => signature,
         Err(error) => {
-            // `TurnKeyError` and the `RunKeyError` behind it hold no value, so the chain is logged;
-            // no header value and no statement ever is.
+            // The chain is logged: nothing ever puts a header value or the statement into these
+            // errors, so the report is safe to write.
             tracing::warn!(
                 class = ?error.class(),
                 error = %adam_error::report(&error),
@@ -248,7 +249,7 @@ async fn handle(State(state): State<Arc<Shared>>, request: Request) -> Response 
             outgoing = outgoing.header(name, value);
         }
     }
-    // Exactly the values that were validated, once each: the loop skipped both names.
+    // Exactly the values that were validated, once each: the loop skipped all three names.
     outgoing = outgoing
         .header(RUN_HEADER, run_text)
         .header(PROMPT_STATEMENT_HEADER, statement);
@@ -378,10 +379,16 @@ fn connection_named(headers: &HeaderMap) -> Vec<String> {
 fn relay(response: reqwest::Response) -> Response {
     let status = response.status();
     let headers = response.headers().clone();
+    let named_by_connection = connection_named(&headers);
     let stream = response.bytes_stream();
     let mut builder = Response::builder().status(status);
     for (name, value) in &headers {
-        if !hop_by_hop(name.as_str()) && name.as_str() != "content-length" {
+        if !hop_by_hop(name.as_str())
+            && !named_by_connection
+                .iter()
+                .any(|named| named == name.as_str())
+            && name.as_str() != "content-length"
+        {
             builder = builder.header(name, value);
         }
     }

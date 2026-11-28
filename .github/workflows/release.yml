@@ -197,7 +197,7 @@ jobs:
           set -eu
           docker pull "$IMAGE@$DIGEST"
           docker tag "$IMAGE@$DIGEST" coder:release
-      - name: The six binaries are static and start in a foreign image
+      - name: The seven binaries are static and start in a foreign image
         run: sh docker/coder/test/static-smoke.sh coder:release
       - name: Container smoke test
         env:
@@ -418,7 +418,7 @@ jobs:
           echo "assets=$assets" >> "$GITHUB_OUTPUT"
 
   # One native build per target; nothing is cross-compiled. The Linux targets are musl, so the binary is static
-  # and runs on any distribution (ADR 0053 decision 11, the coder image's six binaries are the same). The macOS
+  # and runs on any distribution (ADR 0053 decision 11, the coder image's seven binaries are the same). The macOS
   # targets are built on GitHub-hosted macOS runners because there is no way to link for Apple targets from
   # Linux without Apple's SDK; the Intel one runs natively on `macos-26-intel`, so its binary is started, not
   # just built. The arm64 Linux target is a native build on `ubuntu-24.04-arm`.

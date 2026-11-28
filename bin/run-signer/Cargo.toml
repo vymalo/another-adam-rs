@@ -28,7 +28,6 @@ adam-run-cert-broker.workspace = true
 # one that could differ, and `default-features = false` would be a configuration nothing exercises.
 adam-service.workspace = true
 axum.workspace = true
-base64.workspace = true
 mimalloc.workspace = true
 # `rustls` (aws-lc-rs) rather than the workspace's `rustls-no-provider`: the client this crate builds
 # needs an installed TLS provider to exist at all (`reqwest::Client::build` panics without one), and
@@ -45,6 +44,7 @@ uuid.workspace = true
 
 [dev-dependencies]
 async-trait.workspace = true
+base64.workspace = true
 bytes.workspace = true
 futures.workspace = true
 tempfile.workspace = true

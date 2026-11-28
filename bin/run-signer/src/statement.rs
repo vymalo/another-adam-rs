@@ -70,9 +70,10 @@ pub fn person_and_jti(statement: &str) -> Result<PromptIdentity, StatementError>
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum StatementError {
-    /// Not a compact JWS: not three segments joined by dots, an empty segment, a payload that is not
-    /// base64url, or one that is not a JSON object.
-    #[error("the prompt statement is not a compact JWS whose payload is a JSON object")]
+    /// Not a compact JWS: not three segments joined by dots, an empty header or signature, or a
+    /// segment that is not base64url. A payload that is not a JSON object is
+    /// [`NoPerson`](Self::NoPerson), because that is what `adam-model` reports for it.
+    #[error("the prompt statement is not a compact JWS (three base64url segments, at most 8 KiB)")]
     NotAStatement,
     /// The payload has no `sub`, or it is empty or not a string.
     #[error("the prompt statement names no person")]
@@ -93,7 +94,7 @@ impl StatementError {
     pub const fn detail(self) -> &'static str {
         match self {
             Self::NotAStatement => {
-                "the Prompt-Statement is not a compact JWS whose payload is a JSON object"
+                "the Prompt-Statement is not a compact JWS (three base64url segments, at most 8 KiB)"
             }
             Self::NoPerson => "the prompt statement names no person (sub)",
             Self::PersonTooLong => "the prompt statement's person is too long",

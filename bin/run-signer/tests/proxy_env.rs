@@ -44,9 +44,16 @@ async fn a_proxy_in_the_environment_is_not_used() {
         "ALL_PROXY",
         "http_proxy",
         "https_proxy",
+        "all_proxy",
     ] {
         // SAFETY: this integration test is its own process; nothing else reads the environment here.
         unsafe { std::env::set_var(name, "http://127.0.0.1:1") };
+    }
+    // A runner that exports `NO_PROXY=127.0.0.1` would bypass the proxy and make this test green
+    // with the fix reverted, so it is cleared too.
+    for name in ["NO_PROXY", "no_proxy"] {
+        // SAFETY: as above.
+        unsafe { std::env::remove_var(name) };
     }
 
     let upstream = MockServer::start().await;

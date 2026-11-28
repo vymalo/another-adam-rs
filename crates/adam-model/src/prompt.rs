@@ -202,7 +202,6 @@ pub struct NoPromptId;
 /// A prompt statement that names no person ([`PromptStatement::person`]): there is no statement (a
 /// device's envelope alone), or its payload has no non-empty string `sub`. It quotes nothing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
-#[non_exhaustive]
 #[error("the prompt statement names no person (the statement's `sub`)")]
 pub struct NoPerson;
 
