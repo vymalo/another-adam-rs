@@ -14,7 +14,7 @@ use adam_plugin::{
     Decision, EventHeader, EventKind, HookEvent, HookSet, HookedCall, HookedCompaction, HookedEnd,
     HookedMessage, HookedModelRequest, HookedText, MessageFile, ModelCallKind, Plugin,
 };
-use serde_json::{Value, json};
+use serde_json::json;
 
 /// The protocol's test program, as cargo built it for these tests.
 fn program() -> PathBuf {
@@ -32,14 +32,27 @@ fn only(point: DecidePoint) -> Points {
     }
 }
 
-/// How many requests the program logged: its `event` lines. The program logs every line it reads,
-/// so the hello and the shutdown are in the file too, and are not requests.
+/// How many **requests** the program logged: every line it read but the hello.
+///
+/// The program appends every line of its stdin to the log, the handshake included, so counting lines
+/// counted the hello as a request — one too many for every assertion below (ANR-1453). A line that is
+/// not JSON still counts: the program read it, and that is the point of those tests.
 fn requests(log: &std::path::Path) -> usize {
     std::fs::read_to_string(log)
         .unwrap_or_default()
         .lines()
-        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
-        .filter(|line| line.get("type").and_then(Value::as_str) == Some("event"))
+        .filter(|line| !line.trim().is_empty())
+        .filter(|line| {
+            serde_json::from_str::<serde_json::Value>(line)
+                .ok()
+                .and_then(|value| {
+                    value
+                        .get("type")
+                        .and_then(serde_json::Value::as_str)
+                        .map(|kind| kind != "hello")
+                })
+                .unwrap_or(true)
+        })
         .count()
 }
 

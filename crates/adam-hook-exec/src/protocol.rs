@@ -19,7 +19,8 @@ pub const PROTOCOL: &str = "adam-hooks/1";
 /// The version of [`PROTOCOL`], sent in the hello.
 pub const VERSION: u32 = 1;
 
-/// The longest line either side may write, in bytes. A longer line is a broken program.
+/// The longest line either side may write, in bytes, the terminator excluded. A longer line is a
+/// broken program.
 pub const LINE_MAX: usize = 256 * 1024;
 
 /// Whether an event asks the program to decide or only to look (ADR 0050, decision 15).
