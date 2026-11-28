@@ -185,7 +185,8 @@ impl McpServers {
                         Ok(command) => prompts.push(command),
                         Err(why) => tracing::warn!(
                             server = %name,
-                            "an MCP prompt is not served as a command: {why}"
+                            reason = %why,
+                            "an MCP prompt is not served as a command"
                         ),
                     }
                 }
@@ -254,7 +255,8 @@ impl McpServers {
             if out.len() + separator.len() + section.len() > MAX_INSTRUCTIONS_BYTES {
                 tracing::warn!(
                     server = %name,
-                    "the MCP servers' instructions are over {MAX_INSTRUCTIONS_BYTES} bytes together: \
+                    limit = MAX_INSTRUCTIONS_BYTES,
+                    "the MCP servers' instructions are over the limit together: \
                      this server's and the next ones' are left out"
                 );
                 break;

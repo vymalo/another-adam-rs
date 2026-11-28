@@ -1597,8 +1597,9 @@ fn lowered_by_file(
                     agent,
                     asked,
                     allowed,
-                    "`limits.{key}` is more than the deployment allows ({setting}): \
-                     the sessions run under {allowed}"
+                    key,
+                    setting,
+                    "a `limits` entry is more than the deployment allows; the sessions run under the allowed number"
                 );
             }
         }

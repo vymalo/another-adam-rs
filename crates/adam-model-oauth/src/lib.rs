@@ -150,8 +150,7 @@ impl SignInPrompt for LogPrompt {
             user_code = %code.user_code,
             verification_uri = %link,
             expires_in_secs = code.expires_in.as_secs(),
-            "sign in to use the model: open {link} and enter the code {}",
-            code.user_code
+            "sign in to use the model: open the verification URI and enter the code"
         );
     }
 
@@ -309,7 +308,8 @@ impl ModelCredentials for DeviceGrant {
                         Err(Renewal::Unreachable(error)) => {
                             if now < *valid_until {
                                 tracing::warn!(
-                                    "renewing the model's token failed, the current one is still valid: {error}"
+                                    problem = %error,
+                                    "renewing the model's token failed, the current one is still valid"
                                 );
                                 return Ok(CredentialHeaders::bearer(access));
                             }
