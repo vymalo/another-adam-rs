@@ -629,6 +629,7 @@ impl Loader<'_> {
                 url,
                 auth,
                 files,
+                session: frontmatter.session,
                 note: body,
                 path: rel,
             })));

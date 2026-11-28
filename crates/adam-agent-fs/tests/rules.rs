@@ -275,6 +275,42 @@ fn cases() -> Vec<Case> {
             Warning,
             "`limits.max_minutes` is for a subagent",
         ),
+        (
+            "session on a root agent",
+            vec![(
+                "agent/instructions.md",
+                "---\nname: root\nsession: { mode: sealed }\n---\nHi.\n",
+            )],
+            Warning,
+            "`session` is for a subagent",
+        ),
+        with_root(
+            "session mode not one of the three",
+            vec![(
+                "agent/subagents/x.md",
+                "---\ndescription: d\nsession: { mode: shared }\n---\nBody.\n",
+            )],
+            Error,
+            "unknown variant `shared`",
+        ),
+        with_root(
+            "session with an unknown key",
+            vec![(
+                "agent/subagents/x.md",
+                "---\ndescription: d\nsession: { mode: sealed, keep_open: true }\n---\nBody.\n",
+            )],
+            Error,
+            "unknown field `keep_open`",
+        ),
+        with_root(
+            "session wait not a boolean",
+            vec![(
+                "agent/subagents/x.md",
+                "---\ndescription: d\nsession: { wait: soon }\n---\nBody.\n",
+            )],
+            Error,
+            "invalid frontmatter",
+        ),
         with_root(
             "max_minutes is at most a day",
             vec![(
@@ -1929,6 +1965,77 @@ fn files_on_a_remote_subagent_is_read_and_defaults_to_false() {
         })
         .collect();
     assert_eq!(files, [("billing", false), ("browser", true)]);
+}
+
+#[test]
+fn session_on_a_subagent_is_read_local_and_remote_and_absent_by_default() {
+    use adam_agent_fs::{SessionDef, SessionModeDef};
+
+    let dir = write(&[
+        ("agent/instructions.md", ROOT),
+        (
+            "agent/subagents/reviewer.md",
+            "---\ndescription: Reviews.\nsession:\n  mode: sealed\n  wait: true\n---\nYou review.\n",
+        ),
+        (
+            "agent/subagents/browser.md",
+            "---\ndescription: Reads pages.\na2a: https://browser.example.com/card\n\
+             session: { mode: one_shot }\n---\n",
+        ),
+        ("agent/subagents/plain.md", SUB),
+    ]);
+    let report = load(dir.path());
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let sessions: Vec<(&str, Option<SessionDef>)> = report.package.agents[0]
+        .subagents
+        .iter()
+        .map(|s| match s {
+            Subagent::Remote(r) => (r.name.as_str(), r.session),
+            Subagent::Local(l) => (l.name.as_str(), l.frontmatter.session),
+        })
+        .collect();
+    assert_eq!(
+        sessions,
+        [
+            (
+                "browser",
+                Some(SessionDef {
+                    mode: Some(SessionModeDef::OneShot),
+                    wait: None,
+                })
+            ),
+            ("plain", None),
+            (
+                "reviewer",
+                Some(SessionDef {
+                    mode: Some(SessionModeDef::Sealed),
+                    wait: Some(true),
+                })
+            ),
+        ]
+    );
+}
+
+#[test]
+fn a_bad_session_block_stops_the_subagent_with_its_line() {
+    let dir = write(&[
+        ("agent/instructions.md", ROOT),
+        (
+            "agent/subagents/reviewer.md",
+            "---\ndescription: Reviews.\nsession:\n  mode: wide\n---\nYou review.\n",
+        ),
+    ]);
+    let report = load(dir.path());
+    assert!(
+        !report.is_ok(),
+        "a mode that is not one of the three stops the folder"
+    );
+    let error = report.errors().next().expect("one error");
+    assert_eq!(error.line, Some(4), "{error}");
+    let text = error.to_string();
+    for word in ["unknown variant `wide`", "one_shot", "sealed", "open"] {
+        assert!(text.contains(word), "{word}: {text}");
+    }
 }
 
 #[test]

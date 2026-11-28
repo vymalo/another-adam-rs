@@ -357,6 +357,64 @@ pub struct Limits {
     pub extra: BTreeMap<String, Value>,
 }
 
+/// Who may write to a session of a subagent after its first round (`session.mode`, [ADR 0087]
+/// decision 2): the file's word for `adam_runtime::SessionMode`, which this crate does not depend
+/// on. Narrowest first, as the runtime's: `one_shot`, `sealed`, `open`.
+///
+/// The enum is closed on purpose (Rule 3): `adam-assembly` maps it onto the runtime's with a match
+/// that has no wildcard, so a mode added on either side fails to compile there.
+///
+/// [ADR 0087]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0087-every-child-is-a-session-and-the-one-shot-subagent-tool-goes.md
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionModeDef {
+    /// The session closes when its first round has ended.
+    OneShot,
+    /// The session stays open, and only the agent that started it sends it more.
+    Sealed,
+    /// The session stays open, and the agent and the person send it more.
+    Open,
+}
+
+impl SessionModeDef {
+    /// The word as the file writes it: `one_shot`, `sealed` or `open`.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::OneShot => "one_shot",
+            Self::Sealed => "sealed",
+            Self::Open => "open",
+        }
+    }
+}
+
+impl fmt::Display for SessionModeDef {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// `session:` in a subagent's file ([ADR 0087] decision 4): the defaults of a `subagent_start` that
+/// does not say, and the ceiling of one that does. `mode` is both the mode a start gets when it
+/// names none and the widest it may ask (a start only narrows it: `open` is wider than `sealed`,
+/// which is wider than `one_shot`); `wait` is a default only. Both are optional; a file without the
+/// block starts `one_shot`, up to `open`, and does not wait.
+///
+/// **Unknown keys are refused** (`deny_unknown_fields`): a misspelt `mode` would leave a subagent
+/// wider than its file says. A subagent's key: on the root agent it is ignored with a warning.
+///
+/// [ADR 0087]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0087-every-child-is-a-session-and-the-one-shot-subagent-tool-goes.md
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SessionDef {
+    /// The mode of a start that names none, and the widest one a start may name.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mode: Option<SessionModeDef>,
+    /// Whether a start that does not say waits for the first report.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wait: Option<bool>,
+}
+
 /// One skill advertised on the A2A agent card. **Not** an Agent Skill: the two never map
 /// implicitly.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -568,6 +626,11 @@ pub struct AgentFrontmatter {
     /// calling run instead of being described (an adam extension; remote subagents only).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub files: Option<bool>,
+    /// The defaults and the ceiling of the sessions a parent starts on this subagent
+    /// ([`SessionDef`], ADR 0087 decision 4); local and remote subagents alike. Left out of the
+    /// JSON (and so of the digest) when absent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session: Option<SessionDef>,
     /// Free-form map, passed through (an Agent Skills and Copilot convention). Scalars are
     /// read as text; a list or a map is kept as its JSON text.
     #[serde(
@@ -716,6 +779,50 @@ mod tests {
             ToolsLoading::Searchable,
         ] {
             assert_eq!(round_trip(&loading), loading);
+        }
+        for mode in [
+            SessionModeDef::OneShot,
+            SessionModeDef::Sealed,
+            SessionModeDef::Open,
+        ] {
+            assert_eq!(round_trip(&mode), mode);
+            assert_eq!(serde_json::to_value(mode).unwrap(), mode.as_str());
+        }
+    }
+
+    #[test]
+    fn a_session_block_reads_its_two_keys_and_refuses_any_other() {
+        let front: AgentFrontmatter = serde_json::from_value(serde_json::json!({
+            "session": { "mode": "sealed", "wait": true }
+        }))
+        .unwrap();
+        let session = front.session.unwrap();
+        assert_eq!(
+            (session.mode, session.wait),
+            (Some(SessionModeDef::Sealed), Some(true))
+        );
+        assert_eq!(round_trip(&front), front);
+        // An empty block is a block: no default, and nothing written but the key.
+        let empty: AgentFrontmatter =
+            serde_json::from_value(serde_json::json!({ "session": {} })).unwrap();
+        assert_eq!(empty.session, Some(SessionDef::default()));
+        assert_eq!(serde_json::to_string(&empty).unwrap(), r#"{"session":{}}"#);
+        for (bad, needle) in [
+            (
+                serde_json::json!({ "mode": "wide" }),
+                "unknown variant `wide`",
+            ),
+            (
+                serde_json::json!({ "keep_open": true }),
+                "unknown field `keep_open`",
+            ),
+            (serde_json::json!({ "wait": "yes" }), "invalid type"),
+        ] {
+            let error =
+                serde_json::from_value::<AgentFrontmatter>(serde_json::json!({ "session": bad }))
+                    .unwrap_err()
+                    .to_string();
+            assert!(error.contains(needle), "{error}");
         }
     }
 

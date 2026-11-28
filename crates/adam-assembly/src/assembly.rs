@@ -806,6 +806,7 @@ impl BoundDef {
                 within: target.within,
                 remote: target.remote,
                 bounds: self.bounds_of(target),
+                session: target.session,
             });
         }
         Some(SessionTools::new(agents).with_limits(self.session_limits))
@@ -912,6 +913,9 @@ impl BoundDef {
         }
         if !node.session_agents.is_empty() {
             builder = builder.session_agents(node.session_agents.clone());
+        }
+        if let Some(sessions) = sessions {
+            builder = builder.session_default_modes(sessions.default_modes());
         }
         for apply in &self.state {
             builder = apply(builder);

@@ -1201,6 +1201,7 @@ mod tests {
             url: "https://billing.example.com/card".into(),
             auth: Some(RemoteAuth::Bearer { env: "T".into() }),
             files: false,
+            session: None,
             note: String::new(),
             path: "agent/subagents/billing.md".into(),
         };
@@ -1271,6 +1272,7 @@ mod tests {
             url: "https://billing.example.com/card".into(),
             auth: None,
             files: false,
+            session: None,
             note: String::new(),
             path: "agent/subagents/billing.md".into(),
         };

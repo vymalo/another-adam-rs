@@ -66,6 +66,10 @@ before you rely on a detail here.
 3. **Body**: the system prompt. Optional `skills/<name>/SKILL.md` (Agent Skills format, loaded on
    demand by `load_skill` and `read_skill_file`, which take a plain string name and page; a folder with no `skills:` has all of them, `skills: []` none) and `subagents/` (each one tool of the parent, a
    child run with only the tools it lists and never `ask_user`; registered as `<name>/<subagent>`).
+   A subagent file may set `session:` (`mode`: `one_shot`, `sealed` or `open`; `wait`: `true` or `false`): what a
+   `subagent_start` that names none gets, and `mode` is also the widest a call may ask (a call only narrows it; asking
+   wider is an error result naming both). Another key or word is exit 78; on the root it is a warning and ignored
+   (ADR 0087 slice C3; `docs/reference/agent-files.md`).
    A subagent file with `a2a: <agent-card URL>` is a **remote subagent** (another A2A agent): render the URL into
    the file, and give its token through `auth: bearer:VAR` (a variable of the process, from a Secret; unset is exit
    78). Plain `http` to a service of the same cluster needs `A2A_ALLOW_INSECURE_REMOTES=true` on `adam-agent`, and

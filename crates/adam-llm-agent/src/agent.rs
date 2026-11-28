@@ -1453,6 +1453,7 @@ pub struct LlmAgentBuilder {
     stream_text: bool,
     step_io: StepIo,
     session_agents: Vec<String>,
+    session_default_modes: Vec<(String, adam_runtime::SessionMode)>,
     session_reports: bool,
     max_parallel: usize,
     tool_retry: BTreeMap<String, RetryPolicy>,
@@ -1617,6 +1618,23 @@ impl LlmAgentBuilder {
     #[must_use]
     pub fn session_agents(mut self, agents: impl IntoIterator<Item = impl Into<String>>) -> Self {
         self.session_agents = agents.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// The mode `subagent_start` gives each subagent when a call names none ([ADR 0087] slice C3:
+    /// the `session.mode` of its file), by the name the model writes in `agent`:
+    /// [`SessionTools::default_modes`](crate::SessionTools::default_modes). Only the
+    /// `session.started` event of a start that waits reads it, which is said when the call parks,
+    /// from the call's arguments; a subagent not listed here is `one_shot` there. The default is
+    /// none.
+    ///
+    /// [ADR 0087]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0087-every-child-is-a-session-and-the-one-shot-subagent-tool-goes.md
+    #[must_use]
+    pub fn session_default_modes(
+        mut self,
+        modes: impl IntoIterator<Item = (String, adam_runtime::SessionMode)>,
+    ) -> Self {
+        self.session_default_modes = modes.into_iter().collect();
         self
     }
 
@@ -1924,6 +1942,7 @@ impl LlmAgentBuilder {
             stream_text: self.stream_text,
             step_io: self.step_io,
             session_agents: self.session_agents.into(),
+            session_default_modes: self.session_default_modes.into(),
             session_reports: self.session_reports,
             max_parallel: self.max_parallel,
             tool_retry: self.tool_retry,
@@ -2144,6 +2163,8 @@ pub struct LlmAgent {
     step_io: StepIo,
     /// The registered names of the subagents whose sessions the turn-end wait looks at.
     session_agents: Arc<[String]>,
+    /// The mode a `subagent_start` naming none gives each subagent, by the model's name for it.
+    session_default_modes: Arc<[(String, adam_runtime::SessionMode)]>,
     /// Whether a report of a session that ended reaches the model without a read of its own.
     session_reports: bool,
     /// The most tool calls of a turn that run at the same time.
@@ -2291,6 +2312,7 @@ impl LlmAgent {
             stream_text: true,
             step_io: StepIo::default(),
             session_agents: Vec::new(),
+            session_default_modes: Vec::new(),
             session_reports: true,
             max_parallel: DEFAULT_MAX_PARALLEL,
             tool_retry: BTreeMap::new(),
@@ -6435,11 +6457,21 @@ impl LlmAgent {
         let mut event = adam_plugin::HookEvent::new(kind, header)
             .text("call_id", &call.id, &scrub)
             .text("session", &session.to_string(), &scrub);
-        if let Some(agent) = call.arguments.get("agent").and_then(Value::as_str) {
+        let agent = call.arguments.get("agent").and_then(Value::as_str);
+        if let Some(agent) = agent {
             event = event.text("agent", agent, &scrub);
         }
-        // The call parked, so it accepted its mode: the default is never reached here.
-        let mode = crate::sessions::mode_arg(&call.arguments).unwrap_or_default();
+        // The call parked, so it was admitted: the mode it names is the session's, and a call
+        // that names none has its subagent's default (ADR 0087 slice C3).
+        let mode = match crate::sessions::mode_arg(&call.arguments) {
+            Ok(Some(asked)) => asked.mode,
+            Ok(None) | Err(_) => self
+                .session_default_modes
+                .iter()
+                .find(|(name, _)| Some(name.as_str()) == agent)
+                .map(|(_, mode)| *mode)
+                .unwrap_or_default(),
+        };
         event = with_mode(event, mode).plain("wait", true);
         self.flush_events(vec![event]);
     }

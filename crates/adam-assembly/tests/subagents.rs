@@ -1151,6 +1151,113 @@ fn the_root_may_ask_and_a_subagent_that_does_not_is_fine() {
     assert_eq!(assembly.info()[1].tools, ["fetch"]);
 }
 
+// --- `session:` in a subagent's file (ADR 0087 slice C3) -----------------------------------
+
+#[test]
+fn the_definition_carries_each_subagents_session_block() {
+    use adam_llm_agent::SessionDefaults;
+    use adam_runtime::SessionMode;
+
+    let root = uniq("root");
+    let mut files = with_helper(&root, "", "session:\n  mode: sealed\n  wait: true");
+    files.push((
+        "agent/subagents/plain.md".into(),
+        instructions("description: Plain.", "You do it."),
+    ));
+    files.push((
+        "agent/subagents/far.md".into(),
+        instructions(
+            "description: Far away.\na2a: https://far.example.com/card\nsession: { mode: one_shot }",
+            "",
+        ),
+    ));
+    let defaults = def_of(&files).session_defaults();
+    assert_eq!(
+        defaults,
+        [
+            (
+                "far".to_owned(),
+                SessionDefaults {
+                    mode: Some(SessionMode::OneShot),
+                    wait: None,
+                }
+            ),
+            (
+                "helper".to_owned(),
+                SessionDefaults {
+                    mode: Some(SessionMode::Sealed),
+                    wait: Some(true),
+                }
+            ),
+            ("plain".to_owned(), SessionDefaults::default()),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn a_start_gets_the_filed_mode_says_it_in_the_roster_and_may_not_widen_it() {
+    let root = uniq("root");
+    let run = RunId::new();
+    let session = child_run_id(run, "s2");
+    let start = |id: &str, extra: Value| {
+        let mut args = json!({"agent": "helper", "description": "work", "prompt": "do it"});
+        args.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        call(id, "subagent_start", args)
+    };
+    let model = Arc::new(MockModel::new());
+    model
+        .push_tool_calls(vec![start("s1", json!({"mode": "open"}))])
+        .push_tool_calls(vec![start("s2", json!({"wait": true}))])
+        .push_text("helped")
+        .push_text("done");
+    let files = with_helper(&root, "tools: []", "session: { mode: sealed }");
+    let assembly = assemble(&files, ToolSet::new(), &model);
+    let store: DynStore = Arc::new(MemoryStore::new());
+    let rt = runtime_on(&assembly, store);
+    let worker = spawn_worker(&rt);
+    rt.start_with_id(run, &root, user_message("go"), None)
+        .await
+        .unwrap();
+    let view = wait_done(&rt, run).await;
+    worker.stop().await;
+    assert_eq!(view.output.as_ref().unwrap()["text"], "done");
+
+    let requests = model.requests();
+    let spec = requests[0]
+        .tools
+        .iter()
+        .find(|t| t.name == "subagent_start")
+        .unwrap();
+    assert!(
+        spec.description
+            .contains("\n- helper: Helps. (mode sealed by default, at most sealed)"),
+        "{}",
+        spec.description
+    );
+    let (refused, is_error) = last_tool_result(&requests[1], "s1");
+    assert!(is_error, "{refused}");
+    assert!(
+        refused.starts_with("`mode` is open; at most sealed for helper"),
+        "{refused}"
+    );
+    let (report, is_error) = last_tool_result(&requests[3], "s2");
+    assert!(!is_error, "{report}");
+    assert!(report.contains("helped"), "{report}");
+    let read = rt
+        .session_view(&sessions_of(run), session)
+        .await
+        .unwrap()
+        .expect("the session");
+    assert_eq!(
+        read.header.map(|h| h.mode),
+        Some(adam_runtime::SessionMode::Sealed),
+        "the filed mode, which the call did not name"
+    );
+    assert_eq!(read.state, SessionState::Idle, "sealed stays open");
+}
+
 // --- the tool itself -----------------------------------------------------------------------
 
 #[test]

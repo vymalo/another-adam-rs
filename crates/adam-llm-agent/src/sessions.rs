@@ -107,6 +107,123 @@ pub struct SessionAgent {
     ///
     /// [ADR 0054]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md
     pub bounds: SessionBounds,
+    /// What the subagent's file says of its sessions (`session:`, [ADR 0087] decision 4): the
+    /// `mode` and `wait` of a start that names none, and the widest `mode` a start may name.
+    /// [`SessionDefaults::default`] is a file without the block: `one_shot` up to `open`, no wait.
+    ///
+    /// [ADR 0087]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0087-every-child-is-a-session-and-the-one-shot-subagent-tool-goes.md
+    pub session: SessionDefaults,
+}
+
+/// A subagent file's `session:` block ([ADR 0087] decision 4), as `subagent_start` applies it.
+///
+/// * `mode` is the **default and the ceiling** at once: a start that names no mode gets it, and a
+///   start may name it or a narrower one (`one_shot` is narrower than `sealed`, which is narrower
+///   than `open`, as [`SessionMode`] orders them), never a wider one: that is refused naming both,
+///   as ADR 0054 refuses an option above its bound. `None` is a file that says nothing: a start
+///   gets `one_shot` and may ask up to `open`.
+/// * `wait` is a default only: a start that says `wait` is never refused for it.
+///
+/// [ADR 0087]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0087-every-child-is-a-session-and-the-one-shot-subagent-tool-goes.md
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SessionDefaults {
+    /// The file's `session.mode`.
+    pub mode: Option<SessionMode>,
+    /// The file's `session.wait`.
+    pub wait: Option<bool>,
+}
+
+impl SessionDefaults {
+    /// The widest mode a start may ask: the file's `mode`, else [`SessionMode::Open`].
+    #[must_use]
+    pub fn ceiling(self) -> SessionMode {
+        self.mode.unwrap_or(SessionMode::Open)
+    }
+
+    /// The mode of a start that names none: the file's `mode`, else [`SessionMode::OneShot`].
+    #[must_use]
+    pub fn default_mode(self) -> SessionMode {
+        self.mode.unwrap_or_default()
+    }
+
+    /// Whether a start that does not say waits for the first report: the file's `wait`, else
+    /// `false`.
+    #[must_use]
+    pub fn default_wait(self) -> bool {
+        self.wait.unwrap_or(false)
+    }
+
+    /// What the roster of `subagent_start` says of these defaults, when the file sets one that is
+    /// not the tool's own: `mode sealed by default, at most sealed`, `mode open by default`,
+    /// `waits by default`. `None` when the file says nothing the tool's description does not.
+    fn roster_note(self) -> Option<String> {
+        let mode = self.mode.map(|mode| match mode {
+            SessionMode::Open => "mode open by default".to_owned(),
+            SessionMode::OneShot | SessionMode::Sealed => {
+                format!("mode {mode} by default, at most {mode}")
+            }
+        });
+        let wait = (self.wait == Some(true)).then(|| "waits by default".to_owned());
+        let words: Vec<String> = mode.into_iter().chain(wait).collect();
+        (!words.is_empty()).then(|| words.join("; "))
+    }
+
+    /// The mode a start of `agent` runs in: `asked`, held to the [`ceiling`](Self::ceiling), or the
+    /// [`default_mode`](Self::default_mode) when the start names none.
+    ///
+    /// # Errors
+    ///
+    /// The sentence that names the mode asked, the ceiling, the subagent and the modes it takes
+    /// (`` `mode` is open; at most sealed for reviewer, as its file's `session.mode` says: one of
+    /// one_shot, sealed ``), when `asked` is wider than the ceiling.
+    pub(crate) fn admit(
+        self,
+        agent: &str,
+        asked: Option<AskedMode>,
+    ) -> Result<SessionMode, String> {
+        let Some(asked) = asked else {
+            return Ok(self.default_mode());
+        };
+        let ceiling = self.ceiling();
+        if asked.mode <= ceiling {
+            return Ok(asked.mode);
+        }
+        let allowed = SessionMode::ALL
+            .into_iter()
+            .filter(|mode| *mode <= ceiling)
+            .map(SessionMode::as_str)
+            .collect::<Vec<_>>()
+            .join(", ");
+        Err(format!(
+            "{asked}; at most {ceiling} for {agent}, as its file's `session.mode` says: one of \
+             {allowed}"
+        ))
+    }
+}
+
+/// The mode a `subagent_start` call names, and whether it named it as the `keep_open` of before,
+/// so that a refusal repeats what the call wrote.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct AskedMode {
+    /// The mode asked.
+    pub(crate) mode: SessionMode,
+    /// `true` when the call wrote `keep_open` and no `mode` (read for one release).
+    pub(crate) by_keep_open: bool,
+}
+
+impl std::fmt::Display for AskedMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.by_keep_open {
+            write!(
+                f,
+                "`keep_open` {} is mode {}",
+                self.mode.keeps_open(),
+                self.mode
+            )
+        } else {
+            write!(f, "`mode` is {}", self.mode)
+        }
+    }
 }
 
 /// The five session tools, for the subagents of one agent.
@@ -210,6 +327,20 @@ impl SessionTools {
             .agents
             .iter()
             .map(|agent| (agent.name.clone(), agent.bounds.clone()))
+            .collect()
+    }
+
+    /// The mode a `subagent_start` naming none gives each subagent ([`SessionDefaults::default_mode`],
+    /// [ADR 0087] slice C3), by the name the model writes in `agent`, in the roster's order: what
+    /// [`LlmAgentBuilder::session_default_modes`](crate::LlmAgentBuilder::session_default_modes)
+    /// takes, so the `session.started` of a start that waits names the mode it started in.
+    ///
+    /// [ADR 0087]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0087-every-child-is-a-session-and-the-one-shot-subagent-tool-goes.md
+    pub fn default_modes(&self) -> Vec<(String, SessionMode)> {
+        self.roster
+            .agents
+            .iter()
+            .map(|agent| (agent.name.clone(), agent.session.default_mode()))
             .collect()
     }
 }
@@ -330,11 +461,11 @@ fn bool_arg(args: &Value, key: &str, default: bool) -> Result<bool, String> {
 
 /// The [`SessionMode`] a `subagent_start` call asks for ([ADR 0087] slice C2): its `mode`, else
 /// the `keep_open` of before (read for one release: `true` is `open`, `false` is `one_shot`), else
-/// `one_shot`. Both given and disagreeing is the sentence that names both, as is a mode that is
-/// none of the three.
+/// `None`, which the subagent's [`SessionDefaults`] fill (slice C3). Both given and disagreeing is
+/// the sentence that names both, as is a mode that is none of the three.
 ///
 /// [ADR 0087]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0087-every-child-is-a-session-and-the-one-shot-subagent-tool-goes.md
-pub(crate) fn mode_arg(args: &Value) -> Result<SessionMode, String> {
+pub(crate) fn mode_arg(args: &Value) -> Result<Option<AskedMode>, String> {
     let asked = match args.get("mode") {
         None | Some(Value::Null) => None,
         Some(Value::String(word)) => Some(SessionMode::parse(word).ok_or_else(|| {
@@ -357,9 +488,14 @@ pub(crate) fn mode_arg(args: &Value) -> Result<SessionMode, String> {
              give `mode` alone",
             SessionMode::of_keep_open(keep)
         )),
-        (asked, kept) => Ok(asked
-            .or(kept.map(SessionMode::of_keep_open))
-            .unwrap_or_default()),
+        (Some(mode), _) => Ok(Some(AskedMode {
+            mode,
+            by_keep_open: false,
+        })),
+        (None, kept) => Ok(kept.map(|keep| AskedMode {
+            mode: SessionMode::of_keep_open(keep),
+            by_keep_open: true,
+        })),
     }
 }
 
@@ -726,6 +862,13 @@ impl Tool for Start {
                 description.push_str(": ");
                 description.push_str(&text);
             }
+            // Only a file that sets `session:` adds words, so every other roster line, and the
+            // prompt's stable prefix with it, is as it was before the block existed.
+            if let Some(note) = agent.session.roster_note() {
+                description.push_str(" (");
+                description.push_str(&note);
+                description.push(')');
+            }
         }
         ToolSpec {
             name: SUBAGENT_START.to_owned(),
@@ -841,11 +984,13 @@ impl Tool for Start {
                 prompt.chars().count()
             ));
         }
-        let mode = match mode_arg(&args) {
+        // The subagent's file gives the defaults and the ceiling of `mode` (ADR 0087 decision 4):
+        // a start may narrow it, never widen it, and nothing starts when it asks wider.
+        let mode = match mode_arg(&args).and_then(|asked| agent.session.admit(&agent.name, asked)) {
             Ok(mode) => mode,
             Err(why) => return refuse(why),
         };
-        let wait = match bool_arg(&args, "wait", false) {
+        let wait = match bool_arg(&args, "wait", agent.session.default_wait()) {
             Ok(wait) => wait,
             Err(why) => return refuse(why),
         };
@@ -1577,6 +1722,72 @@ impl Tool for List {
 mod tests {
     use super::*;
     use adam_runtime::{ReportRound, RoundOutcome};
+
+    /// ADR 0087 slice C3: a filed mode is the default of a start that names none and the widest
+    /// one a start may name; no file is `one_shot` up to `open`.
+    #[test]
+    fn a_start_may_narrow_the_filed_mode_and_never_widen_it() {
+        let filed = [
+            None,
+            Some(SessionMode::OneShot),
+            Some(SessionMode::Sealed),
+            Some(SessionMode::Open),
+        ];
+        for mode in filed {
+            let defaults = SessionDefaults { mode, wait: None };
+            assert_eq!(
+                defaults.admit("helper", None),
+                Ok(mode.unwrap_or(SessionMode::OneShot)),
+                "{mode:?}"
+            );
+            for asked in SessionMode::ALL {
+                for by_keep_open in [false, true] {
+                    let got = defaults.admit(
+                        "helper",
+                        Some(AskedMode {
+                            mode: asked,
+                            by_keep_open,
+                        }),
+                    );
+                    if asked <= mode.unwrap_or(SessionMode::Open) {
+                        assert_eq!(got, Ok(asked), "{mode:?} {asked}");
+                    } else {
+                        let why = got.unwrap_err();
+                        assert!(
+                            why.contains(&format!("at most {} for helper", defaults.ceiling())),
+                            "{why}"
+                        );
+                    }
+                }
+            }
+        }
+        let one_shot = SessionDefaults {
+            mode: Some(SessionMode::OneShot),
+            wait: None,
+        };
+        assert_eq!(
+            one_shot.admit(
+                "helper",
+                Some(AskedMode {
+                    mode: SessionMode::Sealed,
+                    by_keep_open: false,
+                }),
+            ),
+            Err(
+                "`mode` is sealed; at most one_shot for helper, as its file's `session.mode` \
+                 says: one of one_shot"
+                    .to_owned()
+            )
+        );
+        assert!(!SessionDefaults::default().default_wait());
+        assert!(
+            SessionDefaults {
+                mode: None,
+                wait: Some(true),
+            }
+            .default_wait()
+        );
+    }
 
     fn ended(me: RunId, by: Option<RunId>) -> SessionSummary {
         let latest = RunId::new();

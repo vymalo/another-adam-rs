@@ -250,6 +250,7 @@ impl Rig {
                 within: None,
                 remote: false,
                 bounds: SessionBounds::default(),
+                session: adam_llm_agent::SessionDefaults::default(),
             },
             // A helper the model may start but the card does not list.
             SessionAgent {
@@ -259,6 +260,7 @@ impl Rig {
                 within: None,
                 remote: false,
                 bounds: SessionBounds::default(),
+                session: adam_llm_agent::SessionDefaults::default(),
             },
         ]);
         let mut parent_agent = LlmAgent::builder(&parent, parent_model, "m")

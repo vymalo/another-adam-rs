@@ -151,6 +151,13 @@ pub(crate) fn parse_agent_file(
                 "`a2a` and `auth` make a remote subagent; they cannot be used on an agent",
             );
         }
+        if fm.session.is_some() {
+            sink.warn(
+                key_line(&split, "session"),
+                "`session` is for a subagent (the mode and wait of the sessions its parent starts); \
+                 it is ignored on this agent",
+            );
+        }
     } else {
         if fm.card.is_some() {
             sink.warn(

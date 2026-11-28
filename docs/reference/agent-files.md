@@ -123,6 +123,7 @@ limits:                        # LlmAgent Limits; Claude's `maxTurns` is read as
   max_working_sessions: 2      # root only: most rounds working at once, 1 to 32 and at most max_open_sessions; lowers SESSION_MAX_WORKING
   max_inline_upload_bytes: 10485760 # root only: the largest file sent inline (`uploads/v1`; a larger one asks for a slot; the card carries no params), 1 to 268435456 (256 MiB); wins over UPLOADS_INLINE_MAX_BYTES (a subagent's value is ignored, with a warning)
   max_session_rounds: 10       # root only: most rounds one session may have, 2 to 200; lowers SESSION_MAX_ROUNDS (a subagent's value is ignored, with a warning)
+session: { mode: sealed, wait: true }   # subagent only: what a session its parent starts defaults to, and the widest mode it may be (below; ADR 0087)
 retry:                         # a retry policy per tool (below); this agent's own, none inherits
 plugins: [audit]                # compiled plugins the deployment registered; subagents inherit them (ADR 0050); an unknown name exits 78
   web_search: { attempts: 5, backoff: 2s, max_backoff: 5m, on: [rate-limited] }
@@ -203,6 +204,28 @@ You are the coder agent. Stop after at most {{max_check_cycles}} failed check cy
   declared server that gave no tools (an `optional` one that is down) is skipped with a warning. Ignored, with a
   warning, on a remote subagent. A policy only applies to failures the tool reports as retryable: an MCP tool's
   call that fails is an error result for the model, so its `retry:` covers little more than a refused bearer.
+* **`session:` is a subagent's say in its sessions** ([ADR 0087](../decisions/0087-every-child-is-a-session-and-the-one-shot-subagent-tool-goes.md),
+  slice C3). `mode` (`one_shot`, `sealed` or `open`) is what a `subagent_start` that names no mode gets, **and the widest
+  one a call may ask**: a call only narrows it (`open` is wider than `sealed`, which is wider than `one_shot`). `wait`
+  (`true` or `false`) is a default only. Without the block a session starts `one_shot`, may be asked up to `open`, and
+  does not wait. Local and remote subagents take it alike; only the root has session tools, so on a subagent's own
+  subagent it has no effect. Another key, or another word, stops the load (exit 78); on a
+  root agent the block is ignored with a warning.
+
+  ```markdown
+  ---
+  description: Reviews a change and says what to fix.
+  session:
+    mode: sealed     # starts sealed; a call may ask one_shot, never open
+    wait: true       # a call that does not say waits for the first report
+  ---
+  ```
+
+  A call asking wider is an error result that names both and starts nothing:
+  `` `mode` is open; at most sealed for reviewer, as its file's `session.mode` says: one of one_shot, sealed ``. The
+  subagent's line in `subagent_start`'s description says what the file sets (`(mode sealed by default, at most sealed;
+  waits by default)`), and a subagent without the block keeps its line as it was. A person's own session through
+  `child-sessions/v1` is theirs and is not held to it.
 * **A subagent inherits nothing** from its parent (eve's isolation boundary), and omitting `tools:`
   gives it **no tools** (decision D3). Claude Code inherits everything; adam does not.
 * **A copied file parses unchanged, but its `tools` must name adam tools.** A Claude Code file listing
@@ -217,6 +240,7 @@ description: Handles billing questions for a customer account.
 a2a: https://billing.example.com/.well-known/agent-card.json
 auth: bearer:BILLING_AGENT_TOKEN     # names an environment variable, resolved at startup, fail closed
 files: true                          # optional: the file parts of its answer are shared, not described
+session: { mode: one_shot }          # optional: as on a local subagent (above)
 ---
 ```
 
@@ -444,7 +468,8 @@ sequenceDiagram
   is a string. Unknown keys are read into `serde_json::Value` and become warnings.
 * **Agent files.** One schema, `AgentFrontmatter`, for the root agent, a directory subagent and a flat
   subagent file: `name`, `description`, `tools`, `model`, `skills`, `preload_skills`, `limits`, `vars`,
-  `card` (root only), `a2a` and `auth` (remote subagent), `metadata`. A subagent needs a `description`. The
+  `card` (root only), `a2a` and `auth` (remote subagent), `session` (subagent only; an unknown key or word in it is an
+  error), `metadata`. A subagent needs a `description`. The
   keys `api_key`, `apiKey`, `token`, `secret`, `password` and `base_url` are errors (compared without case,
   `_` and `-`), and so is a `model` that is a URL. Claude Code, Copilot and OpenCode keys adam does not act on
   warn "ignored"; any other unknown key warns "unknown".
@@ -802,7 +827,9 @@ A root with a subagent, local or remote, also gets five tools that run a subagen
 [child runs](child-runs.md#sessions-adr-0045-slices-1-to-4)). No file declares them: they follow the folder's subagents,
 whose names are the enum of `agent`, and they are not given to a subagent. A subagent file needs nothing for them, and a remote
 (`a2a:`) subagent works too ([remote sessions](#remote-sessions)). A tool or a subagent named like one of the five is refused at
-bind. A root whose subagents are all remote gets the five tools as well.
+bind. A root whose subagents are all remote gets the five tools as well. A subagent's `session:` sets the `mode` and
+`wait` of a start that names none, and the widest `mode` a start may name ([above](#agent-and-subagent-files-instructionsmd-subagentsmd-agentmd)).
+The subagent's own tool always starts `one_shot` and waits, the narrowest, so the block never refuses it.
 
 **The same helpers are offered to a person.** `adam-agent` and `adam-coder` list `child-sessions/v1` on the card of a root with a subagent, so a client can open, talk to and close a session on any of them ([A2A server](a2a-server.md#child-sessions-child-sessionsv1)). The card's `maxOpen` is the effective `SESSION_MAX_OPEN`: `limits.max_open_sessions` of the root's file lowers it, never raises it. A root with no subagent lists nothing.
 

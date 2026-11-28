@@ -241,7 +241,7 @@ pub use schema::{ToolSpecExt, spec_for};
 pub use sessions::{
     MAX_DESCRIPTION_CHARS, MAX_OPEN_SESSIONS, MAX_SESSION_ROUNDS, MAX_TEXT_CHARS,
     MAX_WORKING_ROUNDS, SESSION_TOOL_TIME_LIMIT, SESSION_TOOLS, SUBAGENT_CLOSE, SUBAGENT_LIST,
-    SUBAGENT_READ, SUBAGENT_SEND, SUBAGENT_START, SessionAgent, SessionTools,
+    SUBAGENT_READ, SUBAGENT_SEND, SUBAGENT_START, SessionAgent, SessionDefaults, SessionTools,
 };
 pub use source::{
     DynToolSource, Listing, MAX_SOURCE_TOOLS, SourceCtx, ToolNote, ToolSource, Withheld,
