@@ -38,7 +38,8 @@ on:
 # let a later merge replace a pending one (ANR-1457): release-please's job is to **see every merge**,
 # and GitHub replaces a *pending* run in the same group even with `cancel-in-progress: false`. So a
 # push gets a group per commit (the shape `ci.yml` uses since ANR-1360); a dispatch on a ref keeps
-# the ref's group, which is the same commit's push group anyway.
+# the ref's group, which is a different group from that commit's push — the two can run side by side,
+# and the worst case is the sync push below failing visibly, never a merge silently unseen.
 concurrency:
   group: ${{ github.workflow }}-${{ github.event_name == 'push' && github.sha || github.ref }}
   cancel-in-progress: false
