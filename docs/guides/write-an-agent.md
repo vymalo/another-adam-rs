@@ -42,7 +42,7 @@ agent/
 ├── instructions.md          frontmatter + the system prompt
 ├── instructions/            optional: more .md files, appended in filename order
 ├── skills/<name>/SKILL.md   Agent Skills (or skills/<name>.md); loaded on demand
-├── subagents/<name>.md      one tool of the parent; a child run (or <name>/instructions.md)
+├── subagents/<name>.md      a child run the parent starts with subagent_start (or <name>/instructions.md)
 ├── commands/<name>.md       a prompt template a message invokes by name: `/review acme/app`
 └── mcp.json                 MCP servers whose tools the agent gets
 ```
@@ -71,13 +71,14 @@ Rules worth knowing:
 * **A subagent inherits nothing**, and without `tools:` it has none. A tool that asks the person may be in its
   `tools:`, but the question only reaches the person in a kept-open session whose client shows child sessions
   (ADR 0045 decision 9); in any other child run the model is told that nobody can answer and goes on. A file
-  copied from `.claude/agents/` parses unchanged, but its `tools` must name adam's tools.
-* **A remote subagent** is a file with `a2a: <agent-card URL>`: another A2A agent, called like a subagent. Its token
+  copied from `.claude/agents/` parses unchanged, but its `tools` must name adam's tools. **A subagent is no tool**: the
+  parent starts it with `subagent_start` (`wait: true` to have its answer as the result), and a `tools:` that names a
+  subagent stops the load (exit 78) saying so ([ADR 0089](../decisions/0089-every-child-is-a-session-and-the-one-shot-subagent-tool-goes.md)).
+* **A remote subagent** is a file with `a2a: <agent-card URL>`: another A2A agent, started like a subagent. Its token
   is the environment's (`auth: bearer:VAR`), plain `http` to a service of the cluster needs
   `A2A_ALLOW_INSECURE_REMOTES=true`, and one declared in a subagent's directory (`subagents/researcher/subagents/`)
-  is that subagent's tool; `files: true` in its file passes the files of its answer (a screenshot) on, and they
-  reach the person only from the root's own remotes: a subagent's stay on its run
-  ([Remote subagents](../reference/agent-files.md#remote-subagents-a2a)).
+  is that subagent's. A file in its answer (a screenshot) reaches the parent as a line; `files: true` has no effect
+  any more ([Remote subagents](../reference/agent-files.md#remote-subagents-a2a)).
 * **References** (`references:` in the root's frontmatter) are repositories the **coder** reads beside the one it works
   on and never writes: a `name`, a `url`, an optional `branch` and a one-line `description` each. `adam-agent` does not
   serve them (it logs one warning), so use them in a coder's folder
@@ -87,7 +88,7 @@ Rules worth knowing:
 * **The agent already has** `ask_user`, `show` and `ui_catalog` (the person's screen), `plan_work`, `plan_check` and
   `plan_add` (a plan: a checklist the person sees; tell the agent in its instructions when to plan, for example for
   work of three or more steps; with a `tools:` list, name `plan_*` to keep them), the tools of its MCP
-  servers (`<server>__<tool>`), one `load__group__<server>` per MCP server with a `when` (the group's tools load when the task holds one of its keywords or the model calls the loader), `load_skill` and `read_skill_file` when it has skills (a folder with no `skills:` has every skill it holds; `skills: []` turns them off; the name is a plain string and a long skill is read page by page), and one tool per subagent.
+  servers (`<server>__<tool>`), one `load__group__<server>` per MCP server with a `when` (the group's tools load when the task holds one of its keywords or the model calls the loader), `load_skill` and `read_skill_file` when it has skills (a folder with no `skills:` has every skill it holds; `skills: []` turns them off; the name is a plain string and a long skill is read page by page), and, with subagents, the six session tools (`subagent_start` and the others), whatever its `tools:` says.
 * **MCP**: credentials go in `headers` as `${VAR}`; `tools` is an allow-list; `"optional": true` lets a server be
   down; `"files": true` hands the images and documents its tools return (a browser's screenshot and PDF) to the
   person as files of the run, the model reading one line each. Which kinds of server are allowed is the

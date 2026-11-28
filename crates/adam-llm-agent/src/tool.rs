@@ -1808,7 +1808,8 @@ impl ToolCtx {
     }
 
     /// Start `agent` as a **one-shot session** of this run ([ADR 0089] slice C1) and return its
-    /// id, what to put in [`ToolError::AwaitRun`]: what a subagent's own tool does. It is
+    /// id, what to put in [`ToolError::AwaitRun`]: what a host's own tool that waits on a child does
+    /// (a subagent's own tool did until [ADR 0089] slice C4 removed it). It is
     /// [`start_child_within`](Self::start_child_within) for a child that is round 1 of a session of
     /// this run's conversation instead of a run with no conversation:
     ///
@@ -1820,7 +1821,7 @@ impl ToolCtx {
     /// * the session is **closed from the start**: it closes when its round ends, and a message to
     ///   it, from the parent's `subagent_send` or from a person, is refused while it works;
     /// * its first message is [`start_child`](Self::start_child)'s, plus the session's header, and
-    ///   no session limit (open, working) is checked, as none was for a subagent's tool before.
+    ///   no session limit (open, working) is checked.
     ///
     /// The parent's loop counts the round as reported when the wait on it ends, so the end of the
     /// child is told to the model once, as the call's result, and never again as a session report.

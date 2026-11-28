@@ -2483,8 +2483,14 @@ async fn the_builders_level_never_reaches_a_subagent() {
     let mock = Arc::new(MockModel::new());
     mock.push_tool_calls(vec![ToolCall {
         id: "call-1".into(),
-        name: "worker".into(),
-        arguments: json!({ "message": "do the piece" }),
+        name: "subagent_start".into(),
+        arguments: json!({
+            "agent": "worker",
+            "description": "the piece",
+            "prompt": "do the piece",
+            "mode": "one_shot",
+            "wait": true,
+        }),
         ..Default::default()
     }]);
     mock.push_text("the piece is done").push_text("all done");

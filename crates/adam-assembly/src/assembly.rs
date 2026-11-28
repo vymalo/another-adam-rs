@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use adam_agent_fs::{AgentManifest, ModelRef, RemoteAgent, ToolsLoading};
+use adam_agent_fs::{AgentManifest, ModelRef, RemoteAgent, Subagent, ToolsLoading};
 use adam_budget::DynAdmission;
 use adam_llm_agent::{
     DynTool, DynToolSource, Limits, LlmAgent, LlmAgentBuilder, ModelBinding, ModelParking,
@@ -75,8 +75,8 @@ impl std::fmt::Debug for BoundDef {
 }
 
 /// What one agent is built with, beyond its node and its tools: its model alias, the reasoning
-/// effort and the output cap resolved for that alias, and — for the root — the session tools whose
-/// bounds are now known (ADR 0054 slice 1 part 2).
+/// effort and the output cap resolved for that alias, and — for an agent with subagents — the
+/// session tools whose bounds are now known (ADR 0054 slice 1 part 2).
 struct Built<'a> {
     alias: &'a str,
     effort: Option<ReasoningEffort>,
@@ -348,21 +348,23 @@ impl BoundDef {
     /// * [`Error::Build`] when a tool needs state that [`state`](Self::state) did not give.
     pub fn model(self, model: DynModel, alias: impl Into<String>) -> Result<Assembly, Error> {
         let default_alias = alias.into();
-        // The six session tools are made once, here, because their bounds need what `bind` does
-        // not know: the deployment's `MAX_PARALLEL_TOOL_CALLS` (ADR 0054 slice 1 part 2). The root
-        // is the only agent that has them, and the root is built first.
-        let session_tools = match self.nodes.first() {
-            Some(root) => self.session_tools(root),
-            None => None,
-        };
+        // The six session tools are made here, once per agent that has subagents, because their
+        // bounds need what `bind` does not know: the deployment's `MAX_PARALLEL_TOOL_CALLS` (ADR
+        // 0054 slice 1 part 2). The root's are what its A2A front admits a person's start by.
+        let session_tools: Vec<Option<SessionTools>> = self
+            .nodes
+            .iter()
+            .map(|node| self.session_tools(node))
+            .collect();
         let session_bounds = session_tools
-            .as_ref()
+            .first()
+            .and_then(Option::as_ref)
             .map(SessionTools::bounds)
             .unwrap_or_default();
         let mut resolved: Vec<String> = Vec::with_capacity(self.nodes.len());
         let mut agents = Vec::with_capacity(self.nodes.len());
         let mut info = Vec::with_capacity(self.nodes.len());
-        for node in &self.nodes {
+        for (node, sessions) in self.nodes.iter().zip(&session_tools) {
             let origin = Origin::new(node.name.clone(), node.file.clone());
             let alias = match (&node.model, node.parent) {
                 (ModelRef::Alias(alias), _) => alias.clone(),
@@ -389,11 +391,7 @@ impl BoundDef {
                     alias: &alias,
                     effort,
                     cap,
-                    sessions: if node.parent.is_none() {
-                        session_tools.as_ref()
-                    } else {
-                        None
-                    },
+                    sessions: sessions.as_ref(),
                 },
                 fallback,
                 choices,
@@ -417,7 +415,7 @@ impl BoundDef {
                     // The six session tools are built at `model`, not at `bind` (ADR 0054
                     // slice 1 part 2): they come after everything `bind` made, as they always
                     // have.
-                    if node.parent.is_none() && !node.session_targets.is_empty() {
+                    if sessions.is_some() {
                         tools.extend(SESSION_TOOLS.iter().map(|name| (*name).to_owned()));
                     }
                     tools
@@ -811,30 +809,33 @@ impl BoundDef {
         if node.session_targets.is_empty() {
             return None;
         }
-        let mut agents = Vec::with_capacity(node.session_targets.len());
-        for target in &node.session_targets {
-            agents.push(SessionAgent {
+        // The manifest whose subagents the roster names: the root's, or the subagent's own.
+        let manifest = manifest_of(&self.manifest, &node.name)?;
+        let agents: Vec<SessionAgent> = node
+            .session_targets
+            .iter()
+            .map(|target| SessionAgent {
                 name: target.name.clone(),
                 agent: target.agent.clone(),
                 description: target.description.clone(),
                 within: target.within,
                 remote: target.remote,
-                bounds: self.bounds_of(target),
+                bounds: self.bounds_of(manifest, target),
                 session: target.session,
-            });
-        }
+            })
+            .collect();
         Some(SessionTools::new(agents).with_limits(self.session_limits))
     }
 
-    /// The bounds of one subagent a session may be started on (ADR 0054 decision 2): the one
-    /// function of `crate::bounds`, which `AgentDef::session_bounds` calls too, so a worker's tools
-    /// and a control plane's A2A front agree on every number. They differ in one fact only a worker
-    /// has: the names of the tools the subagent is bound with
+    /// The bounds of one subagent of `manifest` a session may be started on (ADR 0054 decision 2):
+    /// the one function of `crate::bounds`, which `AgentDef::session_bounds` calls too, so a
+    /// worker's tools and a control plane's A2A front agree on every number. They differ in one fact
+    /// only a worker has: the names of the tools the subagent is bound with
     /// ([`bound_tool_names`](Self::bound_tool_names)).
-    fn bounds_of(&self, target: &SessionTarget) -> SessionBounds {
+    fn bounds_of(&self, manifest: &AgentManifest, target: &SessionTarget) -> SessionBounds {
         let (names, complete) = self.bound_tool_names(target);
         crate::bounds::bounds_of(
-            &self.manifest,
+            manifest,
             target,
             self.max_parallel,
             self.session_limits.max_rounds(),
@@ -909,14 +910,13 @@ impl BoundDef {
     ///
     /// This is the seam the next slices extend. `bind` has already made the prompt and the tool
     /// list final: the catalog after the prompt (slice S7), and the tools in the order the model
-    /// sees them: the agent's own, `load_skill` and `read_skill_file`, then one
-    /// [`SubagentTool`](crate::SubagentTool) per local subagent (slice S9). They are added at
-    /// bind, not here, so that a name clash is found before a model is needed, and so that
-    /// [`AgentInfo::tools`] and the agent cannot disagree. This function only hands them over.
-    /// The remote subagents (slice S9b) join the same list in `bind`, where their names meet the
-    /// local ones, and so do the MCP tools of `mcp.json` (slice S11), which `tools:` selects. A
-    /// server whose `when` loads it only when a run's task matches gets a source of its own here,
-    /// so its tools are withheld from a run that does not load it.
+    /// sees them: the agent's own (the MCP tools of `mcp.json`, slice S11, among them, as `tools:`
+    /// selects them), then `load_skill` and `read_skill_file`. They are added at bind, not here, so
+    /// that a name clash is found before a model is needed, and so that [`AgentInfo::tools`] and
+    /// the agent cannot disagree. This function only hands them over, and adds the five session
+    /// tools of an agent with subagents after them, whose bounds need the model (ADR 0054 slice 1
+    /// part 2). A server whose `when` loads it only when a run's task matches gets a source of its
+    /// own here, so its tools are withheld from a run that does not load it.
     fn build(
         &self,
         node: &Node,
@@ -1081,10 +1081,13 @@ pub struct RemoteInfo {
 ///
 /// A subagent is an agent of its own, registered under `<parent>/<name>` with its own prompt,
 /// tools, skills, model alias and limits, and it inherits nothing from its parent: not the tools
-/// (a subagent with no `tools:` has none), not the skills, not the history. Its parent gets one
-/// tool named after it ([`SubagentTool`](crate::SubagentTool)) whose call starts the subagent as a
-/// durable child run on the runtime that steps the parent, so **every agent of the assembly must
-/// be registered on that runtime**, which [`register`](Self::register) does.
+/// (a subagent with no `tools:` has none), not the skills, not the history. Its parent gets the
+/// six session tools of `adam-llm-agent`, whose `subagent_start` starts the subagent as a round of
+/// a session, a durable child run on the runtime that steps the parent ([ADR 0089]: no tool is
+/// named after a subagent), so **every agent of the assembly must be registered on that runtime**,
+/// which [`register`](Self::register) does.
+///
+/// [ADR 0089]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0089-every-child-is-a-session-and-the-one-shot-subagent-tool-goes.md
 #[derive(Debug)]
 pub struct Assembly {
     manifest: AgentManifest,
@@ -1148,13 +1151,14 @@ impl Assembly {
         &self.agents[0]
     }
 
-    /// Register every agent on a runtime builder: the root and each subagent. A subagent tool
-    /// starts its child on the runtime that steps the parent, and finds it by the name it is
-    /// registered under, so there is no handle to attach and nothing to forget: what registers the
-    /// agents makes the tools work. A runtime that steps the root but does not know a subagent
-    /// (a process that registered `assembly.root()` alone) refuses the call for good, and the model
-    /// sees an error result naming the missing agent. In a split deployment, register the
-    /// subagents as starters on the process that steps the parent.
+    /// Register every agent on a runtime builder: the root, each subagent and the agent of each
+    /// remote subagent's rounds. `subagent_start` starts its round on the runtime that steps the
+    /// parent, and finds the subagent by the name it is registered under, so there is no handle to
+    /// attach and nothing to forget: what registers the agents makes the tools work. A runtime that
+    /// steps the root but does not know a subagent (a process that registered `assembly.root()`
+    /// alone) refuses the start, and the model sees an error result naming the missing agent. In
+    /// a split deployment, register the subagents as starters on the process that steps the
+    /// parent.
     pub fn register(&self, builder: RuntimeBuilder) -> RuntimeBuilder {
         let builder = self
             .agents
@@ -1163,8 +1167,8 @@ impl Assembly {
         self.rounds.register(builder)
     }
 
-    /// The agents that work the rounds of a session on a remote subagent of the root, registered
-    /// as `<root>/<subagent>`: [`register`](Self::register) registers them with the rest. A
+    /// The agents that work the rounds of a session on a remote subagent, registered as
+    /// `<parent>/<subagent>` (`<root>/<subagent>` for one of the root's): [`register`](Self::register) registers them with the rest. A
     /// composition root that registers [`agents`](Self::agents) one by one registers these too, or
     /// `subagent_start` on a remote subagent is refused in a process that does not know the name.
     /// Only with the feature `remote`.
@@ -1205,8 +1209,23 @@ impl Assembly {
     }
 }
 
+/// The manifest of the agent registered as `name` within the tree of `root` (`coder` is the root,
+/// `coder/researcher` its local subagent `researcher`), or `None` when the tree has no such agent.
+fn manifest_of<'a>(root: &'a AgentManifest, name: &str) -> Option<&'a AgentManifest> {
+    if name == root.name {
+        return Some(root);
+    }
+    let path = name.strip_prefix(root.name.as_str())?.strip_prefix('/')?;
+    path.split('/').try_fold(root, |manifest, segment| {
+        manifest.subagents.iter().find_map(|sub| match sub {
+            Subagent::Local(child) if child.name == segment => Some(child.as_ref()),
+            _ => None,
+        })
+    })
+}
+
 /// The agents that work the rounds of the sessions on remote subagents, one per remote subagent of
-/// the root. Always empty without the feature `remote`, where no remote subagent binds.
+/// any agent of the assembly. Always empty without the feature `remote`, where no remote subagent binds.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct Rounds {
     #[cfg(feature = "remote")]

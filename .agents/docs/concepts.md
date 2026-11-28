@@ -18,7 +18,7 @@ Checked 2026-11-26 against `main` at `83cf1ef5`, by reading the files (no build 
 | The whole process | `serve` | `crates/adam-service/src/serve.rs:735` |
 | Agent folder | `AgentDef` | `crates/adam-assembly/src/def.rs:154` |
 | Skill | `Skill` (parsed), `SkillFiles` (run time) | `crates/adam-agent-fs/src/manifest.rs:36`, `crates/adam-assembly/src/skills.rs:50` |
-| Subagent | `SubagentTool` | `crates/adam-assembly/src/subagent.rs:82` |
+| Subagent | `SessionTools` (started with `subagent_start`; the roster is `session_roster`) | `crates/adam-llm-agent/src/sessions.rs:233`, `crates/adam-assembly/src/def.rs:1376` |
 | `#[tool]` | `pub fn tool` (proc-macro attribute) | `crates/adam-macros/src/lib.rs:67` |
 | TaskBackend | `trait TaskBackend` | `crates/adam-a2a/src/backend.rs:276` |
 | Extension | `ExtensionConfig`; the URIs are constants in `extensions.rs` | `crates/adam-a2a/src/card.rs:190` |

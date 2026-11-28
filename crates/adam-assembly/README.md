@@ -65,13 +65,13 @@ first `AgentDef::from_manifest(AGENT)`; note that `AGENT` is already a reference
 | `SkillError` | why `load_skill` or `read_skill_file` refused a call: closed enum, its `Display` is the tool result the model reads (`Window` is a bad `offset` or `limit`, or an offset past the end: a new variant, so a `match` on it breaks) |
 | `BoundDef` | `state(Arc<T>)`, `tool_source(source)` (a `ToolSource` of `adam-llm-agent` for every agent: tools it learns about while it runs, offered at every model turn after the agent's own; `tools:` does not narrow it), `model_aliases(..)`, `model_profiles(ModelProfiles)` (the deployment's per-model profiles, ADR 0063/0064: the default reasoning effort of each agent is resolved from its folder, its `model_preset`, the profile and the profile's preset, and its output cap from the folder, the preset, the profile and the 128,000 fallback, clamped to the model's limit and window; a value the model does not take is refused), `wait_poll(Duration)` (how often a waiting agent looks: a remote subagent's task is polled at this interval), `max_parallel(n)` (the most tool calls of one model turn that run at once, for every agent: the deployment's `MAX_PARALLEL_TOOL_CALLS`, 10 when not given; an agent's `limits.max_parallel` lowers it for that agent, and a larger one is **clamped** to the deployment's with a warning — a folder is portable across deployments, ADR 0049, ADR 0054 decision 3 — while a *round's requested* config above a bound is refused by `SessionBounds::admit`, decision 2), `model_parking(ModelParking)` (how every agent, the root and its subagents, waits on a model that refused it, ADR 0067: the deployment's `MODEL_PARK_LIMIT` and, behind the injector, an unreachable gateway that parks; the loop's default when not given; `tests/parallel.rs` `the_deployments_model_parking_reaches_every_agent`), `admission(DynAdmission)` (the process's pools of [ADR 0065](../../docs/decisions/0065-resource-governance-admission-pools-and-os-limits.md): every agent built here asks it for every model call and every tool call; `LlmAgentBuilder::admission`; without one nothing is admitted), `scrub(f)` (a function that scrubs secrets out of what the six session tools give the model, which `bind` makes itself and a deployment's own tool wrapper never sees: the coder gives its redactor; the wrapper it makes, `Scrubbed`, also forwards `Tool::read_answer` and scrubs the words and interface of a refusal or an ending, as it scrubs a question), `scrub_longest(f)` (the length of the longest value it replaces, for `ToolCtx::scrub_margin`, as the coder's own wrapper passes it; a report is a child's text scrubbed whole, never a cut one, so no open edge applies), `step_io(StepIo)` (how every agent's tool-call steps report their input and output, and what is scrubbed from them first: `LlmAgentBuilder::step_io`, [ADR 0011](../../docs/decisions/0011-a-tool-calls-step-carries-its-input-and-output.md)), `hooks(HookSet)` (the host's own hooks, ADR 0050, for **every** agent built here, the root and each subagent: they run first, under the set's limits, then the plugins the agent's file names; `AgentInfo::plugins` lists the file's only; what `adam-engine` gives its agents, ADR 0047 slice 5), `model(DynModel, alias)` |
 | `adam_llm_agent::ReadOutput` | **added by `bind` to every agent whose tools include an MCP tool** (unless its tool list already holds `read_output`, as the coder's does), after the tools it selected: a long MCP result is kept and the model reads the rest with `read_output { id, offset?, limit? }` (an agent that is only a folder keeps it in the run's state, 4 MiB; see [`adam-mcp`](../adam-mcp/README.md)). An agent with no MCP tool among its tools does not get it |
-| `SubagentTool` | the tool that runs a subagent as a child run: `new(tool_name, agent, description)`, `agent()`. `bind` adds one per local subagent, so a user never builds one. Its call is a `subagent` step drawn as an agent (`Tool::step_style`), as is a remote subagent's, **labelled with the tool's name as a person reads it** (`explorer` is "Explorer", `code_reviewer` is "Code reviewer"). `load_skill` and `read_skill_file` are "Load a skill" and "Read a skill file" |
+| `DEFAULT_SUBAGENT_MINUTES` | 30: the time limit of a round of a session on a subagent whose file says no `limits.max_minutes`. **Breaking** ([ADR 0089](../../docs/decisions/0089-every-child-is-a-session-and-the-one-shot-subagent-tool-goes.md) slice C4): `SubagentTool`, the tool named after a subagent, is gone, local and remote: a parent delegates with the six session tools of `adam-llm-agent`, and the one-shot call is `subagent_start` with `mode: one_shot` and `wait: true`; a hand-assembled host gives its agent `SessionTools` (or its own tool over `ToolCtx::start_one_shot_session`). `load_skill` and `read_skill_file` are drawn as "Load a skill" and "Read a skill file" |
 | `Assembly` | `agents()`, `root()`, `register(RuntimeBuilder)` (the agents and the round agents of the remote sessions), `remote_round_agents()` (feature `remote`), `info()`, `remotes()`, `manifest()`, `card(url, version)` (feature `a2a`), `child_sessions()` (feature `sessions`: what the definition computed at `bind`), `agent_modes()` (feature `sessions`: the root's modes as the card lists them and the A2A front refuses a message for, `None` without `modes/`; `agent_modes_of(&AgentManifest)` is the same for a manifest), `session_bounds()` (the bounds of each subagent a session may be started on, by its name: [ADR 0054](../../docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md), read from the session tools the root was built with; empty without a subagent — see [The bounds of a session](#the-bounds-of-a-session)). `AgentDef::session_bounds()` gives the same list **without binding**, `AgentDef::session_defaults()` each subagent's `session:` ([The defaults of a session](#the-defaults-of-a-session)), and `AgentDef::session_max_parallel(n)` is the deployment's `MAX_PARALLEL_TOOL_CALLS` for it (and, at `bind`, for the agents unless `BoundDef::max_parallel` says another) |
 | `RemoteRoundAgent` (feature `remote`) | the `Agent` (and `AgentStarter`) that works the rounds of a session on a remote subagent of the root, registered as `<root>/<subagent>`; `with_wait_poll(Duration)` (`BoundDef::wait_poll` sets it). See [Remote sessions](#remote-sessions) |
 | `RemoteRoundStarter` (feature `remote`) | its start-only twin, `new(name)`: makes the same round state (`init`, `init_continuing`) with no endpoint and no credential; `AgentDef::session_starters` registers it |
 | `Assembly::prompt_commands()` (feature `mcp`) | the prompts of the **root's** MCP servers as commands (`adam_mcp::PromptCommand`), read once when the servers were connected; a subagent's give none. `adam-service` adds them to the backend and the card ([adam-mcp](../adam-mcp/README.md#prompts-as-commands)) |
 | `Group`, `Groups` | a named set of tools that load together (ADR 0066): `Group::new(name, note, members)`, `for_server` (a `when` server's group: its name is the server's, its note the server's words, and a bad name's error names the server), `with_keywords`, `searchable` (refused until S2), `loader()`, `server`; `Groups::bind(&Origin, defs, &[(String, DynTool)])` drops every member the agent was not given (an empty group has no loader), refuses a bad name, two groups of one name, a searchable group, a tool in two groups, and a loader name a tool already has; the reserved `load__` catalogue check is `def.rs`'s. `declared_loaders()` is the catalogue (S2/S3 and tests); the run-time path is the trait's `loaders(ctx)`, and `loader_tools()` gives one `load__group__<name>` per group. `Groups` is a `ToolSource`: it withholds a group's members until the task's keywords or the run's load, appends a loaded group after every other tool, and journals the task-loaded groups and the loaders. Constants: `GROUP_LOADER_PREFIX`, `MAX_GROUP_NAME_CHARS`, `MAX_KEYWORDS`, `MAX_KEYWORD_CHARS`, `name_fits`, `keywords_fit`; the reserved prefix is `adam_llm_agent::RESERVED_LOADER_PREFIX` |
-| `AgentInfo` | `name` (`coder`, `coder/reviewer`), `parent`, `description`, `file`, `model_alias`, `model_fallback` (the alias its run continues on when its model is locked) and `model_choices` (the aliases a message may pick), `reasoning_effort` (the default the folder, its `model_preset` or the profile resolves to, or `None`), `prompt` (rendered, with the skills catalog and the instructions of its eager MCP servers), `tools` (own, one `load__group__<server>` per server with a `when`, skill tools, then one per subagent, local or remote, then the six session tools of the root when it has a subagent, local or remote: what the model is offered), `skills`, `preloaded`, `when`, `tools_loading` (`eager`, `lazy` or `searchable`: how the folder's own tools load, ADR 0066; `eager` leaves `when` empty), `limits` (the loop's limits, with `max_output_tokens` resolved for the agent's model and clamped, ADR 0064): what an `LlmAgent` was made from, comparable. **Breaking:** `reasoning_effort`, `model_fallback`, `model_choices` and `tools_loading` are new public fields, so a hand-built literal needs them |
+| `AgentInfo` | `name` (`coder`, `coder/reviewer`), `parent`, `description`, `file`, `model_alias`, `model_fallback` (the alias its run continues on when its model is locked) and `model_choices` (the aliases a message may pick), `reasoning_effort` (the default the folder, its `model_preset` or the profile resolves to, or `None`), `prompt` (rendered, with the skills catalog and the instructions of its eager MCP servers), `tools` (own, one `load__group__<server>` per server with a `when`, skill tools, then the six session tools when the agent has a subagent, local or remote, the root or a subagent with its own: what the model is offered; no tool is named after a subagent), `skills`, `preloaded`, `when`, `tools_loading` (`eager`, `lazy` or `searchable`: how the folder's own tools load, ADR 0066; `eager` leaves `when` empty), `limits` (the loop's limits, with `max_output_tokens` resolved for the agent's model and clamped, ADR 0064): what an `LlmAgent` was made from, comparable. **Breaking:** `reasoning_effort`, `model_fallback`, `model_choices` and `tools_loading` are new public fields, so a hand-built literal needs them |
 | `RemoteInfo` | a remote (`a2a:`) subagent, as data (its tool is in `AgentInfo::tools` like a local subagent's) |
 | `LiveAssembly`, `LiveBuilder`, `Watch` (feature `dev`) | dev reload: `LiveAssembly::builder(dir, model, alias)` then `tools`, `configure`, `configure_bound`, `strictness`, `default_name`, `debounce`, `connect_mcp(&McpPolicy)` (feature `mcp`), `load()`; on the handle `register(RuntimeBuilder)`, `reload()`, `watch()`, `generation()`, `schedules()`, `last_error()`, `info()`, `retired()`, `runs_on_previous_tools()`, `dir()` |
 | `Reloaded`, `ToolChange`, `ReloadError`, `WatchError` (feature `dev`) | what a reload did (`generation`, `changed`, `tool_changes`, `retired`), why it changed nothing (`Load(Error)` with `diagnostics()`, `NeedsRestart { added }`), why a watcher did not start |
@@ -136,7 +136,8 @@ inherits nothing.
 
 **Retry policies.** Each name of an agent's `retry:` ([ADR 0061](../../docs/decisions/0061-a-step-names-its-retry-policy.md))
 must be one of that agent's tools once they are all bound (its own, its MCP servers', which are connected before
-`bind`, and its skill and subagent tools): another is `Error::UnknownRetryTool`, with the closest of its tools as a
+`bind`, and its skill tools; a subagent is no tool since ADR 0089 C4, and the session tools are made after the check):
+another is `Error::UnknownRetryTool`, with the closest of its tools as a
 suggestion; an entry for a declared MCP server that gave no tools (an `optional` one that is down) is skipped with a
 warning. The policy goes to the agent as `LlmAgentBuilder::tool_retry`, so it wins over the tool's own
 `Tool::retry_policy`; `AgentInfo::retry` lists it as the file says it. Each agent has its own: a subagent does not
@@ -211,8 +212,8 @@ the first of the cap's resolution (above); absent, the assembly resolves it from
 and clamps it. Each subagent has its own. A run that
 reaches `max_turns` or `max_tool_calls` gets one closing model call in which it may call no tool and ends `Done`
 with that answer marked `limited` (see `adam-llm-agent`). `limits.max_minutes` is the time limit of a subagent's run
-(`SubagentTool::with_run_limit`; 30 by default, `0` none, at most 1,440; a warning on a root agent): past it the runtime
-fails the child and the parent reads "the run failed: cancelled: time limit: ...". `DEFAULT_SUBAGENT_MINUTES` is 30. The classes of the tools the assembly makes (ADR 0049): `load_skill` and `read_skill_file` are `Independent`; a one-shot subagent tool and a remote subagent tool are `Alone` (they park the run on a child or a task), and so are the session tools. A remote agent's files are taken from the room the turn's calls share (`ToolCtx::spend_files_of`). `limits.max_parallel` is not in the loop's `Limits` (ADR 0049): it is the number of tool calls of one
+(each round's; 30 by default, `0` none, at most 1,440; a warning on a root agent): past it the runtime
+fails the round and the parent reads its report as `failed` with "cancelled: time limit: ...". `DEFAULT_SUBAGENT_MINUTES` is 30. The classes of the tools the assembly makes (ADR 0049): `load_skill` and `read_skill_file` are `Independent`; the session tools are `Alone` (a start that waits parks the run on its round). `limits.max_parallel` is not in the loop's `Limits` (ADR 0049): it is the number of tool calls of one
 model turn that run at once for that agent, 1 to 32, and it can only lower `BoundDef::max_parallel` (the deployment's setting); a larger one is clamped to that setting, with a warning.
 
 **The card.** With feature `a2a`, `Assembly::card(url, version)` is the root's `card:` as an
@@ -537,46 +538,53 @@ It inherits **nothing** from its parent: its tools are the ones its own `tools:`
 lists none (a tool only the parent has is unknown to the child), its skills are the ones under its own
 `skills/`, and its history starts with the message it is called with.
 
-Its parent gets a `SubagentTool`, one per subagent, named after it, added by `bind` after the parent's own
-tools and its skills' tools, in the order of the manifest (`AgentInfo::tools` lists them):
+Its parent delegates to it with **the six session tools** of `adam-llm-agent` (`subagent_start`, `_send`, `_read`,
+`_edit`, `_close`, `_list`, [ADR 0045](../../docs/decisions/0045-a-subagent-can-run-in-the-background-as-a-session.md)), which `bind`
+gives every agent that has a subagent, local or remote, the root or a subagent with its own, after its own tools and its
+skills' tools (`AgentInfo::tools` lists them). **No tool is named after a subagent** ([ADR 0089](../../docs/decisions/0089-every-child-is-a-session-and-the-one-shot-subagent-tool-goes.md) slice C4): every child is a
+round of a session of its parent.
 
-* input `{ "message": string }` (required); description: the subagent's `description`, then "The agent does
-  not see this conversation; put everything it needs in `message`.";
-* a call starts the subagent as a child run of the parent's run and parks the parent until it is done
-  (`ToolCtx::start_one_shot_session` and `ToolError::AwaitRun`, see "Child runs" in `docs/architecture.md`). The
-  child's final **text** is the tool result; an error result if the child failed, and the parent goes on. A
-  blank or missing `message` is an error result and starts nothing;
-* **the child is a one-shot session** of the parent ([ADR 0089](../../docs/decisions/0089-every-child-is-a-session-and-the-one-shot-subagent-tool-goes.md)
-  slice C1): round 1 of a session under the id the call derives, closed from its start. It has a session's conversation
-  id (`<parent escaped>/s/<id>`), so `subagent_list`, `child-sessions/v1` and the exporter see it; the parent's
-  `subagent_send` and a person's message are refused (it is closed); the model gets its answer once, as the call's
-  result. A remote subagent's tool is unchanged (it starts no child run; slice C2 keeps it so, see
-  [remote sessions](#remote-sessions)). The header is `mode: one_shot` and `closed` (`SessionHeader`). Tests: `tests/subagents.rs`
-  (`a_subagents_call_is_a_one_shot_session_that_is_closed_after_its_round`,
+* **The one-shot call** is `subagent_start { agent, description, prompt, mode: one_shot, wait: true }`: the call starts
+  round 1 under the id it derives (`child_run_id(parent, call id)`, so a replay finds the same child), parks the parent
+  (`ToolError::AwaitSession`) and returns the round's report as its result: the session's page, its header line
+  (`session <id> (<agent>, "<description>"): round 1, closed`), `report: done` (or `failed` with the reason) and the
+  child's text. A blank or missing `prompt` is an error result and starts nothing. The session has a conversation id
+  (`<parent escaped>/s/<id>`), so `subagent_list`, `child-sessions/v1` and the exporter see it, and a `one_shot` one is
+  closed after its round. Two starts of one turn are two sessions of their own.
+* **A subagent with subagents of its own** gets the session tools too, for those only: its round starts sessions in its
+  own conversation (`<round's conversation escaped>/s/<id>`). Before C4 sessions were one level deep and a subagent had
+  a tool per subagent instead.
+* **A `tools:` that names a subagent** (an agent's, or a mode's) is refused when the folder is read, naming
+  `subagent_start` (`adam-agent-fs`, exit 78 in `adam-agent`); a mode that names a session tool keeps it (they are made
+  after `bind` resolves the modes, and `resolve_modes` counts them as the agent's). A `retry:` that names a subagent is
+  `Error::UnknownRetryTool`.
+* **Upgrading:** a run parked on a child that a subagent's own tool started before C4 is answered from the store, without
+  the tool (`tests/subagents.rs` `a_parent_parked_on_a_subagents_own_tool_of_before_is_answered_after_the_upgrade`); a run
+  parked on the task of a remote subagent's own tool reads "the tool `<name>` that started this task is gone", and the
+  remote task keeps running. Tests: `tests/subagents.rs`
+  (`a_one_shot_start_that_waits_is_a_session_closed_after_its_round`,
   `two_calls_of_one_turn_are_two_sessions_with_their_own_conversations`,
-  `a_child_started_before_it_was_a_session_is_found_by_the_call`);
+  `every_agent_with_subagents_gets_the_session_tools_and_no_other`, `a_mode_that_names_the_session_tools_keeps_them`,
+  `a_hosts_one_shot_tool_finds_a_child_started_before_it_was_a_session`), `tests/parallel.rs`
+  `the_tools_that_start_a_subagent_run_alone`;
 * the child's own `limits:` apply to the child (its turns and tool calls are not the parent's);
-* **a root that has a subagent, local or remote, also gets the six session tools** (`subagent_start`, `_send`, `_read`, `_edit`, `_close`,
-  `_list` of `adam-llm-agent`, [ADR 0045](../../docs/decisions/0045-a-subagent-can-run-in-the-background-as-a-session.md)), after
-  the subagent tools, and its `LlmAgent` waits at the end of a turn for the sessions it started. Their `agent` argument is the
-  folder's subagent names, sorted (a remote subagent is in the enum: [remote sessions](#remote-sessions)). A tool or
-  a subagent called like one of the six is `Error::SubagentToolClash`. A subagent does not get them (depth is one). **Breaking:**
-  `AgentInfo::tools` of such an agent has six more names, a root with only remote subagents gets them too, and a hot reload that removes its last subagent removes them too;
-* **each subagent's session bounds are computed at `model`, not at `bind`** ([ADR 0054](../../docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md), slice 1 part 2): the deployment's `MAX_PARALLEL_TOOL_CALLS` and the model are known only then. They are the folder's `limits` where it names a value (`max_turns`, `max_tool_calls`, `max_output_tokens`, `max_minutes`), the deployment's for `max_parallel_tool_calls` (lowered by the folder, never raised: a larger one is clamped to it) and `max_rounds` (the root's effective `max_session_rounds`); `context_window` is `None` until the model's window is a fact of its alias (decision 11). `Assembly::session_bounds` and `SessionTools::bounds` ([adam-llm-agent](../adam-llm-agent/README.md)) read the same list, so a card, a client and the tool cannot disagree; `SessionBounds::admit` holds a `subagent_start`'s `config` to them, and a request above a bound is refused by name, never clamped; a worker's bounds also carry `tools` and `tools_complete` (the names the subagent can be offered — its own, and what every source of its node declares with `ToolSource::declared` — and whether they are every one of them), so `config.tools` / `deny_tools` entries are checked against them by the rule in `SessionBounds::tools_complete` (ADR 0054 slice 3, amended 2026-11-28: a declaration may name a **shape**, `*__*` for a relayed `<server>__<tool>`, so the thread-tools source declares the contract's tools and that shape and **both shipped agents' sets are complete**: a `tools` entry that selects nothing is refused there and `github__*` is admitted; a source that answers `Declared::Unknown` still leaves a set incomplete, and the control plane and a remote have no names, so they check the shape); the loop, not the assembly, applies a session's narrowing;
+* the agent's `LlmAgent` waits at the end of a turn for the sessions it started. The `agent` argument is the agent's own
+  subagent names, sorted (a remote subagent is in the enum: [remote sessions](#remote-sessions)). A tool or a subagent called
+  like one of the six is `Error::SubagentToolClash`. **Breaking** (C4): `AgentInfo::tools` of an agent with subagents has no
+  name per subagent any more, a subagent with its own subagents has the six, and a hot reload that removes the last subagent
+  removes them;
 * **the root that has subagents ends its prompt with the *Child sessions* section** ([ADR 0054](../../docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md) decision 9, slice 2): `bind` appends `SessionTools::guide_for` (the six tools, the helpers sorted, what `config` takes) after the skills catalog, so it is in `AgentInfo::prompt` and in the stable prefix. It names no limit and no count, so it is the same bytes under any `SessionLimits`. **Breaking:** `AgentInfo::prompt` of such an agent is longer (about 1.7 KB) and the first request after a deploy misses the prompt cache once. A subagent, and a root without subagents, get nothing;
 * **each subagent's session bounds are computed at `model`, not at `bind`** ([ADR 0054](../../docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md), slice 1 part 2): the deployment's `MAX_PARALLEL_TOOL_CALLS` and the model are known only then. They are the folder's `limits` where it names a value (`max_turns`, `max_tool_calls`, `max_output_tokens`, `max_minutes`), the deployment's for `max_parallel_tool_calls` (lowered by the folder, never raised: a larger one is clamped to it) and `max_rounds` (the root's effective `max_session_rounds`); `context_window` is `None` until the model's window is a fact of its alias (decision 11). `Assembly::session_bounds` and `SessionTools::bounds` ([adam-llm-agent](../adam-llm-agent/README.md)) read the same list, so a card, a client and the tool cannot disagree; `SessionBounds::admit` holds a `subagent_start`'s `config` to them, and a request above a bound is refused by name, never clamped;
-* **the runtime handle is not something you attach.** The tool starts the child on the runtime that steps
+* **the runtime handle is not something you attach.** `subagent_start` starts the round on the runtime that steps
   the parent, through the `ToolCtx` of the call, so there is nothing to forget. What it needs is the child
   registered on that runtime: `Assembly::register` registers every agent. A process that steps the parent
-  without the child (only `assembly.root()` registered) refuses the call for good, with the agent's name, as
+  without the child (only `assembly.root()` registered) refuses the start for good, with the agent's name, as
   an error result; in a split deployment register the subagents as starters where the parent runs;
-* what does not travel back: artifacts (they stay on the child's run). What does not happen: two subagent
-  calls of one model turn run one after the other, not side by side, and cancelling the parent does not
-  cancel the child.
+* what does not travel back: artifacts (they stay on the child's run).
 
 | Mistake | Error, at `bind` |
 |---|---|
-| a subagent named like a tool its parent has (registered and selected, or `load_skill` / `read_skill_file` when the parent has skills), or like another subagent of the parent | `SubagentToolClash { origin, parent, tool, clash: ToolClash }` (origin is the subagent) |
+| a subagent named like a tool its parent has (registered and selected, or `load_skill` / `read_skill_file` when the parent has skills), like one of the session tools, or like another subagent of the parent: the model would read one word as two things | `SubagentToolClash { origin, parent, tool, clash: ToolClash }` (origin is the subagent; the message says ``the parent `coder` would read `helper` as two things, ...``) |
 A registered tool the parent does not select is not a clash. **A subagent may have a tool that asks the
 person** (`Tool::asks_user()`), by name, by `*` or by a pattern: whether the person can be asked is decided
 per **run** (ADR 0045 decision 9, `docs/reference/child-runs.md`), not at `bind`. A round of a kept-open
@@ -607,11 +615,11 @@ A subagent's file may say how the sessions its parent starts on it begin (`sessi
 
 ## Remote subagents
 
-A subagent file with `a2a:` is a tool on the parent whose work is done by another A2A agent. Everything above
-about the tool's shape holds: `{ "message": string }`, the description and the same "does not see this
-conversation" note (the body of the file, if any, extends the description), no questions to the user, the same
-name checks (`SubagentToolClash`, in manifest order with the local subagents). It is not an `LlmAgent` of the
-assembly, so the tool needs nothing registered on the runtime. A session on it does: see [Remote sessions](#remote-sessions).
+A subagent file with `a2a:` is a subagent whose work is done by another A2A agent. Its parent starts it with
+`subagent_start` like a local one (the one-shot use is `mode: one_shot` and `wait: true`), and each round is a run of a
+`RemoteRoundAgent` registered as `<parent>/<name>` ([Remote sessions](#remote-sessions)); there is no tool named after it
+([ADR 0089](../../docs/decisions/0089-every-child-is-a-session-and-the-one-shot-subagent-tool-goes.md) slice C4). The name checks are the local ones (`SubagentToolClash`, in manifest order with the local subagents). It
+is not an `LlmAgent` of the assembly. The roster line is its `description`; the body of the file is not read.
 
 ```markdown
 ---
@@ -621,33 +629,24 @@ auth: bearer:BILLING_AGENT_TOKEN
 ---
 ```
 
-* **A call** is one journaled `SendMessage` (`returnImmediately`) whose message id is derived from the parent's
-  run and the tool call, so a retry or a replay sends the same id (a server that recognises repeated ids, as
-  `adam-a2a-runtime` does, returns the task it already made). A reply that is already final is the result;
-  otherwise the tool returns `ToolError::AwaitRemote { task, timeout_ms }` and the parent parks.
-* **The wait** is polled: nothing tells the parent the task is over, so each time its `wait_poll` timer fires
-  the agent calls `Tool::poll_remote` (a `GetTask`) in a journaled step, until the task is final or the wait
-  passes `AgentDef::remote_timeout` (default one hour: an error result, the remote task is left running).
-  Set `BoundDef::wait_poll` for the remote (default 60 s). See "Remote subagents" in
+* **A round** sends one journaled `SendMessage` (`returnImmediately`) whose message id is the round's run id (for round
+  1, `child_run_id(parent run, call id)`), so a retry or a replay sends the same id (a server that recognises repeated
+  ids, as `adam-a2a-runtime` does, returns the task it already made). It then looks at the task with `GetTask` on its
+  own timer (`BoundDef::wait_poll`, 60 s at most between looks), each look a journaled step, until the task is final or
+  the round passes `AgentDef::remote_timeout` (default one hour: the round fails and the remote task is cancelled, best
+  effort). See "Remote subagents" in
   [`docs/reference/agent-files.md`](../../docs/reference/agent-files.md#remote-subagents-a2a) and the diagrams in
-  [`docs/reference/child-runs.md`](../../docs/reference/child-runs.md#remote-tasks-the-same-wait-without-a-message).
-* **The result:** `completed` gives the text of the artifacts (else of the status message; when the artifacts hold
+  [`docs/reference/child-runs.md`](../../docs/reference/child-runs.md#remote-sessions).
+* **The report:** `completed` gives the text of the artifacts (else of the status message; when the artifacts hold
   files only, as an adam agent's screenshots do, the status message first, then their lines), cut at 64 KiB;
-  `failed`, `canceled` and `rejected` are error results with the remote's message; **`input-required` and
-  `auth-required` are error results too**, because nobody can answer a subagent (the message says so and tells
-  the model to call again with the whole task). Data parts are their JSON; a file at a `url` stays a line (it is not
-  fetched); a `raw` file part is described and dropped, unless the file says `files: true`.
-* **`files: true`** in the subagent's file (a browser agent's screenshots) shares each `raw` part of the answer as a
-  **file artifact of the calling run**, through `adam_runtime::ReceivedFiles`, the rule of a `files: true` MCP server
-  ([`adam-mcp`](../adam-mcp/README.md#files-files-true)), which believes nothing the sender says of a file: it is named
-  `<base>-<hash>.<ext>` (the sender's file name without its extension, cut to `[A-Za-z0-9._-]`, else the subagent's
-  name; a hash of the bytes; the extension of the type checked against the bytes, so `evil.html` that is not a PNG is a
-  `.bin`), the remote artifact's name (one line, at most 120 characters) names the artifact when the part is its only
-  one, and the model reads a line in its place. Every cap is checked on the part's length before its bytes are copied:
-  4 MiB a file, 16 a result and what the run may still share (`ToolCtx::files_left`, also for the `poll:` step); a
-  refused file makes the result an error result. The root's go to the person (its A2A client gets them as shared
-  files); a subagent's stay on its run. A file at a `url` is never fetched. The files are untrusted content for the
-  client too: served as attachments or sanitized.
+  `failed`, `canceled`, `rejected` and `auth-required` fail the round with the remote's message (the parent reads
+  `report: failed`); `input-required` is the report (the question), and a session kept open answers it with its next
+  round. Data parts are their JSON; a file at a `url` stays a line (it is not fetched); a `raw` file part is described
+  in a line and dropped.
+* **`files: true`** in the subagent's file has **no effect** since C4, and `bind` warns that it has none: it shared the
+  `raw` parts of an answer to the remote subagent's own tool as file artifacts of the calling run (`ReceivedFiles`), and
+  a round shares nothing. **Breaking** for a folder that relied on it (a browser agent's screenshots reach the parent as
+  lines). The key still loads, so a folder written for it binds.
 * **Auth.** `auth: bearer:VAR` reads `VAR` at `bind`: `AgentDef::env(VAR, value)` first, then the process
   environment; trimmed; refused as `Error::RemoteAuth { origin, var, problem }` (`Missing`, `Empty`,
   `NotAToken`) without ever showing a value. The token is a `SecretString`, sent as `Authorization: Bearer` on
@@ -661,16 +660,17 @@ auth: bearer:BILLING_AGENT_TOKEN
   only the caller, or mesh mTLS). A card cannot widen it: an `https` card's plain-`http` interface is refused, and a
   plain-`http` interface is accepted only on the card's own host. A URL with a user name or password is
   `Credentials`, always refused, and errors show the URL without them.
-* **Under a local subagent.** `subagents/researcher/subagents/browser.md` with `a2a:` is a tool of `researcher`
-  (the walk binds every local agent's subagents, remote ones included): the researcher's child run calls it, parks
-  on the remote task and polls it like a root, and the root gets the researcher's text. A subagent gets no tool its
-  own files do not declare, so a remote the root declares is the root's alone; a second declaration (the same URL,
-  the same `auth` variable if you like) gives it to another agent.
-* **The client** is made by the first call that needs it (agent card fetched with a size cap, a safe interface
-  chosen, the token attached) and kept in the tool, so `bind` never touches the network and everything it decides
-  is plain values: a reload binds again and gets a new client.
+* **Under a local subagent.** `subagents/researcher/subagents/browser.md` with `a2a:` is a subagent of `researcher`
+  (the walk binds every local agent's subagents, remote ones included): the researcher gets the session tools, the
+  remote a round agent `<root>/researcher/browser`, and the researcher's round starts a session on it like a root;
+  the root gets the researcher's text. A remote the root declares is the root's alone; a second declaration (the same
+  URL, the same `auth` variable if you like) gives it to another agent.
+* **The client** is made by the first round that needs it (agent card fetched with a size cap, a safe interface
+  chosen, the token attached) and kept in the round agent, so `bind` never touches the network and everything it
+  decides is plain values: a reload binds again and gets a new client.
 * **Failures.** A transport error or a JSON-RPC internal error is transient (the step is retried; the message id
-  makes that safe); a 401, a task that no longer exists, or an invalid card is an error result for the model.
+  makes that safe); a 401, a task that no longer exists, or an invalid card fails the round, and the parent reads
+  `report: failed` with the reason.
 
 | Mistake | Error, at `bind` |
 |---|---|
@@ -689,7 +689,7 @@ Without it:
 
 * `bind` refuses a subagent file with `a2a:` with `Error::RemoteNotEnabled { origin }` (class `Invalid`), after the name
   checks and **before any secret is read**: the message names the feature (`` enable the feature `remote` of
-  adam-assembly ``). The agent never starts without a tool its files promise;
+  adam-assembly ``). The agent never starts without a subagent its files promise;
 * `RemoteRoundAgent`, `RemoteRoundStarter` and `Assembly::remote_round_agents` do not exist, and `session_starters`
   registers nothing for a remote subagent (none binds);
 * `env`, `secrets`, `allow_insecure_remotes`, `remote_timeout` and `connect_mcp` keep their signatures and their
@@ -715,11 +715,12 @@ started on a control plane and worked by a worker on every store).
 
 ### Remote sessions
 
-A root's remote subagent can run as a session (`subagent_start` and the other four tools). Each round is a run of a
-`RemoteRoundAgent`, registered as `<root>/<subagent>`: `Assembly::register` registers it, and a composition root that
-registers `agents()` one by one adds `remote_round_agents()` too (`Coder::register` does). It has no model: it sends the
-message to the remote, looks at the task and reports. It shares the connection of the subagent's tool, so the URL and token
-rules are the same and the token is never journaled or logged. Only the root's remote subagents have one.
+A remote subagent runs as a session (`subagent_start` and the other four tools), the only way it is reached. Each round is
+a run of a `RemoteRoundAgent`, registered as `<parent>/<subagent>`: `Assembly::register` registers it, and a composition
+root that registers `agents()` one by one adds `remote_round_agents()` too (`Coder::register` does). It has no model: it
+sends the message to the remote, looks at the task and reports. It holds the connection the bind checked
+(`RemoteEndpoint`), so the URL and token rules above hold and the token is never journaled or logged. Every remote
+subagent has one, the root's and a subagent's alike (C4; before, only the root's).
 
 * **Context.** The remote's `contextId` and the last task go from round to round (`referenceTaskIds`). An adam remote honours
   `referenceTaskIds` only for an authenticated caller, so give the subagent `auth: bearer:VAR`.
@@ -734,14 +735,12 @@ rules are the same and the token is never journaled or logged. Only the root's r
   slice C2) work as on a local session, because the rounds are local runs carrying the session's header: `one_shot` closes
   after its round, `sealed` stays idle and the A2A front refuses the person's message and steer, `open` takes both, and
   `wait: true` parks the start on round 1 and answers the remote's report. The remote is told nothing of the mode (no A2A
-  field carries it; we enforce it). **The remote subagent's own tool stays as it was**: it calls the remote from the
-  parent's step (`ToolError::AwaitRemote`), so it starts no child run and has no session or conversation id. It shares a
-  `files: true` answer as the parent's artifacts, which a round does not, and it exists when the root has no session tools,
-  while a round agent does not; slice C4 removes it (its use becomes `subagent_start` with `mode: one_shot` and
-  `wait: true`).
+  field carries it; we enforce it). Slice C4 removed the remote subagent's own tool, which called the remote from the
+  parent's step (`ToolError::AwaitRemote`): its use is `subagent_start` with `mode: one_shot` and `wait: true`, and what is
+  lost is the sharing of a `files: true` answer and the file's body in the tool's description (above).
 * **Dev reload** does not replace the round agents: a changed remote needs a restart.
-* **Breaking.** A root with only remote subagents now has five more tools; `Assembly::agents()` is unchanged and the runtime
-  has one more registered name per remote subagent.
+* **Breaking.** An agent with remote subagents has the six session tools and none named after them; `Assembly::agents()`
+  is unchanged and the runtime has one more registered name per remote subagent, a subagent's included.
 
 The sequence, the states and the failure table are in
 [`docs/reference/child-runs.md`](../../docs/reference/child-runs.md#remote-sessions).
@@ -905,9 +904,9 @@ place each:
 | Slice | What plugs in | Where |
 |---|---|---|
 | S7 skills (built) | the catalog appended to the prompt, `load_skill` and `read_skill_file` added to the tools | `add_skills` in `def.rs`, called while `bind` resolves an agent, so `Node::prompt` and `Node::tools` are final when `BoundDef::build` hands them to `LlmAgent`; the logic is `skills.rs` |
-| S9 subagents (built) | a `SubagentTool` per local child, the name checks, the asks-user refusal | `add_subagent_tools` and `refuse_asking_tools` in `def.rs`, in the same walk; the tool is `subagent.rs` |
-| S9b remote subagents (built) | a `RemoteSubagentTool` per remote child, through the same name checks | `add_subagent_tools` in `def.rs`; `RemoteSubagentTool::bind` and the tool are `remote.rs`; the deployment's choices (`allow_insecure_remotes`, `remote_timeout`) are `AgentDef` fields passed in as `RemoteSettings`, and the secrets (`env`, `secrets`) as `Secrets`, which `connect_mcp` reads too; feature `remote` |
-| S10 dev reload (built, feature `dev`) | `from_source` + `bind` + `model` again on a changed directory, swapped at a step boundary | `dev.rs`: a `Recipe` (the directory, the `ToolSet`, the model and the hooks that give `AgentDef` and `BoundDef` their values) that a reload runs again from the top; `AgentDef` and `BoundDef` are plain values, and a remote tool holds only plain values (URL, token, limits) until its first call, so a new bind is a new client |
+| S9 subagents (built; the tool removed by ADR 0089 C4) | the name checks, the roster of the session tools | `session_roster` in `def.rs`, in the walk; the session tools are made per agent in `assembly.rs` (`session_tools`, `manifest_of`) |
+| S9b remote subagents (built; the tool removed by ADR 0089 C4) | a `RemoteEndpoint` and a round agent per remote child, through the same name checks | `session_roster` in `def.rs`; `RemoteEndpoint::bind` is `remote.rs`, the round agent `remote_session.rs`; the deployment's choices (`allow_insecure_remotes`, `remote_timeout`) are `AgentDef` fields passed in as `RemoteSettings`, and the secrets (`env`, `secrets`) as `Secrets`, which `connect_mcp` reads too; feature `remote` |
+| S10 dev reload (built, feature `dev`) | `from_source` + `bind` + `model` again on a changed directory, swapped at a step boundary | `dev.rs`: a `Recipe` (the directory, the `ToolSet`, the model and the hooks that give `AgentDef` and `BoundDef` their values) that a reload runs again from the top; `AgentDef` and `BoundDef` are plain values, and a remote endpoint holds only plain values (URL, token) until its first round, so a new bind is a new client |
 | S11 MCP tools (built, feature `mcp`) | the tools of each agent's own `mcp.json`, joined to the catalog `tools:` selects from | `Walk::mcp_tools` and `Catalog::with` in `def.rs`, in the same walk (so `AgentInfo::tools` and the agent cannot disagree); the binding (per agent, with the config it was connected from) and its diagrams are `mcp.rs`; `connect_mcp` calls `adam-mcp`; `AgentDef::env` is where a `${VAR}` in `mcp.json` reads from too; `LiveBuilder::connect_mcp` keeps one binding per root for reloads |
 
 ## Tests
@@ -960,32 +959,33 @@ place each:
   closing round, and the four cancel cases (`CancelTask` on close with cancel, on a cancelled parent, at the time limit, and
   from the next round after a lost one), and `a_remote_session_takes_mode_and_wait_as_a_local_one_does` (ADR 0089 slice C2:
   `sealed` with `wait: true`). Memory, and PostgreSQL when set.
-* `tests/subagents.rs`: a parent calls a subagent which calls its own (root, researcher, summarizer) on a
-  `MockModel` through a `Runtime`, on the memory store and on PostgreSQL when `ADAM_TEST_POSTGRES_URL` is
-  set: each model request's prompt, tool list and history asserted, the answers coming back as tool results,
-  the runs recorded under their parents; the fixture's reviewer; a tool only the parent has is not offered
+* `tests/subagents.rs`: a parent starts a subagent with `subagent_start` (`one_shot`, `wait: true`) which starts its own
+  (root, researcher, summarizer) on a `MockModel` through a `Runtime`, on the memory store and on PostgreSQL when
+  `ADAM_TEST_POSTGRES_URL` is set: each model request's prompt, tool list (the session tools, no tool named after a
+  subagent) and history asserted, the reports coming back as the calls' results, the runs recorded under their parents
+  in their sessions' conversations; the fixture's reviewer; a tool only the parent has is not offered
   to the child and is refused when the child calls it; limits apply per child (a child over its `max_turns`
-  answers from its closing turn, and the parent is told the answer may be incomplete; a child's turns are not the parent's); a call without a `message`; a runtime
+  answers from its closing turn, and the parent is told the answer may be incomplete; a child's turns are not the parent's); a start without a `prompt`; a runtime
   that does not know the child; a parent whose process goes away while it waits and is stepped by a new
-  runtime that gets the child's answer; every name clash and the asks-user refusal.
-* `tests/remote.rs`: an in-process `adam-a2a` server (`InMemoryBackend` where it suffices, a scripted backend
-  for a failing task, a repeated message id and a lost response), a parent on `MockModel` through a `Runtime`
-  on the memory store and on PostgreSQL when set: a remote called, polled and answered (the request's tools and
-  description, the message id derived from run and call, `Authorization: Bearer` on every request, the journal
-  recording `tool:` and `poll:` and no token anywhere in it, the state, the events, the logs or `Debug`);
-  failed, canceled and input-required tasks as error results; a blank message sends nothing; a missing, empty
-  or malformed token variable is a bind error naming it; a wrong token; a card that points the token at another
-  origin; a restart mid-wait that polls on without sending again; a send whose response is lost and is retried
-  under the same message id; the wait limit; plain http refused unless local or allowed; clashes with a tool, a
-  skill tool and a subagent; the tool's place among the subagents; a remote declared in a local subagent's directory
-  is that subagent's tool, and its child run sends (message id from the child's run and call), polls and answers
-  the root with its text; with `files: true` a remote's screenshot is an artifact of the calling run (in its view)
-  and a line for the model, without it a line only. Unit tests in `src/remote.rs`: the parts of a completed task
-  shared (names, types, a `url` part kept as a line; an adam agent's words in its status message kept before its
-  screenshot's line), the parts of a plain message reply shared too (a real PNG called
-  `evil.html` is `evil-<hash>.png`; with no budget left the part is refused before it is copied), a file over the cap
-  refused as an error result, allowed plain `http` never a downgrade from an `https` card nor another host, and a
-  remote card never an interface on this machine.
+  runtime that gets the child's answer; a parent parked on a subagent's own tool of before C4 answered after it; a host's
+  own one-shot tool; a mode that keeps the session tools; every name clash and the asks-user refusal.
+* `tests/remote.rs`: the one-shot use of a remote subagent (`subagent_start`, `one_shot`, `wait: true`) against an
+  in-process `adam-a2a` server (`InMemoryBackend` where it suffices, a scripted backend for a failing task, a repeated
+  message id and a lost response), a parent on `MockModel` through a `Runtime` on the memory store and on PostgreSQL when
+  set: a remote started, polled and answered (the roster line, the message id the round's, `Authorization: Bearer` on
+  every request, the parent's journal recording the wait on the session and the round's `send:` and `poll:`, and no
+  token anywhere in either, the state, the events, the logs or `Debug`); failed and canceled tasks as failed reports, an
+  input-required task as a report of its question; a blank prompt sends nothing; a missing, empty or malformed token
+  variable is a bind error naming it; a wrong token; a card that points the token at another origin; a restart mid-wait
+  that polls on without sending again; a send whose response is lost and is retried under the same message id; the
+  round's limit; plain http refused unless local or allowed; clashes with a tool, a skill tool and a subagent; the
+  roster's order with the local subagents; a remote declared in a local subagent's directory is that subagent's, with a
+  round agent of its own, and the subagent's round starts a session on it and answers the root with its text; an answer
+  with a file is a line, with `files: true` or without. Unit tests in `src/remote.rs`: every state of a task, the parts
+  of an answer described (an adam agent's words in its status message kept before its screenshot's line, a `url` part a
+  line), a long answer cut, the bind's URL and token rules, allowed plain `http` never a downgrade from an `https` card
+  nor another host, and a remote card never an interface on this machine. **Removed with the tool** (C4): the tests of
+  its spec, its step, its `Alone` access and its `files: true` sharing (three).
 * `tests/skills.rs`: the catalog against `tests/golden/coder-prompt.txt` (the fixture; regenerate with
   `ADAM_UPDATE_GOLDEN=1`) and against a hand-written text with escaping; no skill, no tool; `skills:`
   selection and order; unknown, unselected and unsupplied skills, an over-size skill and a reserved tool

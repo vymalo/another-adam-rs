@@ -10,12 +10,13 @@ use std::path::{Path, PathBuf};
 
 use crate::Error;
 use crate::diagnostic::{Diagnostic, Sink};
-use crate::frontmatter::clean_body;
+use crate::frontmatter::{clean_body, key_line, split};
 use crate::load::{self, AgentFile, FileKind, RemoteSpec};
 use crate::manifest::{
     AgentManifest, Command, InstructionPart, Instructions, Layout, MAX_COMMANDS, MAX_MODES, Mode,
     Package, RemoteAgent, Report, Schedule, Skill, SkillLayout, Subagent,
 };
+use crate::schema::ToolList;
 
 /// Something that can produce a [`Report`]: the agents it holds and every finding about them.
 pub trait ManifestSource {
@@ -394,6 +395,12 @@ impl Loader<'_> {
             Some(d) => self.subagents(&d)?,
             None => Vec::new(),
         };
+        if let Some(message) = names_a_subagent(frontmatter.tools.as_ref(), &subagents) {
+            let line = split(&text)
+                .ok()
+                .and_then(|split| key_line(&split, "tools"));
+            self.error(&rel_instructions, line, message);
+        }
         let mcp = match find("mcp.json", EntryKind::File) {
             Some(p) => match self.read(&p)? {
                 Some(t) => {
@@ -423,7 +430,7 @@ impl Loader<'_> {
             (None, _) => Vec::new(),
         };
         let modes = match (find("modes", EntryKind::Dir), kind) {
-            (Some(d), FileKind::Root | FileKind::Named) => self.modes(&d)?,
+            (Some(d), FileKind::Root | FileKind::Named) => self.modes(&d, &subagents)?,
             (Some(d), FileKind::Sub) => {
                 let rel = self.rel(&d);
                 self.warn(&rel, "ignored: modes belong to the root agent");
@@ -743,8 +750,9 @@ impl Loader<'_> {
 
     /// `modes/<name>.md`, flat: a directory inside is not a mode and is warned about. Exactly one
     /// mode of the folder says `default: true`; a folder with modes and none, or with two, is an
-    /// error (a run always works in one mode, and never guesses which).
-    fn modes(&mut self, dir: &Path) -> Result<Vec<Mode>, Error> {
+    /// error (a run always works in one mode, and never guesses which). A mode's `tools:` may not
+    /// name one of the agent's `subagents` ([`names_a_subagent`]).
+    fn modes(&mut self, dir: &Path, subagents: &[Subagent]) -> Result<Vec<Mode>, Error> {
         let mut out: Vec<Mode> = Vec::new();
         for entry in self.list(dir)? {
             if ignored(&entry.name) || is_readme(&entry.name) {
@@ -781,6 +789,12 @@ impl Loader<'_> {
                     let Some(mode) = load::parse_mode(&mut sink, &rel, &text, name) else {
                         continue;
                     };
+                    if let Some(message) = names_a_subagent(mode.tools.as_ref(), subagents) {
+                        let line = split(&text)
+                            .ok()
+                            .and_then(|split| key_line(&split, "tools"));
+                        self.error(&rel, line, message);
+                    }
                     if let Some(first) = out.iter().find(|m| m.name == mode.name) {
                         let first = first.path.display().to_string();
                         self.error(
@@ -879,6 +893,44 @@ impl Loader<'_> {
 }
 
 /// Dotfiles, `*.test.md` and `__tests__`.
+/// What is wrong with a `tools:` (an agent's or one of its modes') that names one of the agent's
+/// own subagents, or `None` when it names none. A subagent used to be a tool named after it; since
+/// [ADR 0089] slice C4 it is started with `subagent_start` (decision 6), so the name would select
+/// nothing, and a mode that listed it would quietly lose the subagent. Refused, naming the tool
+/// that replaces it.
+///
+/// [ADR 0089]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0089-every-child-is-a-session-and-the-one-shot-subagent-tool-goes.md
+fn names_a_subagent(tools: Option<&ToolList>, subagents: &[Subagent]) -> Option<String> {
+    let Some(ToolList::Named(names)) = tools else {
+        return None;
+    };
+    let named: Vec<&str> = names
+        .iter()
+        .map(String::as_str)
+        .filter(|name| subagents.iter().any(|sub| sub.name() == *name))
+        .collect();
+    let first = *named.first()?;
+    let (which, are, them) = match named.as_slice() {
+        [one] => (format!("the subagent `{one}`"), "it is not a tool", "it"),
+        many => (
+            format!(
+                "the subagents {}",
+                many.iter()
+                    .map(|name| format!("`{name}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            "they are not tools",
+            "them",
+        ),
+    };
+    Some(format!(
+        "`tools` names {which}, and {are}: a subagent is started with `subagent_start` \
+         (`agent: {first}`; `mode: one_shot` and `wait: true` to wait for its answer), which an \
+         agent with subagents always has. Remove {them} from `tools`"
+    ))
+}
+
 fn ignored(name: &str) -> bool {
     name.starts_with('.') || name.ends_with(".test.md") || name == "__tests__"
 }

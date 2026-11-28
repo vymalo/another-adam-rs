@@ -1099,6 +1099,100 @@ async fn a_parked_subagent_shows_on_its_parent_and_a_message_wakes_it_through() 
     rig.stop().await;
 }
 
+/// A parent `llm` that starts its subagent `helper` with the session tools, and the child, on one
+/// scripted model, both parking on the model: the one-shot call of ADR 0089 slice C4.
+fn session_family() -> Rig {
+    let mock = Arc::new(MockModel::new());
+    let model: DynModel = mock.clone();
+    let roster = adam_llm_agent::SessionTools::new([adam_llm_agent::SessionAgent {
+        name: "helper".into(),
+        agent: "helper".into(),
+        description: "Helps.".into(),
+        within: None,
+        remote: false,
+        bounds: adam_runtime::SessionBounds::default(),
+        session: adam_llm_agent::SessionDefaults::default(),
+    }]);
+    let mut parent = LlmAgent::builder("llm", model.clone(), "test-model")
+        .session_agents(["helper"])
+        .model_parking(ModelParking::default());
+    for tool in roster.tools() {
+        parent = parent.dyn_tool(tool);
+    }
+    let child = LlmAgent::builder("helper", model, "test-model")
+        .model_parking(ModelParking::default())
+        .build();
+    let mut rig = Rig::build(
+        mock,
+        vec![parent.build(), child],
+        Arc::new(MemoryStore::new()),
+    );
+    rig.spawn();
+    rig
+}
+
+/// The one-shot call is `subagent_start` with `wait: true` (ADR 0089 slice C4), and it waits on its
+/// round as the subagent's own tool waited on its child (ADR 0067 decision 5): a round parked until
+/// woken shows on the parent, which waits with no timer, and a message to the parent wakes the
+/// round through it, its words staying at the parent.
+#[tokio::test]
+async fn a_start_that_waits_carries_its_rounds_park_and_a_message_wakes_the_round_through_it() {
+    let rig = session_family();
+    rig.mock
+        .push_tool_calls(vec![tool_call(
+            "c1",
+            "subagent_start",
+            json!({"agent": "helper", "description": "help", "prompt": "do it",
+                   "mode": "one_shot", "wait": true}),
+        )])
+        .push_error(refused(402, Some("over_limit"), Park::UntilWoken))
+        .push_text("the helper's answer")
+        .push_text("all done");
+    let run = rig.start(None).await;
+    let round = adam_runtime::child_run_id(run, "c1");
+
+    let (view, state) = rig
+        .parked(
+            run,
+            |s| matches!(&s.pending_wait, Some(PendingWait::Session(w)) if w.model_wait.is_some()),
+        )
+        .await;
+    assert!(view.waiting, "the parent waits like a question");
+    assert_eq!(view.wake_at, None);
+    let Some(PendingWait::Session(wait)) = state.pending_wait else {
+        panic!("the parent waits on the session")
+    };
+    assert_eq!(wait.session, round);
+    let copy = wait.model_wait.expect("the copy of the round's wait");
+    assert_eq!(copy.park, ModelPark::UntilWoken);
+    assert_eq!(copy.reason, "the model gateway's limit is reached");
+
+    rig.rt
+        .deliver(run, user_message("the limit is raised"))
+        .await
+        .expect("deliver");
+    let done = rig.done(run).await;
+    assert_eq!(text_of(&done).as_deref(), Some("all done"));
+    let requests = rig.mock.requests();
+    assert_eq!(requests.len(), 4);
+    assert_eq!(
+        texts(&requests[2]),
+        texts(&requests[1]),
+        "the round makes the same call"
+    );
+    let round = rig.state(round).await;
+    assert!(
+        round
+            .messages
+            .iter()
+            .all(|m| m.text() != "the limit is raised"),
+        "no message of the person's reached the round"
+    );
+    let parent = rig.state(run).await;
+    assert!(parent.pending_wait.is_none());
+    rig.stop().await;
+}
+
 /// A resume to the parent adds nothing to it and wakes the child through it: the same call is made
 /// again, and the parent's history has no turn for the resume (ADR 0067 decision 5).
 #[tokio::test]

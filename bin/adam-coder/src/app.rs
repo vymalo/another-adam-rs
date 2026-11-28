@@ -52,7 +52,7 @@ impl Coder {
     /// that cross processes.
     ///
     /// The subagents of the agent's folder ([`CoderAgent::subagents`]) are registered beside it,
-    /// so that a subagent tool finds the agent it starts a child run of.
+    /// so that `subagent_start` finds the agent it starts a round of.
     pub fn new_with(
         store: DynStore,
         agent: CoderAgent,

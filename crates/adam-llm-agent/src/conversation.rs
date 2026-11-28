@@ -76,7 +76,7 @@ pub(crate) fn parse_prompt_statement(payload: &Value) -> Option<adam_model::Prom
 }
 
 /// The key of the payload of a child's first message that names the step of the **root** run the
-/// child's work is under: the root's call of a subagent tool (`tool:<call id>`), handed down to a
+/// child's work is under: the root's call that started the child (`tool:<call id>`), handed down to a
 /// child's own children. Written by [`ToolCtx::start_child`](crate::ToolCtx::start_child) only, like
 /// [`ROOT_RUN_KEY`].
 pub(crate) const ROOT_STEP_KEY: &str = "root_step";
@@ -372,6 +372,22 @@ pub struct PendingSession {
     pub tool: String,
     /// The session: the run id of its first round.
     pub session: RunId,
+    /// The model wait of round 1 when this run last looked, for a `subagent_start` that waits
+    /// ([ADR 0067] decision 5, as [`PendingRun::model_wait`]; ADR 0089 slice C4): `Some` while the
+    /// round is parked on the model. The run waits on an until-woken round with **no timer**, and
+    /// forwards a resume to it. In the head at `/pending_wait/model_wait`; absent from state
+    /// written before it existed, and not written while `None`. A read that waits keeps none.
+    ///
+    /// **Breaking:** a new public field of a struct that is not `#[non_exhaustive]`: a
+    /// `PendingSession` built with a struct literal outside the workspace names it.
+    ///
+    /// [ADR 0067]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0067-a-model-call-through-an-injector-names-its-run-and-a-refusal-parks-the-run.md
+    #[serde(
+        default,
+        deserialize_with = "crate::model_wait::lenient",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub model_wait: Option<crate::ModelWait>,
 }
 
 /// What a parked run is waiting for, so that one result can complete the call
@@ -909,8 +925,8 @@ pub struct Conversation {
     /// [ADR 0077]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0077-a-model-call-carries-the-prompt-statement-and-the-persons-envelope.md
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt_statement: Option<adam_model::PromptStatement>,
-    /// The step of the [`root_run`](Self::root_run) this child run works under: the root's call of a
-    /// subagent tool (`tool:<call id>`), put in the child's first message by the tool that started it
+    /// The step of the [`root_run`](Self::root_run) this child run works under: the root's call that
+    /// started the child (`tool:<call id>`), put in the child's first message by the tool that started it
     /// and handed down to the child's own children. The report of each of this run's model calls
     /// names it, so the task's client counts a subagent's tokens apart. `None` for a run that is
     /// nobody's child. Absent from state written before it existed, and not written while it is

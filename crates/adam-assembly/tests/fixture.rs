@@ -124,13 +124,9 @@ fn the_fixture_binds_each_agent_as_its_files_say() {
             "read_output",
             "load_skill",
             "read_skill_file",
-            // One tool per subagent, named after it, after everything else: `billing` is the
-            // fixture's remote (A2A) subagent, a tool of the same shape. Then the six that run a
-            // subagent in the background.
-            "billing",
-            "legacy",
-            "researcher",
-            "reviewer",
+            // The six that start and follow its subagents, after everything else, local and
+            // remote (`billing`, the fixture's A2A subagent) alike: no tool is named after one
+            // (ADR 0089 slice C4).
             "subagent_start",
             "subagent_send",
             "subagent_read",
@@ -175,12 +171,22 @@ fn the_fixture_binds_each_agent_as_its_files_say() {
         "You review diffs. Report findings as a numbered list."
     );
 
-    // A subagent that lists no tools has none, and one that nests keeps its own.
+    // A subagent that lists no tools has none, and one that nests gets the session tools for its
+    // own subagents.
     assert!(info("coder/legacy").tools.is_empty());
     // A subagent has its own skills (`web-search`, no files) and inherits none of the parent's.
     assert_eq!(
         info("coder/researcher").tools,
-        ["fetch_page", "load_skill", "summarizer"]
+        [
+            "fetch_page",
+            "load_skill",
+            "subagent_start",
+            "subagent_send",
+            "subagent_read",
+            "subagent_edit",
+            "subagent_close",
+            "subagent_list"
+        ]
     );
     assert_eq!(info("coder/researcher").skills, ["web-search"]);
     assert!(info("coder/reviewer").skills.is_empty());
@@ -253,10 +259,6 @@ async fn the_fixture_agent_runs_end_to_end_on_a_mock_model() {
             "read_output",
             "load_skill",
             "read_skill_file",
-            "billing",
-            "legacy",
-            "researcher",
-            "reviewer",
             "subagent_start",
             "subagent_send",
             "subagent_read",

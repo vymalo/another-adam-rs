@@ -17,7 +17,7 @@ Claude or Copilot keys are accepted with a warning.
 | D2 | Tools live in `src/` with an explicit `tools![]`, not `agent/tools/*.rs` auto-discovery | included files are invisible to `cargo fmt` |
 | D3 | A subagent that omits `tools:` gets none | inherit all: Claude-compatible, surprising for a durable backend |
 | D4 | Unknown frontmatter keys and Agent Skills violations warn (`.strict()` opts in to errors); a missing `description` always fails | fail the build on any |
-| D5 | One tool per subagent, named after it | a single `delegate { agent, message }` tool |
+| D5 | One tool per subagent, named after it. *Amended 2026-11-28* ([ADR 0089](../../../docs/decisions/0089-every-child-is-a-session-and-the-one-shot-subagent-tool-goes.md) slice C4): no tool is named after a subagent; every agent with subagents gets the six session tools, and the one-shot call is `subagent_start` with `mode: one_shot`, `wait: true`; a `tools:` that names a subagent is refused at load (`names_a_subagent`, `crates/adam-agent-fs/src/source.rs`) | a single `delegate { agent, message }` tool |
 | D6 | The `dev` feature ships in the facade and is off by default | on by default |
 
 Also confirmed: adam-rs domain types are **closed enums** (no `#[non_exhaustive]` unless an existing

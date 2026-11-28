@@ -4,7 +4,6 @@ ask_user	10024	2506
 commit_and_push	1665	416
 create_repository	1511	377
 edit_file	1873	468
-explorer	725	181
 file_diagnostics	1608	402
 find_definition	1635	408
 find_files	1079	269
@@ -24,7 +23,6 @@ read_files	1330	332
 read_output	934	233
 read_skill_file	868	217
 request_repository	1431	357
-reviewer	720	180
 run	2210	552
 run_checks	2948	737
 run_command	1998	499
@@ -34,11 +32,11 @@ show	1549	387
 start_command	2222	555
 start_scratch	1243	310
 stop_command	664	166
-subagent_close	998	249
+subagent_close	1033	258
 subagent_edit	2231	557
 subagent_list	784	196
 subagent_read	1115	278
 subagent_send	769	192
-subagent_start	3821	955
+subagent_start	3745	936
 ui_catalog	474	118
 write_file	975	243

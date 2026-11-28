@@ -3197,6 +3197,41 @@ impl LlmAgent {
     /// the copy it keeps of its own child's — a park is shown through each parent, one level at a
     /// time. `None` for a child that works or waits on something else, and for a wait this build
     /// cannot read.
+    /// The model wait of `round`, the first round of a session this run started and waits on,
+    /// copied into the run's wait on it (`/pending_wait/model_wait`, where a front reads it), as
+    /// [`PendingWait::Run`] keeps a child's: a message or a resume that woke this run (`waking`) is
+    /// forwarded to a round parked on the model as one resume. Returns whether the round is parked
+    /// until it is woken, so that this run waits with no timer.
+    async fn carry_round_park(
+        &self,
+        ctx: &mut Ctx,
+        state: &mut Conversation,
+        round: RunId,
+        waking: Option<&str>,
+    ) -> Result<bool, AgentError> {
+        let look = ctx.child_look(round).await?;
+        let copy = look
+            .as_ref()
+            .filter(|look| !look.status.is_finished())
+            .and_then(|look| Self::model_wait_of(look.head.as_ref()));
+        let forwarded = match (&copy, waking) {
+            (Some(_), Some(waking)) => {
+                ctx.resume_child(round, forwarded_resume_id(waking, round))
+                    .await?;
+                true
+            }
+            _ => false,
+        };
+        let until_woken = !forwarded
+            && copy
+                .as_ref()
+                .is_some_and(|wait| wait.park == ModelPark::UntilWoken);
+        if let Some(PendingWait::Session(stored)) = &mut state.pending_wait {
+            stored.model_wait = if forwarded { None } else { copy };
+        }
+        Ok(until_woken)
+    }
+
     fn model_wait_of(head: Option<&Value>) -> Option<ModelWait> {
         let head = head?;
         let wait = head
@@ -5238,6 +5273,7 @@ impl LlmAgent {
                         call_id: call.id.clone(),
                         tool: call.name.clone(),
                         session,
+                        model_wait: None,
                     }));
                     return Ok(Flow::Wait);
                 }
@@ -8919,8 +8955,8 @@ impl LlmAgent {
         // task's, with the session as the task).
         if let Some(PendingWait::Session(wait)) = state.pending_wait.clone() {
             let looking = PendingRemote {
-                call_id: wait.call_id,
-                tool: wait.tool,
+                call_id: wait.call_id.clone(),
+                tool: wait.tool.clone(),
                 task: wait.session.to_string(),
                 deadline: None,
             };
@@ -8938,7 +8974,22 @@ impl LlmAgent {
                     .await;
                 }
                 None => {
-                    let wake_at = Some(self.next_poll(ctx));
+                    // A start that waits waits on round 1, a child this call started: its park on
+                    // the model is carried up as a child run's is (ADR 0067 decision 5), so the
+                    // one-shot call of a subagent (ADR 0089 slice C4) waits as it did when it was
+                    // a tool of its own. A read that waits may be on a round of another run: it
+                    // keeps its look.
+                    let waking = absorbed
+                        .read
+                        .as_deref()
+                        .or_else(|| resumes.first().map(|i| i.id.as_str()));
+                    let until_woken = if wait.tool == crate::SUBAGENT_START {
+                        self.carry_round_park(ctx, &mut state, wait.session, waking)
+                            .await?
+                    } else {
+                        false
+                    };
+                    let wake_at = (!until_woken).then(|| self.next_poll(ctx));
                     return Ok(Transition::Park { state, wake_at });
                 }
             }

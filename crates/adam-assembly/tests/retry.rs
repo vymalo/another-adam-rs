@@ -242,10 +242,11 @@ fn the_folders_class_names_are_the_runtimes() {
     );
 }
 
-/// A subagent's tool is one of the parent's tools, and can be given a policy by its name.
+/// A subagent is no tool of its parent (ADR 0089 slice C4: it is started with `subagent_start`),
+/// so a `retry:` that names one names nothing and is refused at bind, as any unknown tool is.
 #[test]
-fn retry_names_a_subagent_tool() {
-    let assembly = def(&[
+fn retry_naming_a_subagent_is_an_unknown_tool() {
+    let error = def(&[
         (
             INSTRUCTIONS,
             &instructions(
@@ -259,10 +260,11 @@ fn retry_names_a_subagent_tool() {
         ),
     ])
     .bind(tools(&[]))
-    .unwrap()
-    .model(Arc::new(MockModel::new()), "m")
-    .unwrap();
-    assert_eq!(assembly.info()[0].retry[0].0, "code-reviewer");
+    .unwrap_err();
+    let Error::UnknownRetryTool { tool, .. } = &error else {
+        panic!("{error}");
+    };
+    assert_eq!(tool, "code-reviewer");
 }
 
 /// A declared MCP server that gave no tools (an optional one that is down) does not stop the

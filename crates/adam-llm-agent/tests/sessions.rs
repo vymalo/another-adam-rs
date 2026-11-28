@@ -1337,7 +1337,7 @@ mod cases {
         let wait_call = "wait_1".to_owned();
         assert!(matches!(
             &state.pending_wait,
-            Some(PendingWait::Session(PendingSession { call_id, tool, session: s }))
+            Some(PendingWait::Session(PendingSession { call_id, tool, session: s, .. }))
                 if *call_id == wait_call && tool == "subagent_read" && *s == session
         ));
         assert_ne!(parked.status, RunStatus::Done);
@@ -3674,7 +3674,7 @@ mod cases {
         let parked = wait_waiting_on_a_session(&rt, second).await;
         assert!(matches!(
             &conversation(&rt, &parked).await.pending_wait,
-            Some(PendingWait::Session(PendingSession { call_id, tool, session: s }))
+            Some(PendingWait::Session(PendingSession { call_id, tool, session: s, .. }))
                 if call_id == "wait_1" && tool == "subagent_read" && *s == session
         ));
         rig.child_gate.release.notify_one();

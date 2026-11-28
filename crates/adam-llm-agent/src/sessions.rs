@@ -3,15 +3,17 @@
 //!
 //! A session is a conversation of child runs ("rounds") of one subagent, kept in the parent's own
 //! conversation. The tools hold nothing: every call reads the sessions from the store, so a replay,
-//! a restart and another worker see what the model saw. They are given to an agent that has local
-//! subagents ([`SessionTools::tools`]), beside the one tool per subagent, which stays for a
-//! synchronous ask. The agent that has them also waits, at the end of a turn, for the sessions it
-//! started in the task ([`LlmAgentBuilder::session_agents`](crate::LlmAgentBuilder::session_agents)).
+//! a restart and another worker see what the model saw. They are given to an agent that has
+//! subagents ([`SessionTools::tools`]), and they are the only way it reaches them: a synchronous ask
+//! is `subagent_start` with `mode: one_shot` and `wait: true` ([ADR 0089]). The agent that has them
+//! also waits, at the end of a turn, for the sessions it started in the task
+//! ([`LlmAgentBuilder::session_agents`](crate::LlmAgentBuilder::session_agents)).
 //!
 //! The schemas are fixed for a run: the only enum is the subagent names, sorted, so the specs are
 //! byte-stable. A session id is the run id of the session's first round.
 //!
 //! [ADR 0045]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0045-a-subagent-can-run-in-the-background-as-a-session.md
+//! [ADR 0089]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0089-every-child-is-a-session-and-the-one-shot-subagent-tool-goes.md
 
 use crate::access::ToolAccess;
 use std::collections::HashSet;
@@ -1124,8 +1126,8 @@ fn one_shot_description(message: &str) -> String {
 /// [`SessionMode::OneShot`] and **closed from the start**: it closes when its round ends, and
 /// nobody (the parent, the person) can send to it meanwhile, not even a steer. It is
 /// `subagent_start` with `mode: one_shot` and `wait: true`, except that the caller waits on it
-/// ([`ToolError::AwaitRun`] with the returned id) and no session limit applies, as none applied to
-/// a subagent's own tool before.
+/// ([`ToolError::AwaitRun`] with the returned id) and no session limit applies. The assembly offers
+/// no tool that calls it since slice C4; it stays for a host's own tool that waits on a child.
 ///
 /// Idempotent, keyed by the call: a replay finds the round it started. A child this call started
 /// as a plain child run before C1 (no conversation) is found too: when the runtime refuses the round
@@ -1175,16 +1177,15 @@ struct Start {
 impl Tool for Start {
     fn spec(&self) -> ToolSpec {
         let mut description = format!(
-            "Start a subagent in the background and get its session id at once; you keep working \
-             while it works. Use it instead of the subagent's own tool when you have other work to \
-             do meanwhile or want to ask it again. The subagent does not see this conversation: put everything it \
-             needs in `prompt`. Read its report with {SUBAGENT_READ} (pass wait: true to wait for \
-             it; never poll), and send it more with {SUBAGENT_SEND}. `mode` says who may send the \
-             session more after its first round: nobody with one_shot (the default: it closes when \
-             its round has ended), only you with sealed, you and the person with open; keep it open \
-             only when another message will follow, and close what you kept open with \
-             {SUBAGENT_CLOSE}. With wait true the call waits for the first report and returns it, \
-             as {SUBAGENT_READ} with wait: true does. Subagents:"
+            "Start a subagent and get its session id at once; you keep working while it works. With \
+             wait true the call waits for the first report and returns it, as {SUBAGENT_READ} with \
+             wait: true does: use it when you need the answer before you go on. The subagent does \
+             not see this conversation: put everything it needs in `prompt`. Read its report with \
+             {SUBAGENT_READ} (pass wait: true to wait for it; never poll), and send it more with \
+             {SUBAGENT_SEND}. `mode` says who may send the session more after its first round: \
+             nobody with one_shot (the default: it closes when its round has ended), only you with \
+             sealed, you and the person with open; keep it open only when another message will \
+             follow, and close what you kept open with {SUBAGENT_CLOSE}. Subagents:"
         );
         for agent in &self.roster.agents {
             let text = one_line(&agent.description);

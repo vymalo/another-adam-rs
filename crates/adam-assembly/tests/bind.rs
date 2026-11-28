@@ -162,16 +162,14 @@ fn default_tool_access_follows_the_owner_decision_d3() {
             .tools
             .clone()
     };
-    // The root with no `tools:` gets everything, then a tool for each subagent; a subagent with
-    // none listed gets none (and not the parent's, nor the parent's subagent tools).
+    // The root with no `tools:` gets everything, then the session tools that start its subagents
+    // (no tool is named after one: ADR 0089 slice C4); a subagent with none listed gets none (and
+    // not the parent's, nor the parent's session tools).
     assert_eq!(
         tools_of("coder"),
         [
             "a",
             "b",
-            "all",
-            "none",
-            "quiet",
             "subagent_start",
             "subagent_send",
             "subagent_read",
@@ -581,9 +579,7 @@ fn hand_supplied_mcp_tools_bind_like_connected() {
                     "ask_user".to_owned(),
                     // After the tools it selected: a long MCP result is read with it.
                     "read_output".to_owned(),
-                    // The tool that calls the subagent, after the agent's own tools, then the
-                    // six that run a subagent in the background.
-                    "researcher".to_owned(),
+                    // The six that run a subagent as a session, after the agent's own tools.
                     "subagent_start".to_owned(),
                     "subagent_send".to_owned(),
                     "subagent_read".to_owned(),
@@ -617,7 +613,6 @@ fn hand_supplied_mcp_tools_bind_like_connected() {
                     "ask_user".to_owned(),
                     "linear__list".to_owned(),
                     "read_output".to_owned(),
-                    "researcher".to_owned(),
                     "subagent_start".to_owned(),
                     "subagent_send".to_owned(),
                     "subagent_read".to_owned(),

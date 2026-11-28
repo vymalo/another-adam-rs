@@ -369,10 +369,11 @@ async fn a_subagent_selects_on_its_own_task_not_the_parents() {
     }
     async fn child_tools(parent_task: &str, child_task: &str) -> Vec<String> {
         let mock = Arc::new(MockModel::new());
+        // The one-shot call: `subagent_start` that waits (ADR 0089 slice C4).
         mock.push_tool_calls(vec![call_with(
             "s1",
-            "helper",
-            json!({"message": child_task}),
+            "subagent_start",
+            json!({"agent": "helper", "description": "help", "prompt": child_task, "wait": true}),
         )])
         .push_text("child done")
         .push_text("parent done");

@@ -185,3 +185,60 @@ started with, which `subagent_start` held to the ceiling, and that is the only p
 Proof: `crates/adam-llm-agent/tests/sessions.rs` (`an_edit_changes_no_mode_and_names_the_ceiling`) and
 `crates/adam-a2a-runtime/tests/child_sessions.rs` (`a_sealed_or_one_shot_session_of_the_agent_refuses_the_persons_message_and_steer`,
 which now sends an edit too).
+
+*Amended 2026-11-28, slice C4 built:* **no tool is named after a subagent.** `adam_assembly::SubagentTool` and the remote
+subagent's own tool are deleted, not kept for hand-assembled hosts: decision 1 starts a subagent only with
+`subagent_start`, and a host that assembles by hand has `SessionTools` (and `ToolCtx::start_one_shot_session`, kept, for a
+tool of its own that waits on a child, as `Runtime::start_child` is). The one-shot call is `subagent_start` with
+`mode: one_shot` and `wait: true`: round 1 under the id the named tool used (`child_run_id(parent, call id)`), the parent
+parked on it (`ToolError::AwaitSession`), the session's page as the result (its header line, `report: done` or `failed`,
+the child's text). `child-sessions/v1` carries `mode` since C2 (verified). The coder's `instructions.md` names
+`subagent_start` (its snapshot `prompt.txt` too; 29,957 characters at the most cycles, under 30,000), its plan mode no longer
+lists `explorer` and `reviewer`, and no dev agent named a subagent tool. **Breaking:** `SubagentTool` is gone from the
+public API (`DEFAULT_SUBAGENT_MINUTES` stays, in `def.rs`); `AgentInfo::tools` and the model's tool list have no name per
+subagent; the coder offers 43 tools, not 45; `PendingSession` gains `model_wait`; the `SubagentToolClash` message is
+reworded (``the parent `coder` would read `helper` as two things, ...``); `subagent_start`'s description no longer points at
+"the subagent's own tool", so its pinned spec and the prompt's stable prefix moved once. Where C4 differs from or adds to the
+decision:
+
+* **The refusal is the loader's** (decision 6): a `tools:` of an agent or of a mode that names one of the agent's subagents
+  stops the load at the line of `tools` (exit 78 in `adam-agent`): ``agent/modes/plan.md:4: `tools` names the subagents
+  `explorer`, `reviewer`, and they are not tools: a subagent is started with `subagent_start` (`agent: explorer`; `mode:
+  one_shot` and `wait: true` to wait for its answer), which an agent with subagents always has. Remove them from `tools` ``.
+  A `retry:` that names a subagent is `Error::UnknownRetryTool` at bind.
+* **A mode keeps the session tools.** They are made at `model`, after `bind` resolved the modes, so a mode that listed
+  them dropped them with a warning: the coder's plan mode offered `explorer` and `reviewer` but not `subagent_*`. The
+  resolution now counts them as the agent's tools.
+* **Every agent with subagents gets the session tools**, the root as before and now a subagent with its own (ADR 0045
+  amended the same day): without them a nested subagent could no longer be reached. The tools are built per agent, with
+  the bounds of that agent's own subagents; the A2A front still offers the root's only.
+* **A start that waits carries its round's park on the model up** (ADR 0067 decision 5), as the named tool's `AwaitRun`
+  did: `PendingSession::model_wait` copies round 1's, the parent waits on an until-woken round with no timer, a message or
+  a resume to it goes down as one resume, and the coder stops its background commands. Only for `subagent_start`, whose
+  round 1 is the run's own child; a `subagent_read` that waits keeps its 60 s look, as before.
+* **A remote one-shot through a round** covers what the remote's own tool did (the send under a derived message id, the
+  poll, the time limit, the token rules, a remote under a local subagent), with three differences, all recorded:
+  **(a)** `files: true` has no effect: a round describes a file of the answer in a line, where the tool shared it as a
+  file of the calling run, so a browser agent's screenshot no longer reaches the person through the root (`bind` warns
+  of the key; the folder still loads); **(b)** the body of the remote's file is read by nothing (it extended the tool's
+  description; the roster line is the file's `description`); **(c)** a dev reload does not rotate the remote's token or
+  change its URL: the round agent is the first load's, as a remote session's always was. And what a round does better: a
+  remote failure is a `failed` report, an `input-required` task reports its question, a round past its limit cancels the
+  remote task, and the child has a session and an export record.
+* **Upgrading.** A run parked on a child that a subagent's own tool started is answered from the store, the tool gone
+  (`PendingWait::Run`); a run parked on the task of a remote's own tool reads "the tool `<name>` that started this task is
+  gone" and goes on, the remote task left running; a journaled model turn that called a named tool and had not run it yet
+  gets "unknown tool". In the coder, `explorer` and `reviewer` are no longer in `tier::known`.
+
+Proof: `crates/adam-assembly/tests/subagents.rs` (`every_agent_with_subagents_gets_the_session_tools_and_no_other`,
+`a_one_shot_start_that_waits_is_a_session_closed_after_its_round`,
+`a_parent_calls_its_subagent_which_calls_its_own_and_the_parent_goes_on`, `a_mode_that_names_the_session_tools_keeps_them`,
+`a_parent_parked_on_a_subagents_own_tool_of_before_is_answered_after_the_upgrade`,
+`a_hosts_one_shot_tool_finds_a_child_started_before_it_was_a_session`), `crates/adam-assembly/tests/remote.rs` (every case
+of the remote's own tool as a round, `the_files_of_a_remote_are_described_and_never_kept_files_true_or_not`,
+`the_remote_subagent_of_a_subagent_has_a_session_and_a_round_agent`), `crates/adam-assembly/tests/parallel.rs`
+(`the_tools_that_start_a_subagent_run_alone`), `crates/adam-assembly/tests/dev.rs`
+(`a_reload_keeps_the_remote_round_agent_and_its_token_until_a_restart`), `crates/adam-agent-fs/tests/modes.rs`
+(`a_tools_list_that_names_a_subagent_is_refused_naming_subagent_start`), `crates/adam-llm-agent/tests/model_park.rs`
+(`a_start_that_waits_carries_its_rounds_park_and_a_message_wakes_the_round_through_it`), the coder's
+`tests/agent_files.rs`, `tiers.rs` and the unit `the_helpers_own_tools_are_unknown_and_subagent_start_is_a_read`.

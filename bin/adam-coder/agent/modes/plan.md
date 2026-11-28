@@ -25,8 +25,6 @@ tools:
   - plan_check
   - plan_add
   - ask_agent
-  - explorer
-  - reviewer
   - subagent_start
   - subagent_send
   - subagent_read

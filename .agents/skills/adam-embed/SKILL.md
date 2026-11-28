@@ -66,7 +66,11 @@ the adam crates pinned in `orchestrator/Cargo.toml`.
      128,000 fallback) apply through `AgentDef::bind`/`model`, not the loop. A `DynModel` you build yourself
      (`OpenAiCompatible`) needs `.with_profiles(profiles)` for a `reasoning_effort` to reach the provider: without
      it the level is dropped silently (ADR 0063 decision 6; `.models(..)` on the engine does not reach the client).
-     Details and the tool rules:
+     **Subagents are started with the session tools** (ADR 0089 slice C4): `bind` gives every agent with subagents
+     `subagent_start` and the four others, and no tool named after a subagent (`adam_assembly::SubagentTool` is gone:
+     a breaking change); the one-shot call is `subagent_start` with `mode: one_shot` and `wait: true`. A hand-assembled
+     agent gives itself `adam_llm_agent::SessionTools::new(roster).tools()` and `.session_agents(names)`, or its own
+     `#[tool]` over `ToolCtx::start_one_shot_session` returning `ToolError::AwaitRun`. Details and the tool rules:
      `crates/adam/README.md` ("`#[tool]`", "Agent directories"), `docs/reference/agent-files.md`.
    * **A host may put compiled hooks around every tool call and around a person's message** (ADR 0050,
      slices H1 and H1b): `LlmAgentBuilder::hooks(HookSet)` or `.plugin(one)` (`adam-plugin`, re-exported

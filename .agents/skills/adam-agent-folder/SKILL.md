@@ -75,20 +75,23 @@ before you rely on a detail here.
      78: `adam-plugin`'s `Audit` (one JSON line per observed event) and the `adam-hooks/1` program
      adapter (`adam-hook-exec`) are for a host that registers them. `hooks:` stays an ignored key.
 3. **Body**: the system prompt. Optional `skills/<name>/SKILL.md` (Agent Skills format, loaded on
-   demand by `load_skill` and `read_skill_file`, which take a plain string name and page; a folder with no `skills:` has all of them, `skills: []` none) and `subagents/` (each one tool of the parent, a
-   child run with only the tools it lists and never `ask_user`; registered as `<name>/<subagent>`).
+   demand by `load_skill` and `read_skill_file`, which take a plain string name and page; a folder with no `skills:` has all of them, `skills: []` none) and `subagents/` (each a child run with only the tools it lists,
+   registered as `<name>/<subagent>`). **A subagent is no tool** (ADR 0089 slice C4): an agent with subagents gets the
+   six session tools, and the instructions tell the model to use `subagent_start` (`agent`, `description`, `prompt`,
+   `wait: true` to have the answer as the result). A `tools:` that names a subagent, the agent's or a mode's, is exit 78
+   with a message naming `subagent_start`; a mode that lists `subagent_*` keeps them.
    A subagent file may set `session:` (`mode`: `one_shot`, `sealed` or `open`; `wait`: `true` or `false`): what a
    `subagent_start` that names none gets, and `mode` is also the widest a call may ask (a call only narrows it; asking
    wider is an error result naming both). Another key or word is exit 78; on the root it is a warning and ignored
    (ADR 0089 slice C3; `docs/reference/agent-files.md`).
-   A root with subagents also gets the five session tools (`subagent_start` .. `subagent_list`) and a fixed *Child sessions* section at the end of its prompt, after the skills catalog (the tools, the helpers sorted, what `config` takes): do not write a paragraph about them in the instructions.
+   A root with subagents also gets the six session tools (`subagent_start` .. `subagent_list`) and a fixed *Child sessions* section at the end of its prompt, after the skills catalog (the tools, the helpers sorted, what `config` takes): do not write a paragraph about them in the instructions.
    A subagent file with `a2a: <agent-card URL>` is a **remote subagent** (another A2A agent): render the URL into
    the file, and give its token through `auth: bearer:VAR` (a variable of the process, from a Secret; unset is exit
    78). Plain `http` to a service of the same cluster needs `A2A_ALLOW_INSECURE_REMOTES=true` on `adam-agent`, and
    then the bearer crosses the pod network in clear text: add a NetworkPolicy or mesh mTLS. A
-   remote under a subagent's directory (`subagents/researcher/subagents/browser.md`) is that subagent's tool.
-   `files: true` in a remote's file shares the file parts of its answer (a browser's screenshot) as files of the
-   calling run; without it they are described and dropped. A subagent's files never reach the person.
+   remote under a subagent's directory (`subagents/researcher/subagents/browser.md`) is that subagent's (it gets the
+   session tools). A file in a remote's answer (a browser's screenshot) is described in a line and dropped; `files: true`
+   has no effect since C4 (a warning). A subagent's files never reach the person.
    Optional `commands/<name>.md` are prompt templates the agent serves (`description`, `argument-hint`, a body with `$ARGUMENTS` and `$1` to `$9`; at most 50, `$$` is a literal `$`, never executed, any `!` right before a backtick is refused; a file is `*.md`, regular, at most 40 KiB): the card lists them (`commands/v1`) and a message `/name arguments` or its metadata invokes one; a subagent's `commands/` is ignored.
    Optional `modes/<name>.md` are the modes a person picks **for one message** (`title`, `description`, `default: true` on exactly one, `tools:` — an allowlist over the agent's own, absent: no narrowing — and a body added to the instructions while it is in force; at most 16; a name the agent does not have is left out with a warning, a pattern that matches nothing is exit 78, and a `permission:` key is **refused** until ADR 0039 decision 4 is built). The card lists them (`agent-mode/v1`: `params {modes: [{name, title, description}], default}`) and a message that activates the extension names one (`metadata[URI] = {"mode": ..}`); an unknown one is refused as `mode_not_offered` before anything runs, and the choice holds until another message names another. **A mode only narrows**: the access tier still caps every tool it allows, and a mode can neither raise the tier nor offer a tool the agent does not have. A subagent starts in its parent's mode. A folder with no `modes/` lists no extension and works as before (ADR 0039 decision 3; the client side is `adam-a2a-extensions`).
    `references:` in the frontmatter of the root `instructions.md` (a list of `name`, `url`, optional `branch`, `description`;
