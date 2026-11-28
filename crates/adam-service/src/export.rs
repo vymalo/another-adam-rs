@@ -326,7 +326,8 @@ pub fn pseudonyms(key: Option<&[u8]>) -> Result<Pseudonyms, ExportCommandError> 
         Some(key) => Ok(Pseudonyms::new(key)),
         None => {
             tracing::info!(
-                "{PSEUDONYM_KEY_ENV} is unset: the ids of this export are pseudonyms under a random \
+                variable = PSEUDONYM_KEY_ENV,
+                "no pseudonym key is set: the ids of this export are pseudonyms under a random \
                  key, so they link to each other and to nothing else (not to another export)"
             );
             Pseudonyms::random().map_err(ExportCommandError::NoRandomness)

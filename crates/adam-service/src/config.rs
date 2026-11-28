@@ -1994,8 +1994,9 @@ fn parse_default_context_window(
             .and_then(|raw| parse_context_window(DEFAULT_CONTEXT_WINDOW_VAR, &raw, problems));
     };
     tracing::warn!(
-        "{DEPRECATED_CONTEXT_WINDOW_VAR} is deprecated: rename it {DEFAULT_CONTEXT_WINDOW_VAR} \
-         (ADR 0088)"
+        variable = DEPRECATED_CONTEXT_WINDOW_VAR,
+        rename_to = DEFAULT_CONTEXT_WINDOW_VAR,
+        "a deprecated context window variable is set: rename it (ADR 0088)"
     );
     let alias = parse_context_window(DEPRECATED_CONTEXT_WINDOW_VAR, &deprecated, problems);
     let Some(current) = current else {
@@ -3547,7 +3548,7 @@ mod tests {
     fn model_context_window_is_a_deprecated_alias_of_default_model_context_window() {
         use adam_model::ModelClient as _;
         const DEPRECATION: &str =
-            "MODEL_CONTEXT_WINDOW is deprecated: rename it DEFAULT_MODEL_CONTEXT_WINDOW";
+            "a deprecated context window variable is set: rename it (ADR 0088)";
         let with = |pairs: &[(&'static str, &'static str)]| {
             let mut vars = model_vars();
             vars.extend(pairs.iter().copied());
@@ -3565,6 +3566,10 @@ mod tests {
         assert!(problems.is_empty(), "{problems:?}");
         assert_eq!(model.context_window, Some(65_536));
         assert_eq!(logs.matches(DEPRECATION).count(), 1, "{logs}");
+        assert!(
+            logs.contains("MODEL_CONTEXT_WINDOW") && logs.contains("DEFAULT_MODEL_CONTEXT_WINDOW"),
+            "the warning names the variable and the one to rename it to: {logs}"
+        );
         let client = model.client().expect("a usable client");
         assert_eq!(client.context_window("large"), Some(65_536));
         assert_eq!(client.context_window("small"), None);
