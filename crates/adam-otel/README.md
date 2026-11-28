@@ -121,7 +121,9 @@ from; a periodic reader on the process's runtime posts to `{endpoint}/v1/metrics
 with [`EXPORT_TIMEOUT`] for one export. Recording a measurement is the SDK's own aggregation in the process, so it
 never blocks a run, and a failed export is the SDK's internal log line. With no endpoint nothing is built at all.
 A dropped `Otel` without `shutdown()` leaves the reader's interval task on the runtime; `shutdown()` is what
-stops it, and every adam binary calls it before exit.
+stops it, and every adam binary calls it before exit. Starting installs the meter provider **globally**, so a
+crate that emits a measurement uses `opentelemetry::global::meter(..)` and needs no handle threaded through the
+layers; where nothing was started that meter is the no-op one. Ask for it per measurement rather than caching it: the global is read at the call, so a meter cached before `init` would stay the no-op one.
 
 **Labels are types.** [`labels`] holds the closed sets the instruments use: `RunState` (the four states of
 `adam_core::store::RunStatus`, held to them by a test) and a `Name` for the names a deployment declares (a tool, a

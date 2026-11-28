@@ -340,6 +340,10 @@ impl Otel {
             .with_resource(resource)
             .with_reader(reader)
             .build();
+        // Installed globally so that a crate which emits a measurement does not have to be handed a
+        // meter through every layer (ANR-1449): `opentelemetry::global::meter(..)` finds this one, and
+        // answers a no-op meter in a process where nothing was started.
+        opentelemetry::global::set_meter_provider(metrics.clone());
         Ok(Some(Self { provider, metrics }))
     }
 
