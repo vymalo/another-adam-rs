@@ -204,6 +204,16 @@ compile (Rule 2); **testkit** is whether the case runs on memory, Postgres, Mong
 | 6 | the epoch in `RunView` and a count of open runs per epoch; the two numbers in the card or health | a started run's view shows its epoch; with two epochs open, the count reports both | no | only if the count is a store query (slice 5) |
 | 7 | docs: `docs/guides/deploy-the-coder.md` gains "roll a change to the step list" (decision 4); `docs/reference/errors.md` the new failure text; the rule "roll every worker first" in ADRs 0004, 0045, 0050 gets a dated *Amended* note | `docs-check` passes with the new links and anchors | no | no |
 
+* *2026-11-28 (ANR-963, slice 3):* the skip set is a **worker-local** `SkipSet`
+  (`crates/adam-runtime/src/worker.rs`): a run refused for its epoch is handed back and held for
+  `SKIP_PERIOD` (60 s), at most `MAX_SKIPPED` (4096) runs with the longest-held dropped first, and
+  every `claim_due` names those runs in `busy` beside the ones the worker is stepping — `busy`
+  already means "never offered, not counted against `limit`", so the store needed no change. The
+  decisive test is `skip_set_tests` plus the ten-poll case; a run below `min_replay_epoch` is still
+  failed rather than skipped, so the two answers of decision 3 cannot be confused. **Not in this
+  slice:** the store-side `claim_due_for(.., epochs)` of slice 5, which is what makes the skip
+  unnecessary once a deployment routes by epoch.
+
 Slices 1 to 4 ask nothing of a store. The first real step-list change after slice 2 carries its own epoch bump and a
 golden fixture of the old journal.
 

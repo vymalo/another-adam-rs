@@ -1002,6 +1002,15 @@ fn conv_id() -> String {
     format!("alice:{}", uniq("ctx"))
 }
 
+/// The three remote-subagent cases all start a subagent the agent definition **declares** as
+/// `far`; the name is the definition's, not the test's, so it cannot be made unique. A worker
+/// claims by agent name, and the conformance suite shares one store, so two of these cases
+/// running at once claim each other's `far` runs and one reads the other's answer. They take
+/// this lock (the `BLOB_SUITE` pattern); nextest runs each test in its own process, where a
+/// mutex excludes nothing, so `.config/nextest.toml` puts the same cases in a single-thread
+/// group.
+static FAR_SUITE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// The state of the parent after it finished (or while it waits), as a `Conversation`.
 async fn state_of(rt: &Runtime, run: RunId) -> Conversation {
     conversation(rt, &rt.view(run).await.unwrap().unwrap()).await
@@ -1951,6 +1960,14 @@ mod cases {
         // journal), so the model is asked again and answers the same call: the edit's second try.
         rig.parent_mock
             .push_tool_calls(vec![start_call("c1", true)])
+            // The edit call twice: a transient tool error re-runs the whole step, and a failed
+            // step is not journaled, so the model is asked again and repeats its call (what a
+            // deterministic model does). The retry's answer is what the run keeps.
+            .push_tool_calls(vec![edit_call(
+                "c2",
+                session,
+                json!({"max_output_tokens": 512}),
+            )])
             .push_tool_calls(vec![edit_call(
                 "c2",
                 session,
@@ -2482,6 +2499,7 @@ mod cases {
     /// A subagent that runs on another system starts a round like any other: the round is a run of
     /// the agent registered under its name, which is the one that talks to the remote.
     pub async fn a_remote_subagent_starts_a_round_of_its_registered_agent(store: DynStore) {
+        let _far = FAR_SUITE.lock().await;
         let rig = Rig::new();
         let far_mock = Arc::new(MockModel::new());
         far_mock.push_text("the far answer");
@@ -4376,6 +4394,7 @@ mod cases {
     pub async fn a_remote_subagent_refuses_every_option_but_time_limit_and_max_rounds(
         store: DynStore,
     ) {
+        let _far = FAR_SUITE.lock().await;
         let rig = Rig::new();
         let far_mock = Arc::new(MockModel::new());
         far_mock.push_text("the far answer");
@@ -4494,6 +4513,7 @@ mod cases {
     /// A remote subagent refuses a `report_schema` by name: its loop is another system's, and
     /// nothing would check the answer.
     pub async fn a_remote_subagent_refuses_a_report_schema(store: DynStore) {
+        let _far = FAR_SUITE.lock().await;
         let rig = Rig::new();
         let far_mock = Arc::new(MockModel::new());
         far_mock.push_text("the far answer");
