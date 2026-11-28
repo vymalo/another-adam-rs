@@ -219,8 +219,10 @@ impl CommandWorkspace for PersonDir {
     /// The guard is **exclusive**: when another guard for the same place is still open, this
     /// returns the refusal the model reads (the tool appends `refusal_note`) and leaves the first
     /// guard's entry untouched, so its report settles as it would have. The first guard is taken
-    /// until [`Recorded::settle`] (its drop) runs, which is exactly one command's life — two guards
-    /// for the same place would race over the listing's `Seen` and corrupt the report.
+    /// until [`CommandGuard::settle`] (or its drop, which releases the place when `settle` has not
+    /// run — a command that `?`-propagates an error before settling) — exactly one command's life,
+    /// and the [`Drop`] impl on `Recorded` keeps the invariant that way: two guards for the same
+    /// place would race over the listing's `Seen` and corrupt the report.
     ///
     /// [ADR 0047]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0047-adam-rs-can-be-embedded-in-an-application.md
     async fn guard(
@@ -277,9 +279,30 @@ impl CommandWorkspace for PersonDir {
 
 /// The guard of one command in a person's directory: it lists the place again and says whether
 /// anything changed. It **undoes nothing**, on purpose, and its verdict is that of the files.
+///
+/// The entry's lifetime is this guard's lifetime: [`Drop`] removes the entry from the map when
+/// [`CommandGuard::settle`] has not run (so the place is released — a command that errored before
+/// settling must not lock out every later one). A settled guard leaves the entry in place for
+/// [`after_run`](CommandWorkspace::after_run) to read once and clear.
 struct Recorded {
     key: PathBuf,
     seen: SeenByPlace,
+}
+
+impl Drop for Recorded {
+    fn drop(&mut self) {
+        // `settle` consumes the box and runs before Drop: when it succeeded, it set
+        // `entry.after = Some(_)` and `after_run` is responsible for clearing the entry, so Drop
+        // must not race with it. When settle didn't run (`Err(_)` from `commands::run` propagated
+        // before the box was consumed, a tool's own error, or a panic), `entry.after` is still
+        // `None` and the place must be released.
+        let mut seen = self.seen.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(entry) = seen.get(&self.key)
+            && entry.after.is_none()
+        {
+            seen.remove(&self.key);
+        }
+    }
 }
 
 #[async_trait]
@@ -505,5 +528,36 @@ mod tests {
             .expect("after the report, a new guard is taken");
         let settled = again.settle().await;
         assert_eq!(settled, Settled::Unchanged);
+    }
+
+    /// A guard dropped without settling (as a tool's error path does, e.g. `inspect::run_command`
+    /// `?`-propagating a `commands::run` failure before `settle`) releases the place: the next
+    /// guard is taken, and `after_run` does not report a phantom change.
+    #[tokio::test]
+    async fn a_dropped_guard_does_not_leak_the_entry() {
+        let (_dir, place) = rig();
+        let person = PersonDir::new(place.path(), std::iter::empty::<&str>()).unwrap();
+
+        let guard = person
+            .guard(&ctx(), &place, Guarding::Look)
+            .await
+            .expect("the first guard is taken");
+        // Drop without settling: `Drop` runs, `entry.after` is still `None`, so the entry is
+        // removed and the place is released.
+        drop(guard);
+
+        let again = person
+            .guard(&ctx(), &place, Guarding::Look)
+            .await
+            .expect("after the drop, a new guard is taken");
+        // Settle the new guard so it cleans up after itself, then check `after_run` reports
+        // nothing — a phantom change from the dropped guard would have left an entry here.
+        let settled = again.settle().await;
+        assert_eq!(settled, Settled::Unchanged);
+        let report = person.after_run(&ctx(), &place).await.unwrap();
+        assert!(
+            report.is_empty(),
+            "no phantom change from the dropped guard: {report:?}"
+        );
     }
 }

@@ -107,7 +107,10 @@ impl Plugin for AsksBeforeWritingOrCommand {
                     Some(cwd) => format!("in `{cwd}` of the person's directory"),
                     None => "in the person's directory".to_owned(),
                 };
-                if command.is_empty() {
+                // A whitespace-only command is treated as missing: the model did not name one.
+                // The raw command is shown verbatim when it is not empty, so the person reads
+                // exactly what the model asked for.
+                if command.trim().is_empty() {
                     format!(
                         "Run a command {in_dir} with `{}`? The model did not name a command.",
                         tool
@@ -129,16 +132,23 @@ impl Plugin for AsksBeforeWritingOrCommand {
 /// The lines are read as the model's bytes are read: a `+++ b/<path>` line is parsed the same way
 /// `git apply` parses it, so the names in the question match the names git applies. A path
 /// component the model wrote without a leading directory (an exact `+++ <path>`) is left alone.
+/// A deletion's `+++ /dev/null` (the side git shows for a file being removed) is skipped: `-p1`
+/// would turn it into `dev/null`, a path that is not the person's file.
 fn patch_paths(patch: &str) -> Vec<String> {
     let mut out = Vec::new();
     for line in patch.lines() {
         let Some(rest) = line.strip_prefix("+++ ") else {
             continue;
         };
+        let path = rest.trim();
+        // A deletion: `+++ /dev/null`. `git apply` would strip the leading `/` and leave
+        // `dev/null`, which is not a file in the person's directory; skip it before `-p1`.
+        if path == "/dev/null" || path == "dev/null" {
+            continue;
+        }
         // `git diff` writes `+++ b/<path>`; a model may also write `+++ x/<path>`. The leading
         // `b/` (or whatever) is a label, not part of the path, and `git apply -p1` drops the first
         // component. Strip it when the rest has one, keep the rest otherwise.
-        let path = rest.trim();
         let stripped = match path.split_once('/') {
             Some((_label, rest)) => rest,
             None => path,
@@ -507,6 +517,26 @@ mod tests {
         );
     }
 
+    /// A deletion's `+++ /dev/null` does not become `dev/null` in the question: `-p1` would strip
+    /// the leading `/`, leaving a path that is not the person's file. The path is skipped, the
+    /// question still asks (other paths on the patch may be real), and it does not contain
+    /// `dev/null`.
+    #[test]
+    fn apply_patch_skips_dev_null_so_the_question_does_not_name_it() {
+        let patch = "--- a/notes.txt\n\
+                     +++ /dev/null\n\
+                     @@ -1 +1 @@\n\
+                     -old\n\
+                     +new\n";
+        let mut args = json!({ "patch": patch });
+        let q = ask("apply_patch", &mut args);
+        assert!(q.contains("notes.txt"), "the real path is named: {q}");
+        assert!(
+            !q.contains("dev/null"),
+            "the deletion side is not named: {q}"
+        );
+    }
+
     /// `run_command` parks with the command and (when set) the cwd; still parks when the command
     /// is missing or empty.
     #[test]
@@ -540,6 +570,26 @@ mod tests {
         );
     }
 
+    /// A whitespace-only command is treated as missing (`trim().is_empty()`): the model did not
+    /// name one. The raw command is shown verbatim when it is not empty.
+    #[test]
+    fn run_command_treats_a_whitespace_only_command_as_missing() {
+        let mut args = json!({ "command": "   \t  " });
+        let q = ask("run_command", &mut args);
+        assert!(
+            q.contains("did not name a command"),
+            "whitespace is not a command: {q}"
+        );
+
+        // Non-empty raw command: shown verbatim.
+        let mut args = json!({ "command": " echo hello " });
+        let q = ask("run_command", &mut args);
+        assert!(
+            q.contains("` echo hello `"),
+            "the raw command is shown verbatim: {q}"
+        );
+    }
+
     /// `run` parks with the command and the tool's own name; still parks when the command is
     /// missing or empty.
     #[test]
@@ -563,6 +613,17 @@ mod tests {
         assert!(
             q.contains("`ui`") && q.contains("did not name a command"),
             "a missing command still asks: {q}"
+        );
+    }
+
+    /// `run` treats a whitespace-only command as missing, like `run_command`.
+    #[test]
+    fn run_treats_a_whitespace_only_command_as_missing() {
+        let mut args = json!({ "command": "   " });
+        let q = ask("run", &mut args);
+        assert!(
+            q.contains("did not name a command"),
+            "whitespace is not a command: {q}"
         );
     }
 
