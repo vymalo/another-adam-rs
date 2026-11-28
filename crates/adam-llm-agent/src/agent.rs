@@ -3594,7 +3594,9 @@ impl LlmAgent {
                 // ANR-1462: the streamed turn is the default one, so it is measured like the
                 // unstreamed turn — the timer inside the joined future, so the request recording
                 // that runs beside it is not in the latency. A failed or cancelled stream returns
-                // before the recording, since its answer (and its usage) was dropped.
+                // before the recording, since its answer (and its usage) was dropped. The interval
+                // ends when the last piece is emitted, so it carries the emitter's writes too: the
+                // words are not otherwise separable from the call that produced them.
                 let alias = request.model.clone();
                 let (recorded_request, (streamed, elapsed)) = tokio::join!(
                     recording,

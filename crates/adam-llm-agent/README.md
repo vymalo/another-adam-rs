@@ -122,7 +122,8 @@ name the model called, measured **only when a tool or a source actually answered
 
 **`adam.llm.tokens`** and **`adam.llm.duration`** (ANR-1462): the tokens a model call was charged for, by `direction`
 (`input` or `output`, the closed [`Direction`](../adam-otel/src/labels.rs) set) and by `model`; and the call's
-latency in seconds by `model`. `model` is the **alias the call was made to** — one the deployment configured
+latency in seconds by `model` — for a streamed turn, the time until the last piece was emitted, since the words are
+not separable from the call that produced them. `model` is the **alias the call was made to** — one the deployment configured
 (`MODEL_ALIASES_FILE` or `MODEL`), so the set is closed by construction. ADR 0075 decision 3 names
 `adam.model.alias_class`; nothing in the tree defines a class, so the alias — the most precise member of that set — is
 what is recorded, and the ADR's 2026-11-28 amendment says so.
