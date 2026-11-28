@@ -16,5 +16,5 @@ render > "$golden/combined.yaml"
 render --set runPods.enabled=true > "$golden/run-pods.yaml"
 render --set topology=split --set 'a2a.push.allowedUrls={hooks.example.com}' \
   --set a2a.cardSigning.secretName=coder-card-key > "$golden/a2a-split.yaml"
-render --set cache.create=true --set cache.storageClass=rwx --set runPods.enabled=true > "$golden/cache.yaml"
+render --set 'cache.allowedClaims={shared-cache}' --set runPods.enabled=true > "$golden/cache.yaml"
 echo "render-goldens: wrote combined, run-pods, a2a-split and cache"

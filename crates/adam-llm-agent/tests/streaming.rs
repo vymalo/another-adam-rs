@@ -825,3 +825,123 @@ async fn a_failure_after_the_reasoning_began_ends_its_stream_abandoned() {
     assert_eq!(joined(&thought), "Let me think");
     assert!(thought.last().is_some_and(|p| p.3 && p.4), "{thought:?}");
 }
+
+// ---------------------------------------------------------------------------
+// What is measured (ANR-1462)
+// ---------------------------------------------------------------------------
+
+/// A streamed turn is the **default** turn, and it is measured like one that does not stream: its
+/// tokens by direction and its latency, under the alias the call was made to.
+///
+/// The alias is one only this test uses. The meter provider is process-wide, so a shared alias would
+/// also count the runs the other tests of this binary make.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_streamed_turn_records_its_tokens_and_latency_under_its_alias() {
+    use opentelemetry::metrics::MeterProvider as _;
+    use opentelemetry_sdk::metrics::periodic_reader_with_async_runtime::PeriodicReader;
+    use opentelemetry_sdk::metrics::{InMemoryMetricExporter, SdkMeterProvider, data};
+
+    const ALIAS: &str = "anr-1462-streamed";
+    const INPUT: u64 = 120;
+    const OUTPUT: u64 = 40;
+
+    let exporter = InMemoryMetricExporter::default();
+    let reader =
+        PeriodicReader::builder(exporter.clone(), opentelemetry_sdk::runtime::Tokio).build();
+    let provider = SdkMeterProvider::builder().with_reader(reader).build();
+    opentelemetry::global::set_meter_provider(provider.clone());
+
+    let answer = ModelResponse {
+        usage: Usage::new(INPUT, OUTPUT),
+        ..ModelResponse::text("Fib.")
+    };
+    let model = ScriptedStreams::new(vec![vec![
+        Ok(ModelDelta::Text("Fib.".into())),
+        Ok(ModelDelta::Finished(answer)),
+    ]]);
+    let h = Harness::new();
+    let (_, view) = h
+        .run(
+            LlmAgent::builder("llm", model.clone(), ALIAS).build(),
+            false,
+            "fibonacci?",
+        )
+        .await;
+    assert_eq!(view.status, RunStatus::Done);
+    assert_eq!(*model.calls.lock().unwrap(), [true], "one call, a stream");
+    provider.force_flush().expect("flush");
+
+    let mut tokens: Vec<(Vec<(String, String)>, u64)> = Vec::new();
+    let mut latencies: Vec<Vec<(String, String)>> = Vec::new();
+    for resource in exporter.get_finished_metrics().expect("metrics") {
+        for scope in resource.scope_metrics() {
+            for metric in scope.metrics() {
+                match (metric.name(), metric.data()) {
+                    (
+                        "adam.llm.tokens",
+                        data::AggregatedMetrics::U64(data::MetricData::Sum(sum)),
+                    ) => {
+                        for point in sum.data_points() {
+                            let mut attributes: Vec<(String, String)> = point
+                                .attributes()
+                                .map(|kv| (kv.key.to_string(), kv.value.as_str().into_owned()))
+                                .collect();
+                            if attributes
+                                .iter()
+                                .any(|(key, value)| key == "model" && value == ALIAS)
+                            {
+                                attributes.sort();
+                                tokens.push((attributes, point.value()));
+                            }
+                        }
+                    }
+                    (
+                        "adam.llm.duration",
+                        data::AggregatedMetrics::F64(data::MetricData::Histogram(histogram)),
+                    ) => {
+                        for point in histogram.data_points() {
+                            let mut attributes: Vec<(String, String)> = point
+                                .attributes()
+                                .map(|kv| (kv.key.to_string(), kv.value.as_str().into_owned()))
+                                .collect();
+                            if attributes
+                                .iter()
+                                .any(|(key, value)| key == "model" && value == ALIAS)
+                            {
+                                attributes.sort();
+                                latencies.push(attributes);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    tokens.sort();
+    assert_eq!(
+        tokens,
+        vec![
+            (
+                vec![
+                    ("direction".to_owned(), "input".to_owned()),
+                    ("model".to_owned(), ALIAS.to_owned()),
+                ],
+                INPUT
+            ),
+            (
+                vec![
+                    ("direction".to_owned(), "output".to_owned()),
+                    ("model".to_owned(), ALIAS.to_owned()),
+                ],
+                OUTPUT
+            ),
+        ],
+        "the streamed call's tokens, by direction, under its alias"
+    );
+    assert_eq!(
+        latencies,
+        vec![vec![("model".to_owned(), ALIAS.to_owned())]],
+        "one latency point, labelled by the alias and nothing else"
+    );
+}

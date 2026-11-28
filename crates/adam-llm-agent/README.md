@@ -120,9 +120,22 @@ name the model called, measured **only when a tool or a source actually answered
 (and that a model can invent) creates no series. The name must also pass
 [`adam_otel::labels::Name`](../adam-otel/README.md)'s alphabet; one that does not is not measured either.
 
-Off with the rest: the instrument comes from `opentelemetry::global::meter`, a no-op meter in a process where
-`adam_otel::init` found no endpoint (ADR 0075). The test asserts the exported data point carries `tool` and nothing
-else, and that a refused name produces no point.
+**`adam.llm.tokens`** and **`adam.llm.duration`** (ANR-1462): the tokens a model call was charged for, by `direction`
+(`input` or `output`, the closed [`Direction`](../adam-otel/src/labels.rs) set) and by `model`; and the call's
+latency in seconds by `model` — for a streamed turn, the time until the last piece was emitted, since the words are
+not separable from the call that produced them. `model` is the **alias the call was made to** — one the deployment configured
+(`MODEL_ALIASES_FILE` or `MODEL`), so the set is closed by construction. ADR 0075 decision 3 names
+`adam.model.alias_class`; nothing in the tree defines a class, so the alias — the most precise member of that set — is
+what is recorded, and the ADR's 2026-11-28 amendment says so.
+
+`model` is checked against [`labels::Name`](../adam-otel/src/labels.rs) (`[a-z0-9._-]`, at most 64 bytes). An alias
+outside that alphabet — an upper-case one, one with a `/` — records **nothing**: neither instrument, and no
+substitute label. The alias the deployment declares is therefore also the alias it can measure; ANR-1512 adds a
+startup warning that names such an alias, rather than refusing the boot.
+
+Off with the rest: the instruments come from `opentelemetry::global::meter`, a no-op meter in a process where
+`adam_otel::init` found no endpoint (ADR 0075). The tests assert each exported data point carries exactly its declared
+labels, and that a name the alphabet refuses produces no point.
 
 ## Continuing a conversation
 
