@@ -8,8 +8,9 @@
 //! `tracing_subscriber::fmt()`.
 //!
 //! The **logs** half rides it too: the process's `tracing` events become OTLP log records through an
-//! allowlist ([`logs`]), so a record carries a class and a message and never a prompt, an argument
-//! or a token.
+//! allowlist ([`logs`]), so a record carries a class and a message. The allowlist governs **fields**;
+//! the message is the format string the macro wrote, so a call site that formats a value into it
+//! exports that value (as the JSON layer already does).
 //!
 //! The **metrics** half rides the same switch: [`Otel::meter`] gives the meter a run's instruments
 //! are created from, exported by a periodic reader on the same runtime, to `{endpoint}/v1/metrics`.
@@ -359,7 +360,11 @@ impl Otel {
         opentelemetry::global::set_meter_provider(metrics.clone());
         let logs = SdkLoggerProvider::builder()
             .with_resource(resource_for_logs(settings))
-            .with_log_processor(BatchLogProcessor::builder(log_exporter, runtime::Tokio).build())
+            .with_log_processor(
+                BatchLogProcessor::builder(log_exporter, runtime::Tokio)
+                    .with_batch_config(log_batch())
+                    .build(),
+            )
             .build();
         // There is no global log provider in `opentelemetry` 0.33 (only traces and metrics have
         // one), so the layer is composed into the subscriber by [`init`] and a host that builds its
@@ -477,6 +482,15 @@ fn otlp_logs(endpoint: &str) -> Result<opentelemetry_otlp::LogExporter, BoxError
         .map_err(|error| Box::new(error) as BoxError)
 }
 
+/// The logs queue, with the crate's documented bounds rather than the SDK's defaults.
+fn log_batch() -> opentelemetry_sdk::logs::BatchConfig {
+    opentelemetry_sdk::logs::BatchConfigBuilder::default()
+        .with_max_queue_size(MAX_QUEUE_SIZE)
+        .with_max_export_batch_size(MAX_EXPORT_BATCH_SIZE)
+        .with_scheduled_delay(EXPORT_INTERVAL)
+        .build()
+}
+
 /// The resource a log record carries: the same service name as the spans and the metrics.
 fn resource_for_logs(settings: &Settings) -> Resource {
     Resource::builder()
@@ -570,6 +584,18 @@ mod tests {
         assert_eq!(
             metrics_endpoint("http://collector:4318/v1/metrics"),
             "http://collector:4318/v1/metrics"
+        );
+        assert_eq!(
+            logs_endpoint("http://collector:4318/"),
+            "http://collector:4318/v1/logs"
+        );
+        assert_eq!(
+            logs_endpoint("http://collector:4318/otlp"),
+            "http://collector:4318/otlp/v1/logs"
+        );
+        assert_eq!(
+            logs_endpoint("http://collector:4318/v1/logs"),
+            "http://collector:4318/v1/logs"
         );
     }
 

@@ -134,9 +134,11 @@ half:
   `SHUTDOWN_TIMEOUT`.
 - **Logs go through an allowlist, not a redactor.** The process's `tracing` events are exported to
   `{endpoint}/v1/logs`; a record carries its message, its severity and only the fields named in
-  `adam_otel::logs::ALLOWED` (a class, a state, a count, a declared name), so a prompt, an argument or a token is
-  dropped before the record exists. The coder's redactor holds per-run secrets this layer cannot see, which is why
-  the allowlist, and not a scrub, is what makes the record safe.
+  `adam_otel::logs::ALLOWED` (a class, a state, a count, a declared name), so a field outside that list — a prompt,
+  an argument, a token — is dropped before the record exists. **The message is exempt**: it is the format string the
+  code wrote, so a call site that formats a value into it exports that value, as the JSON log on stdout already
+  does; eight call sites do that today and moving them into fields is its own card. The coder's redactor holds
+  per-run secrets this layer cannot see, which is why the allowlist, and not a scrub, is what makes the record safe.
 - **A label is a type, not a string.** `adam_otel::labels` holds the closed sets — `RunState`, held to
   `adam_core::store::RunStatus` by a test, and a shape-checked `Name` for the names a deployment declares. The shape
   check is **not** a secret filter (a token can have a name's shape: `ghp_0123…` is lower-case, digits and `_`), so

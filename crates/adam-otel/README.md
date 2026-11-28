@@ -143,6 +143,10 @@ attempt number. Every other field the event carries (a prompt, a tool's argument
 the record exists, so it cannot reach an exporter even by accident. The test emits an event with a prompt, an
 argument and a token beside a class, and asserts the exporter saw the class and neither of the other three.
 
+**No trace context.** A record carries no span's trace id, so a collector cannot join it to the traces this same
+`Otel` exports; the JSON log on stdout remains the join. Whether to inject the current span's context is ADR 0075
+open question 2's decision, not this card's.
+
 The coder's redactor holds per-run secrets this process-level layer cannot see; the allowlist is what makes that
 unnecessary, and it is why the log bridge is adam's own layer rather than a copy-everything appender.
 

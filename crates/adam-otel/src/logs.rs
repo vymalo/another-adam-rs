@@ -149,6 +149,33 @@ mod tests {
     use opentelemetry_sdk::logs::{InMemoryLogExporter, SdkLoggerProvider};
     use tracing_subscriber::layer::SubscriberExt as _;
 
+    /// The deployment's filter governs the layer: an `info` event does not reach the collector when
+    /// `RUST_LOG` says `error`. Without the filter on this layer, a per-layer filter leaves it enabled
+    /// for every event in the process, including every dependency's TRACE lines.
+    #[test]
+    fn the_filter_keeps_an_event_out() {
+        use tracing_subscriber::EnvFilter;
+        use tracing_subscriber::Layer as _;
+
+        let exporter = InMemoryLogExporter::default();
+        let provider = SdkLoggerProvider::builder()
+            .with_simple_exporter(exporter.clone())
+            .build();
+        let subscriber = tracing_subscriber::registry()
+            .with(Logs::new(&provider).with_filter(EnvFilter::new("error")));
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!("this event is below the filter");
+            tracing::error!("this one is at it");
+        });
+        let records = exporter.get_emitted_logs().expect("records");
+        assert_eq!(records.len(), 1, "{records:?}");
+        let body = match records[0].record.body() {
+            Some(AnyValue::String(body)) => body.as_str().to_owned(),
+            other => panic!("not a string body: {other:?}"),
+        };
+        assert_eq!(body, "this one is at it");
+    }
+
     /// The record reaches the exporter with its message and its allowlisted fields, and **without**
     /// the ones beside them: a prompt-shaped string, an argument, a token.
     #[test]

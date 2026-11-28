@@ -51,10 +51,17 @@ fn start() -> (Option<Otel>, Option<String>) {
 ///
 /// `otel` is `None` when tracing is off, and an `Option<Layer>` composes as no layer at all.
 fn compose(filter: EnvFilter, otel: Option<&Otel>) -> impl Subscriber + Send + Sync + 'static {
+    // The same filter on the logs layer: without it, a per-layer filter leaves `Logs` enabled for
+    // every event in the process, so the collector would receive TRACE-level events from every
+    // dependency whatever `RUST_LOG` says (and the message is not allowlisted).
     Registry::default()
-        .with(tracing_subscriber::fmt::layer().json().with_filter(filter))
+        .with(
+            tracing_subscriber::fmt::layer()
+                .json()
+                .with_filter(filter.clone()),
+        )
         .with(otel_layer(otel))
-        .with(logs_layer(otel))
+        .with(logs_layer(otel).with_filter(filter))
 }
 
 /// The logs half of [`compose`]: `None` when tracing is off, so no record is built.
