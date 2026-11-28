@@ -202,7 +202,7 @@ sh tools/release/check-versions.sh           # every version a release moves is 
 sh deploy/coder/tests/render-goldens.sh && git diff --exit-code deploy/coder/tests/golden   # goldens are the chart's render
 shellcheck deploy/coder/bump-tag.sh deploy/coder/tests/*.sh docker/coder/test/*.sh dev/*.sh
 docker buildx build -f docker/coder/Dockerfile -t coder:smoke --load .
-sh docker/coder/test/static-smoke.sh coder:smoke    # `file` says static; each binary starts in debian:bookworm-slim and alpine
+sh docker/coder/test/static-smoke.sh coder:smoke    # `file` says static; each starts in debian:bookworm-slim and alpine (run-signer also on loopback, stopped by SIGTERM)
 sh docker/coder/test/container-smoke.sh coder:smoke   # needs a reachable Postgres, see the script header; EXPECT_REVISION=<sha> checks the build argument
 sh docker/coder/test/agent-smoke.sh coder:smoke
 ```

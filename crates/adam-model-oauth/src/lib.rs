@@ -452,11 +452,13 @@ impl Inner {
                 }
             }
             Err(Renewal::Refused(reason)) => {
-                tracing::warn!("the sign-in for the model ended: {reason}");
+                // The reason is free text from the provider (it can carry a URL): a field the
+                // allowlist drops, so the collector sees the class and the JSON log the detail.
+                tracing::warn!(reason = %reason, "the sign-in for the model ended");
                 Phase::SignedOut(reason)
             }
             Err(Renewal::Unreachable(error)) => {
-                tracing::warn!("the sign-in for the model could not start: {error}");
+                tracing::warn!(problem = %error, "the sign-in for the model could not start");
                 Phase::Idle
             }
         };
