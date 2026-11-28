@@ -94,6 +94,7 @@ mod events;
 mod file;
 mod head;
 mod lines;
+mod metrics;
 mod notify;
 mod retry;
 mod runtime;

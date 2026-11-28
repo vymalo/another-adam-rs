@@ -159,6 +159,32 @@ fn not_blank(lookup: &impl Fn(&str) -> Option<String>, name: &str) -> Option<Str
 /// The path in the variable `name`, which must be an existing file: `None` when it is unset (or
 /// blank), and also, after adding a problem naming the variable, when it is not a file (a path
 /// that does not exist, or a directory). Reads the file system, not the file.
+/// Read a variable that names an **existing directory**, or report a problem and answer `None`.
+///
+/// The counterpart of [`parse_file`] for a setting that is a folder rather than a file (the L1
+/// memory's `SI_MEMORY_DIR`, ADR 0081 decision 2). Unset or blank is `None`: a setting with no
+/// default is absent, not an error.
+pub fn parse_dir(
+    get: &impl Fn(&str) -> Option<String>,
+    name: &str,
+    problems: &mut Vec<String>,
+) -> Option<std::path::PathBuf> {
+    let raw = get(name)?;
+    let path = std::path::PathBuf::from(raw.trim());
+    if path.is_dir() {
+        Some(path)
+    } else {
+        problems.push(format!(
+            "{name} {:?} is not a directory (name an existing directory, or unset it)",
+            path.display().to_string()
+        ));
+        None
+    }
+}
+
+/// Read a variable that names an **existing file**, or report a problem and answer `None`.
+///
+/// Unset or blank is `None`: a setting with no default is absent, not an error.
 pub fn parse_file(
     get: &impl Fn(&str) -> Option<String>,
     name: &str,

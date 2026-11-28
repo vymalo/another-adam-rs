@@ -36,7 +36,7 @@ use tokio::io::{AsyncBufRead, AsyncBufReadExt};
 const DRAIN: Duration = Duration::from_secs(5);
 
 /// What `/help` and an unknown command print.
-pub const HELP: &str = "type a message, or /steer <text>, /answer <text>, /approve, /deny [reason], /cancel, /list, /quit";
+pub const HELP: &str = "type a message, or /steer <text>, /answer <text>, /approve, /deny [reason], /cancel, /list, /quit (--dir <path> starts the chat with the local agent over <path>)";
 
 /// The notes the host keeps: what `save_note` saved, once the person approved it.
 pub type Notes = Arc<Mutex<Vec<String>>>;

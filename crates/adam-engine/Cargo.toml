@@ -17,13 +17,19 @@ a2a-lf.workspace = true
 adam-a2a = { path = "../adam-a2a", version = "0.7.0", default-features = false } # x-release-please-version
 adam-a2a-runtime = { path = "../adam-a2a-runtime", version = "0.7.0", default-features = false } # x-release-please-version
 adam-agent-fs.workspace = true
+# The file and command tools over a person's directory (ADR 0047 slice 7). Used by the local
+# agent (`EngineBuilder::local_agent`). Brings no forbidden crate (a tree check confirms).
+adam-code-tools = { path = "../adam-code-tools", version = "0.7.0", default-features = false } # x-release-please-version
 # `sessions`: `child-sessions/v1` for local subagents, without the A2A client (`remote`).
 adam-assembly = { path = "../adam-assembly", version = "0.7.0", default-features = false, features = ["sessions"] } # x-release-please-version
+# `#[tool]` for the local agent's tools (`adam-engine::local_agent`). The macro brings no HTTP or
+# TLS; its only deps are `proc-macro2`, `quote` and `syn`.
+adam-macros = { path = "../adam-macros", version = "0.7.0" } # x-release-please-version
 adam-budget.workspace = true
 adam-core.workspace = true
 adam-device-state.workspace = true
 adam-error.workspace = true
-adam-llm-agent.workspace = true
+adam-llm-agent = { workspace = true, features = ["schema"] }
 adam-model.workspace = true
 adam-runtime.workspace = true
 # A folder's `schedules/` (ADR 0060): the scheduler agent and the reconcile at start.

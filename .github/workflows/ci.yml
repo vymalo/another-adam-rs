@@ -64,12 +64,26 @@ jobs:
       # back — #495 re-added actions/checkout@v4 after ANR-62 had moved every pin (ANR-1410).
       - name: Every workflow action pin is at or above its recorded major
         run: sh tools/check-workflow-pins.sh
+      # ANR-1456: a log record's body is its format string, which the collector's allowlist cannot
+      # drop; a value belongs in a field. Eight sites had it the other way round.
+      - name: Every tracing message is static
+        run: sh tools/check-log-messages.sh
       # ADR 0084: every version a release moves is marked for release-please, and the Cargo lines agree.
       - name: The release's version lines are marked and agree
         run: sh tools/release/check-versions.sh
       # ADR 0082 decision 11: every PostgreSQL of CI, the release workflow and compose is one pinned image.
       - name: Every postgres image is the same pinned one
         run: sh tools/release/check-postgres-pin.sh
+      # ANR-1349: `deploy/dashboards/*.json` is generated from `tools/dashboards/*.py`, so a hand edit
+      # is a difference. Regenerating writes the files the scripts produce; a diff is a dashboard that
+      # no longer matches its script, and the untracked check catches a dashboard a script writes that
+      # nobody committed. The script itself refuses an orphan `*.json` and a run where no script ran.
+      # The scripts need nothing but python3's standard library.
+      - name: The generated dashboards are up to date
+        run: |
+          sh tools/dashboards/regenerate.sh
+          git diff --exit-code -- deploy/dashboards
+          test -z "$(git ls-files --others --exclude-standard -- deploy/dashboards)"
       - run: cargo fmt --all --check
 
   # The two clippy arms: the default features, and the optional ones (or their code never runs in CI).

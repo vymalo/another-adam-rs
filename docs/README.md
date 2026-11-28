@@ -42,6 +42,7 @@ These pages are for people. The procedures and evidence that coding agents use l
 | Configuration | [Agent files and `#[tool]`](reference/agent-files.md) | the folder layout and formats, validation, skills, subagents, MCP, dev reload, the macro |
 | Configuration | [Hook programs (`adam-hooks/1`)](reference/hooks-protocol.md) | the JSON lines a program on stdio speaks, the points it decides, its environment and what happens when it fails |
 | Configuration | [The chart](../deploy/coder/README.md) | every value of the coder's Helm chart |
+| Configuration | [Dashboards](../deploy/dashboards/README.md) | the Grafana dashboards of the exported metrics: what each panel shows, how they are generated and checked, and what a deployment needs to import them |
 | Configuration | [Parity of the surfaces](reference/parity.md) | every setting and feature by surface (coder, folder agent, embedded engine, orchestrator, platform), and the gaps |
 | Errors | [Errors](reference/errors.md) | error classes, the variant-to-class tree, A2A codes and exit codes |
 | Rust API | [Rustdoc of the library crates](rust/adam/index.html){target="_self"} | the generated API of every library crate (published with the site); [the crate map](architecture.md#the-crate-map) says which crate does what, and each crate's README is its guide |

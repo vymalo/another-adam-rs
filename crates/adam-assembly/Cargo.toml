@@ -61,6 +61,8 @@ tracing.workspace = true
 url = { workspace = true, optional = true }
 
 [dev-dependencies]
+# The two memory tools' test: an in-process L1 store (ADR 0081).
+adam-memory.workspace = true
 # The embedded agent (`build.rs` + `include_agent!`) that the end-to-end tests bind. The fixture
 # depends on `adam`, which depends on this crate: a dev-dependency cycle, which cargo allows.
 adam-agent-fixture = { path = "../adam-agent-fixture" }

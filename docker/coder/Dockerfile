@@ -3,7 +3,8 @@
 # ghcr.io/vymalo/another-adam-rs/coder: the coder agent (bin/adam-coder) on
 # the workspace toolchain image, and beside it the general agent binary
 # (bin/adam-agent, which serves any agent folder), the egress proxy for run pods
-# (bin/adam-egress, entrypoint `tini -- adam-egress`) and the git sandbox
+# (bin/adam-egress, entrypoint `tini -- adam-egress`), the loopback sidecar that signs a run's
+# model requests with its own certificate (bin/run-signer, ADR 0086) and the git sandbox
 # (crates/adam-git-sandbox: the server `adam-git-sandbox`, entrypoint `tini -- adam-git-sandbox`, and the
 # relay `adam-git` that stands in for git). Build from the REPOSITORY ROOT:
 #
@@ -14,8 +15,9 @@
 # ADAM_AGENT_DIR (compose.yaml, service `agent`): one image and one package, so
 # there is nothing else to publish or to make public.
 #
-# Stage 1 compiles the six binaries (and `adam-kube-exec`, the client a run's commands use to run in a pod of
-# their own, ADR 0019, `adam-egress`, the HTTPS-only proxy those pods reach the internet through, and
+# Stage 1 compiles the seven binaries (and `adam-kube-exec`, the client a run's commands use to run in a pod of
+# their own, ADR 0019, `adam-egress`, the HTTPS-only proxy those pods reach the internet through,
+# `run-signer`, the sidecar that adds a run's `Turn-Signature` in front of the gateway, and
 # `adam-git-sandbox` with `adam-git`, which run the coder's git where no secret is readable)
 # for `x86_64-unknown-linux-musl`, statically linked (ADR 0053 decision 11), so they start in any x86-64
 # Linux image whatever its C library: the bench starts the coder from each task image (ADR 0052
@@ -64,12 +66,12 @@ RUN apt-get update \
  && rustup target add x86_64-unknown-linux-musl
 ENV CC_x86_64_unknown_linux_musl=musl-gcc
 # The workspace is `crates/*` and `bin/*`, so every member's manifest is needed to
-# resolve the lockfile even though only the six binaries are built. Only a C compiler is needed
+# resolve the lockfile even though only the seven binaries are built. Only a C compiler is needed
 # (aws-lc-sys uses its pregenerated sources; the vendored protoc covers a2a-pb), here the musl one.
 COPY Cargo.toml Cargo.lock ./
 COPY crates crates
 COPY bin bin
-# The commit the image is built from (CI passes the commit sha): `option_env!` bakes it into the six binaries, which say
+# The commit the image is built from (CI passes the commit sha): `option_env!` bakes it into the seven binaries, which say
 # it on their card as the version's build metadata (`0.1.0+<first 7>`) and in `build/v1` (ADR 0028). A build
 # without it says `unknown`. Declared after the COPYs so that it never invalidates them.
 ARG ADAM_BUILD_REVISION=
@@ -78,16 +80,18 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     cargo build --release --locked --target x86_64-unknown-linux-musl \
       -p adam-coder --bin adam-coder -p adam-agent --bin adam-agent \
       -p adam-env-kubernetes --bin adam-kube-exec -p adam-egress --bin adam-egress \
+      -p adam-run-signer --bin run-signer \
       -p adam-git-sandbox --bin adam-git-sandbox --bin adam-git \
  && install -D -m 0755 target/x86_64-unknown-linux-musl/release/adam-coder /out/adam-coder \
  && install -D -m 0755 target/x86_64-unknown-linux-musl/release/adam-agent /out/adam-agent \
  && install -D -m 0755 target/x86_64-unknown-linux-musl/release/adam-kube-exec /out/adam-kube-exec \
  && install -D -m 0755 target/x86_64-unknown-linux-musl/release/adam-egress /out/adam-egress \
+ && install -D -m 0755 target/x86_64-unknown-linux-musl/release/run-signer /out/run-signer \
  && install -D -m 0755 target/x86_64-unknown-linux-musl/release/adam-git-sandbox /out/adam-git-sandbox \
  && install -D -m 0755 target/x86_64-unknown-linux-musl/release/adam-git /out/adam-git \
- && file /out/adam-coder /out/adam-agent /out/adam-kube-exec /out/adam-egress /out/adam-git-sandbox /out/adam-git \
+ && file /out/adam-coder /out/adam-agent /out/adam-kube-exec /out/adam-egress /out/run-signer /out/adam-git-sandbox /out/adam-git \
       > /tmp/binaries.file \
- && test "$(grep -Ec 'statically linked|static-pie linked' /tmp/binaries.file)" = 6
+ && test "$(grep -Ec 'statically linked|static-pie linked' /tmp/binaries.file)" = 7
 
 FROM ghcr.io/github/github-mcp-server:v1.12.2@sha256:508a0857ec762b1ab1cece29193345b501fab1dd9d1228a7b617062954cecac6 AS github-mcp
 
@@ -99,9 +103,9 @@ LABEL org.opencontainers.image.source="https://github.com/vymalo/another-adam-rs
 
 # hadolint ignore=DL3066
 USER root
-# The six binaries are static (x86_64-unknown-linux-musl): they carry their own C library and need no
+# The seven binaries are static (x86_64-unknown-linux-musl): they carry their own C library and need no
 # loader from this base or from a task image that runs them (ADR 0053 decision 11). The paths do not change.
-COPY --from=build /out/adam-coder /out/adam-agent /out/adam-kube-exec /out/adam-egress /out/adam-git-sandbox /out/adam-git /usr/local/bin/
+COPY --from=build /out/adam-coder /out/adam-agent /out/adam-kube-exec /out/adam-egress /out/run-signer /out/adam-git-sandbox /out/adam-git /usr/local/bin/
 COPY --from=github-mcp /server/github-mcp-server /usr/local/bin/github-mcp-server
 # The tools a run pod gets (ADR 0019): the chart's init container copies /opt/adam/bin/* into an emptyDir that the
 # run container mounts read-only at the same path. `adam-exec` is the script adam-env-kubernetes ships (one
@@ -130,7 +134,8 @@ EXPOSE 8080
 
 # Smoke test in a login shell as uid 10001: the binaries start and reject an
 # empty environment (they fail closed) instead of crashing, adam-agent names the
-# folder it needs, adam-egress exits 78 for want of an allow-list, adam-git-sandbox exits 78 for want of
+# folder it needs, adam-egress exits 78 for want of an allow-list, run-signer exits 78 for want of its
+# upstream and its run certificate, adam-git-sandbox exits 78 for want of
 # its socket and root, adam-git (the relay that stands in for git, and never runs it itself) says that it
 # has no socket and exits 78, and the tools the agent
 # shells out to are on PATH. The GitHub MCP server
@@ -142,7 +147,7 @@ EXPOSE 8080
 RUN --mount=type=bind,source=docker/coder/test/github-mcp-tools.sh,target=/tmp/github-mcp-tools.sh \
     bash -lc 'set -e; \
       test "$(id -u)" = 10001; \
-      command -v adam-coder adam-agent adam-kube-exec adam-egress adam-git-sandbox adam-git git opencode tini github-mcp-server obscura; \
+      command -v adam-coder adam-agent adam-kube-exec adam-egress run-signer adam-git-sandbox adam-git git opencode tini github-mcp-server obscura; \
       github-mcp-server --version | grep -q "v1.12.2"; \
       test -x /opt/adam/bin/adam-exec; \
       test ! -e /opt/adam/bin/opencode; \
@@ -155,6 +160,9 @@ RUN --mount=type=bind,source=docker/coder/test/github-mcp-tools.sh,target=/tmp/g
       out="$(env -i PATH="$PATH" adam-agent 2>&1 || true)"; \
       echo "$out" | grep -q "ADAM_AGENT_DIR is required"; \
       code=0; out="$(env -i PATH="$PATH" adam-egress 2>&1)" || code=$?; \
+      test "$code" = 78; \
+      echo "$out" | grep -q "invalid configuration"; \
+      code=0; out="$(env -i PATH="$PATH" run-signer 2>&1)" || code=$?; \
       test "$code" = 78; \
       echo "$out" | grep -q "invalid configuration"; \
       code=0; out="$(env -i PATH="$PATH" adam-git-sandbox 2>&1)" || code=$?; \

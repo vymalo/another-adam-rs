@@ -6,7 +6,7 @@
 docker buildx build -f docker/coder/Dockerfile .
 ```
 
-Stage 1 compiles six binaries for `x86_64-unknown-linux-musl` on the pinned `rust:1.98-trixie` (with
+Stage 1 compiles seven binaries for `x86_64-unknown-linux-musl` on the pinned `rust:1.98-trixie` (with
 `musl-tools`), so each is **statically linked** and starts in any x86-64 Linux image whatever its C library
 ([ADR 0053](../../docs/decisions/0053-sqlite-a-store-service-a-database-per-agent-and-a-static-coder.md)
 decision 11). Every one sets `mimalloc` as its global allocator (`#[global_allocator]`), because musl's own
@@ -18,6 +18,7 @@ is slow under many threads:
 | `adam-agent` | any agent folder over A2A (`--entrypoint tini -- adam-agent`) |
 | `adam-kube-exec` | runs one command in a run pod, for the coder |
 | `adam-egress` | the HTTPS-only egress proxy of the run pods |
+| `run-signer` | the loopback sidecar that signs a run's model requests with the run's own certificate (`MODEL_BASE_URL` at it with `MODEL_AUTH=injector`, ADR 0086) |
 | `adam-git-sandbox` | the server that runs the coder's git where no secret is readable |
 | `adam-git` | the relay that stands in for git and speaks to that server |
 
@@ -35,7 +36,7 @@ gateway, GitHub or a git remote.
 
 | Script | What it checks |
 |---|---|
-| `test/static-smoke.sh <image>` | `file` says each binary is static, the image's default user is 10001, and each starts in `debian:bookworm-slim` and Alpine as uid 10001, ending on its configuration error (78; 64 for `adam-kube-exec`), never a loader error |
+| `test/static-smoke.sh <image>` | `file` says each binary is static, the image's default user is 10001, and each starts in `debian:bookworm-slim` and Alpine as uid 10001, ending on its configuration error (78; 64 for `adam-kube-exec`), never a loader error; `run-signer` is also started on loopback with a run-certificate configuration and stopped with SIGTERM, so its own bind and clean stop are proved in the image and not only its exit 78 |
 | `test/container-smoke.sh <image>` | the coder starts under tini, serves A2A fail-closed and takes a task to completion against a stub model (needs a Postgres) |
 | `test/agent-smoke.sh <image>` | the same image with `--entrypoint tini -- adam-agent` |
 | `test/http-smoke.sh <base-url> <bearer-token>` | the HTTP+JSON binding, `/docs` and `/openapi.json` (run by the container and agent smoke tests) |

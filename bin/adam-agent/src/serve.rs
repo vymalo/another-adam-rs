@@ -13,7 +13,7 @@ use adam::AgentDef;
 use adam_llm_agent::ModelParking;
 
 use crate::agent::{WorkerParts, agents, card_of_folder};
-use crate::config::{Config, WorkerConfig};
+use crate::config::Config;
 use crate::error::AgentError;
 use crate::folder;
 use crate::redact;
@@ -51,7 +51,7 @@ pub async fn serve(
             .with_extra_mcp_file(file)
             .map_err(|e| AgentError::ExtraMcp(Box::new(e)))?;
         for warning in &warnings {
-            tracing::warn!("{warning}");
+            tracing::warn!(warning = %warning, "a warning while adding the extra MCP servers");
         }
         tracing::info!(file = %file.display(), "extra MCP servers added to the folder's own");
         folder.def = def;
@@ -73,8 +73,8 @@ pub async fn serve(
             "session limits"
         );
     }
-    if let Some(worker) = &config.worker {
-        folder.def = for_workers(folder.def, worker);
+    if config.worker.is_some() {
+        folder.def = for_workers(folder.def, &config);
     }
     let named_vars = folder.def.mcp_env_references();
 
@@ -114,9 +114,50 @@ pub async fn serve(
 /// The definition the workers bind: what the deployment decides of the folder's remote subagents
 /// applied, which is whether one may be at plain `http` on another machine (a service of the same
 /// cluster: `A2A_ALLOW_INSECURE_REMOTES`).
-fn for_workers(def: AgentDef, worker: &WorkerConfig) -> AgentDef {
-    def.allow_insecure_remotes(worker.allow_insecure_remotes)
-        .si_memory_ceiling(worker.si_memory)
+fn for_workers(def: AgentDef, config: &Config) -> AgentDef {
+    let Some(worker) = &config.worker else {
+        return def;
+    };
+    let def = def
+        .allow_insecure_remotes(worker.allow_insecure_remotes)
+        .si_memory_ceiling(worker.si_memory);
+    // The memory is the deployment's L1 (ADR 0081 decision 2): the folder it names, the ceiling
+    // it set, and the folder's own `si_memory:` key. No folder, or a ceiling of `off`, means the
+    // run holds none and is offered neither tool.
+    let Some(dir) = &worker.si_memory_dir else {
+        return def;
+    };
+    if !def.si_memory().is_on() {
+        return def;
+    }
+    let secrets = crate::redact::secret_values(config, crate::redact::process_vars());
+    let settings = adam_memory::Settings::new(adam_memory::Scrubber::new(move |text: &str| {
+        crate::redact::scrub(&secrets, text)
+    }));
+    let memory = match adam_memory::FolderSiMemory::open(dir, settings) {
+        Ok(memory) => std::sync::Arc::new(memory),
+        Err(error) => {
+            // A folder that cannot be opened is not a reason to refuse to serve: the run goes on
+            // without a memory (ADR 0081 decision 12), and the operator reads why.
+            tracing::warn!(%error, dir = %dir.display(), "the self-improvement memory's folder cannot be opened; runs go on without it");
+            return def;
+        }
+    };
+    // The folder is the deployment's L1, so its key is the agent it serves; two agents of one
+    // process are kept apart by the agent key as well. The caller is the message's: the A2A
+    // conversation id is `<subject>:<context id>`.
+    let name = def.name().to_owned();
+    def.si_memory_handle(adam_llm_agent::SiMemoryHandle::new(
+        memory,
+        adam_memory::Scope::agent(name.clone(), "-", name),
+        |ctx: &adam_llm_agent::ToolCtx| {
+            ctx.conversation_id()
+                .and_then(|id| id.split_once(':'))
+                .map(|(subject, _)| subject.to_owned())
+                .filter(|subject| !subject.is_empty())
+                .unwrap_or_else(|| "-".to_owned())
+        },
+    ))
 }
 
 #[cfg(test)]
@@ -163,9 +204,9 @@ mod tests {
         };
         let bind = |flag: Option<&str>| {
             let config = config(flag);
-            let worker = config.worker.as_ref().expect("the role runs workers");
+            assert!(config.worker.is_some(), "the role runs workers");
             let def = crate::folder::load(tmp.path()).expect("the folder").def;
-            for_workers(def, worker).bind(ToolSet::new()).is_ok()
+            for_workers(def, &config).bind(ToolSet::new()).is_ok()
         };
         assert!(!bind(None), "off by default");
         assert!(!bind(Some("false")));

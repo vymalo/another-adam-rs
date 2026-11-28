@@ -30,16 +30,23 @@ pub const SI_RECORD: &str = "si_record";
 /// The lazy group the two tools load together under (ADR 0066): `load__group__memory`.
 pub const SI_MEMORY_GROUP: &str = "memory";
 
-/// What the two tools read: the store, and the scope this run writes and reads in.
+/// What the two tools read: the store, the scope this run writes and reads in, and how the
+/// **caller** is named (ADR 0081 decision 4: no L1 entry crosses a caller).
 ///
-/// One handle per run: the scope names the deployment, the caller and the agent, and no entry
-/// crosses a caller (ADR 0081 decision 4). A deployment that serves several agents gives each its
-/// own.
+/// The caller is a property of the message, not of the process: `adam-agent` serves several, so a
+/// handle built once cannot hold one fixed caller. It holds the deployment, the agent and the kind,
+/// and a resolver that names the caller of the call being made — `adam-service` supplies one that
+/// reads the A2A subject, and a process with no callers passes
+/// [`one_caller`](Self::one_caller).
 #[derive(Clone)]
 pub struct SiMemoryHandle {
     memory: Arc<dyn SiMemory>,
     scope: Scope,
+    caller: CallerResolver,
 }
+
+/// How a handle names the caller of one call.
+type CallerResolver = Arc<dyn Fn(&ToolCtx) -> String + Send + Sync>;
 
 impl std::fmt::Debug for SiMemoryHandle {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -50,16 +57,32 @@ impl std::fmt::Debug for SiMemoryHandle {
 }
 
 impl SiMemoryHandle {
-    /// A handle over `memory` for the run that works in `scope`.
+    /// A handle over `memory` for the run that works in `scope`, with `caller` naming the caller of
+    /// every call.
     #[must_use]
-    pub fn new(memory: Arc<dyn SiMemory>, scope: Scope) -> Self {
-        Self { memory, scope }
+    pub fn new(
+        memory: Arc<dyn SiMemory>,
+        scope: Scope,
+        caller: impl Fn(&ToolCtx) -> String + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            memory,
+            scope,
+            caller: Arc::new(caller),
+        }
     }
 
-    /// The scope this handle reads and writes.
+    /// A handle whose every call is the same caller: a process that serves one, or a test.
     #[must_use]
-    pub fn scope(&self) -> &Scope {
-        &self.scope
+    pub fn one_caller(memory: Arc<dyn SiMemory>, scope: Scope, caller: impl Into<String>) -> Self {
+        let caller = caller.into();
+        Self::new(memory, scope, move |_| caller.clone())
+    }
+
+    /// The scope of one call: the handle's deployment, agent and kind, and the caller the resolver
+    /// names for `ctx`.
+    fn scope_for(&self, ctx: &ToolCtx) -> Scope {
+        self.scope.clone().with_caller((self.caller)(ctx))
     }
 
     /// The two tools, ready for a [`ToolSet`] and a group named [`SI_MEMORY_GROUP`].
@@ -98,8 +121,8 @@ impl Tool for SiRecall {
         }
     }
 
-    async fn call(&self, _ctx: &ToolCtx, _args: Value) -> Result<ToolOutput, ToolError> {
-        match self.handle.memory.recall(&self.handle.scope) {
+    async fn call(&self, ctx: &ToolCtx, _args: Value) -> Result<ToolOutput, ToolError> {
+        match self.handle.memory.recall(&self.handle.scope_for(ctx)) {
             Ok(problems) => Ok(ToolOutput::text(render(&problems))),
             Err(error) => Err(refuse(error)),
         }
@@ -174,7 +197,11 @@ impl Tool for SiRecord {
             Ok(None) => draft,
             Err(why) => return Ok(ToolOutput::error(why)),
         };
-        match self.handle.memory.record(&self.handle.scope, draft) {
+        match self
+            .handle
+            .memory
+            .record(&self.handle.scope_for(ctx), draft)
+        {
             Ok(problem) => Ok(ToolOutput::text(format!(
                 "recorded: {} now holds {} attempt(s)",
                 problem.root_cause,
@@ -274,7 +301,7 @@ mod tests {
     }
 
     fn handle(memory: Arc<InProcessSiMemory>) -> SiMemoryHandle {
-        SiMemoryHandle::new(memory, Scope::agent("dep", "caller", "adam-coder"))
+        SiMemoryHandle::one_caller(memory, Scope::agent("dep", "-", "adam-coder"), "caller")
     }
 
     fn ctx(call: &str) -> ToolCtx {
