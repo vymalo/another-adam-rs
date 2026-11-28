@@ -35,19 +35,31 @@
 //! the check (see [`ChecksReport::bound_to`] and `RunNotes::checked`), and otherwise says the commit
 //! was not checked ([`ChecksReport::unchecked`]).
 //!
-//! # A failed check is not run again on the same tree
+//! # A check is not run again on the same tree
 //!
-//! When the notes hold a **failed** record for the same call — the same commands in the same order,
-//! directory, slot and timeout on exactly the tree the commands are about to run on, made at the
-//! current `ChecksNotes::epoch` (`run` and the file tools bump it; the call is told apart by the
-//! SHA-256 of its commands' raw text, each behind its length, so two calls that differ only in a
-//! secret, or in where one command ends and the next begins, are two checks), the call is not run:
-//! the result quotes that run's findings, names the call that made
+//! When the notes hold a record for the same call — the same commands in the same order,
+//! directory, slot and timeout on exactly the tree the commands are about to run on (the tree id
+//! of the worktree as it would be committed: tracked changes and untracked, not ignored files,
+//! nothing else; see [`super::gitcli::working_tree_id`]; the call is told apart by the SHA-256 of
+//! its commands' raw text, each behind its length, so two calls that differ only in a secret, or
+//! in where one command ends and the next begins, are two checks) — the commands are not run. The
+//! key is the tree id and the call, **never the time**.
+//!
+//! A **passed** record is the tree's verdict and is reused whatever the run's file/environment
+//! epoch is now — never by time or by the epoch. The answer says the checks passed and were not
+//! run again because this call already passed on the same tree, and its `checks` artifact is the
+//! earlier report marked [`reused`](ChecksReport::reused): the report says which results were
+//! reused. No check cycle is spent and no new record is written (the earlier pass is the record
+//! for this tree).
+//!
+//! A **failed** record is reused only at the `ChecksNotes::epoch` it ran at (`run` and the file
+//! tools bump it; nothing a check reads may have moved since): the result quotes that run's
+//! findings, names the call that made
 //! them, spends no check cycle and emits no `checks` artifact (the earlier run's is the verdict on
-//! this tree). It is still a failure, so the gate refuses a pull request on the tree. A passing
-//! record is never reused (the model may be confirming it, and the environment may have changed),
-//! and neither is a pre-existing failure (it spends no cycle and the model is told the failure is
-//! the repository's).
+//! this tree). It is still a failure, so the gate refuses a pull request on the tree. A
+//! pre-existing failure is never reused (it spends no cycle and the model is told the failure is
+//! the repository's), and the most recent run of the check on the tree decides: a pass after a
+//! failure means the command runs again, not that the older failure is the answer.
 
 use adam::Artifact;
 use adam::prelude::*;
@@ -145,6 +157,7 @@ impl EnvironmentReport {
 /// | `environment` | where the check ran, when that was the run's own pod: `{kind, image}` (`kubernetes`); absent for a run in the coder's own container and in reports of an older coder. A report of an older coder may say `devcontainer` with a `source` |
 /// | `preexisting` | `true` when the command also fails on the base commit (`base_commit`), before the run changed anything: the failure is the repository's and the run's change did not cause it. Absent otherwise, and in reports of an older coder. `passed` is still `false`: a consumer that gates on the checks reads this to accept the failure |
 /// | `base_commit` | with `preexisting`: the commit `origin/<base>` was at when the command failed there too (40 hex) |
+/// | `reused` | `true` when the results are an earlier call's, not a new run: the same call had already passed on exactly the tree of this call and nothing ran again. The summary says which results were reused. Absent otherwise, and in reports of an older coder |
 /// | `summary` | one line |
 /// | `findings` | the failing checks; at most [`MAX_FINDINGS`] and [`MAX_FINDINGS_BYTES`] in total, the cut marked |
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -168,6 +181,11 @@ pub struct ChecksReport {
     /// The commit `origin/<base>` was at when the command failed there too; with `preexisting`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_commit: Option<String>,
+    /// The results are an earlier call's on this tree, not a new run: the same call had already
+    /// passed on exactly this code and the commands were not run again. Only a `passed` report is
+    /// ever marked ([`ChecksReport::reused_at`]); the summary says which results were reused.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub reused: bool,
     /// One line about the run.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub summary: Option<String>,
@@ -247,9 +265,27 @@ impl ChecksReport {
             environment: batch.environment.clone(),
             preexisting: preexisting.is_some(),
             base_commit: preexisting.map(str::to_owned),
+            reused: false,
             summary: Some(summary),
             findings: cap_findings(findings),
         }
+    }
+
+    /// The same report, marked as reused: the results are the earlier call's run on tree `tree`,
+    /// not a new one. The summary says which results were reused; marking twice changes nothing.
+    #[must_use]
+    pub fn reused_at(mut self, tree: &str) -> Self {
+        if self.reused {
+            return self;
+        }
+        self.reused = true;
+        let short = &tree[..tree.len().min(10)];
+        let mark = format!("these results were reused: the same call passed on tree {short}");
+        self.summary = Some(match self.summary.take() {
+            Some(summary) => format!("{summary}; {mark}"),
+            None => mark,
+        });
+        self
     }
 
     /// This report for the repository `url`: what a verdict on a pushed commit names.
@@ -288,6 +324,7 @@ impl ChecksReport {
                 .base_commit
                 .clone()
                 .filter(|_| self.preexisting && !command_passed),
+            reused: self.reused,
             summary: Some(format!(
                 "{core}; checked on the identical tree before it was committed as {}",
                 &commit[..commit.len().min(10)]
@@ -319,6 +356,7 @@ impl ChecksReport {
             environment: None,
             preexisting: false,
             base_commit: None,
+            reused: false,
             summary: Some(format!(
                 "the pushed commit {} was not checked",
                 &commit[..commit.len().min(10)]
@@ -671,6 +709,39 @@ fn unchanged_failure_text(record: &CheckRecord, command: &str, failures: u32, ma
     )
 }
 
+/// What the model is told when a passed check is not run again: the same call already passed on
+/// exactly this tree, so its results are the answer. It quotes the earlier report's summary and
+/// any findings (a pass has none, but the report may carry a `commit` finding when the run's
+/// `HEAD` was unknown — kept), names the call that made them, says the key of a check is the tree
+/// id and the call, never the time or the epoch (so any change to the tree runs the checks again),
+/// and that the `checks` result is the earlier report marked reused, not a new run.
+fn unchanged_pass_text(record: &CheckRecord, command: &str) -> String {
+    let tree = record.start_tree.as_deref().unwrap_or_default();
+    let short = &tree[..tree.len().min(10)];
+    let report = record.report.as_ref();
+    let summary = report
+        .and_then(|report| report.summary.as_deref())
+        .unwrap_or("the checks passed");
+    let mut said = format!(
+        "The checks passed and were not run again: `{command}` already passed on tree {short} \
+         (call `{}`), and this call starts on exactly that tree again. A check is keyed on the \
+         tree id (tracked changes and untracked files, not what `.gitignore` hides) and the call, \
+         never on when it ran or on the run's epoch: any change to the tree runs the checks \
+         again. The results reused are those of that run: {summary}",
+        record.call_id
+    );
+    if let Some(report) = report {
+        for finding in &report.findings {
+            said.push_str(&format!("\n{}: {}", finding.check, finding.message));
+        }
+    }
+    said.push_str(
+        "\nNothing ran and nothing was recorded again: the `checks` result is that earlier \
+         report, marked as reused.",
+    );
+    said
+}
+
 /// The commands a call names: `command`, or `commands`, exactly one of the two (whether it is
 /// given is decided before trimming, so a blank `command` beside a list is still both). Every
 /// command is trimmed, an empty one is refused, and a NUL is refused: it is what the reuse key's
@@ -857,7 +928,9 @@ fn batch_repeat_key(outcomes: &[ShellOutcome]) -> String {
 /// code 0 counts as passing. Every failed call uses up one of your limited check cycles and is
 /// reported as a check: never use it to look around (use run_command) or to make a file or change
 /// the worktree (use run). A call that failed, asked again on exactly the same unchanged code, is
-/// answered from the earlier run (no cycle, no new `checks` artifact, still a failure). A command
+/// answered from the earlier run (no cycle, no new `checks` artifact, still a failure); the same
+/// call that passed on exactly the same code is answered from that pass too (nothing runs, and the
+/// `checks` report says the results were reused). A command
 /// the shell cannot find means the workspace lacks that tool: that is reported, costs no cycle, and
 /// is for the person to decide.
 #[tool(label = "Run the checks", icon = "execute", parallel = "exclusive")]
@@ -930,7 +1003,8 @@ pub async fn run_checks(
     let named = joined(&shown);
 
     // The code the commands are about to run on, computed before they run: it says whether a
-    // failure already seen on exactly this code can be answered instead of running them again. The
+    // result already seen on exactly this code (a failure at its epoch, or a pass whatever the
+    // epoch) can be answered instead of running them again. The
     // report below is bound to the tree they leave (a check may write a file), as it always was.
     let at = super::gitcli::GitAt::slot(&slot);
     let tree_before = super::gitcli::working_tree_id(&at).await;
@@ -967,6 +1041,43 @@ pub async fn run_checks(
                     "unchanged:{}",
                     earlier.start_tree.as_deref().unwrap_or_default()
                 )),
+        );
+    }
+
+    // A pass on this exact tree, from this exact call (raw commands, directory, slot, timeout) in
+    // this kind of work: the tree is the verdict's key (it holds the tracked changes and untracked
+    // files of the worktree), never the time or the run's file/environment epoch
+    // (`RunNotes::passed_check_on`), so the commands are not run again. The earlier report,
+    // marked reused, is the answer and the `checks` artifact; no check cycle is spent and no
+    // record is written (the earlier pass is the record for this tree). A record that keeps no
+    // report cannot say what the earlier run found (only notes written before reports did can
+    // make one): the check runs.
+    let passed_earlier = match tree_before.as_deref() {
+        Some(tree) => notes
+            .passed_check_on(&CheckKey {
+                tree,
+                command_sha: &command_sha,
+                cwd: &dir_key,
+                slot: slot.dir(),
+                epoch,
+                timeout_secs: timeout.as_secs(),
+                scratch,
+            })
+            .and_then(|earlier| earlier.report.clone().map(|report| (earlier, report))),
+        None => None,
+    };
+    if let Some((earlier, report)) = passed_earlier {
+        ctx.emit_progress(format!("checks not run again (unchanged tree): {named}"))
+            .await;
+        // No `with_repeat_key`: this answer never varies (it quotes the earlier report and counts
+        // nothing), so the repeated-call rule already refuses a third ask of it, and that key is
+        // for a failure whose text varies while its cause does not.
+        return Ok(
+            ToolOutput::text(unchanged_pass_text(earlier, &named)).with_artifact(
+                report
+                    .reused_at(earlier.start_tree.as_deref().unwrap_or_default())
+                    .into_artifact(redactor),
+            ),
         );
     }
 
@@ -1438,6 +1549,36 @@ mod tests {
         assert!(!headless.passed);
         let bound = headless.bound_to(pushed, TREE, true);
         assert!(bound.passed && bound.findings.is_empty());
+    }
+
+    /// A report marked reused says which results were reused: the summary carries the marker once,
+    /// the rest of the earlier report is unchanged, and `reused` is absent while nothing was.
+    #[test]
+    fn a_reused_report_says_which_results_were_reused() {
+        let r = report(&outcome(Some(0), "ok\n"), Some(SHA), false);
+        assert!(!r.reused);
+        let data = serde_json::to_value(&r).unwrap();
+        assert!(data.get("reused").is_none(), "{data}");
+
+        let reused = r.clone().reused_at(TREE);
+        assert!(reused.reused);
+        assert_eq!(
+            reused.summary.as_deref(),
+            Some(
+                "`cargo test` passed; these results were reused: the same call passed on tree \
+                 fedcba9876"
+            )
+        );
+        assert_eq!(serde_json::to_value(&reused).unwrap()["reused"], true);
+        // Marking twice does not repeat the marker, and the verdict is the earlier one.
+        assert_eq!(reused.clone().reused_at(TREE), reused);
+        assert_eq!(reused.passed, r.passed);
+        assert_eq!(reused.commit, r.commit);
+        assert_eq!(reused.tree, r.tree);
+        assert_eq!(reused.findings, r.findings);
+        // Binding to a commit keeps the mark.
+        let bound = reused.bound_to("aaaaaaaaaabbbbbbbbbbccccccccccdddddddddd", TREE, true);
+        assert!(bound.reused);
     }
 
     #[test]
