@@ -5,7 +5,7 @@ resolver = "3"
 members = ["crates/*", "bin/*"]
 
 [workspace.package]
-version = "0.6.0" # x-release-please-version
+version = "0.7.0" # x-release-please-version
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/vymalo/another-adam-rs"
@@ -16,50 +16,50 @@ unwrap_used = "warn"
 expect_used = "warn"
 
 [workspace.dependencies]
-adam = { path = "crates/adam", version = "0.6.0" } # x-release-please-version
-adam-a2a = { path = "crates/adam-a2a", version = "0.6.0" } # x-release-please-version
-adam-a2a-runtime = { path = "crates/adam-a2a-runtime", version = "0.6.0" } # x-release-please-version
-adam-acp = { path = "crates/adam-acp", version = "0.6.0" } # x-release-please-version
-adam-admission-local = { path = "crates/adam-admission-local", version = "0.6.0" } # x-release-please-version
-adam-admission-testkit = { path = "crates/adam-admission-testkit", version = "0.6.0" } # x-release-please-version
-adam-assembly = { path = "crates/adam-assembly", version = "0.6.0" } # x-release-please-version
-adam-budget = { path = "crates/adam-budget", version = "0.6.0" } # x-release-please-version
-adam-agent-fs = { path = "crates/adam-agent-fs", version = "0.6.0" } # x-release-please-version
-adam-code-tools = { path = "crates/adam-code-tools", version = "0.6.0" } # x-release-please-version
-adam-code-tools-testkit = { path = "crates/adam-code-tools-testkit", version = "0.6.0" } # x-release-please-version
-adam-confine = { path = "crates/adam-confine", version = "0.6.0" } # x-release-please-version
-adam-confine-testkit = { path = "crates/adam-confine-testkit", version = "0.6.0" } # x-release-please-version
-adam-core = { path = "crates/adam-core", version = "0.6.0" } # x-release-please-version
-adam-device-state = { path = "crates/adam-device-state", version = "0.6.0" } # x-release-please-version
-adam-device-state-testkit = { path = "crates/adam-device-state-testkit", version = "0.6.0" } # x-release-please-version
-adam-env-kubernetes = { path = "crates/adam-env-kubernetes", version = "0.6.0" } # x-release-please-version
-adam-error = { path = "crates/adam-error", version = "0.6.0" } # x-release-please-version
-adam-git-sandbox = { path = "crates/adam-git-sandbox", version = "0.6.0" } # x-release-please-version
-adam-hook-exec = { path = "crates/adam-hook-exec", version = "0.6.0" } # x-release-please-version
-adam-host = { path = "crates/adam-host", version = "0.6.0" } # x-release-please-version
-adam-llm-agent = { path = "crates/adam-llm-agent", version = "0.6.0" } # x-release-please-version
-adam-macros = { path = "crates/adam-macros", version = "0.6.0" } # x-release-please-version
-adam-mcp = { path = "crates/adam-mcp", version = "0.6.0" } # x-release-please-version
-adam-mcp-testkit = { path = "crates/adam-mcp-testkit", version = "0.6.0" } # x-release-please-version
-adam-memory = { path = "crates/adam-memory", version = "0.6.0" } # x-release-please-version
-adam-memory-testkit = { path = "crates/adam-memory-testkit", version = "0.6.0" } # x-release-please-version
-adam-model = { path = "crates/adam-model", version = "0.6.0" } # x-release-please-version
-adam-model-oauth = { path = "crates/adam-model-oauth", version = "0.6.0", default-features = false } # x-release-please-version
-adam-model-openai = { path = "crates/adam-model-openai", version = "0.6.0", default-features = false } # x-release-please-version
-adam-notify-postgres = { path = "crates/adam-notify-postgres", version = "0.6.0" } # x-release-please-version
-adam-notify-testkit = { path = "crates/adam-notify-testkit", version = "0.6.0" } # x-release-please-version
-adam-plugin = { path = "crates/adam-plugin", version = "0.6.0" } # x-release-please-version
-adam-plugin-testkit = { path = "crates/adam-plugin-testkit", version = "0.6.0" } # x-release-please-version
-adam-postgres = { path = "crates/adam-postgres", version = "0.6.0" } # x-release-please-version
-adam-run-cert-broker = { path = "crates/adam-run-cert-broker", version = "0.6.0" } # x-release-please-version
-adam-runtime = { path = "crates/adam-runtime", version = "0.6.0" } # x-release-please-version
-adam-service = { path = "crates/adam-service", version = "0.6.0" } # x-release-please-version
-adam-store-mongodb = { path = "crates/adam-store-mongodb", version = "0.6.0" } # x-release-please-version
-adam-store-postgres = { path = "crates/adam-store-postgres", version = "0.6.0" } # x-release-please-version
-adam-store-sqlite = { path = "crates/adam-store-sqlite", version = "0.6.0" } # x-release-please-version
-adam-store-testkit = { path = "crates/adam-store-testkit", version = "0.6.0" } # x-release-please-version
-adam-ui = { path = "crates/adam-ui", version = "0.6.0" } # x-release-please-version
-adam-workspace = { path = "crates/adam-workspace", version = "0.6.0" } # x-release-please-version
+adam = { path = "crates/adam", version = "0.7.0" } # x-release-please-version
+adam-a2a = { path = "crates/adam-a2a", version = "0.7.0" } # x-release-please-version
+adam-a2a-runtime = { path = "crates/adam-a2a-runtime", version = "0.7.0" } # x-release-please-version
+adam-acp = { path = "crates/adam-acp", version = "0.7.0" } # x-release-please-version
+adam-admission-local = { path = "crates/adam-admission-local", version = "0.7.0" } # x-release-please-version
+adam-admission-testkit = { path = "crates/adam-admission-testkit", version = "0.7.0" } # x-release-please-version
+adam-assembly = { path = "crates/adam-assembly", version = "0.7.0" } # x-release-please-version
+adam-budget = { path = "crates/adam-budget", version = "0.7.0" } # x-release-please-version
+adam-agent-fs = { path = "crates/adam-agent-fs", version = "0.7.0" } # x-release-please-version
+adam-code-tools = { path = "crates/adam-code-tools", version = "0.7.0" } # x-release-please-version
+adam-code-tools-testkit = { path = "crates/adam-code-tools-testkit", version = "0.7.0" } # x-release-please-version
+adam-confine = { path = "crates/adam-confine", version = "0.7.0" } # x-release-please-version
+adam-confine-testkit = { path = "crates/adam-confine-testkit", version = "0.7.0" } # x-release-please-version
+adam-core = { path = "crates/adam-core", version = "0.7.0" } # x-release-please-version
+adam-device-state = { path = "crates/adam-device-state", version = "0.7.0" } # x-release-please-version
+adam-device-state-testkit = { path = "crates/adam-device-state-testkit", version = "0.7.0" } # x-release-please-version
+adam-env-kubernetes = { path = "crates/adam-env-kubernetes", version = "0.7.0" } # x-release-please-version
+adam-error = { path = "crates/adam-error", version = "0.7.0" } # x-release-please-version
+adam-git-sandbox = { path = "crates/adam-git-sandbox", version = "0.7.0" } # x-release-please-version
+adam-hook-exec = { path = "crates/adam-hook-exec", version = "0.7.0" } # x-release-please-version
+adam-host = { path = "crates/adam-host", version = "0.7.0" } # x-release-please-version
+adam-llm-agent = { path = "crates/adam-llm-agent", version = "0.7.0" } # x-release-please-version
+adam-macros = { path = "crates/adam-macros", version = "0.7.0" } # x-release-please-version
+adam-mcp = { path = "crates/adam-mcp", version = "0.7.0" } # x-release-please-version
+adam-mcp-testkit = { path = "crates/adam-mcp-testkit", version = "0.7.0" } # x-release-please-version
+adam-memory = { path = "crates/adam-memory", version = "0.7.0" } # x-release-please-version
+adam-memory-testkit = { path = "crates/adam-memory-testkit", version = "0.7.0" } # x-release-please-version
+adam-model = { path = "crates/adam-model", version = "0.7.0" } # x-release-please-version
+adam-model-oauth = { path = "crates/adam-model-oauth", version = "0.7.0", default-features = false } # x-release-please-version
+adam-model-openai = { path = "crates/adam-model-openai", version = "0.7.0", default-features = false } # x-release-please-version
+adam-notify-postgres = { path = "crates/adam-notify-postgres", version = "0.7.0" } # x-release-please-version
+adam-notify-testkit = { path = "crates/adam-notify-testkit", version = "0.7.0" } # x-release-please-version
+adam-plugin = { path = "crates/adam-plugin", version = "0.7.0" } # x-release-please-version
+adam-plugin-testkit = { path = "crates/adam-plugin-testkit", version = "0.7.0" } # x-release-please-version
+adam-postgres = { path = "crates/adam-postgres", version = "0.7.0" } # x-release-please-version
+adam-run-cert-broker = { path = "crates/adam-run-cert-broker", version = "0.7.0" } # x-release-please-version
+adam-runtime = { path = "crates/adam-runtime", version = "0.7.0" } # x-release-please-version
+adam-service = { path = "crates/adam-service", version = "0.7.0" } # x-release-please-version
+adam-store-mongodb = { path = "crates/adam-store-mongodb", version = "0.7.0" } # x-release-please-version
+adam-store-postgres = { path = "crates/adam-store-postgres", version = "0.7.0" } # x-release-please-version
+adam-store-sqlite = { path = "crates/adam-store-sqlite", version = "0.7.0" } # x-release-please-version
+adam-store-testkit = { path = "crates/adam-store-testkit", version = "0.7.0" } # x-release-please-version
+adam-ui = { path = "crates/adam-ui", version = "0.7.0" } # x-release-please-version
+adam-workspace = { path = "crates/adam-workspace", version = "0.7.0" } # x-release-please-version
 
 a2a-client-lf = "0.2"
 a2a-lf = "0.3"

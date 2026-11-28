@@ -118,20 +118,35 @@ fn scrub(
     raw: &str,
     settings: &Settings,
 ) -> MemoryResult<String> {
-    let clean = settings.scrubber.scrub(raw);
+    scrub_text(
+        field,
+        raw,
+        &settings.scrubber,
+        matches!(scope.kind(), Kind::Agent),
+    )
+}
+
+/// The scrub and the marker check every text passes, then the address check when `forbid_address`
+/// is set. L2 lessons forbid addresses whatever their audience (ADR 0081 decision 5), so they call
+/// this directly instead of going through an L1 scope.
+pub(crate) fn scrub_text(
+    field: &'static str,
+    raw: &str,
+    scrubber: &crate::Scrubber,
+    forbid_address: bool,
+) -> MemoryResult<String> {
+    let clean = scrubber.scrub(raw);
     if clean.contains(REDACTION_MARKER) {
         return Err(MemoryError::Redacted { field });
     }
-    if matches!(scope.kind(), Kind::Agent)
-        && let Some(what) = names_address(&clean)
-    {
+    if forbid_address && let Some(what) = names_address(&clean) {
         return Err(MemoryError::NamesAddress { field, what });
     }
     Ok(clean)
 }
 
-/// The shapes an agent-scoped text may not name. The list is conservative on purpose: a false
-/// positive refuses a write, which decision 12 makes the safe side.
+/// The shapes an agent-scoped text, or an L2 lesson, may not name. The list is conservative on
+/// purpose: a false positive refuses a write, which decision 12 makes the safe side.
 fn names_address(text: &str) -> Option<&'static str> {
     for token in text.split(|c: char| {
         c.is_whitespace()

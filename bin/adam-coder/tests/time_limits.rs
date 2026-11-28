@@ -57,8 +57,9 @@ async fn every_tool_declares_its_own_bound_or_is_quick_by_construction() {
 }
 
 /// A command's own `timeout` is at most the deployment's command limit, so it always fits under the
-/// time limit of the tool that runs it (the environment's start, the command and the margin): the loop
-/// never cuts a command the deployment allowed.
+/// time limit of the tool that runs it (the environment's start, the command — for `run_checks`, its
+/// wave and the base run it may need — and the margin): the loop never cuts a command the deployment
+/// allowed.
 #[tokio::test]
 async fn a_commands_timeout_at_the_cap_fits_under_its_tools_limit() {
     for environment_start in [0, 90] {
@@ -74,15 +75,59 @@ async fn a_commands_timeout_at_the_cap_fits_under_its_tools_limit() {
     }
 }
 
+/// A `run_checks` call pays for the commands it names: one wave of `MAX_PARALLEL_TOOL_CALLS` at
+/// once, and one run on the base for each failing command. The limit grows with the list, so the
+/// agent does not drop a long call mid-way.
+#[tokio::test]
+async fn a_checks_call_that_names_a_list_is_given_time_for_every_command() {
+    let fx = Fixture::with(|settings| {
+        settings.check_timeout = Duration::from_secs(700);
+        settings.environment_start = Duration::ZERO;
+        settings.max_parallel_tool_calls = 4;
+    })
+    .await
+    .offering_creation();
+    let tool = coder_tools(&fx.env)
+        .into_iter()
+        .find(|tool| tool.spec().name == "run_checks")
+        .unwrap();
+    // One command: one wave, and the base run it may need.
+    assert_eq!(
+        tool.time_limit_for(&serde_json::json!({"command": "cargo test"}))
+            .unwrap()
+            .as_secs(),
+        2 * 700 + MARGIN
+    );
+    // Four commands, one wave of four: four commands and one wave.
+    assert_eq!(
+        tool.time_limit_for(&serde_json::json!({"commands": ["a", "b", "c", "d"]}))
+            .unwrap()
+            .as_secs(),
+        (4 + 1) * 700 + MARGIN
+    );
+    // Eight commands, two waves: eight commands and two waves.
+    assert_eq!(
+        tool.time_limit_for(
+            &serde_json::json!({"commands": ["a", "b", "c", "d", "e", "f", "g", "h"]})
+        )
+        .unwrap()
+        .as_secs(),
+        (8 + 2) * 700 + MARGIN
+    );
+}
+
 #[tokio::test]
 async fn the_limits_come_from_the_deployments_settings() {
     // A deployment whose environment takes up to 2100 s to be made ready (up 1200 + setup 900) and
     // whose commands may run 700 s.
     let limits = limits_with(2100).await;
     let secs = |name: &str| limits[name].unwrap().as_secs();
-    for command in ["run_command", "run", "run_checks"] {
+    for command in ["run_command", "run"] {
         assert_eq!(secs(command), 2100 + 700 + MARGIN, "{command}");
     }
+    // `run_checks` with no arguments is a call of one command: its wave and the base run it may
+    // need, two commands' time (see `a_checks_call_that_names_a_list_is_given_time_for_every_command`).
+    assert_eq!(secs("run_checks"), 2100 + 2 * 700 + MARGIN);
     // A command that keeps running: the environment is made ready and the call waits for it up to
     // 120 s; stopping it, 60 s, after the environment is made ready for a command this worker does not
     // hold; listing asks for the session and reads records (the finders' deadline, 30 s).

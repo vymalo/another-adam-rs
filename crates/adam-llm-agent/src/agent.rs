@@ -5874,7 +5874,9 @@ impl LlmAgent {
             let span = tool_span(&name);
             let called = match own {
                 Some(tool) => {
-                    let limit = tool.time_limit().unwrap_or(DEFAULT_TOOL_TIME_LIMIT);
+                    let limit = tool
+                        .time_limit_for(&args)
+                        .unwrap_or(DEFAULT_TOOL_TIME_LIMIT);
                     within(&tool_ctx, &name, limit, |ctx| async move {
                         tool.call(&ctx, ran).await
                     })

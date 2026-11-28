@@ -41,7 +41,7 @@ adam-llm-agent.workspace = true
 adam-model.workspace = true
 adam-runtime.workspace = true
 # The files' schedules: the scheduler and its `schedules` component (ADR 0060).
-adam-schedule = { path = "../../crates/adam-schedule", version = "0.6.0" } # x-release-please-version
+adam-schedule = { path = "../../crates/adam-schedule", version = "0.7.0" } # x-release-please-version
 adam-service = { workspace = true, features = ["mcp"] }
 adam-ui.workspace = true
 adam-workspace.workspace = true
@@ -87,6 +87,7 @@ rustls = { workspace = true, features = ["aws_lc_rs"] }
 adam-postgres.workspace = true
 tokio-postgres = { version = "0.7", features = ["with-jiff-0_2", "with-serde_json-1", "with-uuid-1"] }
 tempfile.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
 uuid.workspace = true
 wiremock.workspace = true
 

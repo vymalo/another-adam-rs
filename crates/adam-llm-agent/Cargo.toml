@@ -39,16 +39,18 @@ thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 uuid.workspace = true
+# The two self-improvement-memory tools (`si_recall`, `si_record`, ADR 0081 decision 6): the port
+# and its types. The adapters stay with the deployment.
+adam-memory.workspace = true
 
 [dev-dependencies]
-adam-memory.workspace = true
 # The call-span tests of `agent` (ANR-1346): a subscriber that captures what a span renders.
 tracing-subscriber.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
 schemars = { workspace = true, features = ["derive"] }
 proptest.workspace = true
-adam-store-mongodb = { path = "../adam-store-mongodb", version = "0.6.0" } # x-release-please-version
-adam-store-postgres = { path = "../adam-store-postgres", version = "0.6.0" } # x-release-please-version
+adam-store-mongodb = { path = "../adam-store-mongodb", version = "0.7.0" } # x-release-please-version
+adam-store-postgres = { path = "../adam-store-postgres", version = "0.7.0" } # x-release-please-version
 adam-store-testkit.workspace = true
 adam-model-openai = { workspace = true, features = ["aws-lc"] }
 secrecy.workspace = true

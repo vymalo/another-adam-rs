@@ -315,3 +315,9 @@ starts when its arguments are complete, and a conflict with an earlier call that
 written**, not proposals. Nothing in the decision changes; this note records the date and the question, which the
 amendment text of 2026-11-18 asked for. The finishing slice is ANR-248 (`adam`), and the code the amendments describe
 shipped in `adam#191`.
+
+*Amended 2026-11-28 (ANR-243):* the `Tool` trait gained `time_limit_for(&self, args: &Value)`, so the row
+above that lists `asks_user`, `paged`, `time_limit` and `step_style` is superseded on that point. It is
+defaulted (it answers `time_limit()`), so no implementer breaks, and every wrapper (`Gated`,
+`Redacting`, `Scrubbed`) forwards it; the loop asks it at the one place a limit is enforced, with the
+arguments the call runs with.

@@ -57,6 +57,9 @@ jobs:
       # ADR 0084: every version a release moves is marked for release-please, and the Cargo lines agree.
       - name: The release's version lines are marked and agree
         run: sh tools/release/check-versions.sh
+      # ADR 0082 decision 11: every PostgreSQL of CI, the release workflow and compose is one pinned image.
+      - name: Every postgres image is the same pinned one
+        run: sh tools/release/check-postgres-pin.sh
       - run: cargo fmt --all --check
 
   # The two clippy arms: the default features, and the optional ones (or their code never runs in CI).
@@ -293,6 +296,20 @@ jobs:
         run: |
           bash <(curl -sSfL https://raw.githubusercontent.com/rhysd/actionlint/v1.7.7/scripts/download-actionlint.bash) 1.7.7
           ./actionlint -color
+
+  # The Homebrew formula writer of release.yml (ADR 0084, amended 2026-11-27): the golden formula and tap README for
+  # fixed checksums, a Ruby syntax check of the formula, and the scripts' shell. Needs no compiler.
+  release-tools:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - run: node --test "tools/release/test/*.test.mjs"
+      - run: ruby -c tools/release/test/golden/adam-agent.rb
+      - run: sh -n tools/release/homebrew-smoke.sh && shellcheck tools/release/homebrew-smoke.sh
 
   # Every Mermaid diagram parses (pinned Mermaid), every relative Markdown link
   # and #heading resolves, every crate has a README. See tools/docs-check.

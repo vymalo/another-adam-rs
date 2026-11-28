@@ -339,6 +339,8 @@ async fn only_the_optional_arguments_are_nullable() {
             "run.cwd",
             "run.repo",
             "run.timeout",
+            "run_checks.command",
+            "run_checks.commands",
             "run_checks.cwd",
             "run_checks.repo",
             "run_checks.timeout",

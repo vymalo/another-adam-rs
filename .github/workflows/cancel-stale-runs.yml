@@ -1,0 +1,66 @@
+name: cancel-stale-runs
+
+# When a pull request is closed (merged or not) or its branch is deleted, cancel every run of that branch that
+# is still queued or running: nothing is waiting for them any more, and the runners they hold or wait for are
+# other branches' time. The owner, 2026-11-27: "add a line in all PR that cancels all running workflows when a
+# newer job lands, or when the PR get merged, or when the branch is deleted".
+#
+# A newer push is already handled where each workflow starts: ci.yml, coder.yml, bench.yml, docs-site.yml and
+# commit-lint.yml cancel an older run of the same pull request (`cancel-in-progress`), and none of them
+# cancels a run on main, a tag or a manual dispatch. This workflow covers the other two cases, which a
+# concurrency group cannot see: a run is only replaced by another run, and a merge or a deletion starts none
+# of the PR's own.
+#
+# It never touches the default branch, and never its own run. `actions: write` is the only permission. A pull
+# request from a fork gets a read-only token: cancelling is refused, which is a warning and not a failure. The
+# branch name is read from the event into the environment and never into the script text.
+
+on:
+  pull_request:
+    types: [closed]
+  delete:
+
+permissions: {}
+
+jobs:
+  cancel:
+    name: cancel the branch's queued and running workflow runs
+    # `delete` fires for tags too.
+    if: github.event_name == 'pull_request' || github.event.ref_type == 'branch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      actions: write
+    steps:
+      - name: Cancel the runs that have not finished
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          EVENT: ${{ github.event_name }}
+          HEAD_REF: ${{ github.head_ref }}
+          DELETED_REF: ${{ github.event.ref }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          set -eu
+          if [ "$EVENT" = delete ]; then branch=$DELETED_REF; else branch=$HEAD_REF; fi
+          if [ -z "$branch" ] || [ "$branch" = "$DEFAULT_BRANCH" ]; then
+            echo "::notice::no branch to clean up, or the default branch: nothing cancelled"
+            exit 0
+          fi
+          cancelled=0
+          for status in queued in_progress waiting pending requested; do
+            ids=$(gh run list -R "$REPO" --branch "$branch" --status "$status" --limit 100 --json databaseId --jq '.[].databaseId') || {
+              echo "::warning::could not list the $status runs of $branch (a fork's pull request has a read-only token)"
+              continue
+            }
+            for id in $ids; do
+              [ "$id" = "$RUN_ID" ] && continue
+              if gh run cancel -R "$REPO" "$id"; then
+                cancelled=$((cancelled + 1))
+              else
+                echo "::warning::could not cancel run $id"
+              fi
+            done
+          done
+          echo "cancelled $cancelled run(s) of $branch"

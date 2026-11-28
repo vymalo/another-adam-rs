@@ -1,6 +1,6 @@
 [package]
 name = "adam-memory-testkit"
-description = "The conformance suite of adam-memory's SiMemory port: a si_memory_conformance! macro that proves a scope answers only its own entries, a record lands once, every text is scrubbed or refused, and every bound holds"
+description = "The conformance suites of adam-memory's SiMemory (L1) and Memory (L2) ports: a si_memory_conformance! macro that proves a scope answers only its own entries, a record lands once, every text is scrubbed or refused, and every bound holds, and a memory_conformance! macro that proves two configured scopes never see each other's lessons and an audience answers only its own"
 readme = "README.md"
 publish = false
 version.workspace = true
