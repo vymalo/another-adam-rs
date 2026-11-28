@@ -1930,9 +1930,15 @@ pub(crate) fn page_of_sessions(
             let mut runs = ordered(runs);
             let round = u32::try_from(runs.len()).unwrap_or(u32::MAX);
             let (latest, facts) = runs.pop()?;
-            // A deleted session is gone from every listing (ADR 0054 decision 10): the tombstone
-            // is the latest round's header, so it is checked where the latest round is known.
-            if facts.header.as_ref().is_some_and(|h| h.deleted) {
+            // A deleted session is gone from every listing (ADR 0054 decision 10). A tombstone on
+            // **any** round counts, not only the latest: a send that raced the delete lands a round
+            // after it whose header was built from the view it read before, and that round must not
+            // resurrect the session.
+            if facts.header.as_ref().is_some_and(|h| h.deleted)
+                || runs
+                    .iter()
+                    .any(|(_, f)| f.header.as_ref().is_some_and(|h| h.deleted))
+            {
                 return None;
             }
             // The report is of the newest round that worked: all of them but a closing one, and one
@@ -2100,8 +2106,12 @@ impl SessionView {
             .unwrap_or(last);
         let (latest, facts) = &runs[last];
         // A deleted session is gone (ADR 0054 decision 10): not listed, and every tool's `view` is
-        // `None`, so each refuses it with `no_such_session`. Its runs stay in the store.
-        if facts.header.as_ref().is_some_and(|h| h.deleted) {
+        // `None`, so each refuses it with `no_such_session`. Its runs stay in the store. As in the
+        // listing, a tombstone on any round counts.
+        if runs
+            .iter()
+            .any(|(_, f)| f.header.as_ref().is_some_and(|h| h.deleted))
+        {
             return None;
         }
         let mut read = read_latest(latest, facts, now, idle_ttl);
@@ -2894,6 +2904,29 @@ mod tests {
             SessionView::from_rounds(session, vec![rec], t0(), idle_ttl()).is_none(),
             "a deleted session is gone"
         );
+    }
+
+    /// A send that raced the delete lands a round after the tombstone, with a header built from
+    /// the view it read before: the session stays gone, because any round's tombstone counts.
+    #[test]
+    fn a_deleted_session_is_not_listed_even_when_a_later_round_came() {
+        let session = RunId::new();
+        let mut tombstone = header(session, false, true);
+        tombstone.deleted = true;
+        let first = with_header(session, Some(tombstone), RunStatus::Failed, vec![]);
+        // The racing round: a header without `deleted`, as the send built it before the delete.
+        let later = with_header(
+            session,
+            Some(header(session, true, false)),
+            RunStatus::Runnable,
+            vec![],
+        );
+        let list = page_of_sessions("p", rounds(vec![first, later]), 0, 10, t0(), idle_ttl());
+        assert!(
+            list.sessions.is_empty(),
+            "a later round resurrected it: {list:?}"
+        );
+        assert_eq!(list.total, 0, "it counts in no page");
     }
 
     /// The listing drops a deleted session as well, not only a view: the tombstone is read where

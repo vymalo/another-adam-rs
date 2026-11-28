@@ -1923,11 +1923,19 @@ impl Tool for Close {
             }
             if view.state == SessionState::Working {
                 if delete {
-                    starter
-                        .delete_round(&view, "the session was deleted")
-                        .await
-                        .map_err(|e| runtime_error(&e))?;
-                    return Ok(closed(session, None));
+                    match starter.delete_round(&view, "the session was deleted").await {
+                        Ok(()) => return Ok(closed(session, None)),
+                        // The session changed under us (a send, another delete): read it again and
+                        // delete the round that is there now, as the busy case below does.
+                        Err(e)
+                            if is_busy_or_finished(&e)
+                                || matches!(e, RuntimeError::Contended(_)) =>
+                        {
+                            note = None;
+                            continue;
+                        }
+                        Err(e) => return Err(runtime_error(&e)),
+                    }
                 }
                 if cancel {
                     starter

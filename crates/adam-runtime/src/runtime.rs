@@ -857,11 +857,16 @@ impl Inner {
             update.head = head;
             match self.store.commit_run(run, rec.version, update).await {
                 Ok(committed) => {
-                    // ANR-1449: a cancel is a transition to `failed`, and the family counts it.
-                    crate::metrics::record_run_status(
-                        &opentelemetry::global::meter(crate::metrics::SCOPE),
-                        committed.status,
-                    );
+                    // ANR-1449: a cancel is a transition to `failed`, and the family counts it. The
+                    // tombstone of a run that had ended is no transition: its status is the one it
+                    // already had, and counting it again would inflate the family on every delete of
+                    // an idle session (as a delivery to a runnable run is not counted).
+                    if cancelling {
+                        crate::metrics::record_run_status(
+                            &opentelemetry::global::meter(crate::metrics::SCOPE),
+                            committed.status,
+                        );
+                    }
                     let Some(error) = error else {
                         // The tombstone of a run that had ended: nothing to announce, but a step
                         // of ours that is still running it is pointless all the same.
@@ -2109,9 +2114,10 @@ impl Runtime {
     /// commit**, so from the moment the round stops the session is gone from every listing and no
     /// report of it can reach the parent. Its runs stay in the store.
     ///
-    /// A round that ended before this call is tombstoned without a cancel. A session that is idle
-    /// or closed has no round to cancel: it is deleted by a closing round whose header already says
-    /// `deleted` (the session tools do that), which is one commit of its own.
+    /// A round that has already ended is tombstoned without a cancel, and its status is left as it
+    /// was. `subagent_close` reaches that path only when a round it read as working ends meanwhile;
+    /// an idle or closed session it deletes with a closing round instead, whose header already says
+    /// `deleted` (one commit of its own, and no cancel to make).
     ///
     /// # Errors
     ///
