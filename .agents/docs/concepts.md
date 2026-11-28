@@ -6,9 +6,9 @@ Checked 2026-11-26 against `main` at `83cf1ef5`, by reading the files (no build 
 | Term | Definition | Line |
 |---|---|---|
 | Run | `RunRecord` | `crates/adam-core/src/store/mod.rs:371` |
-| Journal | `JournalEntry` | `crates/adam-core/src/store/mod.rs:484` |
-| Step | `Ctx::step` (`step_retrying`, `step_all`, `step_race` beside it) | `crates/adam-runtime/src/ctx.rs:297` |
-| Store | `trait Store`; `commit_run` 747, `journal_put` 774 | `crates/adam-core/src/store/mod.rs:636` |
+| Journal | `JournalEntry` (`signature` is the runtime's `adam-step/v1` signature) | `crates/adam-core/src/store/mod.rs:484` |
+| Step | `Ctx::step` (`step_retrying`, `step_all`, `step_race` beside it) | `crates/adam-runtime/src/ctx.rs:325` |
+| Store | `trait Store`; `commit_run` 757, `journal_put` 785 | `crates/adam-core/src/store/mod.rs:646` |
 | Lease | `Store::claim_due` 803 and `Store::lease_until` 853 | `crates/adam-core/src/store/mod.rs` |
 | Store testkit | `store_conformance!` | `crates/adam-store-testkit/src/lib.rs:49` |
 | Notifier | `trait Notifier` | `crates/adam-runtime/src/notify.rs:68` |

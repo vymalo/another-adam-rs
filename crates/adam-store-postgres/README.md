@@ -31,7 +31,7 @@ store alone (the one table the feature needs is still in the schema, below).
 * `PgStore::from_pool(pool)`: reuse your application's `deadpool_postgres::Pool`.
 * `PgStore::with_table_prefix(prefix)`: table-name prefix (default `adam_`,
   only `[a-z0-9_]`, at most 40 characters).
-* `PgStore::pool()`, `SCHEMA_VERSION` (10), `MIN_SERVER_VERSION_NUM` (`180000`: `migrate()` refuses an older server).
+* `PgStore::pool()`, `SCHEMA_VERSION` (11), `MIN_SERVER_VERSION_NUM` (`180000`: `migrate()` refuses an older server).
 * `create_run` and `commit_run` return the record with `state` set to `null`: the caller supplied the
   state, and the state is the largest column, so a `RETURNING` that echoed it would parse it back on
   every transition. `load_run`, `load_head`, the claim, `open_run_for_conversation` and the listings
@@ -66,7 +66,8 @@ let store: DynStore = Arc::new(store);
 ```
 
 Tables are `<prefix>runs` (state as `JSONB`), `<prefix>journal` (primary key
-`(run_id, seq)`, `ON DELETE CASCADE`), `<prefix>push` (the A2A push-notification configs, primary
+`(run_id, seq)`, `ON DELETE CASCADE`; `signature TEXT` holds the runtime's `adam-step/v1` signature
+of the entry, nullable, schema version 11: see below), `<prefix>push` (the A2A push-notification configs, primary
 key `(run_id, id)`, `ON DELETE CASCADE`, schema version 3; a partial index on
 `(agent, next_attempt_at)` for active configs is the claim scan; `config` holds the webhook
 credentials as the client gave them), `<prefix>blob` and `<prefix>run_blob` (file bytes out of a
@@ -297,6 +298,15 @@ current-thread runtime it runs the future on the owned runtime from a scoped thr
 Never call `Runtime::block_on` from async code directly; the adapter is `Send + Sync + 'static` and
 holds no transaction open while caller code runs.
 
+## Schema version 11: the journal's signature
+
+`<prefix>journal` gains `signature TEXT`, nullable: the runtime's signature of the entry
+(`adam-step/v1`, [ADR 0068](../../docs/decisions/0068-adam-signs-its-own-history.md) decision 2,
+slice T3a-4). `journal_put` stores the string byte for byte and returns it; the adapter never signs
+or checks. A fresh database gets the column in its `CREATE TABLE`; a version 10 one gets it from
+`ALTER TABLE .. ADD COLUMN IF NOT EXISTS signature TEXT`, additive and metadata-only, so a journal
+written before the feature replays with `None` and nothing is rewritten.
+
 ## Schema version and the owner column
 
 The owner column is schema version 2. Version 2 adds `<prefix>runs.owner TEXT`, the worker a pinned claim
@@ -362,8 +372,8 @@ serialization failure are `Transient`, a bad statement is `Internal` (needs the
 server), and an unreachable server is `Transient` (offline).
 `tests/fixtures/schema-v5.sql` is the schema exactly as the `sqlx` build emitted it: `tests/fixture.rs`
 applies it with `batch_execute`, opens the store and takes a create/load round trip with **no
-migration**, then migrates to the current version and commits a head and a body. `tests/fixtures/schema-v10.sql` is the
-current schema; a unit test (`the_statements_equal_the_version_10_fixture`) compares the live
+migration**, then migrates to the current version and commits a head and a body. `tests/fixtures/schema-v11.sql` is the
+current schema; a unit test (`the_statements_equal_the_version_11_fixture`) compares the live
 statements with it whitespace-normalised, so they cannot drift; `ADAM_WRITE_FIXTURE=1` regenerates it.
 The fixture is named for its version: a change to a statement, a function's included, without a bump
 of `SCHEMA_VERSION` shows as an edit of a released version's file.

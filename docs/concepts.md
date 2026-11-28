@@ -55,7 +55,7 @@ URI (steps, streamed text, usage, ...) and a client activates; a client that doe
 |---|---|---|
 | Run | One execution of an agent; `RunRecord` in `crates/adam-core/src/store/mod.rs` | [0055](decisions/0055-a-runs-state-is-a-head-and-an-append-only-transcript.md) |
 | Step | One journaled side effect, `Ctx::step` in `crates/adam-runtime/src/ctx.rs` | [0061](decisions/0061-a-step-names-its-retry-policy.md) |
-| Journal | The recorded outcome of each step, `JournalEntry` in `crates/adam-core/src/store/mod.rs` | [0076](decisions/0076-a-run-records-the-journal-epoch-it-started-on.md) |
+| Journal | The recorded outcome of each step, `JournalEntry` in `crates/adam-core/src/store/mod.rs`; its `signature` is the runtime's `adam-step/v1` signature of the entry ([0068](decisions/0068-adam-signs-its-own-history.md)) | [0076](decisions/0076-a-run-records-the-journal-epoch-it-started-on.md) |
 | Lease | A worker's time-limited claim on a due run, `Store::claim_due` in `crates/adam-core/src/store/mod.rs` | none of its own; [architecture](architecture.md#the-worker-claim-step-journal-commit) |
 | Store | The durable-state port, `Store` in `crates/adam-core/src/store/mod.rs` | [0053](decisions/0053-sqlite-a-store-service-a-database-per-agent-and-a-static-coder.md) |
 | Notifier | The hint port between processes, `crates/adam-runtime/src/notify.rs` | none of its own; [architecture](architecture.md#across-processes-signals-and-events) |

@@ -614,8 +614,15 @@ slice T3a-2) makes the runtime sign what it commits as a run's state and check i
   session round). A client polling `GetTask` still sees the status. **To retire a key without losing history, rotate:**
   add the new key and keep the old one in the set (not revoked), so old runs verify while new commits are signed with the new
   one; revoke only a key you consider compromised, knowing what it takes with it.
-* **Not done** (T2 and later): the journal is not signed, and no host sets the keys yet (the engine and the service), so
-  only an embedder that calls `turn_keys` is affected.
+* **The journal's entries** (slice T3a-4, 2026-11-28). `Ctx::step` (and every `ReservedStep`) signs the entry it records
+  (`adam-step/v1`, `Sealer::sign_entry`) and checks every entry it replays (`Sealer::check_entry`, in `recorded_at`), when the
+  runtime has turn keys. The payload is the run and the entry's `seq`, `name`, `ok` and `payload` (`adam_core::turn::step_payload`),
+  with the payload as the store keeps it (`storable`); `recorded_at` is not covered. Entries are not chained: each is checked on
+  its own, one key-set read and one Ed25519 check per replayed step. A signed entry that does not verify fails the run `Corrupt`
+  before the step's effect runs; an entry with no signature is adopted (decision 11, release N), so a journal written before the
+  feature replays as it is. A store keeps the string byte for byte and never signs or checks it.
+* **Not done** (T2 and later): no host sets the keys yet (the engine and the service), so only an embedder that calls
+  `turn_keys` is affected.
 
 Tests: `tests/head_signature.rs`; `src/seal.rs` (`turn_tests`); and, with a real `LlmAgent`, `adam-llm-agent`'s `tests/turn_reentry.rs`.
 

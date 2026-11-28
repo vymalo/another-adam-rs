@@ -14,7 +14,7 @@ feature `memory`): `connect`, `from_pool`, `with_table_prefix`, `pool`, `scope`,
 adapter uses the port's own write path, exported for it: `prepare`, `MemoryError::backend`,
 `MemoryScope::validate`, `Audience::validate` (`crates/adam-memory/src/lesson.rs`, `error.rs`). The table
 `<prefix>memory_lesson` and its recall index are in `Sql::migrate` **unconditionally** — schema version 10
-(`memory_lesson_ddl`, `crates/adam-store-postgres/src/lib.rs`; `tests/fixtures/schema-v10.sql`) — so a binary built
+(`memory_lesson_ddl`, `crates/adam-store-postgres/src/lib.rs`; `tests/fixtures/schema-v11.sql`) — so a binary built
 without the feature cannot leave one with it on a schema with no table. `record` is one transaction:
 `pg_advisory_xact_lock(hashtextextended(scope || chr(31) || audience, 0))` (64-bit keys), the served count
 and the key's state, the bound refused

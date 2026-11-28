@@ -9,7 +9,8 @@ signature)*.
 *Amended 2026-11-26:* slice T3a-1 signs each assistant and tool turn at commit (see *Amended 2026-11-26 (slice T3a-1)*
 below), and slice T3a-2 signs the run's head at commit and checks it on decode (see *Amended 2026-11-26 (slice T3a-2)*);
 slice T3a-3 verifies each turn on re-entry and signs a carried history again (see *Amended 2026-11-27 (slice T3a-3)*
-at the end); the journal's signature is not built.
+at the end); slice T3a-4 signs each journal entry at write and checks it on replay (see *Amended 2026-11-28 (slice
+T3a-4)* at the end).
 
 *Amended 2026-11-28:* a run's **model requests** may be signed by a key a certificate authority certified for that
 run, when the host gives run keys ([ADR 0086](0086-a-run-signs-its-model-requests-with-a-certificate.md)). The
@@ -302,6 +303,7 @@ After ADR 0067's S8b and S8c.
 | T3a-1 | sign each assistant and tool turn at commit in `LlmAgent` (**built**, 2026-11-26): the row as stored, the chain, signatures cleared after a compaction or a shortening | the golden vector (`tests/vectors/turn_chain_vector.py`); a NUL verifies after the store; a compaction re-signs; failing keys commit no unsigned turn |
 | T3a-2 | sign the run's head at every commit and check it on every decode in `adam-runtime` (**built**, 2026-11-26): `RuntimeBuilder::turn_keys`, `head_payload`, `Head.signature` and `seal` | a changed head field, a row appended past `len` and a run moved to another run and conversation are each `Corrupt` before any step; a v4 state is covered the same way; a store that keeps bodies and one that does not both round-trip; no keys changes nothing; adoption and its refusal over a signed turn |
 | T3a-3 | verify the turns on re-entry and sign a carried history again (**built**, 2026-11-27): `Sealer::check_turns` in the one function every row read calls; the carry strips the old signatures so the new run signs them | a forged assistant row, a forged tool row, a changed user row and a row spliced from another run each refused `Corrupt` with no model call at a resume, a new task and a session round; the unit cases where the head verifies and the turn does not; a carry verifies under the new run; a legacy run adopted once; a revoked key |
+| T3a-4 | sign each journal entry at write and check it on replay (**built**, 2026-11-28): `JournalEntry::signature`, `sign_step`/`verify_step`/`step_payload` (`adam-step/v1`), `Sealer::sign_entry`/`check_entry` in `Ctx`; the four store adapters keep the string (PostgreSQL schema version 11 and SQLite schema version 2 add a nullable column, MongoDB a field) and the testkit requires the round trip | a signed entry comes back byte for byte and verifies; an unsigned one round-trips as `None` and is adopted on replay; an entry changed in the store (payload, name, seq, ok, run) is refused `Corrupt` before the step's effect runs |
 | T4 | `signed-turns/v1`, behind a deployment setting: the card lists it and its JWKS the turn keys; the rows on the task's message; a message that continues from signed rows | a client that kept the earlier rows verifies a task's rows with the card's key set, and one that did not checks them against the given `prv`; a fork from them is verified and re-signed under the new run; a forged or reordered row, and rows of another subject's conversation, are `-32602` with nothing written; off by default, the card does not list it; plain A2A, a data part shaped like signed rows without the extension, is one user turn |
 | T5 | release N+1: no adoption | an unsigned assistant or tool row is refused `Corrupt`, with an error that names this ADR's migration |
 
@@ -621,3 +623,39 @@ from the vault" for the request signature only, and leaves decisions 1 to 6, 8 a
    `adam-model::SignedRequests`, defaulting to `Process`. **Not built:** an issuer adapter, the `RUN_CERT_*` variables, and
    the renewal clock. Until then no deployment reads a variable, and every request is signed with the process key as
    *Amended 2026-11-25 (the request signature)* says.
+
+## Amended 2026-11-28 (slice T3a-4: the journal's signature)
+
+Decision 2's journal row and decisions 3, 4 and 11 are built for the journal. What was open after T3a-3 (the journal's
+signature "is not built", lines above and in *Amended 2026-11-27*) is now closed.
+
+1. **The field and the form.** `JournalEntry` gains `signature: Option<String>`: a detached compact JWS
+   (`BASE64URL(header)..BASE64URL(signature)`, RFC 7515 appendix F) whose header is
+   `{"alg":"EdDSA","kid":"…","typ":"adam-step/v1"}`, made by `adam_core::turn::{step_payload, sign_step, verify_step}` over
+   the RFC 8785 form of `{typ, run, seq, name, ok, payload}`. `payload` is signed as the store keeps it (`storable`'s NUL
+   rule, ADR 0051); `recorded_at` is not covered, because a store truncates it and it says when the entry landed. Entries
+   are **not** chained: each is checked on its own (decision 4). `SignatureType::Step` already existed; no new signature
+   type, and no second encoder.
+2. **Who signs and who checks.** The **runtime** does both, in `Ctx`: `Sealer::sign_entry` before `journal_put` and
+   `Sealer::check_entry` on every entry a replay reads (`Ctx::recorded_at`, which every `Ctx::step` and `ReservedStep`
+   goes through). The **store** keeps the string byte for byte and never signs or checks it: it is opaque, as decision 2
+   says, and the testkit proves the round trip rather than the meaning. A store that dropped the signature would fail the
+   testkit's byte-for-byte comparison.
+3. **The schema.** PostgreSQL schema version **11** adds `journal.signature TEXT`; a fresh database gets it in its
+   `CREATE TABLE` and a version 10 one from `ALTER TABLE .. ADD COLUMN IF NOT EXISTS`, additive and metadata-only. SQLite
+   schema version **2** adds the same nullable column; SQLite has no `ADD COLUMN IF NOT EXISTS`, so the upgrade asks
+   `PRAGMA table_info` and adds it only when it is missing. MongoDB adds a `signature` member (a string, or `null`) and a
+   document written before it reads as `None`. No existing row is rewritten and no journal is invalidated.
+4. **Adoption (decision 11) in this release.** An entry with no signature is replayed as it is, so a journal written
+   before this slice keeps working; it is refused in release N+1 with the unsigned turns. An entry **with** a signature
+   must verify: a changed `payload`, `name`, `seq` or `ok`, an entry moved to another run, or a signature by a key not in
+   the set fails the run `Corrupt` before the step's effect runs. A runtime without turn keys writes and checks nothing,
+   as everywhere else in this ADR.
+5. **What this does not do.** It does not sign `journal_list` reads (nothing replays them), does not cover `recorded_at`,
+   and does not change a `Store` trait method: an adapter outside this repository that builds a `JournalEntry` by its
+   fields must add the field (Rule 2), and one that does not store it loses the signature silently until the testkit case
+   `journal_signature_roundtrip` fails.
+6. **Tests.** `adam-store-testkit`'s `journal_signature_roundtrip` (every adapter: the round trip, `None`, and a changed
+   entry refused), `adam-core`'s `turn::step` unit cases, and `crates/adam-runtime/tests/head_signature.rs`: an entry the
+   runtime writes is signed and verifies, an entry signed by another key fails the run `Corrupt` with the step's effect
+   never run, and an unsigned entry is adopted.

@@ -97,6 +97,69 @@ fn an_older_schema_is_upgraded_in_place() {
     let _ = std::fs::remove_file(&database);
 }
 
+/// A file a version 1 release left gets the journal's signature column (schema version 2, ADR
+/// 0068): SQLite has no `ADD COLUMN IF NOT EXISTS`, so the upgrade adds it when it is missing.
+#[test]
+fn a_version_1_file_gains_the_journal_signature_column() {
+    let database = unique("journal-signature");
+    {
+        let conn = rusqlite::Connection::open(&database).expect("a raw connection");
+        conn.execute_batch(
+            "CREATE TABLE adam_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+             CREATE TABLE adam_journal (
+                 run_id      TEXT    NOT NULL,
+                 seq         INTEGER NOT NULL CHECK (seq >= 0),
+                 name        TEXT    NOT NULL,
+                 ok          INTEGER NOT NULL CHECK (ok IN (0, 1)),
+                 payload     TEXT    NOT NULL,
+                 recorded_at INTEGER NOT NULL,
+                 PRIMARY KEY (run_id, seq)
+             );
+             INSERT INTO adam_meta (key, value) VALUES ('schema_version', '1');",
+        )
+        .expect("a version 1 file");
+    }
+
+    let runtime = tokio::runtime::Runtime::new().expect("a runtime");
+    runtime.block_on(async {
+        let store = SqliteStore::open(&database).expect("open the older file");
+        store.migrate().await.expect("a version 1 file upgrades");
+    });
+
+    let conn = rusqlite::Connection::open(&database).expect("a raw connection");
+    let mut statement = conn
+        .prepare("PRAGMA table_info(adam_journal)")
+        .expect("the journal's columns");
+    let columns: Vec<String> = statement
+        .query_map([], |row| row.get("name"))
+        .expect("read the columns")
+        .map(|name| name.expect("a column name"))
+        .collect();
+    assert!(
+        columns.iter().any(|name| name == "signature"),
+        "the upgrade adds the column: {columns:?}"
+    );
+    // It is nullable: an entry written before the column existed has no signature.
+    conn.execute(
+        "INSERT INTO adam_journal (run_id, seq, name, ok, payload, recorded_at)
+         VALUES ('legacy', 0, 'step', 1, '{}', 0)",
+        [],
+    )
+    .expect("an unsigned entry");
+    let signature: Option<String> = conn
+        .query_row(
+            "SELECT signature FROM adam_journal WHERE run_id = 'legacy' AND seq = 0",
+            [],
+            |row| row.get(0),
+        )
+        .expect("read the signature");
+    assert_eq!(signature, None);
+
+    drop(statement);
+    drop(conn);
+    let _ = std::fs::remove_file(&database);
+}
+
 /// A file that is not a SQLite database is a **corrupt** store (exit 70), not a configuration
 /// mistake (exit 78): the bytes are damaged, and no `DATABASE_URL` fixes them.
 #[test]

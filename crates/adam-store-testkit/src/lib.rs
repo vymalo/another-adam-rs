@@ -30,6 +30,7 @@ use std::time::Duration;
 
 use adam_core::store::{now, truncate_ms};
 use adam_core::time::Timestamp;
+use adam_core::turn::{TurnKeys, sign_step, verify_step};
 use adam_core::{
     BlobId, BodyRow, BodyWrite, ClaimScope, ConversationScope, DynStore, JournalEntry,
     NewPushConfig, NewRun, PushProgress, PushState, RunId, RunQuery, RunRecord, RunStatus,
@@ -57,6 +58,7 @@ macro_rules! store_conformance {
             run_header_matches_the_record,
             commit_advances_version, commit_stale_version_conflicts, commit_missing_run,
             concurrent_commits_single_winner, journal_roundtrip_and_order,
+            journal_signature_roundtrip,
             journal_first_writer_wins, journal_concurrent_writers_agree,
             journal_detects_nondeterminism, journal_requires_run,
             claim_respects_due_rules, claim_filters_agents_and_limit, claim_skips_busy_runs,
@@ -1990,6 +1992,92 @@ pub mod cases {
         assert!(
             store.journal_list(other.id).await.unwrap().is_empty(),
             "journals are per run"
+        );
+    }
+
+    /// A journal entry's signature (ADR 0068, `adam-step/v1`) is stored and returned byte for byte,
+    /// and an entry changed after it was signed does not verify: what a replay refuses. An entry
+    /// with no signature round-trips as `None`, so a journal written before the feature still
+    /// replays.
+    pub async fn journal_signature_roundtrip(store: DynStore) {
+        let keys = <dyn TurnKeys>::ephemeral().unwrap();
+        let set = keys.key_set().await.unwrap();
+        let run = store
+            .create_run(NewRun::new(agent(), json!({})))
+            .await
+            .unwrap();
+
+        // A signed entry: the write and every read give back the same bytes.
+        let mut signed = JournalEntry::ok(0, "tool:charge", json!({"receipt": "r-1", "n": 2}));
+        signed.signature = Some(sign_step(keys.as_ref(), run.id, &signed).await.unwrap());
+        let stored = store.journal_put(run.id, signed.clone()).await.unwrap();
+        assert_eq!(stored, signed, "the write returns the entry as stored");
+        let read = store.journal_get(run.id, 0).await.unwrap().unwrap();
+        assert_eq!(
+            read.signature, signed.signature,
+            "the signature round-trips"
+        );
+        assert_eq!(read, signed);
+        verify_step(&set, run.id, &read).unwrap();
+
+        // An entry with no signature round-trips as `None`.
+        let unsigned = JournalEntry::ok(1, "tool:refund", json!({"receipt": "r-2"}));
+        assert_eq!(unsigned.signature, None);
+        let stored = store.journal_put(run.id, unsigned.clone()).await.unwrap();
+        assert_eq!(stored, unsigned);
+        assert_eq!(
+            store
+                .journal_get(run.id, 1)
+                .await
+                .unwrap()
+                .unwrap()
+                .signature,
+            None
+        );
+
+        // The list carries both, and the signature survives it.
+        let list = store.journal_list(run.id).await.unwrap();
+        assert_eq!(list.len(), 2);
+        assert_eq!(list[0].signature, signed.signature);
+        assert_eq!(list[1].signature, None);
+
+        // An entry the store altered after it was signed is refused on re-entry: the payload, the
+        // name, the sequence, the outcome and the run are each bound.
+        for (what, altered) in [
+            ("a changed payload", {
+                let mut e = read.clone();
+                e.payload = json!({"receipt": "r-9", "n": 2});
+                e
+            }),
+            ("a changed name", {
+                let mut e = read.clone();
+                e.name = "tool:refund".into();
+                e
+            }),
+            ("a changed outcome", {
+                let mut e = read.clone();
+                e.ok = false;
+                e
+            }),
+            ("a moved entry", {
+                let mut e = read.clone();
+                e.seq = 7;
+                e
+            }),
+            ("a stripped signature", {
+                let mut e = read.clone();
+                e.signature = None;
+                e
+            }),
+        ] {
+            assert!(
+                verify_step(&set, run.id, &altered).is_err(),
+                "{what} must not verify"
+            );
+        }
+        assert!(
+            verify_step(&set, RunId::new(), &read).is_err(),
+            "an entry of another run must not verify"
         );
     }
 

@@ -29,13 +29,19 @@
 //! Without keys nothing here runs: no signature is written, none is required and an existing one is
 //! not read (a write without keys drops it).
 //!
+//! **The journal** ([`Sealer::sign_entry`], [`Sealer::check_entry`]): the runtime signs each entry
+//! it records (`adam-step/v1`, the run and the entry's `seq`, `name`, `ok` and `payload`) and checks
+//! every entry it replays, in `Ctx`. Entries are not chained: each is checked on its own, and one
+//! with no signature is adopted in this release (decision 11).
+//!
 //! [ADR 0068]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0068-adam-signs-its-own-history.md
 
 use adam_core::turn::{
     ChainHash, ConversationHash, DynTurnKeys, KeySet, TurnKeyError, TurnKeys, TurnPosition,
-    TurnSignatureError, sign_head, turn_signature, verify_head, verify_turn,
+    TurnSignatureError, sign_head, sign_step, turn_signature, verify_head, verify_step,
+    verify_turn,
 };
-use adam_core::{RunId, storable};
+use adam_core::{JournalEntry, RunId, storable};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -250,6 +256,49 @@ impl Sealer {
     ) -> Result<(), RuntimeError> {
         let (len, chain) = self.seal_parts(run, seal)?;
         self.check(run, conversation, len, &chain, doc).await
+    }
+
+    /// The signature of a journal entry the runtime is about to write (`adam-step/v1`, ADR 0068
+    /// decision 2): the detached JWS of the entry's `{typ, run, seq, name, ok, payload}`.
+    ///
+    /// # Errors
+    ///
+    /// [`TurnKeyError`] from the keys.
+    pub(crate) async fn sign_entry(
+        &self,
+        run: RunId,
+        entry: &JournalEntry,
+    ) -> Result<String, TurnKeyError> {
+        sign_step(self.keys.as_ref(), run, entry).await
+    }
+
+    /// Check the signature a journal entry the store returned carries. An entry with **no**
+    /// signature is adopted (ADR 0068 decision 11, release N): a journal written before the feature
+    /// replays as it is. A signed one must verify, and an entry altered in the store does not.
+    ///
+    /// # Errors
+    ///
+    /// [`RuntimeError::Corrupt`] (class `Corrupt`) naming the entry's `seq` for one that does not
+    /// verify; [`RuntimeError::TurnKeys`] when the key set cannot be read.
+    pub(crate) async fn check_entry(
+        &self,
+        run: RunId,
+        entry: &JournalEntry,
+    ) -> Result<(), RuntimeError> {
+        if entry.signature.is_none() {
+            return Ok(());
+        }
+        let set = self.keys.key_set().await?;
+        verify_step(&set, run, entry)
+            .map(drop)
+            .map_err(|cause| RuntimeError::Corrupt {
+                run,
+                reason: format!(
+                    "the journal entry {} is refused (ADR 0068): {cause}",
+                    entry.seq
+                ),
+                source: Some(Box::new(cause)),
+            })
     }
 
     /// Check the head of a record read with its rows: the rows are chained and the one signature

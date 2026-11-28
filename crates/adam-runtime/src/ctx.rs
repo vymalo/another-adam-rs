@@ -8,7 +8,7 @@ use futures::{StreamExt, TryStreamExt};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
-use adam_core::{BlobId, DynStore, JournalEntry, RunId, RunRecord, StoreError};
+use adam_core::{BlobId, DynStore, JournalEntry, RunId, RunRecord, StoreError, storable_owned};
 
 use crate::agent::{AgentError, Inbound};
 use crate::blob::BlobWriter;
@@ -18,6 +18,7 @@ use crate::clock::DynClock;
 use crate::events::{Artifact, DynEventSink, RunEvent};
 use crate::retry::RetryPolicy;
 use crate::runtime::{Runtime, RuntimeError};
+use crate::seal::Sealer;
 
 /// Journal name of [`Ctx::now_journaled`].
 const NOW_STEP: &str = "ctx.now";
@@ -329,7 +330,16 @@ impl Ctx {
     {
         let seq = self.seq;
         let recorded = self.recorded_at(seq, name).await?;
-        let outcome = settle(&self.store, self.run, seq, name, recorded, f).await?;
+        let outcome = settle(
+            &self.store,
+            self.runtime.inner.sealer.as_ref(),
+            self.run,
+            seq,
+            name,
+            recorded,
+            f,
+        )
+        .await?;
         self.seq = seq + 1;
         Ok(outcome)
     }
@@ -403,6 +413,7 @@ impl Ctx {
                 name: name.clone(),
                 recorded,
                 store: self.store.clone(),
+                sealer: self.runtime.inner.sealer.clone(),
             });
         }
         self.seq += names.len() as u64;
@@ -536,7 +547,22 @@ impl Ctx {
                 "run {} step {seq}: journal has {:?}, code asked for {name:?}",
                 self.run, entry.name
             ))),
-            other => Ok(other),
+            Some(entry) => {
+                // A replay reads the store: a signed entry that does not verify was altered there
+                // (ADR 0068 decision 4), and an unsigned one is adopted in this release.
+                self.check_entry(&entry).await?;
+                Ok(Some(entry))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Check the signature a journal entry carries, when the runtime signs (ADR 0068): a signed
+    /// entry must verify against the key set, an unsigned one is adopted (decision 11, release N).
+    async fn check_entry(&self, entry: &JournalEntry) -> Result<(), AgentError> {
+        match &self.runtime.inner.sealer {
+            Some(sealer) => sealer.check_entry(self.run, entry).await.map_err(sealed),
+            None => Ok(()),
         }
     }
 
@@ -866,6 +892,7 @@ impl Ctx {
 /// first. If two workers race, the first recording wins and both see it.
 async fn settle<T, E, F, Fut>(
     store: &DynStore,
+    sealer: Option<&Sealer>,
     run: RunId,
     seq: u64,
     name: &str,
@@ -889,12 +916,24 @@ where
                 AgentError::permanent(format!("step {name:?} result is not serializable"))
                     .with_source(e)
             })?;
-            let entry = if ok {
+            let mut entry = if ok {
                 JournalEntry::ok(seq, name, payload)
             } else {
                 JournalEntry::err(seq, name, payload)
             };
-            store.journal_put(run, entry).await.map_err(store_error)?
+            if let Some(sealer) = sealer {
+                // Sign what the store will keep: it applies `storable` before it writes (ADR 0051),
+                // and a replay verifies the entry it reads.
+                entry.payload = storable_owned(entry.payload);
+                entry.signature = Some(sealer.sign_entry(run, &entry).await.map_err(sealed)?);
+            }
+            let stored = store.journal_put(run, entry).await.map_err(store_error)?;
+            // Another writer may have won the race, so the entry decoded is the one a replay reads:
+            // a signed one must verify wherever it came from.
+            if let Some(sealer) = sealer {
+                sealer.check_entry(run, &stored).await.map_err(sealed)?;
+            }
+            stored
         }
     };
     decode::<T, E>(entry).map_err(|e| {
@@ -903,6 +942,17 @@ where
         ))
         .with_source(e)
     })
+}
+
+/// A signature check's failure as the agent loop's: a `Corrupt` entry fails the run (ADR 0068
+/// decision 6), and a key set that cannot be read keeps its own class (a retry when transient).
+fn sealed(e: RuntimeError) -> AgentError {
+    match e {
+        RuntimeError::Corrupt { reason, .. } => AgentError::Store(StoreError::Corrupt(reason)),
+        other => {
+            AgentError::from_classified("the journal entry's signature could not be checked", other)
+        }
+    }
 }
 
 /// Run `contenders` at the same time, each with its own child of `parent`: the first `Ok` wins and
@@ -965,6 +1015,9 @@ pub struct ReservedStep {
     name: String,
     recorded: Option<JournalEntry>,
     store: DynStore,
+    /// The runtime's keys, so the step it records is signed and a recorded one is checked
+    /// (ADR 0068); `None`: nothing is signed or required.
+    sealer: Option<Sealer>,
 }
 
 impl std::fmt::Debug for ReservedStep {
@@ -1011,6 +1064,7 @@ impl ReservedStep {
     {
         settle(
             &self.store,
+            self.sealer.as_ref(),
             self.run,
             self.seq,
             &self.name,

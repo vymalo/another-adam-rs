@@ -118,7 +118,11 @@ use uuid::Uuid;
 ///   built without the feature that stamps version 10 must not leave a feature-enabled binary on a
 ///   schema with no table. Indexed by `(scope, audience, updated DESC, root_cause)` where `state =
 ///   'active'`, the recall scan; `PgMemory` (feature `memory`) reads and writes it.
-pub const SCHEMA_VERSION: i32 = 10;
+/// * 11: `journal.signature`, the runtime's signature of a journal entry ([ADR
+///   0068](../../docs/decisions/0068-adam-signs-its-own-history.md), decision 2), nullable so a
+///   journal written before it replays as it is. Additive and metadata-only: a fresh database gets
+///   the column in its `CREATE TABLE`, a version 10 one from `ADD COLUMN IF NOT EXISTS`.
+pub const SCHEMA_VERSION: i32 = 11;
 
 /// The oldest server [`Store::migrate`] accepts, as PostgreSQL's `server_version_num`: 18.0, the
 /// floor of [ADR 0082](../../docs/decisions/0082-the-sql-adapters-keep-their-rules-in-the-database.md)
@@ -937,10 +941,15 @@ impl Sql {
                     name        TEXT        NOT NULL,
                     ok          BOOLEAN     NOT NULL,
                     payload     JSONB       NOT NULL,
+                    signature   TEXT,
                     recorded_at TIMESTAMPTZ NOT NULL,
                     PRIMARY KEY (run_id, seq)
                 )"
             ),
+            // Schema version 11 (ADR 0068, decision 2): the runtime's signature of a journal entry,
+            // nullable so a journal written before the feature replays as it is. A fresh database
+            // gets the column above; a version 10 one gets it here.
+            format!("ALTER TABLE {journal} ADD COLUMN IF NOT EXISTS signature TEXT"),
         ]
         .into_iter()
         .map(Arc::from)
@@ -1085,16 +1094,16 @@ impl Sql {
                 served_columns("")
             )),
             journal_get: Arc::from(format!(
-                "SELECT seq, name, ok, payload, recorded_at FROM {journal} WHERE run_id = $1 AND seq = $2"
+                "SELECT seq, name, ok, payload, signature, recorded_at FROM {journal} WHERE run_id = $1 AND seq = $2"
             )),
             journal_insert: Arc::from(format!(
-                "INSERT INTO {journal} (run_id, seq, name, ok, payload, recorded_at)
-                 VALUES ($1, $2, $3, $4, $5, $6)
+                "INSERT INTO {journal} (run_id, seq, name, ok, payload, signature, recorded_at)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7)
                  ON CONFLICT (run_id, seq) DO NOTHING
-                 RETURNING seq, name, ok, payload, recorded_at"
+                 RETURNING seq, name, ok, payload, signature, recorded_at"
             )),
             journal_list: Arc::from(format!(
-                "SELECT seq, name, ok, payload, recorded_at FROM {journal} WHERE run_id = $1 ORDER BY seq"
+                "SELECT seq, name, ok, payload, signature, recorded_at FROM {journal} WHERE run_id = $1 ORDER BY seq"
             )),
             claim_due: Arc::from(format!(
                 "SELECT {} FROM {p}claim_due($1, $2, $3, $4, $5, $6, $7)",
@@ -1533,6 +1542,7 @@ fn entry_from_row(row: &Row) -> StoreResult<JournalEntry> {
         ok: decode(row, "ok")?,
         payload: decode(row, "payload")?,
         recorded_at: time(row, "recorded_at")?,
+        signature: decode(row, "signature")?,
     })
 }
 
@@ -1785,6 +1795,7 @@ impl Store for PgStore {
             &entry.name,
             &entry.ok,
             payload.as_ref(),
+            &entry.signature,
             &recorded_at,
         ];
         // The connection is given back before `journal_get`, which needs one of its own.
@@ -2648,9 +2659,9 @@ mod tests {
     /// fixture: a start on a current schema runs no DDL, so such a change would never reach a
     /// database (ADR 0082, decision 10).
     #[test]
-    fn the_statements_equal_the_version_10_fixture() {
+    fn the_statements_equal_the_version_11_fixture() {
         assert_eq!(
-            SCHEMA_VERSION, 10,
+            SCHEMA_VERSION, 11,
             "a new version gets a fixture of its own"
         );
         let sql = Sql::new("adam_");
@@ -2659,16 +2670,16 @@ mod tests {
             "the fixture must hold the whole migration"
         );
         let mut generated = String::from(
-            "-- The schema version 10 that adam-store-postgres emits.\n\
-             -- Regenerate with ADAM_WRITE_FIXTURE=1 cargo test -p adam-store-postgres --lib the_statements_equal_the_version_10_fixture\n",
+            "-- The schema version 11 that adam-store-postgres emits.\n\
+             -- Regenerate with ADAM_WRITE_FIXTURE=1 cargo test -p adam-store-postgres --lib the_statements_equal_the_version_11_fixture\n",
         );
         generated.push_str(&sql.migrate.join(";\n\n"));
         generated.push_str(";\n");
-        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/schema-v10.sql");
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/schema-v11.sql");
         if std::env::var_os("ADAM_WRITE_FIXTURE").is_some() {
             std::fs::write(path, &generated).expect("write the fixture");
         }
-        let fixture = include_str!("../tests/fixtures/schema-v10.sql");
+        let fixture = include_str!("../tests/fixtures/schema-v11.sql");
         assert_eq!(
             normalise(&(sql.migrate.join("; ") + ";")),
             normalise(fixture)

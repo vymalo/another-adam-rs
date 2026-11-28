@@ -55,7 +55,10 @@ the version, the parent and the creation time, and only the head's `body` — no
 artifacts): it never reads the state it is about to replace.
 `journal_put` inserts the entry and, when the run still exists, returns it as it was written; a
 duplicate key means an earlier writer won, and their entry is read back. A journaled step is two
-round trips rather than the four of read, check, insert, check. `lease_until` reads one field.
+round trips rather than the four of read, check, insert, check. The entry's `signature` is stored as
+a string, or `null` for an entry without one (the runtime's `adam-step/v1` signature,
+[ADR 0068](../../docs/decisions/0068-adam-signs-its-own-history.md) decision 2); a document written
+before the member existed reads as `None`, so no migration is needed. `lease_until` reads one field.
 
 ```rust
 use std::sync::Arc;

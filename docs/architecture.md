@@ -929,6 +929,14 @@ unsigned, moved or revoked-key row fails the run before any model call. A histor
 again under the new run, so no signature names a run it does not belong to; a compaction and a shortening do the same for the
 rows they change. A run with no signature at all is still accepted once and signed at its next commit. A runtime that has keys but an agent that does not sign its turns fails the run at its first step, with an error that says to give the agent the same keys, instead of storing a history it could not read back. Reading a run's history back costs one signature check per turn, with no model call behind it when you ask for its state or continue it; polling a task's status does not pay it. Revoking a key makes every run it signed unreadable for good: to retire a key, add its replacement and keep the old one in the set.
 
+The journal is signed the same way ([slice T3a-4](decisions/0068-adam-signs-its-own-history.md)). Each step's recorded
+outcome carries a signature over the run, the step's number, its name, whether it succeeded and its payload. The runtime
+signs an entry when it records it and checks it when a replay reads it back; a signed entry changed in the store (its
+payload, name, number or outcome, or moved to another run) fails the run before the step's effect runs again. Entries are
+checked one by one, not chained, and the check is one signature per replayed step. A journal written before this has no
+signature and is accepted as it is for one release. Every store keeps the signature as it was given, in a column or a field
+of its own.
+
 ### The access tier: which tools a step may use
 
 The person picks a tier for each message (`plan`, `edits`, `auto`, `bypass`; the A2A extension `access-tier/v1`, [ADR 0036](decisions/0036-the-coder-keeps-to-the-access-tier-the-person-picks.md)).

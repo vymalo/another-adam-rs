@@ -27,7 +27,7 @@ database driver.
 | `head_body`, `set_head_body` | the `(generation, len)` a v5 head's `body` names, and the store's write into it: the runtime leaves the generation `null` and the store resolves it |
 | `BlobId` | the content address of a file artifact's bytes: a SHA-256 as 64 lower-case hex, opaque in this crate (see *File bytes*) |
 | `RunHeader` | a run without its state: `run_header`'s answer, with `claimed(now)` (a runnable run and a live lease) for a reader that only needs the run's own bookkeeping. `adam_core::claimed(status, lease_until, now)` is that rule, shared with a runtime view |
-| `JournalEntry` | the recorded outcome of one step, keyed by `(run, seq)` |
+| `JournalEntry` | the recorded outcome of one step, keyed by `(run, seq)`; `signature: Option<String>` is the runtime's `adam-step/v1` signature of it ([ADR 0068](../../docs/decisions/0068-adam-signs-its-own-history.md) decision 2, slice T3a-4), stored byte for byte and never signed or checked by the store; `None` for an entry written before the feature or without turn keys |
 | `ClaimScope` | `Any` (default) or `Pinned`, the scope of a `claim_due`. Closed: no `#[non_exhaustive]` |
 | `Lease` | a run claimed by a worker until a deadline |
 | `RunQuery`, `ConversationScope` | what `list_runs` and `count_runs` select: always scoped (`Prefix` of an owner's conversations, or `Exact`), optionally by run statuses and last update, one page after a `(updated_at, id)` position |
@@ -48,6 +48,7 @@ database driver.
 | `ModelCall`, `request_payload`, `sign_request`, `sign_request_at`, `verify_request`, `VerifiedRequest`, `body_sha256`, `TURN_SIGNATURE_HEADER`, `REQUEST_NONCE_LEN`, `REQUEST_MAX_AGE_SECS`, `REQUEST_MAX_SKEW_SECS` | the request signature ([ADR 0068](../../docs/decisions/0068-adam-signs-its-own-history.md), *Amended 2026-11-25 (the request signature)*): the payload `{typ, run, method, path, body_sha256, prompt_jti, iat, nonce}` attached, signed now with a random nonce (`sign_request`) or at a given `iat` and nonce for a test vector; `verify_request(set, jws, call, now)` checks the form, the key and the signature, each member against the request (`Mismatch { member }`), then the window, 300 s before to 60 s after (`Expired`). `ModelCall`'s `Debug` shows the body's length only |
 | `turn_payload`, `sign_turn`, `verify_turn`, `TurnPosition`, `ChainHash` (with `parse`), `ConversationHash`, `turn_signature`, `set_turn_signature` | a turn's payload `{typ, run, cnv, idx, prv, msg}`, the chain `prv`, and the member `extra_content.adam.turn_signature` |
 | `head_payload`, `sign_head`, `verify_head` | a run's head signature (`adam-head/v1`, ADR 0068 decision 4, slice T3a-2): the payload `{typ, run, cnv, len, chain, head}`; the runtime decides which members of its state document are `head` |
+| `step_payload`, `sign_step`, `verify_step` | a journal entry's signature (`adam-step/v1`, ADR 0068 decision 2, slice T3a-4): the payload `{typ, run, seq, name, ok, payload}` with the payload as `storable` keeps it, detached, and **not** chained; `verify_step` answers `Unsigned` for an entry with no signature, which the caller adopts or refuses |
 | `TurnKeyError`, `TurnKeyConfigError`, `KeySetError`, `TurnSignatureError` | see *Errors* |
 | `turn::testkit`, `turn_keys_conformance!` | the cases every `TurnKeys` passes, and `testkit::Certified`: a key named by a certificate chain, whose signatures carry `x5c` |
 | `RunCertIssuer` (trait), `DynRunCertIssuer`, `CertificateRequest`, `RunCertError` | the run-certificate issuer port ([ADR 0086](../../docs/decisions/0086-a-run-signs-its-model-requests-with-a-certificate.md)): `issue(&CertificateRequest)` answers the `CertificateChain` that vouches for a run key, `kind()` for `Debug`; the request is a bounded PKCS#10 CSR as DER (1 to 8 KiB, `Debug` shows the length), the error carries a class. No driver type is in the trait |
@@ -211,10 +212,11 @@ keeps no bodies keeps today's bytes exactly. A store does not decide the format.
 ## Turn keys and signatures
 
 [ADR 0068](../../docs/decisions/0068-adam-signs-its-own-history.md) has adam sign the turns it
-produces and verify every history that comes back. Slice T1 is this crate's part: the port, its
-Ed25519 implementation and the form. **Nothing signs or verifies a run yet** (slice T3), and no
-variable is read (`TURN_SIGNING_KEY_FILE`, `TURN_SIGNING_KEY_ID`, `TURN_VERIFY_KEYS_FILE` are slice
-T2's; `Ed25519TurnKeys::from_files` reads the files they will name).
+produces and verify every history that comes back. This crate holds the port, its Ed25519
+implementation, the form and the payloads; the agent loop signs the turns, and the runtime
+(`adam-runtime`) signs the head and each journal entry, and checks what it reads back. No variable is
+read here (`TURN_SIGNING_KEY_FILE`, `TURN_SIGNING_KEY_ID`, `TURN_VERIFY_KEYS_FILE` are slice T2's;
+`Ed25519TurnKeys::from_files` reads the files they will name).
 
 * **The port.** A host gives a `TurnKeys`: adam asks it for the current key, then to sign bytes with
   it, and for the key set. A private key never crosses the port, so a keychain, a KMS or an HSM can
@@ -231,6 +233,9 @@ T2's; `Ed25519TurnKeys::from_files` reads the files they will name).
   `h(i) = SHA-256(h(i-1) ‖ SHA-256(JCS(message i)))`), `msg` the message without its
   `extra_content.adam` member. The signature rides in that member, at the message's top level, not
   in a provider's members (which a model switch drops).
+* **A journal entry.** The payload is the RFC 8785 form of `{typ: "adam-step/v1", run, seq, name, ok,
+  payload}`, with `payload` as `storable` keeps it (a NUL becomes U+FFFD, ADR 0051). Entries are not
+  chained: each one is checked on its own when the runtime replays it. `recorded_at` is not covered.
 * **Revocation.** A `KeySet` refuses a revoked id whether its public key is listed or not; a signing
   key the set revokes is refused at start.
 * **Ed25519 here is pure Rust** (`ed25519-dalek`, strict verification, weak keys refused), because

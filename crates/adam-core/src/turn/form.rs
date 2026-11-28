@@ -25,9 +25,9 @@ pub const MAX_SIGNATURE_LEN: usize = 16 * 1024;
 pub enum SignatureType {
     /// An assistant or tool message at its place in a run (`adam-turn/v1`, [`turn_payload`](super::turn_payload)).
     Turn,
-    /// A run's head (`adam-head/v1`; its payload is slice T3's).
+    /// A run's head (`adam-head/v1`; its payload is [`head_payload`](super::head_payload)).
     Head,
-    /// A journal entry (`adam-step/v1`; its payload is slice T3's).
+    /// A journal entry (`adam-step/v1`, [`step_payload`](super::step_payload)).
     Step,
     /// One model request as adam sends it (`adam-request/v1`, [`request_payload`](super::request_payload)):
     /// the payload is **attached** ([`sign_attached`]), never kept, and a history signature never
