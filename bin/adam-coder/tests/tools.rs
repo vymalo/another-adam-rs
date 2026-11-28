@@ -759,10 +759,12 @@ async fn the_output_of_every_check_is_kept_in_the_callers_order() {
     );
     assert!(!quiet.content.contains("\none\n"), "{}", quiet.content);
 
+    // Other commands than the first call's: a repeat of a passed call on the same tree is
+    // answered from its record (ANR-247), not run again.
     let out = RunChecks
         .call(
             &rig.ctx,
-            json!({"commands": ["echo one", "echo two", "echo three"], "output": "full"}),
+            json!({"commands": ["echo one # full", "echo two # full", "echo three # full"], "output": "full"}),
         )
         .await
         .unwrap();
@@ -1197,7 +1199,13 @@ async fn a_pass_is_not_reused_after_write_file_wrote_an_ignored_file() {
         "the ignored file now says bad, so the pass is stale: {}",
         again.content
     );
-    assert_eq!(runs_of(&counter), 2, "the epoch moved: the check ran again");
+    // Three: the first gate, this one (the epoch moved, so the check ran again), and the base
+    // commit, which a failing command is also run on to tell a pre-existing failure (ADR 0026).
+    assert_eq!(
+        runs_of(&counter),
+        3,
+        "the epoch moved: the check ran again, and its failure was asked of the base"
+    );
     assert!(
         checks_of(&again).get("reused").is_none(),
         "{:?}",
