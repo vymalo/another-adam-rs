@@ -160,18 +160,19 @@ superuser, for its reconnect test). See [Store adapters](../reference/store-adap
 
 Scripts in `dev/` drive the compose stack through A2A and assert the whole chain on the mocks. Each script's
 header lists its steps and variables. CI runs them in `.github/workflows/coder.yml` ("Compose e2e") on the image
-it has just built: a pull request runs the seven default coder scenarios, the hook-program scenario
-(`dev/hooks-e2e.sh`) and two App-mode ones (all 20 when it carries the `e2e-full` label or changes `dev/`,
+it has just built: a pull request runs the eight default coder scenarios, the hook-program scenario
+(`dev/hooks-e2e.sh`) and two App-mode ones (all 21 when it carries the `e2e-full` label or changes `dev/`,
 `docker/coder/` or `compose.yaml`), main and a manual `workflow_dispatch` run all of
 them. Start the stack first:
 
 ```sh
-docker compose --profile app up -d --build --wait postgres mock-openai mock-github mock-github-mcp git-server coder
+docker compose --profile app up -d --build --wait postgres mock-openai mock-github mock-github-mcp mock-uploads git-server coder
 ```
 
 | Script | What it proves |
 |---|---|
 | `sh dev/coder-e2e.sh` | one task ends in a pushed branch and one pull request; the `checks`, `branch` and `pull_request` artifacts; GitHub read over MCP with the coder's credentials of each call. Variants: `SCENARIO=files` (the coder reads a file first), `scratch` (no repository named, then published), `second-repo` and `create-repo` (each with `ANSWER=yes` or `no`: consent is asked and honoured), `GITHUB_AUTH=app` (with `-f dev/compose.github-app.yaml`) |
+| `sh dev/uploads-e2e.sh` | `uploads/v1`'s outgoing direction: a file over the inline cap goes to the mock bucket by reference, the artifact names the `uploadId` with no bytes in it, the thread tools were asked for the file's own size and SHA-256, and the bucket holds exactly the bytes the model wrote (read back from WireMock's journal). `UPLOADS_E2E_TAMPER=1` is its red proof |
 | `sh dev/greeting-e2e.sh` | "hi" gets a greeting built from the folder's persona lines, streamed, and its one model call reported over `usage/v1` (the task carries the totals); the same task goes on to a pull request; a restart on an edited folder changes the answer |
 | `sh dev/coder-choices-e2e.sh` | three questions asked as one A2UI form, one action answers them; a screen that cannot read it gets the options as text (the screen's capabilities are `a2uiRendererCapabilities["1.0"]` and its catalog is catalog 9, a `ui-catalog/v2` document) |
 | `sh dev/agent-e2e.sh` | the general agent answers "hi" in role; a restart on an edited folder changes the card and the answer |

@@ -120,6 +120,18 @@ services:
     volumes:
       - ./dev/wiremock/mock-image-mcp/mappings:/home/wiremock/mappings:ro
 
+  # `uploads/v1`'s two ends, in one WireMock: the thread-tools endpoint (`POST /mcp`, answering
+  # `request_upload` with a presigned slot) and the bucket (`PUT /bucket/...`, 200). WireMock's
+  # request journal (`GET /__admin/requests`) is where a test reads the bytes back, which is what
+  # dev/uploads-e2e.sh asserts. The slot's URL names this service, so the coder's PUT comes here.
+  # Endpoints: http://127.0.0.1:8087/mcp and http://127.0.0.1:8087/__admin/requests
+  mock-uploads:
+    <<: *wiremock
+    command: ["--global-response-templating"]
+    ports: ["127.0.0.1:${MOCK_UPLOADS_PORT:-8087}:8080"]
+    volumes:
+      - ./dev/wiremock/mock-uploads/mappings:/home/wiremock/mappings:ro
+
   # A git remote for the coder: bare repositories over smart HTTP, seeded with
   # local/sandbox.git (a README and a `just check` script). No authentication.
   # Clone URL: http://127.0.0.1:8083/local/sandbox.git
@@ -188,6 +200,10 @@ services:
       # What each usage/v1 report of a call on that model says as its context window (ADR 0032): the
       # window of a model whose profile names none (ADR 0088; MODEL_CONTEXT_WINDOW is its deprecated alias).
       DEFAULT_MODEL_CONTEXT_WINDOW: "131072"
+      # The largest file `share_file` sends inline (`uploads/v1`): a larger one asks the thread tools
+      # for a slot. The default is the code's own (10 MiB), so the stack behaves as it always did;
+      # dev/uploads-e2e.sh sets it low so its report goes by reference.
+      UPLOADS_INLINE_MAX_BYTES: ${UPLOADS_INLINE_MAX_BYTES:-10485760}
       GITHUB_API_URL: http://mock-github:8080
       # Dummy. Set MOCK_GITHUB_TOKEN=bad-token to make mock-github answer 401. An installation is
       # a token OR a GitHub App, never both: dev/compose.github-app.yaml turns this one off (empty)
