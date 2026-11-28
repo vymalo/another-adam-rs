@@ -4,6 +4,11 @@ Status: **Accepted** (2026-11-27), the owner's decision; the points under [Still
 Nothing is built. The evidence behind this page (the paper, the code it was checked against, the code index, the
 proposals for a memory protocol) is in [the agent page](../../.agents/docs/decisions/0081-an-agent-keeps-a-self-improvement-memory-near-it-and-what-holds-becomes-the-deployments-memory.md).
 
+**Amended 2026-11-28 (ANR-1292).** The PostgreSQL L2 adapter is built: `PgMemory`, the `memory`
+feature of `adam-store-postgres`, one configured scope per adapter over one `memory_lesson` table
+(schema version 10 of the run store's database), proved by `memory_conformance!` with two scopes on
+one database. The MongoDB (ANR-1293) and Redis (ANR-1294) adapters remain unbuilt.
+
 The owner said (2026-11-27):
 
 > *"We'll also add this [arXiv 2611.18856] to the adam-rs, in the form of a new crate on all coding agents. Also, we
@@ -165,7 +170,7 @@ Cards of the board epic; each is one pull request, its proof seen failing first.
 | M0 | this ADR and its pages | docs-check |
 | M1 | the L1 port, its testkit and the in-folder adapter, L1's only one | a double that answers another scope or writes twice for one key fails the suite |
 | M2a | the L2 port, its testkit and the in-process reference | `memory_conformance!`; two configured scopes on one store never see each other's lessons |
-| M2b | the PostgreSQL, MongoDB and Redis adapters (ANR-1292, ANR-1293, ANR-1294, unbuilt) | the suite on each; two scopes on one database never see each other; fails with a URL unset under the CI switch |
+| M2b | the PostgreSQL, MongoDB and Redis adapters (ANR-1292 built, ANR-1293 and ANR-1294 unbuilt) | the suite on each; two scopes on one database never see each other; fails with a URL unset under the CI switch |
 | M3 + M4 | `si_memory:` and the deployment's settings; the `si_recall` and `si_record` tools as a lazy group, over L1 | a folder `off` is off; a replay asks the store nothing; a secret in a field is refused |
 | M5 + M6 | the outcome observer; the defaults in `adam-coder` and `adam-agent`, and the chart | a passing check stamps a success; the first request differs by one loader line; the chart renders unchanged by default |
 | M7 + M8 | the promotion pass and rule; the reviewer agent | the same evidence twice is one lesson; one L1 scope alone is never a candidate; a rejected candidate is never served; one scope never reaches every audience |
@@ -174,8 +179,8 @@ Cards of the board epic; each is one pull request, its proof seen failing first.
 
 The M2 port-and-kit half (M2a) is built (*2026-11-27*): `adam-memory`'s `Memory` trait, its types,
 its in-process reference and `adam-memory-testkit`'s `memory_conformance!`, with the two-scope case.
-The PostgreSQL, MongoDB and Redis adapters remain M2b (ANR-1292, ANR-1293, ANR-1294); this slice
-claims no adapter.
+M2b is the three database adapters (ANR-1292, ANR-1293, ANR-1294): the PostgreSQL one is built
+(*2026-11-28*, ANR-1292), the MongoDB and Redis ones are not. M2a claimed no adapter.
 
 ## Still open
 

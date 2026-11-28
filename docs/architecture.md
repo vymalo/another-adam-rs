@@ -209,6 +209,7 @@ classDiagram
     SiMemory <|.. FolderSiMemory
     SiMemory <|.. InProcessSiMemory
     class Memory { <<interface>> }
+    Memory <|.. PgMemory
     Memory <|.. InProcessMemory
 ```
 
@@ -232,7 +233,7 @@ classDiagram
 | `Confine` | `adam-workspace` | `Rlimits`, `SystemdScope` (`adam-confine`, Unix); `best_effort()` picks | `NoConfine`; the suite `confine_conformance!` (`adam-confine-testkit`) is the reference |
 | `DeviceState` | `adam-device-state` | none yet: the host pushes its readings, and `adam_budget::Throttled` lowers the admission by them ([ADR 0065](decisions/0065-resource-governance-admission-pools-and-os-limits.md) decision 8) | `FakeDevice`, the reference of `device_state_conformance!` |
 | `SiMemory` (L1) | `adam-memory` | `FolderSiMemory`, the in-folder store and L1's only one ([ADR 0081](decisions/0081-an-agent-keeps-a-self-improvement-memory-near-it-and-what-holds-becomes-the-deployments-memory.md) decision 2) | `InProcessSiMemory` (reference); `ScopeBlindSiMemory` and `DoubleWritingSiMemory` (testkit, which the suite rejects) |
-| `Memory` (L2) | `adam-memory` | none yet (M2b: PostgreSQL, MongoDB, Redis) | `InProcessMemory` (reference); `ScopeBlindMemory` and `DoubleWritingMemory` (testkit, which the suite rejects) |
+| `Memory` (L2) | `adam-memory` | `PgMemory` (`adam-store-postgres`, feature `memory`); MongoDB and Redis remain unbuilt (M2b) | `InProcessMemory` (reference); `ScopeBlindMemory` and `DoubleWritingMemory` (testkit, which the suite rejects) |
 | `PermissionPrompt` | `adam-acp` | none (the default policy needs no prompt) | `StaticPrompt` |
 
 `AgentStarter` is the start-only half of `Agent` (`name`, `init`, `init_continuing`): a process that
@@ -1171,6 +1172,7 @@ erDiagram
 | `run_blob (digest)` | blob GC: does any run still reference this digest |
 | `body (run_id, generation, idx)` | reading one generation in order, and the GC's "which generations of this run" (MongoDB now; index `adam_body_generation`) |
 | `body (written_at)` | body GC: superseded generations older than the cutoff (MongoDB now) |
+| `memory_lesson (scope, audience, updated DESC, root_cause)` where active | the L2 recall: one scope and audience's active lessons, freshest first |
 
 MongoDB keeps the same fields in `adam_runs` (`_id` is the run's UUID) plus `open_key` (a plain unique
 index; closed runs get `~<run id>`), `lease_token`, the listing indexes `adam_list`
@@ -1181,6 +1183,14 @@ index; closed runs get `~<run id>`), `lease_token`, the listing indexes `adam_li
 references in `adam_run_blob` with `_id = "<run>:<digest>"`, and the transcript in `adam_body` with
 `_id = "<run>:<generation>:<idx>"`. A version 4 run document has neither `head` nor `head_version`
 (`{head_version: null}` matches a missing field). How each adapter keeps its promises: [store adapters](reference/store-adapters.md).
+
+Beside the run store, the L2 memory's lessons live in the same PostgreSQL schema since version 10
+([ADR 0081](decisions/0081-an-agent-keeps-a-self-improvement-memory-near-it-and-what-holds-becomes-the-deployments-memory.md)):
+the table `memory_lesson`, keyed `(scope, audience, root_cause)` with `state`, `created`, `updated`
+and `retired_at`, created by **every** migration and read and written by `PgMemory`
+(`adam-store-postgres`, feature `memory`). It is outside the run's cascade: a lesson survives the
+runs that evidenced it, and a retired lesson is kept, never deleted. The MongoDB and Redis adapters
+are not built.
 
 What `state` holds (JSON, versioned `v`; the layout is private to the runtime,
 `crates/adam-runtime/src/envelope.rs`):
