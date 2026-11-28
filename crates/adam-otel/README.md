@@ -126,6 +126,10 @@ stops it, and every adam binary calls it before exit. Starting installs the mete
 crate that emits a measurement uses `opentelemetry::global::meter(..)` and needs no handle threaded through the
 layers; where nothing was started that meter is the no-op one. Ask for it per measurement rather than caching it: the global is read at the call, so a meter cached before `init` would stay the no-op one.
 
+**The instruments so far:** `adam.runs` (a counter of committed transitions, labelled by the run's state —
+`adam-runtime`) and `adam.tool.duration` (a histogram of a tool call's latency, labelled by the tool's
+registered name — `adam-llm-agent`).
+
 **Labels are types.** [`labels`] holds the closed sets the instruments use: `RunState` (the four states of
 `adam_core::store::RunStatus`, held to them by a test) and a `Name` for the names a deployment declares (a tool, a
 model alias, a pool), which accepts only `[a-z0-9._-]`, at most 64 bytes. A value outside a set cannot be built, so a
