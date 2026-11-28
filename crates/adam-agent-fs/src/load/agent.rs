@@ -144,6 +144,18 @@ pub(crate) fn parse_agent_file(
             "`limits.max_inline_upload_bytes` is the root agent's (`uploads/v1`): ignored on a subagent",
         );
     }
+    if kind == FileKind::Sub
+        && fm
+            .limits
+            .as_ref()
+            .is_some_and(|limits| limits.output.is_some())
+    {
+        sink.warn(
+            key_line(&split, "limits"),
+            "`limits.output` is the root agent's (the command tools are the process's, ADR 0088): \
+             ignored on a subagent",
+        );
+    }
     if kind != FileKind::Sub {
         if fm.a2a.is_some() || fm.auth.is_some() {
             sink.error(

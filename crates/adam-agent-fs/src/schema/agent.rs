@@ -352,9 +352,72 @@ pub struct Limits {
         alias = "maxInlineUploadBytes"
     )]
     pub max_inline_upload_bytes: Option<u64>,
+    /// What the command tools show of an output when a call gives no `output` ([ADR 0088]
+    /// decision 3): a default per tool. Root agent only (the tools are the process's); read by
+    /// `adam-coder`, the agent that has the three tools.
+    ///
+    /// [ADR 0088]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0088-a-tool-result-is-bounded-when-it-is-made-and-a-command-that-succeeds-says-so.md
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output: Option<OutputDef>,
     /// Keys this schema does not know.
     #[serde(flatten)]
     pub extra: BTreeMap<String, Value>,
+}
+
+/// What a command's result shows of its output (`limits.output.<tool>`, [ADR 0088] decision 3):
+/// the file's word for `adam_code_tools::OutputMode`, which this crate does not depend on.
+///
+/// The enum is closed on purpose (Rule 3): `adam-coder` maps it onto the tools' with a match that
+/// has no wildcard, so a mode added on either side fails to compile there.
+///
+/// [ADR 0088]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0088-a-tool-result-is-bounded-when-it-is-made-and-a-command-that-succeeds-says-so.md
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OutputModeDef {
+    /// A command that succeeded is one line, naming the id its output is kept under; one that
+    /// failed is shown whole.
+    OnError,
+    /// The output is shown however the command ended.
+    Full,
+}
+
+impl OutputModeDef {
+    /// The word as the file writes it: `on_error` or `full`.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::OnError => "on_error",
+            Self::Full => "full",
+        }
+    }
+}
+
+impl fmt::Display for OutputModeDef {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// `limits.output`: the default `output` of each command tool, the one a call that gives none
+/// takes ([ADR 0088] decision 3). A tool the block leaves out keeps its own default (`run_checks`
+/// and `run`: `on_error`; `run_command`: `full`), and a call's `output` always wins.
+///
+/// **Unknown keys are refused** (`deny_unknown_fields`): the keys are the three tools' names, and
+/// a misspelt one would leave a tool showing what the file says it does not.
+///
+/// [ADR 0088]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0088-a-tool-result-is-bounded-when-it-is-made-and-a-command-that-succeeds-says-so.md
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct OutputDef {
+    /// `run_checks`'s default.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run_checks: Option<OutputModeDef>,
+    /// `run`'s default.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run: Option<OutputModeDef>,
+    /// `run_command`'s default.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run_command: Option<OutputModeDef>,
 }
 
 /// Who may write to a session of a subagent after its first round (`session.mode`, [ADR 0087]

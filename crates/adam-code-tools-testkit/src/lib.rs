@@ -24,7 +24,7 @@ use adam_code_tools::git::GitAt;
 use adam_code_tools::sandbox::Meter;
 use adam_code_tools::{
     CodeWorkspace, CommandGuard, CommandLimits, CommandWorkspace, DynCodeWorkspace,
-    DynCommandWorkspace, Guarding, Intent, Outcome, Place, Redactor, Unwatched,
+    DynCommandWorkspace, Guarding, Intent, Outcome, OutputDefaults, Place, Redactor, Unwatched,
 };
 use adam_llm_agent::{KeptOutputs, MemoryKept, ToolCtx, ToolError, ToolOutput};
 use adam_runtime::CollectingSink;
@@ -598,11 +598,12 @@ pub struct DirWorkspace {
     kept: MemoryKept,
 }
 
-/// The limits of a [`DirWorkspace`]'s commands unless it is given others: 30 seconds, and 16 KiB of
-/// output shown.
+/// The limits of a [`DirWorkspace`]'s commands unless it is given others: 30 seconds, 16 KiB of
+/// output shown, and each tool's own default `output` ([`OutputDefaults::TOOLS`]).
 pub const DEFAULT_LIMITS: CommandLimits = CommandLimits {
     timeout: Duration::from_secs(30),
     output_tail: 16 * 1024,
+    output: OutputDefaults::TOOLS,
 };
 
 impl fmt::Debug for DirWorkspace {

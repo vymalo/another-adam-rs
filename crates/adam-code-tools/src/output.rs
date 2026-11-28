@@ -14,7 +14,8 @@
 //!   capture that is only the start of the output (or a tail that is only the end of it) is cut back
 //!   where it was cut, at a place no secret straddles, whatever scrubbing did to the length.
 //!
-//! What a result shows is the call's `output` ([`OutputMode`], ADR 0088): `full` shows it as
+//! What a result shows is the call's `output` ([`OutputMode`], ADR 0088), else the workspace's
+//! default for the tool ([`CommandLimits::output`], [`OutputDefaults`]): `full` shows it as
 //! above; `on_error` shows a command that **succeeded** (exit code 0, no timeout, not stopped) as
 //! one line, its size and the id it is kept under, and one that failed as above. The output of such
 //! a command is kept even when it is short ([`settle_as`]), so `read_output` reads it later; one
@@ -51,7 +52,8 @@ use crate::shell::{KeptNote, ShellOutcome};
 
 /// What a command's result shows of its output: the call's `output` argument (ADR 0088,
 /// decision 3). Each tool has its default (`run_command`: [`Full`](Self::Full); `run` and the
-/// coder's `run_checks`: [`OnError`](Self::OnError)), and a call's `output` wins.
+/// coder's `run_checks`: [`OnError`](Self::OnError)), a workspace may set others
+/// ([`OutputDefaults`]), and a call's `output` wins.
 ///
 /// Closed on purpose (rule 3): a new way of showing an output must be thought through by every
 /// tool that renders one, so it fails to compile in each until it is.
@@ -99,6 +101,34 @@ impl OutputMode {
             Self::OnError => outcome.passed(),
             Self::Full => false,
         }
+    }
+}
+
+/// What `run_command` and `run` show of an output when a call gives no `output`
+/// ([`CommandLimits::output`]): each tool's own default ([`TOOLS`](Self::TOOLS)) unless the
+/// workspace was given others (the coder's: the folder's `limits.output`, ADR 0088 slice T3). A
+/// call's `output` always wins.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OutputDefaults {
+    /// `run_command`'s: [`inspect::DEFAULT_OUTPUT`](crate::inspect::DEFAULT_OUTPUT) by default.
+    pub run_command: OutputMode,
+    /// `run`'s: [`make::DEFAULT_OUTPUT`](crate::make::DEFAULT_OUTPUT) by default.
+    pub run: OutputMode,
+}
+
+impl OutputDefaults {
+    /// Each tool's own default: `run_command` [`Full`](OutputMode::Full), `run`
+    /// [`OnError`](OutputMode::OnError) (ADR 0088, decision 3).
+    pub const TOOLS: Self = Self {
+        run_command: crate::inspect::DEFAULT_OUTPUT,
+        run: crate::make::DEFAULT_OUTPUT,
+    };
+}
+
+impl Default for OutputDefaults {
+    /// [`TOOLS`](Self::TOOLS).
+    fn default() -> Self {
+        Self::TOOLS
     }
 }
 

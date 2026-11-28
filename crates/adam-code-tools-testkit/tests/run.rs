@@ -4,7 +4,8 @@
 //! settled, and not at all for a `run` refused before its command; its text appended only when
 //! files changed; a failing `after_run`, whose error is returned once the guard is settled; and its
 //! `output`: one line for a command that succeeded by default (the output kept for `read_output`),
-//! the whole output with `full` or for a command that failed.
+//! the whole output with `full` or for a command that failed, and the workspace's default for a
+//! call that gives none.
 #![allow(clippy::unwrap_used, clippy::expect_used)] // integration tests assert by unwrapping
 
 use std::path::Path;
@@ -14,10 +15,10 @@ use std::sync::{Arc, Mutex};
 use adam_code_tools::make::run;
 use adam_code_tools::shell::MissingTool;
 use adam_code_tools::{
-    CodeWorkspace, CommandGuard, CommandLimits, CommandWorkspace, Guarding, Intent, Outcome, Place,
-    Redactor, Settled,
+    CodeWorkspace, CommandGuard, CommandLimits, CommandWorkspace, Guarding, Intent, Outcome,
+    OutputDefaults, OutputMode, Place, Redactor, Settled,
 };
-use adam_code_tools_testkit::DirWorkspace;
+use adam_code_tools_testkit::{DEFAULT_LIMITS, DirWorkspace};
 use adam_llm_agent::{KeptOutputs, ToolCtx, ToolError, ToolOutput, output_id_of};
 use adam_runtime::{CollectingSink, RunEvent};
 use adam_workspace::EnvSession;
@@ -66,6 +67,15 @@ impl Scripted {
 
     fn calls(&self) -> Vec<Call> {
         self.calls.lock().unwrap().clone()
+    }
+
+    /// The same workspace, whose tools default to `output` (the coder's folder sets these).
+    fn with_output(mut self, output: OutputDefaults) -> Self {
+        self.inner = self.inner.with_limits(CommandLimits {
+            output,
+            ..DEFAULT_LIMITS
+        });
+        self
     }
 }
 
@@ -622,4 +632,40 @@ async fn a_run_that_succeeded_printing_nothing_says_so() {
     let dir = tempfile::tempdir().unwrap();
     let (out, _, _, _) = make(dir.path(), Ok(Settled::Unwatched), "true").await;
     assert_eq!(out.content, "$ true\nexit code 0\n(no output)\n");
+}
+
+/// A workspace that defaults `run` to `full` (the coder's folder, `limits.output.run`) shows a call
+/// that gives no `output` whole; a call's `on_error` still wins; and `run_command`'s default does
+/// not touch `run` (ADR 0088 slice T3).
+#[tokio::test]
+async fn the_workspaces_default_is_what_a_call_without_output_shows() {
+    let dir = tempfile::tempdir().unwrap();
+    let full = OutputDefaults {
+        run: OutputMode::Full,
+        ..OutputDefaults::TOOLS
+    };
+    let ws = Scripted::over(dir.path(), Ok(Settled::Unwatched)).with_output(full);
+    let (call, _) = ctx();
+    let out = run(&ws, &call, "echo hi".into(), None, None, None, None)
+        .await
+        .unwrap();
+    assert_eq!(out.content, FULL, "the workspace's default");
+
+    let (call, _) = ctx();
+    let asked = Some("on_error".to_owned());
+    let out = run(&ws, &call, "echo hi".into(), None, None, None, asked)
+        .await
+        .unwrap();
+    assert_eq!(out.content, rendered(&call), "the call's `output` wins");
+
+    let looks = OutputDefaults {
+        run_command: OutputMode::OnError,
+        ..OutputDefaults::TOOLS
+    };
+    let ws = Scripted::over(dir.path(), Ok(Settled::Unwatched)).with_output(looks);
+    let (call, _) = ctx();
+    let out = run(&ws, &call, "echo hi".into(), None, None, None, None)
+        .await
+        .unwrap();
+    assert_eq!(out.content, rendered(&call), "`run` keeps its own default");
 }

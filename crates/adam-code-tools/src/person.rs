@@ -36,14 +36,16 @@ use async_trait::async_trait;
 
 use crate::commands::{CommandGuard, CommandLimits, CommandWorkspace, Guarding, Settled};
 use crate::git::GitAt;
+use crate::output::OutputDefaults;
 use crate::sandbox::Meter;
 use crate::{CodeWorkspace, Intent, Outcome, Place, Redactor};
 
-/// The limits of a [`PersonDir`]'s commands unless it is given others: 30 seconds, and 16 KiB of
-/// output shown.
+/// The limits of a [`PersonDir`]'s commands unless it is given others: 30 seconds, 16 KiB of
+/// output shown, and each tool's own default `output` ([`OutputDefaults::TOOLS`]).
 pub const DEFAULT_LIMITS: CommandLimits = CommandLimits {
     timeout: Duration::from_secs(30),
     output_tail: 16 * 1024,
+    output: OutputDefaults::TOOLS,
 };
 
 /// The place a [`PersonDir`] gives when a tool names none, unless it is given another name.

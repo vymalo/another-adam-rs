@@ -106,3 +106,12 @@ finished, with the change and the case of decision 5 that the movement is (no th
 The ledger keeps a tool call's name, not its arguments, so it cannot say whose output a `read_output` call read; decision 5
 is per tool, and a case that points back to `full` does not name the tool. The command, the table to fill and what a
 ledger cannot say: [The numbers: ADR 0088](../../bench/NUMBERS.md#adr-0088-hidden-outputs).
+
+*Amended 2026-11-28:* slice T3 is built. The root agent's file sets the defaults with `limits.output`, a map from the three
+tools to the two modes: `limits: { output: { run_checks: full, run_command: on_error } }`. A tool the block leaves out
+keeps decision 3's default, and a call's `output` still wins. Another key or another word stops the load (exit 78). Two
+choices the decision left open: the block is the **root agent's** (the tools are the process's, so on a subagent it is
+ignored with a warning), and the tools' descriptions keep naming their own defaults, so the prompt prefix does not move
+with a folder; every result says what it shows. `adam-coder` reads it; `adam-agent` has none of these tools. No variable
+is involved, and the shipped folder sets none. The evidence:
+[0088: the evidence and the slice proofs](../../.agents/docs/decisions/0088-a-tool-result-is-bounded-when-it-is-made-and-a-command-that-succeeds-says-so.md#t3-built-2026-11-28).

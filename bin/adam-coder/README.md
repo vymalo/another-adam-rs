@@ -633,6 +633,15 @@ exit code 0
 | `run` | `on_error` (`adam_code_tools::make::DEFAULT_OUTPUT`) | the same, then the files that changed as before |
 | `run_checks` | `on_error` (`tools::checks::DEFAULT_OUTPUT`) | `$ cargo test`, `exit code 0: passed`, then the one line |
 
+**The folder may change a default** (slice T3): the root agent's `limits.output` (`run_checks`, `run`, `run_command`, each
+`on_error` or `full`; [agent files](../../docs/reference/agent-files.md#agent-and-subagent-files-instructionsmd-subagentsmd-agentmd))
+is read by `serve` into `CoderSettings::set_output_defaults`: `command_output` (an `adam_code_tools::OutputDefaults`, which
+`ToolEnv`'s `CommandLimits::output` carries to `run_command` and `run`) and `checks_output` (`run_checks`'s). A tool the block
+leaves out keeps the default above, a call's `output` still wins, and the shipped folder sets none. The tools' descriptions
+keep naming their own defaults (they are the prompt's fixed prefix); every result says what it shows. No variable is
+involved. Tests: `tests/kept_output.rs` (`the_folders_output_defaults_are_what_a_call_without_output_shows`, for each tool,
+and `without_a_folder_block_each_tool_keeps_its_own_default`).
+
 ```text
 $ cargo build
 exit code 0

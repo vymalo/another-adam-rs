@@ -10,7 +10,10 @@
 //! it has an answer.
 //!
 //! Its output is shown whole by default ([`DEFAULT_OUTPUT`]): it exists to look, and what a look
-//! printed is its answer. A call may ask for `output: "on_error"` ([`OutputMode`]).
+//! printed is its answer. A workspace may give it another default
+//! ([`CommandLimits::output`](crate::commands::CommandLimits::output); the coder's folder,
+//! `limits.output.run_command`), and a call may ask for `output: "on_error"` ([`OutputMode`]), which
+//! wins.
 //!
 //! It never calls [`after_run`](CommandWorkspace::after_run): a look changes nothing that follows.
 //! The guard of a workspace that does not undo ([`Settled::FilesChanged`], [`Settled::Unwatched`])
@@ -32,7 +35,8 @@ pub const DEFAULT_OUTPUT: OutputMode = OutputMode::Full;
 /// `tools::inspect`).
 ///
 /// In order: the command is required, the `timeout` within the limits, the `output` one of its
-/// values ([`OutputMode::of`], default [`DEFAULT_OUTPUT`]), the place found for a read,
+/// values ([`OutputMode::of`], default the workspace's [`OutputDefaults::run_command`](crate::output::OutputDefaults::run_command), which is
+/// [`DEFAULT_OUTPUT`] unless it was given another), the place found for a read,
 /// the `cwd` inside it, the session made (it may take a while, so before the place is watched), the
 /// guard taken (its refusal is the answer, and nothing runs), then the command runs, its output is
 /// settled, and the guard is settled: a command it undid is refused; a missing tool is the
@@ -59,7 +63,7 @@ pub async fn run_command(
         Ok(timeout) => timeout,
         Err(reason) => return Ok(ToolOutput::error(reason)),
     };
-    let mode = match OutputMode::of(output.as_deref(), DEFAULT_OUTPUT) {
+    let mode = match OutputMode::of(output.as_deref(), limits.output.run_command) {
         Ok(mode) => mode,
         Err(reason) => return Ok(ToolOutput::error(reason)),
     };

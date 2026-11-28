@@ -190,6 +190,11 @@ async fn build_agent(
         folder.and_then(|l| l.command_memory.as_deref()),
         folder.and_then(|l| l.command_cpu.as_deref()),
     ));
+    // What the command tools show when a call gives no `output` (ADR 0088 slice T3): the folder's
+    // `limits.output`, else each tool's own default.
+    if let Some(output) = folder.and_then(|l| l.output.as_ref()) {
+        settings.set_output_defaults(output);
+    }
     let admission: adam_budget::DynAdmission =
         Arc::new(adam_admission_local::LocalAdmission::new(budget.clone()));
     settings.admission = Some(Arc::clone(&admission));

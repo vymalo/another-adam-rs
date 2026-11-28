@@ -1120,3 +1120,89 @@ fn the_kept_output_of_a_command_is_in_the_value_only_as_text() {
     let v: Value = serde_json::to_value(ToolOutput::text("x")).unwrap();
     assert!(v.get("kept").is_none());
 }
+
+/// The folder's `limits.output` (ADR 0088 slice T3) is what a call that gives no `output` shows, for
+/// each of the three tools: here each is set to the other mode than its own. A call's `output`
+/// still wins, and a tool the block leaves out keeps its own default.
+#[tokio::test]
+async fn the_folders_output_defaults_are_what_a_call_without_output_shows() {
+    use adam::agent_fs::{OutputDef, OutputModeDef};
+
+    let flipped = OutputDef {
+        run_checks: Some(OutputModeDef::Full),
+        run: Some(OutputModeDef::Full),
+        run_command: Some(OutputModeDef::OnError),
+    };
+    let rig = Rig::with(|s| s.set_output_defaults(&flipped)).await;
+    for (tool, on_error_by_default, passed) in COMMAND_TOOLS {
+        let command = format!("seq 1 3 # folder {tool}");
+        // The tool's own default, asked for, then nothing asked: the folder's, which is the other.
+        let own = if on_error_by_default {
+            "on_error"
+        } else {
+            "full"
+        };
+        for (output, hidden) in [
+            (Some(own), on_error_by_default),
+            (None, !on_error_by_default),
+        ] {
+            let ctx = rig.call_ctx(&format!("folder-{tool}-{output:?}"));
+            let mut args = json!({ "command": command });
+            if let Some(output) = output {
+                args["output"] = json!(output);
+            }
+            let out = call_command(tool, &ctx, args).await;
+            assert!(!out.is_error, "{tool} {output:?}: {}", out.content);
+            let id = output_id_of(&ctx);
+            let shown = if hidden {
+                format!(
+                    "$ {command}\n{passed}\n[output: 6 bytes, not shown because the command \
+                     succeeded; kept as {id}; read_output {{\"id\":\"{id}\"}} reads it]\n"
+                )
+            } else {
+                format!("$ {command}\n{passed}\n--- output ---\n1\n2\n3\n")
+            };
+            assert!(
+                out.content.starts_with(&shown),
+                "{tool} {output:?}: {}",
+                out.content
+            );
+        }
+    }
+
+    // A block that names one tool leaves the other two at their own defaults.
+    let mut settings = adam_coder::CoderSettings::new();
+    settings.set_output_defaults(&OutputDef {
+        run: Some(OutputModeDef::Full),
+        ..OutputDef::default()
+    });
+    assert_eq!(
+        (
+            settings.command_output.run,
+            settings.command_output.run_command,
+            settings.checks_output
+        ),
+        (
+            adam_code_tools::OutputMode::Full,
+            adam_code_tools::inspect::DEFAULT_OUTPUT,
+            adam_coder::tools::checks::DEFAULT_OUTPUT
+        )
+    );
+}
+
+/// Without `limits.output` the settings hold each tool's own default (ADR 0088 decision 3), and an
+/// empty block changes nothing.
+#[test]
+fn without_a_folder_block_each_tool_keeps_its_own_default() {
+    let mut settings = adam_coder::CoderSettings::new();
+    let untouched = (settings.command_output, settings.checks_output);
+    assert_eq!(
+        untouched,
+        (
+            adam_code_tools::OutputDefaults::TOOLS,
+            adam_code_tools::OutputMode::OnError
+        )
+    );
+    settings.set_output_defaults(&adam::agent_fs::OutputDef::default());
+    assert_eq!((settings.command_output, settings.checks_output), untouched);
+}

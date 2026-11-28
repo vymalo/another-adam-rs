@@ -123,6 +123,7 @@ limits:                        # LlmAgent Limits; Claude's `maxTurns` is read as
   max_working_sessions: 2      # root only: most rounds working at once, 1 to 32 and at most max_open_sessions; lowers SESSION_MAX_WORKING
   max_inline_upload_bytes: 10485760 # root only: the largest file sent inline (`uploads/v1`; a larger one asks for a slot; the card carries no params), 1 to 268435456 (256 MiB); wins over UPLOADS_INLINE_MAX_BYTES (a subagent's value is ignored, with a warning)
   max_session_rounds: 10       # root only: most rounds one session may have, 2 to 200; lowers SESSION_MAX_ROUNDS (a subagent's value is ignored, with a warning)
+  output: { run_command: on_error }  # root only: what a command tool shows when a call gives no `output` (below; read by adam-coder; ADR 0088)
 session: { mode: sealed, wait: true }   # subagent only: what a session its parent starts defaults to, and the widest mode it may be (below; ADR 0087)
 retry:                         # a retry policy per tool (below); this agent's own, none inherits
 plugins: [audit]                # compiled plugins the deployment registered; subagents inherit them (ADR 0050); an unknown name exits 78
@@ -226,6 +227,26 @@ You are the coder agent. Stop after at most {{max_check_cycles}} failed check cy
   subagent's line in `subagent_start`'s description says what the file sets (`(mode sealed by default, at most sealed;
   waits by default)`), and a subagent without the block keeps its line as it was. A person's own session through
   `child-sessions/v1` is theirs and is not held to it.
+* **`limits.output` sets what a command tool shows by default** ([ADR 0088](../decisions/0088-a-tool-result-is-bounded-when-it-is-made-and-a-command-that-succeeds-says-so.md),
+  slice T3). Its keys are the three command tools, `run_checks`, `run` and `run_command`; each value is `on_error` (a
+  command that succeeds is one line naming the id its output is kept under) or `full` (the output however it ended).
+  A call that gives no `output` takes the file's value; a tool the block leaves out keeps its own default
+  (`run_checks` and `run` `on_error`, `run_command` `full`); a call's `output` always wins. Another key, or another
+  word, stops the load (exit 78). Root agent only: the tools are the process's, so on a subagent the block is ignored
+  with a warning. `adam-coder` reads it; `adam-agent` has none of these tools, so there it changes nothing. The
+  tools' descriptions name their own defaults, and every result says what it shows, so a folder that changes a
+  default can say so in its instructions.
+
+  ```markdown
+  ---
+  name: coder
+  limits:
+    output:
+      run_command: on_error   # a look that succeeds is one line too; read_output reads it
+      run_checks: full        # a check that passes shows its output
+  ---
+  ```
+
 * **A subagent inherits nothing** from its parent (eve's isolation boundary), and omitting `tools:`
   gives it **no tools** (decision D3). Claude Code inherits everything; adam does not.
 * **A copied file parses unchanged, but its `tools` must name adam tools.** A Claude Code file listing

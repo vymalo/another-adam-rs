@@ -13,8 +13,9 @@
 //! git is undone, and then its error is the tool's.
 //!
 //! A command that succeeds is shown as one line by default ([`DEFAULT_OUTPUT`]): its result is the
-//! files it made, and its output is kept for `read_output`. A call may ask for `output: "full"`
-//! ([`OutputMode`]).
+//! files it made, and its output is kept for `read_output`. A workspace may give `run` another
+//! default ([`CommandLimits::output`](crate::commands::CommandLimits::output); the coder's folder,
+//! `limits.output.run`), and a call may ask for `output: "full"` ([`OutputMode`]), which wins.
 
 use std::fmt::Write as _;
 
@@ -39,7 +40,8 @@ pub const DEFAULT_OUTPUT: OutputMode = OutputMode::OnError;
 /// `tools::make`).
 ///
 /// In order: the command is required, the `timeout` within the limits, the `output` one of its
-/// values ([`OutputMode::of`], default [`DEFAULT_OUTPUT`]), the place found for a write,
+/// values ([`OutputMode::of`], default the workspace's [`OutputDefaults::run`](crate::output::OutputDefaults::run), which is
+/// [`DEFAULT_OUTPUT`] unless it was given another), the place found for a write,
 /// the `cwd` inside it, the session made (it may take a while, so before the place is watched), the
 /// guard taken for a [`Make`](Guarding::Make) (its refusal is the answer, and nothing runs), then the
 /// command runs, its output is settled, [`after_run`](CommandWorkspace::after_run) follows, and the
@@ -68,7 +70,7 @@ pub async fn run(
         Ok(timeout) => timeout,
         Err(reason) => return Ok(ToolOutput::error(reason)),
     };
-    let mode = match OutputMode::of(output.as_deref(), DEFAULT_OUTPUT) {
+    let mode = match OutputMode::of(output.as_deref(), limits.output.run) {
         Ok(mode) => mode,
         Err(reason) => return Ok(ToolOutput::error(reason)),
     };

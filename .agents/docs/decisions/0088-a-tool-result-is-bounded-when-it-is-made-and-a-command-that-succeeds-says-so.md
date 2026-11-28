@@ -4,7 +4,7 @@ For people: [0088. A tool result is bounded when it is made, and a command that 
 which states the decision. This page holds where each slice is in the code, the invariants to check when it changes, and
 the tests that prove it.
 
-Slices T1 and T2 are built (2026-11-28, on `3d1e5b5`): [T1's proofs](#t1-built-2026-11-28), [T2's](#t2-built-2026-11-28). T4's tooling is built ([below](#t4-the-tooling-built-2026-11-28)); its measurement and T3 are not.
+Slices T1 and T2 are built (2026-11-28, on `3d1e5b5`): [T1's proofs](#t1-built-2026-11-28), [T2's](#t2-built-2026-11-28). T3 is built (2026-11-28, on `223b4dc`): [its proofs](#t3-built-2026-11-28). T4's tooling is built ([below](#t4-the-tooling-built-2026-11-28)); its measurement is not.
 
 ## T1, built 2026-11-28
 
@@ -88,6 +88,45 @@ The MCP bound follows the tool-result bound; shortenings counted in the run's us
 | `adam-coder` `src/config.rs`: `the_mcp_result_bound_is_check_output_tail_bytes` | the coder's bound is `CHECK_OUTPUT_TAIL_BYTES` |
 | `adam-llm-agent` `tests/prefix.rs`: `a_shortening_is_counted_in_the_runs_usage` (the exact characters, from the requests), `without_a_budget_nothing_is_shortened_and_the_state_has_no_member_for_it`, `a_retried_model_call_sends_the_same_request_after_a_shortening` (counted once); `src/history.rs`: `the_first_changed_message_is_reported` (and the characters removed) | the count, and nothing new without one |
 | `adam-runtime` `src/usage.rs`: `shortenings_count_and_sum_and_say_nothing_until_there_is_one`; `adam-a2a-runtime` `src/usage.rs`: `shortenings_are_a_member_beside_the_totals_only_when_there_were_some`, `tokens_only_is_the_object_it_always_was` | the type and the `usage/v1` member |
+
+## T3, built 2026-11-28
+
+A folder's `limits` sets the defaults.
+
+| What | Where |
+|---|---|
+| The file's block and words | `Limits::output: Option<OutputDef>` (`crates/adam-agent-fs/src/schema/agent.rs:361`); `OutputModeDef { OnError, Full }`, closed, `snake_case` (`:376`); `OutputDef { run_checks, run, run_command }`, each `Option<OutputModeDef>`, `deny_unknown_fields` (`:411`) |
+| Root only | the warning on a subagent (`crates/adam-agent-fs/src/load/agent.rs:155`) |
+| The tools' side | `OutputDefaults { run_command, run }` and `OutputDefaults::TOOLS` (the two constants; `crates/adam-code-tools/src/output.rs:112`, `:122`); `CommandLimits::output` (`src/commands.rs:44`); read where each tool parses `output`: `inspect.rs:66`, `make.rs:73`. `PersonDir`'s and the testkit's `DEFAULT_LIMITS` carry `TOOLS` (`person.rs:48`, testkit `src/lib.rs:606`) |
+| The coder's settings | `CoderSettings::command_output`, `checks_output` (`bin/adam-coder/src/tools/mod.rs:185`, `:188`), `set_output_defaults` (`:276`); the mapping with no wildcard, `mode_of` (`src/tools/output.rs:19`); `ToolEnv`'s `limits()` carries `command_output` (`src/tools/workspace.rs:119`); `run_checks` reads `checks_output` (`src/tools/checks.rs:656`) |
+| Where the folder is read | `build_agent`, beside the folder's process limits (`bin/adam-coder/src/serve.rs:196`): the root's `limits.output` only, once, before `ToolEnv` is built |
+
+### Invariants to check
+
+1. **Closed on both sides** (Rule 3). `mode_of` matches `OutputModeDef` with no wildcard onto `OutputMode`, so a mode
+   added to either fails to compile in the coder until it is mapped.
+2. **Strict at load.** A key other than the three tools' names, or a word other than `on_error` and `full`, is
+   `invalid frontmatter` at the line of `output:` (exit 78), never a warning: a misspelt key would leave a tool showing
+   what the file says it does not.
+3. **A call's `output` wins**, and a tool the block leaves out keeps the default it had (`map_or` over the current
+   setting), so an absent block or an empty one changes nothing: `CommandLimits::output` is `TOOLS` and `checks_output`
+   is `checks::DEFAULT_OUTPUT`.
+4. **The prompt prefix does not move with a folder.** The specs (`tests/fixtures/tool-specs/*.json`) name each tool's own
+   default; only results differ, and each says what it shows.
+5. **No global state.** The defaults travel in `CoderSettings` and `CommandLimits`, like `check_timeout` and
+   `check_output_tail`.
+6. **Breaking for literals.** `Limits` gained `output` and `CommandLimits` gained `output`: a struct literal built field by
+   field needs them (both crate READMEs say so).
+
+### Tests
+
+| Test | Proves |
+|---|---|
+| `crates/adam-agent-fs/tests/rules.rs`: `limits_output_is_read_per_tool_and_is_no_diagnostic` (and the JSON round trip of the embedded copy), `a_bad_limits_output_stops_the_folder_with_its_line` (an unknown word, an unknown key, line 4), and the table's three cases (`run_test`, `quiet`, the subagent's warning) in `every_invalid_directory_produces_exactly_one_diagnostic` | the loader |
+| `crates/adam-code-tools-testkit/tests/run_command.rs`: `the_workspaces_default_is_what_a_look_without_output_shows`; `tests/run.rs`: `the_workspaces_default_is_what_a_call_without_output_shows` | each tool reads its own default from `CommandLimits::output`, the call's value wins, the other tool's does not reach it |
+| `bin/adam-coder/tests/kept_output.rs`: `the_folders_output_defaults_are_what_a_call_without_output_shows` (all three tools, flipped, through `set_output_defaults`; a block that names one tool), `without_a_folder_block_each_tool_keeps_its_own_default` | the coder's threading |
+
+Unchanged, and so the proof that an absent block changes nothing: every T1 test above.
 
 ## T4, the tooling, built 2026-11-28
 

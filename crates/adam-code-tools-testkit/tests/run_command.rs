@@ -2,7 +2,8 @@
 //! what the tool answers and the progress line it adds; the guard's refusal (nothing runs); the
 //! refusal note on refusals only; a missing tool answered by the workspace or left to the result;
 //! that `run_command` never calls `after_run`; and its `output`: the whole output by default,
-//! one line for a command that succeeded with `on_error` (the output kept for `read_output`).
+//! one line for a command that succeeded with `on_error` (the output kept for `read_output`), and
+//! the workspace's default for a call that gives none.
 //! (`output` is unit-tested in `adam_code_tools::output`.)
 #![allow(clippy::unwrap_used, clippy::expect_used)] // integration tests assert by unwrapping
 
@@ -13,10 +14,10 @@ use std::sync::{Arc, Mutex};
 use adam_code_tools::inspect::run_command;
 use adam_code_tools::shell::MissingTool;
 use adam_code_tools::{
-    CodeWorkspace, CommandGuard, CommandLimits, CommandWorkspace, Guarding, Intent, Outcome, Place,
-    Redactor, Settled,
+    CodeWorkspace, CommandGuard, CommandLimits, CommandWorkspace, Guarding, Intent, Outcome,
+    OutputDefaults, OutputMode, Place, Redactor, Settled,
 };
-use adam_code_tools_testkit::DirWorkspace;
+use adam_code_tools_testkit::{DEFAULT_LIMITS, DirWorkspace};
 use adam_llm_agent::{KeptOutputs, ToolCtx, ToolError, ToolOutput, output_id_of};
 use adam_runtime::{CollectingSink, RunEvent};
 use adam_workspace::EnvSession;
@@ -45,6 +46,15 @@ impl Scripted {
             guarded: Mutex::default(),
             after_runs: AtomicUsize::new(0),
         }
+    }
+
+    /// The same workspace, whose tools default to `output` (the coder's folder sets these).
+    fn with_output(mut self, output: OutputDefaults) -> Self {
+        self.inner = self.inner.with_limits(CommandLimits {
+            output,
+            ..DEFAULT_LIMITS
+        });
+        self
     }
 }
 
@@ -447,4 +457,51 @@ async fn a_look_with_on_error_shows_a_failure_and_says_when_nothing_was_printed(
     let (out, _, _, _) =
         look_as(dir.path(), Ok(Settled::Unchanged), "true", Some("on_error")).await;
     assert_eq!(out.content, "$ true\nexit code 0\n(no output)\n");
+}
+
+/// A workspace that defaults `run_command` to `on_error` (the coder's folder,
+/// `limits.output.run_command`) shows a look that succeeded and gives no `output` as one line; a
+/// call's `full` still wins; and `run`'s default does not touch `run_command` (ADR 0088 slice T3).
+#[tokio::test]
+async fn the_workspaces_default_is_what_a_look_without_output_shows() {
+    let dir = tempfile::tempdir().unwrap();
+    let quiet = OutputDefaults {
+        run_command: OutputMode::OnError,
+        ..OutputDefaults::TOOLS
+    };
+    let ws = Scripted::over(dir.path(), Ok(Settled::Unchanged)).with_output(quiet);
+    let (call, _) = ctx();
+    let out = run_command(&ws, &call, "echo hi".into(), None, None, None, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        out.content,
+        format!("$ echo hi\nexit code 0\n{}", hidden(&call, 3)),
+        "the workspace's default"
+    );
+    assert!(kept_page(&ws, &call).await.starts_with("hi\n"));
+
+    let (call, _) = ctx();
+    let asked = Some("full".to_owned());
+    let out = run_command(&ws, &call, "echo hi".into(), None, None, None, asked)
+        .await
+        .unwrap();
+    assert_eq!(
+        out.content, "$ echo hi\nexit code 0\n--- output ---\nhi\n",
+        "the call's `output` wins"
+    );
+
+    let builds = OutputDefaults {
+        run: OutputMode::Full,
+        ..OutputDefaults::TOOLS
+    };
+    let ws = Scripted::over(dir.path(), Ok(Settled::Unchanged)).with_output(builds);
+    let (call, _) = ctx();
+    let out = run_command(&ws, &call, "echo hi".into(), None, None, None, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        out.content, "$ echo hi\nexit code 0\n--- output ---\nhi\n",
+        "`run_command` keeps its own default"
+    );
 }

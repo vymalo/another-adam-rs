@@ -37,8 +37,10 @@
 //! By default ([`DEFAULT_OUTPUT`], `output: "on_error"`) a check that passes is shown as its
 //! command, `exit code 0: passed` and one line with the size of its output and the id it is kept
 //! under (`read_output` reads it); a check that fails is shown as before, and so is every check
-//! with `output: "full"` (ADR 0088). Only the result changes: the `checks` artifact, the record in
-//! the notes and the check cycles are the same either way.
+//! with `output: "full"` (ADR 0088). The folder's `limits.output.run_checks` may set the other
+//! default ([`CoderSettings::checks_output`](crate::CoderSettings::checks_output)); a call's
+//! `output` wins. Only the result changes: the `checks` artifact, the record in the notes and the
+//! check cycles are the same either way.
 
 use adam::Artifact;
 use adam::prelude::*;
@@ -651,7 +653,7 @@ pub async fn run_checks(
         Ok(timeout) => timeout,
         Err(reason) => return Ok(ToolOutput::error(reason)),
     };
-    let mode = match OutputMode::of(output.as_deref(), DEFAULT_OUTPUT) {
+    let mode = match OutputMode::of(output.as_deref(), env.settings.checks_output) {
         Ok(mode) => mode,
         Err(reason) => return Ok(ToolOutput::error(reason)),
     };
