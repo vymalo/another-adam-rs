@@ -3,6 +3,7 @@
 //
 //   bench config            check the configuration and print what may be shown of it
 //   bench report            build report.md from the ledger
+//   bench numbers [--against B]   the figures from the ledger; with --against, beside a baseline ledger
 //   bench review            the blind quality review of every Done run's patch (spends money, within the cap)
 //   bench tasks <fetch|mine|lint|build|check|select>   task sources and the environment check
 //   bench doctor [--start]  what the machine must have, and whether the coder starts in each selected task image
@@ -19,7 +20,7 @@ import { doctor, renderDoctor } from '../lib/doctor.mjs';
 import { BENCH_DIR, runDryRun } from '../lib/dryrun.mjs';
 import { fetchPinnedBinary } from '../lib/npm.mjs';
 import { LedgerError, readLedger } from '../lib/ledger.mjs';
-import { computeNumbers, formatNumbers } from '../lib/numbers.mjs';
+import { compareNumbers, computeNumbers, formatComparison, formatNumbers } from '../lib/numbers.mjs';
 import { PINS } from '../lib/pins.mjs';
 import { ReportError, buildReport } from '../lib/report.mjs';
 import { readReviews, reviewRuns } from '../lib/review.mjs';
@@ -33,9 +34,11 @@ const USAGE = `usage: bench <command>
   config                          check the configuration; print what may be shown of it
   report [--ledger FILE] [--out FILE] [--show-model-id]
                                   build the report from the ledger (default $BENCH_HOME/report.md)
-  numbers [--ledger FILE]         the three figures the faster-coder epic rests on, from the ledger
-                                  (calls per task, the cache share of the fixed prompt, the run_checks
-                                  share of named tool calls), with the basis of each
+  numbers [--ledger FILE] [--against FILE]
+                                  the figures from the ledger, per agent over finished runs (calls, read_output
+                                  calls and input tokens per task, the cache share of the fixed prompt, the
+                                  run_checks share of named tool calls), with the basis of each; --against a
+                                  baseline ledger prints both and the change on the tasks both finished (ADR 0088)
   review                          score every Done run's patch with one blind reviewer and rubric ($BENCH_HOME/reviews.jsonl)
   tasks fetch|mine|lint|build|check|select
                                   task sources, the environment check and selection (bench tasks --help)
@@ -88,21 +91,38 @@ function report(argv, env) {
 }
 
 /**
- * The three figures the faster-coder epic rests on (sys#345, slice 1), from a ledger: calls per
- * task, the cache share of the fixed prompt, and the `run_checks` share of the named tool calls.
- * Read-only, no configuration and no key: it is a fold over records (bench/lib/numbers.mjs).
+ * The figures from a ledger: the three the faster-coder epic rests on (sys#345, slice 1) — calls per
+ * task, the cache share of the fixed prompt, the `run_checks` share of the named tool calls — and
+ * the two ADR 0088 decision 5 adds, `read_output` calls and input tokens per task. With `--against`,
+ * the ledger (after) beside a baseline (before) on the tasks both finished. Read-only, no
+ * configuration and no key: it is a fold over records (bench/lib/numbers.mjs).
  */
 function numbers(argv, env) {
-  const { values } = parseArgs({ args: argv, options: { ledger: { type: 'string' } }, allowPositionals: false });
+  const { values } = parseArgs({ args: argv, options: { ledger: { type: 'string' }, against: { type: 'string' } }, allowPositionals: false });
   const home = benchHome(env);
   assertOutsideRepo(home, 'BENCH_HOME');
   const ledgerFile = values.ledger ?? path.join(home, 'ledger.jsonl');
   if (values.ledger) assertOutsideRepo(ledgerFile, '--ledger');
-  const { records, warnings } = readLedger(ledgerFile);
-  for (const w of warnings) process.stderr.write(`bench: warning: ${w}\n`);
-  if (records.length === 0) {
-    process.stderr.write('bench: the ledger has no records; nothing to count\n');
-    return 1;
+  const read = (file, flag) => {
+    const { records, warnings } = readLedger(file);
+    for (const w of warnings) process.stderr.write(`bench: warning: ${flag} ${w}\n`);
+    if (records.length === 0) process.stderr.write(`bench: the ledger ${file} (${flag}) has no records; nothing to count\n`);
+    return records;
+  };
+  const records = read(ledgerFile, '--ledger');
+  if (records.length === 0) return 1;
+  if (values.against !== undefined) {
+    // ADR 0088 decision 5: the ledger measured against a baseline, on the tasks both finished.
+    assertOutsideRepo(values.against, '--against');
+    const baseline = read(values.against, '--against');
+    if (baseline.length === 0) return 1;
+    const cmp = compareNumbers(records, baseline);
+    process.stdout.write(formatComparison(cmp, { ledger: ledgerFile, against: values.against }));
+    if (cmp.agents.size === 0) {
+      process.stderr.write('bench: no agent finished the same task in both ledgers; nothing to compare\n');
+      return 1;
+    }
+    return 0;
   }
   const n = computeNumbers(records);
   if (n.runs.finished === 0) {

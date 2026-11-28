@@ -4,7 +4,7 @@ For people: [0088. A tool result is bounded when it is made, and a command that 
 which states the decision. This page holds where each slice is in the code, the invariants to check when it changes, and
 the tests that prove it.
 
-Slices T1 and T2 are built (2026-11-28, on `3d1e5b5`): [T1's proofs](#t1-built-2026-11-28), [T2's](#t2-built-2026-11-28). T3 and T4 are not.
+Slices T1 and T2 are built (2026-11-28, on `3d1e5b5`): [T1's proofs](#t1-built-2026-11-28), [T2's](#t2-built-2026-11-28). T4's tooling is built ([below](#t4-the-tooling-built-2026-11-28)); its measurement and T3 are not.
 
 ## T1, built 2026-11-28
 
@@ -88,3 +88,33 @@ The MCP bound follows the tool-result bound; shortenings counted in the run's us
 | `adam-coder` `src/config.rs`: `the_mcp_result_bound_is_check_output_tail_bytes` | the coder's bound is `CHECK_OUTPUT_TAIL_BYTES` |
 | `adam-llm-agent` `tests/prefix.rs`: `a_shortening_is_counted_in_the_runs_usage` (the exact characters, from the requests), `without_a_budget_nothing_is_shortened_and_the_state_has_no_member_for_it`, `a_retried_model_call_sends_the_same_request_after_a_shortening` (counted once); `src/history.rs`: `the_first_changed_message_is_reported` (and the characters removed) | the count, and nothing new without one |
 | `adam-runtime` `src/usage.rs`: `shortenings_count_and_sum_and_say_nothing_until_there_is_one`; `adam-a2a-runtime` `src/usage.rs`: `shortenings_are_a_member_beside_the_totals_only_when_there_were_some`, `tokens_only_is_the_object_it_always_was` | the type and the `usage/v1` member |
+
+## T4, the tooling, built 2026-11-28
+
+Decision 5's comparison is one command once the owner has two ledgers of the same pinned tasks, one per default
+(`bench/lib/numbers.mjs`, `bench/bin/bench.mjs`):
+
+```sh
+node bench/bin/bench.mjs numbers --ledger after.jsonl --against before.jsonl
+```
+
+Invariants to check when it changes:
+
+* **Read-only.** No configuration, no network, no child process, no write; `--against` is refused inside a work tree like
+  `--ledger`. `numbers.mjs` imports only `./ledger.mjs`.
+* **Only tasks both ledgers finished** are compared, matched per agent on the `task` of each run's `Planned` record; the
+  others are listed as left out, never folded in.
+* **Every attempt counts.** Calls are keyed by attempt and call number, so a resumed run's attempts no longer overwrite
+  each other (the fix this slice made to calls per task).
+* **The verdict states decision 5's rule, untuned**: `read_output` calls per task against input tokens per task, with no
+  threshold.
+
+What a ledger cannot give: which tool's output a `read_output` call read (the meter keeps a call's name, not its
+arguments), the tokens hidden outputs saved apart from every other difference between the two series, names past the
+first 64 of one answer (`MAX_TOOL_NAMES`), and the cache share of the whole prompt (the figure is the fixed prompt's).
+
+| Proof | What it shows |
+|---|---|
+| `bench/test/numbers.test.mjs`: the new figures (a child session, a failed call, a call with no usage, an unfinished run), a resumed run across attempts, the comparison and its left-out lists, the verdict cases, the printed rows, the CLI with `--against` and its two exit-1 cases, and the read-only run under `--permission` with the network made to throw | the figures, the comparison and the guarantee |
+
+The result table in `bench/NUMBERS.md` ("ADR 0088: hidden outputs") waits for the owner's runs.

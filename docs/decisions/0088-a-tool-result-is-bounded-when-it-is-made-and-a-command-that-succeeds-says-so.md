@@ -97,3 +97,12 @@ the `usage/v1` object, `{"count": 2, "charsRemoved": 412000}`, with an `info` lo
 the count is the run's own history, not its children's, and a task whose history was never shortened carries the object it
 always did. The evidence:
 [0088: the evidence and the slice proofs](../../.agents/docs/decisions/0088-a-tool-result-is-bounded-when-it-is-made-and-a-command-that-succeeds-says-so.md#t2-built-2026-11-28).
+
+*Amended 2026-11-28:* slice T4's tooling is built; the measurement waits for the owner's ledgers. `bench numbers` prints,
+per agent over the finished runs, `read_output` calls per task (the `read_output` entries of the settled calls'
+`toolNames`) and input tokens per task (`usage.input` of the settled calls) beside calls per task and the cache share of
+the fixed prompt, and `bench numbers --ledger <after> --against <before>` puts two ledgers side by side on the tasks both
+finished, with the change and the case of decision 5 that the movement is (no threshold: the weighing stays the owner's).
+The ledger keeps a tool call's name, not its arguments, so it cannot say whose output a `read_output` call read; decision 5
+is per tool, and a case that points back to `full` does not name the tool. The command, the table to fill and what a
+ledger cannot say: [The numbers: ADR 0088](../../bench/NUMBERS.md#adr-0088-hidden-outputs).
