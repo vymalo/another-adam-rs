@@ -80,6 +80,12 @@ pub(crate) struct HeadArtifact {
 pub(crate) struct Head {
     /// Layout version ([`VERSION`]).
     pub v: u32,
+    /// The journal epoch the run started on ([ADR 0076]), carried from the envelope so a
+    /// head-only commit keeps it. `0` for a run stored before the field existed.
+    ///
+    /// [ADR 0076]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0076-a-run-records-the-journal-epoch-it-started-on.md
+    #[serde(default, skip_serializing_if = "crate::envelope::is_zero")]
+    pub epoch: u32,
     /// The agent's head: its state without the messages.
     pub agent: Value,
     /// Delivered, not yet consumed messages, oldest first.
@@ -158,6 +164,7 @@ impl Head {
     ) -> Self {
         Self {
             v: VERSION,
+            epoch: env.epoch,
             agent,
             inbox: env.inbox.clone(),
             seq: env.seq,
@@ -230,6 +237,7 @@ impl Head {
     /// encoding it as the whole state, which is v4.
     pub(crate) fn into_parts(self, agent: Value) -> (Envelope, HeadParts) {
         let Self {
+            epoch,
             inbox,
             seq,
             attempt,
@@ -254,6 +262,7 @@ impl Head {
         };
         let env = Envelope {
             v: FULL_VERSION,
+            epoch,
             agent,
             inbox,
             seq,
@@ -322,6 +331,7 @@ impl HeadParts {
     pub(crate) fn carried(&self, env: &Envelope, added: &[Artifact]) -> Head {
         Head {
             v: VERSION,
+            epoch: env.epoch,
             agent: env.agent.clone(),
             inbox: env.inbox.clone(),
             seq: env.seq,
@@ -844,5 +854,30 @@ mod tests {
             .push(Inbound::new("message", json!({"text": "hi"})).with_id("m-2"));
         assert_eq!(stored.error(), Some("later"));
         assert_eq!(stored.inbox_mut().len(), 1);
+    }
+}
+
+/// The epoch on a head ([ADR 0076]): a head-only commit must not lose it.
+///
+/// [ADR 0076]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0076-a-run-records-the-journal-epoch-it-started-on.md
+#[cfg(test)]
+mod epoch_tests {
+    use super::{Head, Stored};
+    use crate::envelope::Envelope;
+    use adam_core::RunId;
+    use serde_json::json;
+
+    #[test]
+    fn a_head_carries_the_epoch_of_the_run_it_belongs_to() {
+        let env = Envelope::new(json!({})).with_epoch(3);
+        let head = Head::of(&env, json!({}), 0, &[], &[]);
+        assert_eq!(head.epoch, 3);
+        let encoded = head.encode().expect("encodes");
+        match Stored::decode(RunId::new(), &encoded).expect("decodes") {
+            Stored::Head(back) => assert_eq!(back.epoch, 3),
+            Stored::Full(_) => panic!("a v5 head decodes as a head"),
+        }
+        let (joined, _) = head.into_parts(json!({}));
+        assert_eq!(joined.epoch, 3, "a joined head keeps the run's epoch");
     }
 }
