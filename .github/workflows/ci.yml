@@ -54,6 +54,10 @@ jobs:
       # one are gone. The scan is what keeps them from coming back by habit; the script says what it reads.
       - name: The dev stack and CI carry no container engine
         run: sh tools/check-dev-stack.sh
+      # ANR-1427: a pin below the major recorded in tools/workflow-pins.txt is how a node20 action comes
+      # back — #495 re-added actions/checkout@v4 after ANR-62 had moved every pin (ANR-1410).
+      - name: Every workflow action pin is at or above its recorded major
+        run: sh tools/check-workflow-pins.sh
       # ADR 0084: every version a release moves is marked for release-please, and the Cargo lines agree.
       - name: The release's version lines are marked and agree
         run: sh tools/release/check-versions.sh
