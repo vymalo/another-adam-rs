@@ -319,7 +319,11 @@ called. A session with no budget spends and is never refused.
 a `*` pattern; `github__*` selects an MCP server). The session is offered only the tools `tools` matches, less the ones `deny_tools`
 matches (the deny-list is applied after the allow-list); `read_output` always stays. A hidden tool is not in the model's request,
 and a call to it anyway is refused without running; this holds even when an oversized message context was dropped, because the session's header, not the
-context, is the truth. At most 32 entries, each at most 200 characters, none blank. **Which names are
+context, is the truth. A lazy MCP server's tools are loaded by a tool of its own, `load__group__<server>` (ADR 0066), so a
+session that names any tool of that server keeps that loader — `tools: ["github__*"]` can load the `github` group — and a
+session that names none of its tools keeps no loader, because a loader that can load nothing is not handed out. The rule is exact for a `when` MCP server's group, whose members are `<server>__<tool>`; a group whose members do not share its name is not covered (none ships today). The loader is a
+means to the tools the list names, never an extra tool the session may use: once the group is loaded its tools are held to the
+same lists, so nothing widens. At most 32 entries, each at most 200 characters, none blank. **Which names are
 checked at the start depends on what the starter knows.** The tool names of a subagent are known where the agent is bound (a
 worker), not on a control plane that only answers A2A; and a worker knows the whole set only when no source adds tools to the
 agent while it runs. **Neither shipped agent has the whole set** (both add tools through sources), so in practice: a concrete

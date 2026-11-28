@@ -287,10 +287,16 @@ fn the_child_sees_only_the_safe_variables() {
         Some("yes"),
         "the configuration's variables reach the program"
     );
-    assert!(
-        !vars.contains_key("CARGO_MANIFEST_DIR"),
-        "the parent's environment does not: {vars:?}"
-    );
+    // Nothing else reaches it: every variable is a safe one or one the configuration added. This
+    // is the assertion that fails when `env_clear` is removed, not a single absent name.
+    for name in vars.keys() {
+        assert!(
+            SAFE_VARS.contains(&name.as_str())
+                || name == "ADAM_HOOK_TEST_ENV"
+                || name == "ADAM_HOOK_TEST_ADDED",
+            "the child inherited {name}: {vars:?}"
+        );
+    }
     if std::env::var_os("PATH").is_some() {
         assert!(
             vars.contains_key("PATH"),

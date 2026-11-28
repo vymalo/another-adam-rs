@@ -287,6 +287,44 @@ impl Withheld {
     }
 }
 
+/// The tools a [`ToolSource`] can offer, when it can name them **before a run calls it** (ADR 0054,
+/// decision 4): what a session's `tools` and `deny_tools` are checked against, beside the agent's
+/// own names.
+///
+/// A session's bounds are made at startup, before any run exists, so a source answers only what it
+/// knows then: a folder's own tools, a server it connected and listed, the members of a group. A
+/// source whose tools are another system's, and change with the conversation, answers
+/// [`Unknown`](Self::Unknown): a session's set is then incomplete, and
+/// `SessionBounds::admit` checks the shape of an entry alone, never that it matches a tool.
+///
+/// [ADR 0054]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum Declared {
+    /// Every tool the source can offer, by name, each once: what it offers on a turn **and** what it
+    /// withholds until a load, a mode or the access tier allows it. The set, not the offering of one
+    /// turn.
+    All(Vec<String>),
+    /// The source cannot name its tools before a run calls it: a remote endpoint that lists per
+    /// conversation, or a listing that may change under it. A session's set is then incomplete.
+    #[default]
+    Unknown,
+}
+
+impl Declared {
+    /// Whether these are every tool the source can offer.
+    pub fn is_complete(&self) -> bool {
+        matches!(self, Self::All(_))
+    }
+
+    /// The names, when they are all of them.
+    pub fn names(&self) -> Option<&[String]> {
+        match self {
+            Self::All(names) => Some(names),
+            Self::Unknown => None,
+        }
+    }
+}
+
 /// A group of tools the agent learns about while it runs, not when it is built: what a caller
 /// says it can offer in the messages it sends (the endpoint for a thread's tools, for instance),
 /// read again at every model turn.
@@ -410,6 +448,21 @@ pub trait ToolSource: Send + Sync + 'static {
     /// nothing: a source that cannot tell leaves the descriptions as they are. The default does.
     async fn refine(&self, ctx: &SourceCtx, specs: &mut [ToolSpec]) {
         let _ = (ctx, specs);
+    }
+
+    /// The tools this source can offer, when it can name them **before a run calls it**: a session's
+    /// `tools` and `deny_tools` are checked against them, with the agent's own names (ADR 0054,
+    /// decision 4; `SessionBounds::tools_complete` in `adam-runtime`).
+    ///
+    /// [`Declared::All`] is the whole set: a tool the source withholds on a turn (a mode that does
+    /// not list it, a group a run has not loaded, an access tier that is too low) is named too,
+    /// because a later turn of the run may offer it. [`Declared::Unknown`], the default, says the
+    /// source cannot name its tools: a remote endpoint whose listing is another system's, or one
+    /// that changes with the conversation. A session's set is then incomplete and `admit` checks
+    /// the shape of an entry alone. The default is what a source written before this method
+    /// existed answers, so adding it breaks no implementer.
+    fn declared(&self) -> Declared {
+        Declared::Unknown
     }
 
     /// Which of `tools` this source holds back on this turn, **whoever offers them**: the agent's

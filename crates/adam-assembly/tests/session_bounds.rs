@@ -494,6 +494,9 @@ fn a_worker_bounds_hold_the_names_of_the_subagents_tools_and_a_definitions_do_no
 }
 
 /// A source that offers nothing: what matters is that the agent has one, as both shipped agents do.
+/// It does **not** declare its tools, so it answers the default, [`Declared::Unknown`]
+/// ([`adam_llm_agent::Declared::Unknown`]): a source written before the method existed compiles
+/// untouched (ADR 0054 decision 4).
 struct Quiet;
 
 #[async_trait::async_trait]
@@ -556,5 +559,98 @@ fn an_agent_with_a_source_has_an_incomplete_set_that_still_catches_a_deny_typo()
             ))
             .is_ok(),
         "a pattern and an allow entry are not checked on an incomplete set"
+    );
+}
+
+/// A source that names every tool it can offer, each once.
+struct Declares(&'static [&'static str]);
+
+#[async_trait::async_trait]
+impl adam_llm_agent::ToolSource for Declares {
+    fn declared(&self) -> adam_llm_agent::Declared {
+        adam_llm_agent::Declared::All(self.0.iter().map(|name| (*name).to_owned()).collect())
+    }
+
+    async fn specs(&self, _ctx: &adam_llm_agent::SourceCtx) -> Vec<adam_model::ToolSpec> {
+        Vec::new()
+    }
+
+    async fn call(
+        &self,
+        _ctx: &adam_llm_agent::ToolCtx,
+        _name: &str,
+        _args: serde_json::Value,
+    ) -> Option<Result<adam_llm_agent::ToolOutput, adam_llm_agent::ToolError>> {
+        None
+    }
+}
+
+/// ADR 0054 decision 4: a source that declares its tools makes the subagent's set **complete**, so a
+/// `tools` entry that matches no tool — a typo, or a pattern nothing has — is refused with the list,
+/// and an entry naming a declared tool is admitted. The declaration joins the bound node's names,
+/// each once.
+///
+/// **This test is red before ANR-1319**, first at the names assertion below (the old
+/// `BoundDef::bound_tool_names` returned the node's own names and never joined a source's
+/// declaration), and then at the completeness line it ended with,
+/// `self.sources.is_empty() && node.sources.is_empty()`: any source at all made the set incomplete,
+/// whatever it declared, so `tools_complete` was `false` here and `a_typo` was admitted.
+#[test]
+fn a_source_that_declares_its_tools_makes_the_set_complete_and_catches_an_allow_typo() {
+    let definition = def(&[
+        (
+            "agent/instructions.md",
+            &instructions("name: coder", "You are the root."),
+        ),
+        (
+            "agent/subagents/reviewer.md",
+            &instructions(
+                "description: Reviews a change.\ntools: [read_file, write_file]",
+                "You review.",
+            ),
+        ),
+    ]);
+    let worker = definition
+        .bind(tools(&["read_file", "write_file"]))
+        .unwrap()
+        // `read_file` again: a declaration that names a tool the node already has adds it once.
+        .tool_source(Declares(&["thread_tool", "read_file"]))
+        .model(Arc::new(MockModel::new()), "m")
+        .unwrap();
+    let bound = bound_of(&worker);
+    assert_eq!(
+        bound.tools,
+        ["read_file", "write_file", "thread_tool"],
+        "the node's names, then what the source declares, each once"
+    );
+    assert!(bound.tools_complete, "every source names its tools");
+
+    let asked = |value| SessionConfig::from_value(value).expect("a config");
+    let why = bound
+        .admit(asked(json!({"tools": ["a_typo"]})))
+        .expect_err("an allow entry matching none of a complete set");
+    assert_eq!(why.option(), Some("tools"));
+    assert!(
+        why.message()
+            .contains("matches none of its tools: read_file, write_file, thread_tool"),
+        "{why}"
+    );
+    assert!(
+        !why.message().contains("may get more tools"),
+        "a complete set has no hint about tools a source may add: {why}"
+    );
+    // A pattern is checked too, now that the set is complete.
+    let why = bound
+        .admit(asked(json!({"tools": ["github__*"]})))
+        .expect_err("a pattern matching none of a complete set");
+    assert_eq!(why.option(), Some("tools"));
+    // An entry that names a declared tool is admitted, and one that names only some of them too.
+    assert!(bound.admit(asked(json!({"tools": ["thread_*"]}))).is_ok());
+    assert!(
+        bound
+            .admit(asked(
+                json!({"tools": ["read_file"], "denyTools": ["write_file"]})
+            ))
+            .is_ok()
     );
 }

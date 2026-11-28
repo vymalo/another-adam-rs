@@ -2329,6 +2329,12 @@ impl LlmAgent {
         self.index.get(name).map(|&i| &self.tools[i])
     }
 
+    /// The names of the agent's own tools, loaders included: what a session's `tools` selects
+    /// among, and the group loaders a session keeps ([`SessionNarrowing`], ANR-1304).
+    fn own_names(&self) -> Vec<&str> {
+        self.specs.iter().map(|spec| spec.name.as_str()).collect()
+    }
+
     /// The retry policy of the tool `name`, first found: the one set by name
     /// ([`LlmAgentBuilder::tool_retry`]), the tool's own ([`Tool::retry_policy`]); `None`: the
     /// runtime's (ADR 0061, decision 3).
@@ -3182,7 +3188,11 @@ impl LlmAgent {
 
         let model = self.model.clone();
         let sources = self.sources.clone();
-        let narrowing = Arc::new(narrowing_of(state, context.map(|c| &**c)));
+        let narrowing = Arc::new(narrowing_of(
+            state,
+            context.map(|c| &**c),
+            &self.own_names(),
+        ));
         let turn = state.turns;
         // The step start seeded a journal written before `loaded` existed; a fresh run (or a
         // continuation) has no seed, and its task-loaded groups are journaled here.
@@ -3263,7 +3273,11 @@ impl LlmAgent {
             task: state.task().map(Arc::from),
             loaded: Arc::from(state.loaded.clone()),
             removed_tools: Arc::from(state.removed_tools.clone()),
-            narrowing: Arc::new(narrowing_of(state, context.map(|c| &**c))),
+            narrowing: Arc::new(narrowing_of(
+                state,
+                context.map(|c| &**c),
+                &self.own_names(),
+            )),
             event_budget: Arc::clone(&state.event_budget.0),
             approvable: approvable(ctx, state),
             turn: crate::early::Turn {
@@ -4015,7 +4029,7 @@ impl LlmAgent {
         let model = self.model.clone();
         let ordered = self.max_parallel > 1;
         let sources = self.sources.clone();
-        let narrowing = Arc::new(narrowing_of(state, Some(&state.context)));
+        let narrowing = Arc::new(narrowing_of(state, Some(&state.context), &self.own_names()));
         let source_ctx = (!sources.is_empty()).then(|| {
             SourceCtx::new(
                 ctx.run_id(),
@@ -4849,7 +4863,11 @@ impl LlmAgent {
                         task: state.task().map(Arc::from),
                         loaded: Arc::from(state.loaded.clone()),
                         removed_tools: Arc::from(state.removed_tools.clone()),
-                        narrowing: Arc::new(narrowing_of(state, context.map(|c| &**c))),
+                        narrowing: Arc::new(narrowing_of(
+                            state,
+                            context.map(|c| &**c),
+                            &self.own_names(),
+                        )),
                         event_budget: Arc::clone(&state.event_budget.0),
                         approvable: approvable(ctx, state),
                     },
@@ -5203,7 +5221,11 @@ impl LlmAgent {
                 task: state.task().map(Arc::from),
                 loaded: Arc::from(state.loaded.clone()),
                 removed_tools: Arc::from(state.removed_tools.clone()),
-                narrowing: Arc::new(narrowing_of(state, context.map(|c| &**c))),
+                narrowing: Arc::new(narrowing_of(
+                    state,
+                    context.map(|c| &**c),
+                    &self.own_names(),
+                )),
                 event_budget: Arc::clone(&state.event_budget.0),
                 approvable: approvable(ctx, state),
             };
