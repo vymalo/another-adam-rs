@@ -29,8 +29,8 @@ use common::Fixture;
 // the 68 bytes the `delete` argument of `subagent_close` added to that section (slice 5), plus the
 // 11 bytes `command | commands` added to `run_checks`'s line (ANR-243). The deltas are computed,
 // not measured: re-pin this from the `system N B` line this test prints on the first green CI run.
-const BASELINE_PROMPT_BYTES: usize = 32591;
-const BASELINE_TOOLS_BYTES: usize = 64752; // measured 2026-11-28 on the branch of ANR-243 (the `commands` argument of run_checks)
+const BASELINE_PROMPT_BYTES: usize = 32858; // 32591 + the 267 bytes `subagent_edit`'s line adds to the guide
+const BASELINE_TOOLS_BYTES: usize = 66847; // 64752 + the 2095 bytes of `subagent_edit`'s spec (ANR-216)
 const GROWTH_ALLOWED: usize = 1024;
 /// The owner's budget for the coder's tools once S3 makes it lean (ADR 0066).
 const TOOLS_BUDGET_TOKENS: usize = 3000;

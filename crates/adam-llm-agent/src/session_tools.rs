@@ -201,11 +201,7 @@ pub(crate) fn narrowing_of(
     context: Option<&Map<String, Value>>,
     own: &[&str],
 ) -> SessionNarrowing {
-    SessionNarrowing::of(
-        state.session.as_ref().and_then(|h| h.config.as_ref()),
-        context,
-        own,
-    )
+    SessionNarrowing::of(state.config(), context, own)
 }
 
 /// What a withheld tool's call answers: a result for the model, not for the person.
@@ -480,6 +476,8 @@ mod tests {
                 visible: false,
                 config: Some(config(Some(&["read_file"]), None)),
                 spent: 0,
+                editing: false,
+                edits: Vec::new(),
             }),
             ..Conversation::default()
         };

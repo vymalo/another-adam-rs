@@ -581,6 +581,8 @@ fn narrowed_session(tools: &[&str]) -> SessionHeader {
         visible: false,
         config: Some(config),
         spent: 0,
+        editing: false,
+        edits: Vec::new(),
     }
 }
 

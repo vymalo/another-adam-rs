@@ -50,3 +50,27 @@ reads the lists from the round's session header first (`crates/adam-llm-agent/sr
   `a_source_that_declares_a_shape_makes_the_set_complete_and_admits_a_servers_tools`; `bin/adam-agent/tests/agent.rs`
   `a_helpers_bounds_are_complete_and_admit_a_relayed_servers_tools`; `bin/adam-coder/tests/agent_files.rs`
   `the_helpers_bounds_are_complete_and_admit_a_relayed_servers_tools`.
+
+## `edit` of `child-sessions/v1` (ADR 0054 decision 11, slice 4)
+
+For people: [the `edit` paragraph](../../../docs/reference/a2a-server.md#child-sessions-child-sessionsv1) of the page
+above. `parse_edit` in `crates/adam-a2a-runtime/src/child_sessions.rs` reads `metadata[URI].edit {config}` — one member,
+`config`, an object of the same camelCase options `start.config` takes, where `null` is a **reset** — and refuses a message
+that asks two of `start`, `close` and `edit`. `asked` answers `Asked::Edit {patch}`, `submit_child` passes it to
+`message_to_session`, and that function does what `subagent_edit` does, in the same order and with the same function:
+`SessionBounds::clamp` the session's config to the bounds of now, `SessionPatch::apply` the patch over it,
+`SessionBounds::admit` the result, and rewrite the refusal's `config.<snake>` words to `edit.config.<camel>`.
+
+* A **working** round gets an `Inbound::new(SESSION_EDIT_KIND, SessionEditRequest {config, by: Person, members})` with the
+  message id; an **idle** session gets a round of `editing_round_payload(&header)` through `next_round`. Both count toward
+  `max_rounds` (`countable_rounds` counts an editing round: it is not `closing && !closed`).
+* `SessionEditRequest` is the whole admitted config, so the round applies it and never merges; `by: Person` is what
+  `SessionHeader.edits` records.
+* **Evidence:** `crates/adam-runtime/src/session.rs` tests `a_patch_sets_resets_and_leaves_the_rest`,
+  `an_edit_of_a_running_round_adopts_next_model_call_options_only`, `a_header_keeps_the_last_sixteen_edits`,
+  `an_edit_a_round_never_read_is_applied_by_its_reader`, `an_editing_round_says_edit_and_carries_its_header`;
+  `crates/adam-llm-agent/tests/sessions.rs` `an_edit_of_a_working_round_changes_its_next_model_call`,
+  `an_edit_of_an_idle_session_is_a_round_that_calls_no_model`,
+  `an_edit_past_a_bound_is_refused_and_changes_nothing`, `a_retried_edit_applies_once`.
+* **Not verified without a compiler:** the front's own `edit` tests are not written; the unit tests above are. The A2A
+  `Asked::Edit` path is exercised by no test yet (ANR-216's note says so).

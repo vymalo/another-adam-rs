@@ -419,6 +419,7 @@ where a store is involved (`crates/adam-llm-agent/tests/sessions.rs` holds the s
 * Accepted when: an edit of a working round changes the next model call for *next model call* options and the next round for the
   others; an idle edit is a round with no model call and no report; an edit past a bound is refused; the history holds 16; a
   replay of a journal with an edit is the same.
+* *Built 2026-11-28 (ANR-216):* see the amendment at the end of this page.
 
 **5. Delete** (decision 10). Depends on 1.
 * Files: `sessions.rs` (`subagent_close` `delete`), `crates/adam-runtime/src/session.rs` (`deleted`, the listing filter, the due rule).
@@ -511,3 +512,44 @@ round that writes the tombstone until it has ended.
 2. **`delete: true` implies `cancel: true`**, as decision 10 says: a working round is stopped as a close with cancel
    stops it, and the closing round then writes the tombstone. The first cut of the change refused a working session
    instead; that was wrong, and the review caught it — the flag is honoured now.
+
+## Amended 2026-11-28 (slice 4, `subagent_edit`)
+
+Slice 4 is built as decision 11 reads, with these decisions where it left a choice.
+
+1. **The patch is a type of its own**, `SessionPatch` (`adam-runtime`), because `SessionConfig` cannot say "leave this alone"
+   apart from "return it to the folder's": both are an absent member there. A member of a patch is `Option<Option<T>>`, so
+   `null` is a reset and an absent one is untouched. `SessionPatch::apply(base)` is the one merge the model's `subagent_edit`
+   and the A2A `edit` share, and `subagent_start` builds a patch over nothing, so the two spellings of `config` cannot merge
+   differently.
+2. **The bounds are the ones of the moment**, and the base is clamped first. An edit merges its patch over the session's config
+   **clamped to `SessionBounds` of now** (decision 3's rule), then admits the whole result with `SessionBounds::admit`: an
+   untouched option can never be raised back by a lowered deployment, and a member the patch names past a bound is refused with
+   the words of a start (`config.max_turns is 500; at most 50`), leaving the session as it was. A helper the roster no longer
+   has refuses the edit (its bounds are unknown) rather than guess `SessionBounds::default()`, which could widen.
+3. **A working round is delivered the whole admitted config**, not the patch: `adam.session.edit`'s payload is a
+   `SessionEditRequest {config, by, members}`. The round applies it and merges nothing, so a replay reads the same bytes and
+   decides the same. The round keeps what it runs with in `Conversation::round_config`
+   (`SessionConfig::adopted_mid_round`: the edit's *next model call* options, its own of the *next round* ones — `time_limit`,
+   `max_rounds`, `report_schema`, `instructions`), while the header carries the edit's whole config for the next round. That is
+   the ADR's "pending in the header", and it is why `time_limit` and `max_rounds` do not move under a running round.
+4. **An edit is not lost when the round ends first.** `adam.session.edit` is not counted as unread input (`news_since`), as a
+   close request is not, so it does not reopen a finishing round; a round that ended before reading it leaves it in its inbox,
+   where `read_latest` applies it — a listing, a view and the next round's header all read the edit — and the tool's retry
+   falls back to the idle round when the round it steered into has already ended. `cancel_run` keeps a pending edit, as it keeps
+   a close request.
+5. **An idle session's edit is a round with `editing: true`** (`editing_round_payload`), which `LlmAgent` and the remote round
+   agent both end at once without a model call and with no report; it is not a cleanup round, so it counts toward `max_rounds`,
+   and it is not refused by the round cap (a close is not either). `read_output` and the listing skip it when they look for the
+   round that worked.
+6. **The history** is `SessionHeader.edits: Vec<SessionEdit>` — `{round, by, members}` with `by` a closed enum (`agent`,
+   `person`) — trimmed to `MAX_SESSION_EDITS` (16) by `SessionHeader::record_edit`, and carried by every later round, which
+   copies the header. `members` names the options the patch named, camelCase, in decision 4's order.
+7. **The A2A front** takes `metadata[URI].edit {config}` on a message to the child context, refuses a message that asks two of
+   start, close and edit, and rewrites the refusal's words to `edit.config.<member>`. The round event's session object reports
+   the new `config` and `edits`.
+8. **Not changed here:** `instructions` and `model` stay out of the tools' and the front's option lists until their own slices
+   list them (the type already carries `instructions`, and the split above already keeps it for the next round); a remote
+   helper's *working* round does not read an edit mid-round — the options it takes (`timeLimit`, `maxRounds`) are next-round
+   ones, so the edit waits in its inbox and the next round carries it; the A2A front still starts every round with the helper's
+   `within` and does not read the session's own `timeLimit` (a gap that predates this slice).

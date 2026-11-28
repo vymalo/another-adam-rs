@@ -5,7 +5,7 @@
 //! holds the derivation and what a listing reads back from the runs alone.
 
 use adam_core::time::Timestamp;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 
 use std::collections::HashMap;
@@ -145,12 +145,41 @@ pub const SESSION_CLOSE_KIND: &str = "adam.session.close";
 /// (`close_session: true`): the round calls no model, and its header says `closing`.
 pub const SESSION_CLOSE_ROUND_KEY: &str = "close_session";
 
+/// [`Inbound::kind`](crate::Inbound) of the message that delivers an edit of a working round's
+/// config ([ADR 0054], decision 11): the round reads it at its next step, applies the options the
+/// ADR marks *next model call*, and journals the whole edit in its header. A round that has ended
+/// before reading it leaves it in its inbox, where a reader of the session finds it and the next
+/// round carries it ([`SessionHeader::edits`]), as a close request is found.
+///
+/// Its payload is a [`SessionEditRequest`]. It is **not counted as unread input**: it does not
+/// reopen a round that is finishing, exactly like [`SESSION_CLOSE_KIND`].
+///
+/// [ADR 0054]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md
+pub const SESSION_EDIT_KIND: &str = "adam.session.edit";
+
+/// The key of a round's first message that asks for a round which only edits its session
+/// (`edit_session: true`): the round calls no model and has no report, as a closing round does.
+pub const SESSION_EDIT_ROUND_KEY: &str = "edit_session";
+
 /// The payload of the first message of a round that only closes the session `header` describes:
 /// `{"close_session": true, "session": <header>}`. The header must already be the closing round's
 /// (the next round number, `closed` and `closing`).
 pub fn closing_round_payload(header: &SessionHeader) -> Value {
     let mut payload = serde_json::Map::new();
     payload.insert(SESSION_CLOSE_ROUND_KEY.to_owned(), Value::Bool(true));
+    payload.insert(
+        SESSION_STATE_KEY.to_owned(),
+        serde_json::to_value(header).unwrap_or(Value::Null),
+    );
+    Value::Object(payload)
+}
+
+/// The payload of the first message of a round that only edits the session `header` describes:
+/// `{"edit_session": true, "session": <header>}`. The header must already be the editing round's
+/// (the next round number, `editing`, the new `config` and the edit in `edits`).
+pub fn editing_round_payload(header: &SessionHeader) -> Value {
+    let mut payload = serde_json::Map::new();
+    payload.insert(SESSION_EDIT_ROUND_KEY.to_owned(), Value::Bool(true));
     payload.insert(
         SESSION_STATE_KEY.to_owned(),
         serde_json::to_value(header).unwrap_or(Value::Null),
@@ -183,6 +212,14 @@ pub struct SessionHeader {
     /// when `false`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub closing: bool,
+    /// This round only **edits** the session ([ADR 0054], decision 11): it calls no model and its
+    /// report is not a report either, so a read still gives the last round that worked. Written by
+    /// the round an edit of an idle session starts; a working round takes its edit in a step of its
+    /// own and never says `editing`. Absent when `false`.
+    ///
+    /// [ADR 0054]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub editing: bool,
     /// The session was **deleted** ([ADR 0054] decision 10): it is gone from every listing and every
     /// tool refuses it with `no_such_session`, while its runs stay in the store. Written by the
     /// closing round a `subagent_close` with `delete: true` starts. Absent when `false`.
@@ -244,6 +281,108 @@ pub struct SessionHeader {
     /// [ADR 0054]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md
     #[serde(default, skip_serializing_if = "is_zero_u64")]
     pub spent: u64,
+    /// The last [`MAX_SESSION_EDITS`] edits of the session's config ([ADR 0054], decision 11): the
+    /// round each took effect in, who made it, and the options it set or returned to the folder's.
+    /// Written by the round that reads an edit (a working one, at its next step) or by the editing
+    /// round of an idle session, and carried by every later round, which copies the header. Absent
+    /// from state written before it existed, and not written while empty.
+    ///
+    /// [ADR 0054]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub edits: Vec<SessionEdit>,
+}
+
+/// The most edits a session's header keeps ([ADR 0054], decision 11): the oldest is dropped.
+///
+/// [ADR 0054]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md
+pub const MAX_SESSION_EDITS: usize = 16;
+
+/// Who edited a session's config ([ADR 0054], decision 11): the parent agent through
+/// `subagent_edit`, or a person through the A2A front's `edit`. A closed enum on purpose (Rule 3).
+///
+/// [ADR 0054]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SessionEditor {
+    /// The parent agent's `subagent_edit`.
+    Agent,
+    /// A person, through `metadata[URI].edit` of the A2A front.
+    Person,
+}
+
+/// One edit of a session's config, as the header's [`edits`](SessionHeader::edits) keeps it
+/// ([ADR 0054], decision 11): the round it took effect in, who made it, and the options the patch
+/// named — those it set, and those it returned to the folder's.
+///
+/// [ADR 0054]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionEdit {
+    /// The round it took effect in: the working round that read it, or the editing round of an
+    /// idle session.
+    pub round: u32,
+    /// Who made it.
+    pub by: SessionEditor,
+    /// The options the patch named, camelCase as the wire spells them, in the ADR's order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub members: Vec<String>,
+}
+
+/// The payload of a [`SESSION_EDIT_KIND`] message ([ADR 0054], decision 11): the config the session
+/// runs with from then on (absent: every option is the folder's), who edited it, and the options
+/// the patch named.
+///
+/// The **whole** config travels, already admitted against the bounds of the time of the edit, so the
+/// round that reads it applies it and never merges or admits anything again: a replay reads the same
+/// bytes and decides the same.
+///
+/// [ADR 0054]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct SessionEditRequest {
+    /// The config the session runs with from then on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config: Option<SessionConfig>,
+    /// Who made the edit.
+    pub by: SessionEditor,
+    /// The options the patch named, camelCase as the wire spells them, in the ADR's order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub members: Vec<String>,
+}
+
+impl SessionEditRequest {
+    /// This request as the header records it, for `round`.
+    pub fn record(&self, round: u32) -> SessionEdit {
+        SessionEdit {
+            round,
+            by: self.by,
+            members: self.members.clone(),
+        }
+    }
+
+    /// Read a payload of a [`SESSION_EDIT_KIND`] message. `None` for one that is not an edit of
+    /// this build: the round then ignores it, as it ignores any message it cannot read.
+    pub fn from_payload(payload: &Value) -> Option<Self> {
+        serde_json::from_value(payload.clone()).ok()
+    }
+}
+
+impl SessionHeader {
+    /// Record `edit` in [`edits`](Self::edits), keeping the last [`MAX_SESSION_EDITS`].
+    pub fn record_edit(&mut self, edit: SessionEdit) {
+        self.edits.push(edit);
+        let extra = self.edits.len().saturating_sub(MAX_SESSION_EDITS);
+        if extra > 0 {
+            self.edits.drain(..extra);
+        }
+    }
+
+    /// Apply `request` to this header: the config it carries becomes the session's, and the edit
+    /// joins the history, at the round the header is at.
+    pub fn apply_edit(&mut self, request: &SessionEditRequest) {
+        self.config = request.config.clone();
+        self.record_edit(request.record(self.round));
+    }
 }
 
 impl SessionHeader {
@@ -277,6 +416,11 @@ struct RoundFacts {
     header: Option<SessionHeader>,
     /// A close request waits in the round's inbox.
     close_asked: bool,
+    /// Edits the round was delivered and has not read ([ADR 0054], decision 11): they sit in the
+    /// stored inbox, which a commit empties of what the run read, so a reader of the session finds
+    /// them and the next round carries them — a round that ended first does not lose its edit, as
+    /// it does not lose a close request.
+    edits: Vec<SessionEditRequest>,
     /// How the round ended, as a parent reads it: `Failed` when its state cannot be read.
     status: RunStatus,
     /// Why it failed, when it did.
@@ -302,13 +446,16 @@ struct ListedState {
     agent_wake: Option<Timestamp>,
 }
 
-/// The one member of an inbox message a listing reads. Required, as it is in [`Inbound`]: a message
-/// without one is not a state the runtime wrote.
+/// The members of an inbox message a listing reads. `kind` is required, as it is in [`Inbound`]: a
+/// message without one is not a state the runtime wrote. `payload` is read only for an edit
+/// ([`SESSION_EDIT_KIND`]), and a message without one reads as an edit nothing applies.
 ///
 /// [`Inbound`]: crate::agent::Inbound
 #[derive(Deserialize)]
 struct ListedInbound {
     kind: String,
+    #[serde(default)]
+    payload: Value,
 }
 
 impl RoundFacts {
@@ -318,6 +465,7 @@ impl RoundFacts {
             // for ever.
             header: None,
             close_asked: true,
+            edits: Vec::new(),
             status: if rec.status.is_open() {
                 rec.status
             } else {
@@ -353,11 +501,29 @@ impl RoundFacts {
         Some(Self {
             header: header_of(agent),
             close_asked: state.inbox.iter().any(|i| i.kind == SESSION_CLOSE_KIND),
+            edits: state
+                .inbox
+                .iter()
+                .filter(|i| i.kind == SESSION_EDIT_KIND)
+                .filter_map(|i| SessionEditRequest::from_payload(&i.payload))
+                .collect(),
             status: rec.status,
             error: state.error,
             hb: state.hb,
             agent_wake: state.agent_wake,
         })
+    }
+
+    /// `header` with the edits this round was delivered and never read applied, in the order they
+    /// arrived ([ADR 0054], decision 11): what a listing and a view read, so an edit a round ended
+    /// before reading is not lost, and the next round carries it.
+    ///
+    /// [ADR 0054]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md
+    fn with_pending_edits(&self, mut header: SessionHeader) -> SessionHeader {
+        for edit in &self.edits {
+            header.apply_edit(edit);
+        }
+        header
     }
 
     /// Whether the round waits for the person: it is parked with no timer, as
@@ -843,6 +1009,250 @@ impl SessionConfig {
     /// [ADR 0054]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md
     pub fn from_value(value: Value) -> Result<Self, Refusal> {
         serde_json::from_value(value).map_err(|e| Refusal::new(None, e.to_string()))
+    }
+
+    /// The config a round that is running adopts from `edit` ([ADR 0054], decision 11): every option
+    /// takes the edit's value, **except** the ones decision 4's table marks *next round*
+    /// ([`next_round_only`](Self::next_round_only)), which stay as the round has them — the header
+    /// carries the edit's, so the next round applies those.
+    ///
+    /// `self` is the config the round runs with, `edit` the one the header now holds.
+    ///
+    /// [ADR 0054]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md
+    #[must_use]
+    pub fn adopted_mid_round(&self, edit: &Self) -> Self {
+        let mut adopted = edit.clone();
+        let kept = self.next_round_only();
+        adopted.time_limit = kept.time_limit;
+        adopted.max_rounds = kept.max_rounds;
+        adopted.report_schema = kept.report_schema;
+        adopted.instructions = kept.instructions;
+        adopted
+    }
+
+    /// The options decision 4's table marks *next round*: an edit of a working round leaves them
+    /// pending in the header, and the next round applies them. `time_limit` and `max_rounds` are
+    /// read where a round starts, `instructions` is the round's system prompt and `report_schema`
+    /// the gate of its final answer, so none of them moves under a round that is running.
+    ///
+    /// A slice that adds an option with *next round* in that column adds it here, and to
+    /// [`adopted_mid_round`](Self::adopted_mid_round), or an edit would apply it mid-round.
+    ///
+    /// [ADR 0054]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md
+    #[must_use]
+    pub fn next_round_only(&self) -> Self {
+        Self {
+            time_limit: self.time_limit,
+            max_rounds: self.max_rounds,
+            report_schema: self.report_schema.clone(),
+            instructions: self.instructions.clone(),
+            ..Self::default()
+        }
+    }
+}
+
+/// A **patch** of a [`SessionConfig`] ([ADR 0054], decision 11): `subagent_edit`'s `config`, where a
+/// member set to `null` returns that option to the folder's and a member left out is not touched.
+///
+/// It is a type of its own because [`SessionConfig`] cannot say the difference: an absent option is
+/// the folder's, so "leave it alone" and "return it to the folder's" would be the same bytes. The
+/// tool and the A2A front both build one from their spelling of the wire (snake_case for the model,
+/// camelCase for a person) and hand it to [`apply`](Self::apply), so the two cannot merge
+/// differently.
+///
+/// It is `#[non_exhaustive]` for the same reason as [`SessionConfig`]: a slice that adds an option
+/// adds it here.
+///
+/// [ADR 0054]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+#[non_exhaustive]
+pub struct SessionPatch {
+    /// `Some(None)` returns the option to the folder's; `Some(Some(v))` sets it; `None` leaves it.
+    #[serde(
+        default,
+        deserialize_with = "double_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub max_turns: Option<Option<u32>>,
+    /// See [`max_turns`](Self::max_turns).
+    #[serde(
+        default,
+        deserialize_with = "double_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub max_tool_calls: Option<Option<u32>>,
+    /// See [`max_turns`](Self::max_turns).
+    #[serde(
+        default,
+        deserialize_with = "double_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub max_output_tokens: Option<Option<u32>>,
+    /// See [`max_turns`](Self::max_turns).
+    #[serde(
+        default,
+        deserialize_with = "double_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub context_window: Option<Option<u32>>,
+    /// See [`max_turns`](Self::max_turns).
+    #[serde(
+        default,
+        deserialize_with = "double_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub max_parallel_tool_calls: Option<Option<u32>>,
+    /// See [`max_turns`](Self::max_turns).
+    #[serde(
+        default,
+        deserialize_with = "double_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub time_limit: Option<Option<u32>>,
+    /// See [`max_turns`](Self::max_turns).
+    #[serde(
+        default,
+        deserialize_with = "double_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub max_rounds: Option<Option<u32>>,
+    /// See [`max_turns`](Self::max_turns).
+    #[serde(
+        default,
+        deserialize_with = "double_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub token_budget: Option<Option<u64>>,
+    /// See [`max_turns`](Self::max_turns).
+    #[serde(
+        default,
+        deserialize_with = "double_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub tools: Option<Option<Vec<String>>>,
+    /// See [`max_turns`](Self::max_turns).
+    #[serde(
+        default,
+        deserialize_with = "double_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub deny_tools: Option<Option<Vec<String>>>,
+    /// See [`max_turns`](Self::max_turns).
+    #[serde(
+        default,
+        deserialize_with = "double_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub report_schema: Option<Option<Value>>,
+    /// See [`max_turns`](Self::max_turns).
+    #[serde(
+        default,
+        deserialize_with = "double_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub instructions: Option<Option<String>>,
+}
+
+/// Read a **present** member of a patch as `Some(..)` whatever it is, so that a member set to
+/// `null` is `Some(None)` (a reset) and an absent one — the field's `default` — is `None` (not
+/// touched). Serde's own `Option` reads `null` as `None`, which cannot tell the two apart.
+fn double_option<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer).map(Some)
+}
+
+impl SessionPatch {
+    /// Read a `config` object of an edit, in the header's own spelling (camelCase). **An unknown
+    /// member is refused**, as [`SessionConfig::from_value`] does: an ignored narrowing fails open.
+    ///
+    /// # Errors
+    ///
+    /// A [`Refusal`] naming the member that is not an option, or the one whose value is not of its
+    /// type.
+    pub fn from_value(value: Value) -> Result<Self, Refusal> {
+        serde_json::from_value(value).map_err(|e| Refusal::new(None, e.to_string()))
+    }
+
+    /// Whether the patch names no option at all.
+    pub fn is_empty(&self) -> bool {
+        self.members().is_empty()
+    }
+
+    /// The options the patch names, camelCase as the wire spells them, in the ADR's order: those it
+    /// sets and those it returns to the folder's.
+    #[must_use]
+    pub fn members(&self) -> Vec<String> {
+        let mut named = Vec::new();
+        let mut name = |own: &str, set: bool| {
+            if set {
+                named.push(own.to_owned());
+            }
+        };
+        name("maxTurns", self.max_turns.is_some());
+        name("maxToolCalls", self.max_tool_calls.is_some());
+        name("maxOutputTokens", self.max_output_tokens.is_some());
+        name("contextWindow", self.context_window.is_some());
+        name(
+            "maxParallelToolCalls",
+            self.max_parallel_tool_calls.is_some(),
+        );
+        name("timeLimit", self.time_limit.is_some());
+        name("maxRounds", self.max_rounds.is_some());
+        name("tokenBudget", self.token_budget.is_some());
+        name("tools", self.tools.is_some());
+        name("denyTools", self.deny_tools.is_some());
+        name("reportSchema", self.report_schema.is_some());
+        name("instructions", self.instructions.is_some());
+        named
+    }
+
+    /// `base` with this patch applied: every member the patch names is set, or, for `Some(None)`,
+    /// returned to the folder's. A member the patch leaves out is `base`'s. `None` for a base is the
+    /// folder's own settings, which is what a start patches.
+    #[must_use]
+    pub fn apply(&self, base: Option<&SessionConfig>) -> SessionConfig {
+        let mut config = base.cloned().unwrap_or_default();
+        if let Some(v) = &self.max_turns {
+            config.max_turns = *v;
+        }
+        if let Some(v) = &self.max_tool_calls {
+            config.max_tool_calls = *v;
+        }
+        if let Some(v) = &self.max_output_tokens {
+            config.max_output_tokens = *v;
+        }
+        if let Some(v) = &self.context_window {
+            config.context_window = *v;
+        }
+        if let Some(v) = &self.max_parallel_tool_calls {
+            config.max_parallel_tool_calls = *v;
+        }
+        if let Some(v) = &self.time_limit {
+            config.time_limit = *v;
+        }
+        if let Some(v) = &self.max_rounds {
+            config.max_rounds = *v;
+        }
+        if let Some(v) = &self.token_budget {
+            config.token_budget = *v;
+        }
+        if let Some(v) = &self.tools {
+            config.tools = v.clone();
+        }
+        if let Some(v) = &self.deny_tools {
+            config.deny_tools = v.clone();
+        }
+        if let Some(v) = &self.report_schema {
+            config.report_schema = v.clone();
+        }
+        if let Some(v) = &self.instructions {
+            config.instructions = v.clone();
+        }
+        config
     }
 }
 
@@ -1454,7 +1864,10 @@ fn read_latest(
     Latest {
         state,
         outcome,
-        header: facts.header.clone(),
+        header: facts
+            .header
+            .clone()
+            .map(|header| facts.with_pending_edits(header)),
         closed,
         idle_expired,
         status,
@@ -1489,14 +1902,15 @@ pub(crate) fn page_of_sessions(
             let mut runs = ordered(runs);
             let round = u32::try_from(runs.len()).unwrap_or(u32::MAX);
             let (latest, facts) = runs.pop()?;
-            // The report is of the newest round that worked: all of them but a closing one.
+            // The report is of the newest round that worked: all of them but a closing one, and one
+            // that only edited the session.
             let worked = runs
                 .iter()
                 .rev()
-                .find(|(_, f)| !f.header.as_ref().is_some_and(|h| h.closing))
+                .find(|(_, f)| !f.header.as_ref().is_some_and(|h| h.closing || h.editing))
                 .map_or(&latest, |(r, _)| r);
             let read = read_latest(&latest, &facts, now, idle_ttl);
-            let report = if read.header.as_ref().is_some_and(|h| h.closing) {
+            let report = if read.header.as_ref().is_some_and(|h| h.closing || h.editing) {
                 ReportRound::of(worked)
             } else {
                 // The report is of `latest`, whose status `read_latest` already read: no second
@@ -1614,10 +2028,11 @@ impl SessionView {
         let runs = ordered(runs);
         let round = u32::try_from(runs.len()).unwrap_or(u32::MAX);
         let last = runs.len().checked_sub(1)?;
-        // The report is the last round that did work: a round that only closes the session has none.
+        // The report is the last round that did work: a round that only closes the session has none,
+        // and neither has one that only edits it.
         let worked = runs
             .iter()
-            .rposition(|(_, f)| !f.header.as_ref().is_some_and(|h| h.closing))
+            .rposition(|(_, f)| !f.header.as_ref().is_some_and(|h| h.closing || h.editing))
             .unwrap_or(last);
         let (latest, facts) = &runs[last];
         // A deleted session is gone (ADR 0054 decision 10): not listed, and every tool's `view` is
@@ -1769,6 +2184,8 @@ mod tests {
             visible: false,
             config: None,
             spent: 0,
+            editing: false,
+            edits: Vec::new(),
         };
         let encoded = serde_json::to_value(&header).unwrap();
         assert_eq!(
@@ -1808,11 +2225,169 @@ mod tests {
             visible: false,
             config: None,
             spent: 0,
+            editing: false,
+            edits: Vec::new(),
         };
         let payload = closing_round_payload(&header);
         assert_eq!(payload[SESSION_CLOSE_ROUND_KEY], Value::Bool(true));
         assert_eq!(payload.as_object().map(|o| o.len()), Some(2));
         assert_eq!(header_of(&payload), Some(header));
+    }
+
+    /// An editing round says `editing` and carries its header, as a closing round says `closing`:
+    /// the round calls no model and has no report ([ADR 0054], decision 11).
+    ///
+    /// [ADR 0054]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md
+    #[test]
+    fn an_editing_round_says_edit_and_carries_its_header() {
+        let mut header = header(RunId::new(), true, false);
+        header.editing = true;
+        header.round = 4;
+        header.config = Some(SessionConfig {
+            max_turns: Some(10),
+            ..SessionConfig::default()
+        });
+        header.record_edit(SessionEdit {
+            round: 4,
+            by: SessionEditor::Person,
+            members: vec!["maxTurns".to_owned()],
+        });
+        let payload = editing_round_payload(&header);
+        assert_eq!(payload[SESSION_EDIT_ROUND_KEY], Value::Bool(true));
+        assert_eq!(payload.as_object().map(|o| o.len()), Some(2));
+        assert_eq!(header_of(&payload), Some(header));
+    }
+
+    /// A patch of a config ([ADR 0054], decision 11): a member set to `null` returns that option to
+    /// the folder's, a member left out is not touched, and an unknown one is refused.
+    ///
+    /// [ADR 0054]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md
+    #[test]
+    fn a_patch_sets_resets_and_leaves_the_rest() {
+        let base = SessionConfig {
+            max_turns: Some(20),
+            max_output_tokens: Some(2048),
+            ..SessionConfig::default()
+        };
+        let patch = SessionPatch::from_value(serde_json::json!({
+            "maxTurns": 10,
+            "maxOutputTokens": null,
+            "tokenBudget": 5000
+        }))
+        .expect("a patch");
+        assert_eq!(
+            patch.members(),
+            vec!["maxTurns", "maxOutputTokens", "tokenBudget"]
+        );
+        let merged = patch.apply(Some(&base));
+        assert_eq!(merged.max_turns, Some(10), "set");
+        assert_eq!(
+            merged.max_output_tokens, None,
+            "null returns it to the folder's"
+        );
+        assert_eq!(merged.token_budget, Some(5000), "a member the base lacks");
+        assert_eq!(
+            patch.apply(None).max_turns,
+            Some(10),
+            "a start patches the folder's own"
+        );
+        assert!(SessionPatch::from_value(serde_json::json!({"turbo": 1})).is_err());
+        assert!(
+            SessionPatch::from_value(serde_json::json!({}))
+                .expect("an empty patch")
+                .is_empty()
+        );
+    }
+
+    /// An edit of a working round applies the options the ADR marks *next model call* and leaves
+    /// the *next round* ones as the round has them, which the header keeps as pending
+    /// ([ADR 0054], decision 11).
+    ///
+    /// [ADR 0054]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md
+    #[test]
+    fn an_edit_of_a_running_round_adopts_next_model_call_options_only() {
+        let schema = |kind: &str| Some(serde_json::json!({"type": kind}));
+        let running = SessionConfig {
+            max_turns: Some(20),
+            max_output_tokens: Some(2048),
+            time_limit: Some(5),
+            max_rounds: Some(8),
+            report_schema: schema("object"),
+            instructions: Some("the round's words".into()),
+            ..SessionConfig::default()
+        };
+        let edit = SessionConfig {
+            max_turns: Some(10),
+            max_output_tokens: Some(512),
+            time_limit: Some(9),
+            max_rounds: Some(2),
+            report_schema: schema("string"),
+            instructions: Some("the next round's words".into()),
+            ..SessionConfig::default()
+        };
+        let adopted = running.adopted_mid_round(&edit);
+        assert_eq!(adopted.max_turns, Some(10), "next model call");
+        assert_eq!(adopted.max_output_tokens, Some(512), "next model call");
+        assert_eq!(adopted.time_limit, Some(5), "next round");
+        assert_eq!(adopted.max_rounds, Some(8), "next round");
+        assert_eq!(adopted.report_schema, running.report_schema, "next round");
+        assert_eq!(adopted.instructions, running.instructions, "next round");
+    }
+
+    /// The header keeps the last [`MAX_SESSION_EDITS`] edits ([ADR 0054], decision 11).
+    ///
+    /// [ADR 0054]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md
+    #[test]
+    fn a_header_keeps_the_last_sixteen_edits() {
+        let mut header = header(RunId::new(), true, false);
+        for round in 1..=18 {
+            header.record_edit(SessionEdit {
+                round,
+                by: SessionEditor::Person,
+                members: Vec::new(),
+            });
+        }
+        assert_eq!(header.edits.len(), MAX_SESSION_EDITS);
+        assert_eq!(header.edits.first().map(|e| e.round), Some(3));
+        assert_eq!(header.edits.last().map(|e| e.round), Some(18));
+    }
+
+    /// An edit a round was delivered and never read stays in its inbox, and a reader of the session
+    /// applies it: a round that ended first does not lose it, and the next round carries it
+    /// ([ADR 0054], decision 11).
+    ///
+    /// [ADR 0054]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md
+    #[test]
+    fn an_edit_a_round_never_read_is_applied_by_its_reader() {
+        let id = RunId::new();
+        let mut header = header(id, true, false);
+        header.config = Some(SessionConfig {
+            max_turns: Some(20),
+            ..SessionConfig::default()
+        });
+        let request = SessionEditRequest {
+            config: Some(SessionConfig {
+                max_turns: Some(10),
+                ..SessionConfig::default()
+            }),
+            by: SessionEditor::Agent,
+            members: vec!["maxTurns".to_owned()],
+        };
+        let inbox = vec![crate::agent::Inbound::new(
+            SESSION_EDIT_KIND,
+            serde_json::to_value(&request).expect("the request serialises"),
+        )];
+        let rec = with_header(id, Some(header), RunStatus::Done, inbox);
+        let view = SessionView::from_rounds(id, vec![rec], t0(), idle_ttl()).expect("a session");
+        let header = view.header.expect("a header");
+        assert_eq!(
+            header.config.and_then(|config| config.max_turns),
+            Some(10),
+            "the reader applies the edit the round never read"
+        );
+        assert_eq!(header.edits.len(), 1);
+        assert_eq!(header.edits[0].round, 1);
+        assert_eq!(header.edits[0].by, SessionEditor::Agent);
     }
 
     /// The tokens a session spent ([ADR 0054], decision 6) are a field of its header: they
@@ -2057,6 +2632,8 @@ mod tests {
             visible: false,
             config: None,
             spent: 0,
+            editing: false,
+            edits: Vec::new(),
         }
     }
 

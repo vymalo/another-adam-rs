@@ -1433,7 +1433,7 @@ The failure interleavings, their tests and what the design refuses are in
 ### Child sessions
 
 A subagent can also run in the background as a **session** ([ADR 0045](decisions/0045-a-subagent-can-run-in-the-background-as-a-session.md)):
-a conversation of child runs ("rounds") in the parent's own conversation, started, read, sent to and closed by five tools
+a conversation of child runs ("rounds") in the parent's own conversation, started, read, sent to, edited and closed by six tools
 that return at once. The parent parks only when a read asks to wait, or when its model answers while a session it started
 still works or a round ended and was not yet reported. A round that ends meanwhile is told to the model by its next call: the
 journaled step `model:<turn>` lists the sessions first and records the reports it appended (`reports`, no new step). A round that ended during the final call is read at the end of the turn with `wait_<turn>`, which answers at once and does not park. The sequence, the states and the interleavings are in [Child runs](reference/child-runs.md#sessions-adr-0045-slices-1-to-4).

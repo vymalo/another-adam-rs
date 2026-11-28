@@ -1,4 +1,4 @@
-//! Child sessions seen from an `LlmAgent` parent (ADR 0045, slice 2): the five tools that run a
+//! Child sessions seen from an `LlmAgent` parent (ADR 0045, slice 2): the six tools that run a
 //! subagent in the background (`subagent_start`, `_send`, `_read`, `_close`, `_list`), the wait a
 //! parent's turn makes for the sessions it started, and the interleavings that must not change what
 //! the model is told.
@@ -659,6 +659,23 @@ fn send_call(id: &str, session: RunId, message: &str) -> ToolCall {
     )
 }
 
+fn edit_call(id: &str, session: RunId, config: Value) -> ToolCall {
+    call(
+        id,
+        "subagent_edit",
+        json!({"session": session.to_string(), "config": config}),
+    )
+}
+
+fn start_call_with_config(id: &str, keep_open: bool, config: Value) -> ToolCall {
+    call(
+        id,
+        "subagent_start",
+        json!({"agent": "helper", "description": "look at it", "prompt": "do the work",
+               "keep_open": keep_open, "config": config}),
+    )
+}
+
 fn close_call(id: &str, session: RunId, cancel: bool) -> ToolCall {
     call(
         id,
@@ -929,6 +946,8 @@ async fn start_persons_round_with(
         visible: true,
         config,
         spent: 0,
+        editing: false,
+        edits: Vec::new(),
     };
     let mut first = user_message(text);
     first.payload["session"] = serde_json::to_value(&header).unwrap();
@@ -1611,6 +1630,233 @@ mod cases {
             requests[1].messages.last(),
             Some(&Message::user_text("do it differently"))
         );
+    }
+
+    /// An edit of a working round applies from its next model call ([ADR 0054], decision 11): the
+    /// round reads it at the step after the tool call it made, and journals it there, so it makes
+    /// no round of its own.
+    ///
+    /// [ADR 0054]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md
+    pub async fn an_edit_of_a_working_round_changes_its_next_model_call(store: DynStore) {
+        let (rig, _ran) = Rig::new().holding(0).with_child_tools();
+        rig.child_mock
+            .push_tool_calls(vec![call("r", "read_file", json!({}))])
+            .push_text("done");
+        let (parent_agent, child_agent) = (rig.parent(), rig.child());
+        let rt = rig.together(&store, &parent_agent, &child_agent);
+        let conv = conv_id();
+        let parent = rig.start(&rt, &conv).await;
+        let session = child_run_id(parent, "c1");
+        rig.parent_mock
+            .push_tool_calls(vec![start_call_with_config(
+                "c1",
+                true,
+                json!({"maxOutputTokens": 2048}),
+            )])
+            .push_tool_calls(vec![edit_call(
+                "c2",
+                session,
+                json!({"max_output_tokens": 512}),
+            )])
+            .push_tool_calls(vec![read_call("c3", session, true)])
+            .push_text("edited it");
+        let worker = spawn_worker(&rt);
+        reached(&rig.child_gate.reached, "the child's model call").await;
+        wait_for_state(&rt, parent, "the edit to be answered", |_, state| {
+            tool_results(state).iter().any(|(id, _, _)| id == "c2")
+        })
+        .await;
+        rig.child_gate.release.notify_one();
+        wait_done(&rt, parent).await;
+        worker.stop().await;
+        let results = tool_results(&state_of(&rt, parent).await);
+        let edited = as_json(&result_of(&results, "c2").1);
+        assert_eq!(edited["delivered"], "steered", "{edited}");
+        assert_eq!(edited["edited"], json!(["maxOutputTokens"]), "{edited}");
+        let requests = rig.child_mock.requests();
+        assert_eq!(requests.len(), 2, "the edit made no round of its own");
+        assert_eq!(requests[0].max_output_tokens, Some(2048));
+        assert_eq!(
+            requests[1].max_output_tokens,
+            Some(512),
+            "the round's next call runs with the edit"
+        );
+        let view = rt
+            .session_view(&conv, session)
+            .await
+            .unwrap()
+            .expect("the session");
+        let header = view.header.expect("a round of a session has a header");
+        assert_eq!(
+            header.config.and_then(|config| config.max_output_tokens),
+            Some(512)
+        );
+        assert_eq!(header.edits.len(), 1);
+        assert_eq!(header.edits[0].round, 1, "the round that read it");
+        assert_eq!(header.edits[0].by, adam_runtime::SessionEditor::Agent);
+        assert_eq!(header.edits[0].members, vec!["maxOutputTokens".to_owned()]);
+    }
+
+    /// An edit of an idle session is a round that calls no model and has no report ([ADR 0054],
+    /// decision 11): it counts toward `max_rounds`, and a read still gives the last round that
+    /// worked. The next round runs with the new options.
+    ///
+    /// [ADR 0054]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md
+    pub async fn an_edit_of_an_idle_session_is_a_round_that_calls_no_model(store: DynStore) {
+        let rig = Rig::new();
+        rig.child_mock.push_text("kept answer").push_text("went on");
+        let (parent_agent, child_agent) = (rig.parent(), rig.child());
+        let rt = rig.together(&store, &parent_agent, &child_agent);
+        let conv = conv_id();
+        let parent = rig.start(&rt, &conv).await;
+        let session = child_run_id(parent, "c1");
+        rig.parent_mock
+            .push_tool_calls(vec![start_call("c1", true)])
+            .push_tool_calls(vec![read_call("c2", session, true)])
+            .push_tool_calls(vec![edit_call(
+                "c3",
+                session,
+                json!({"max_output_tokens": 512}),
+            )])
+            .push_tool_calls(vec![read_call("c4", session, true)])
+            .push_tool_calls(vec![send_call("c5", session, "go on")])
+            .push_tool_calls(vec![read_call("c6", session, true)])
+            .push_text("edited and sent");
+        let worker = spawn_worker(&rt);
+        wait_done(&rt, parent).await;
+        worker.stop().await;
+        let results = tool_results(&state_of(&rt, parent).await);
+        let edited = as_json(&result_of(&results, "c3").1);
+        assert_eq!(edited["edited"], json!(["maxOutputTokens"]), "{edited}");
+        assert_eq!(edited["round"], 2, "the round it started");
+        // The editing round has no report: a read still gives the round that worked.
+        let read = &result_of(&results, "c4").1;
+        assert!(read.contains("kept answer"), "{read}");
+        assert!(read.contains("idle"), "{read}");
+        let requests = rig.child_mock.requests();
+        assert_eq!(requests.len(), 2, "the edit called no model, the send did");
+        assert_eq!(
+            requests[1].max_output_tokens,
+            Some(512),
+            "the round after the edit runs with it"
+        );
+        let list = rt
+            .list_sessions(&conv, &[&rig.child_name], 0, 10)
+            .await
+            .unwrap();
+        assert_eq!(
+            list.sessions[0].round, 3,
+            "an edit is a round, and so is the send"
+        );
+        let view = rt
+            .session_view(&conv, session)
+            .await
+            .unwrap()
+            .expect("the session");
+        let header = view.header.expect("a round of a session has a header");
+        assert_eq!(
+            header.config.and_then(|config| config.max_output_tokens),
+            Some(512)
+        );
+        assert_eq!(header.edits.len(), 1, "the send carried the edit's history");
+        assert_eq!(header.edits[0].round, 2);
+        assert!(!header.editing, "a later round is not an editing one");
+    }
+
+    /// An edit past a bound is refused in words, as a start is, and the session is left as it was
+    /// ([ADR 0054], decision 11).
+    ///
+    /// [ADR 0054]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md
+    pub async fn an_edit_past_a_bound_is_refused_and_changes_nothing(store: DynStore) {
+        let rig = Rig::new();
+        rig.child_mock.push_text("kept answer");
+        let (parent_agent, child_agent) = (rig.parent(), rig.child());
+        let rt = rig.together(&store, &parent_agent, &child_agent);
+        let conv = conv_id();
+        let parent = rig.start(&rt, &conv).await;
+        let session = child_run_id(parent, "c1");
+        rig.parent_mock
+            .push_tool_calls(vec![start_call("c1", true)])
+            .push_tool_calls(vec![edit_call(
+                "c2",
+                session,
+                json!({"max_turns": 500, "max_output_tokens": 512}),
+            )])
+            .push_text("refused");
+        let worker = spawn_worker(&rt);
+        wait_done(&rt, parent).await;
+        worker.stop().await;
+        let results = tool_results(&state_of(&rt, parent).await);
+        let (_, refusal, is_error) = result_of(&results, "c2");
+        assert!(*is_error, "{refusal}");
+        assert!(
+            refusal.contains("config.max_turns is 500; at most 50"),
+            "{refusal}"
+        );
+        let view = rt
+            .session_view(&conv, session)
+            .await
+            .unwrap()
+            .expect("the session");
+        let header = view.header.expect("a round of a session has a header");
+        assert!(
+            header.config.is_none(),
+            "nothing of a refused edit is kept: {:?}",
+            header.config
+        );
+        assert!(header.edits.is_empty(), "and it is no edit of the history");
+        let list = rt
+            .list_sessions(&conv, &[&rig.child_name], 0, 10)
+            .await
+            .unwrap();
+        assert_eq!(list.sessions[0].round, 1, "a refusal starts no round");
+    }
+
+    /// A retried edit finds the round it started: one round, one entry in the history, and the
+    /// child asked once ([ADR 0054], decision 11).
+    ///
+    /// [ADR 0054]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md
+    pub async fn a_retried_edit_applies_once(store: DynStore) {
+        let rig = Rig::new();
+        rig.child_mock.push_text("kept answer");
+        let parent_agent = rig.parent_with(|tool| {
+            if tool.spec().name == "subagent_edit" {
+                Arc::new(Blip { inner: tool })
+            } else {
+                tool
+            }
+        });
+        let child_agent = rig.child();
+        let rt = rig.together(&store, &parent_agent, &child_agent);
+        let conv = conv_id();
+        let parent = rig.start(&rt, &conv).await;
+        let session = child_run_id(parent, "c1");
+        rig.parent_mock
+            .push_tool_calls(vec![start_call("c1", true)])
+            .push_tool_calls(vec![edit_call(
+                "c2",
+                session,
+                json!({"max_output_tokens": 512}),
+            )])
+            .push_text("edited once");
+        let worker = spawn_worker(&rt);
+        wait_done(&rt, parent).await;
+        worker.stop().await;
+        let results = tool_results(&state_of(&rt, parent).await);
+        assert!(!result_of(&results, "c2").2, "the retry answered");
+        let list = rt
+            .list_sessions(&conv, &[&rig.child_name], 0, 10)
+            .await
+            .unwrap();
+        assert_eq!(list.sessions[0].round, 2, "one editing round");
+        let view = rt
+            .session_view(&conv, session)
+            .await
+            .unwrap()
+            .expect("the session");
+        let header = view.header.expect("a round of a session has a header");
+        assert_eq!(header.edits.len(), 1, "one edit in the history");
+        assert_eq!(rig.child_mock.requests().len(), 1, "no model call at all");
     }
 
     /// Closing an idle session takes one round that calls no model; the session is then closed.
@@ -3007,6 +3253,8 @@ mod cases {
             visible: false,
             config: None,
             spent: 0,
+            editing: false,
+            edits: Vec::new(),
         };
         let mut first = user_message("old work");
         first.payload["session"] = serde_json::to_value(&header).unwrap();
@@ -5328,6 +5576,8 @@ mod cases {
             visible: false,
             config: None,
             spent: 0,
+            editing: false,
+            edits: Vec::new(),
         };
         rt.start_child_continuing(
             cleanup,
@@ -6258,10 +6508,10 @@ fn the_guide_is_the_same_bytes_under_any_limits_and_any_order() {
     );
 }
 
-/// The five specs, as the model sees them, pinned: a spec is the model's contract, so a change is
+/// The six specs, as the model sees them, pinned: a spec is the model's contract, so a change is
 /// deliberate. Regenerate with `ADAM_UPDATE_SNAPSHOTS=1 cargo test -p adam-llm-agent --test sessions`.
 #[test]
-fn the_five_specs_are_pinned() {
+fn the_six_specs_are_pinned() {
     let roster = SessionTools::new([
         SessionAgent {
             name: "reviewer".into(),
@@ -6316,6 +6566,10 @@ macro_rules! session_suite {
                 a_kept_open_session_continues_in_round_two,
                 a_message_to_a_working_round_is_steered,
                 closing_an_idle_session_takes_a_round_that_calls_no_model,
+                an_edit_of_a_working_round_changes_its_next_model_call,
+                an_edit_of_an_idle_session_is_a_round_that_calls_no_model,
+                an_edit_past_a_bound_is_refused_and_changes_nothing,
+                a_retried_edit_applies_once,
                 closing_a_working_session_lets_the_round_finish,
                 closing_with_cancel_stops_the_round,
                 the_list_orders_open_sessions_first_and_pages,
