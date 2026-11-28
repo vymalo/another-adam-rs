@@ -325,7 +325,7 @@ session is left as it was. The whole admitted config travels, so the round that 
 
 * **A working round** receives `adam.session.edit` in its inbox (not counted as unread input: it does not reopen a round that is
   finishing) and reads it at its next step. The options that apply at the next model call take effect there; the others
-  (`time_limit`, `max_rounds`, `report_schema`, and `instructions` when it is settable) are pending in the header and apply from
+  (`time_limit`, `max_rounds`, `report_schema`, `skills`, and `instructions` when it is settable) are pending in the header and apply from
   the next round. A round that ends before reading it leaves it in its inbox, where a reader of the session applies it, so an
   edit is never lost.
 * **An idle session** gets a round that calls no model and has no report (`header.editing`), as a close of an idle session does:
