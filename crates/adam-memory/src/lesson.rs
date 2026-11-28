@@ -311,7 +311,7 @@ impl LessonSettings {
 /// bounded.
 /// Validate a draft and turn it into the lesson an adapter stores.
 ///
-/// This is the half of [`Memory::record`] that is the **rules** rather than the storage: the scrub,
+/// This is the half of [`Memory::record`](crate::Memory::record) that is the **rules** rather than the storage: the scrub,
 /// the redaction marker, the bounds and the address check. Every adapter calls it first, so the
 /// rules cannot drift between them. `now` is the adapter's clock.
 ///
