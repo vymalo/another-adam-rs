@@ -315,7 +315,7 @@ its parent.
 conversation, and otherwise the latest round (`SessionView`: its status and output as a parent reads a child, its number,
 `SessionState`, whether the session takes more messages, which run started it, and `waiting` with `waiting_reason` when the
 round is parked with no timer: it asks the person, or the model refused it until woken, and only an answer moves it). Whether a session is **closed** is read from
-the latest round: its `SessionHeader` (`session` in the round's agent state: id, agent, description, `keep_open`, `closed`,
+the latest round: its `SessionHeader` (`session` in the round's agent state: id, agent, description, `mode` (below), `closed`,
 `closing`, `round`, `visible` (a client that activated `child-sessions/v1` sees the session, so a round of it may ask the
 person, ADR 0045 decision 9; a `SessionHeader` literal needs it too), `config` (the admitted session configuration, ADR 0054
 slice 1 part 1, absent when none; **a `SessionHeader` literal needs it too**), and `root`: the run the round's model calls name, the
@@ -333,6 +333,19 @@ round only closes the session (it calls no model and reports nothing new), so a 
 leave it alone. **Breaking (ADR 0045 slice 3):** `SessionSummary` has a sixth field, `report` (`ReportRound`: the run, whether it ended or was cancelled, who started it
 and when it was last updated), the round the session's report is of: the latest that worked, so a closing round that follows does not hide it.
 A struct literal of `SessionSummary` stops compiling.
+
+**Who may write a session: `SessionMode` (ADR 0087 slice C2).** A closed enum, narrowest first: `OneShot` (the default: the
+session closes when its round has ended), `Sealed` (it stays open; only the agent that started it writes to it) and `Open` (the
+person writes to it too). `as_str` and `parse` are the words `one_shot`, `sealed`, `open`; `of_keep_open` maps the `keep_open`
+of before (`true` is `Open`), `keeps_open` says whether a round leaves the session idle, `takes_person_messages` whether a
+person may write to an agent's session, and `SessionHeader::takes_person_messages` adds that a person's own session (it names
+no `root`) is theirs whatever its mode. **Breaking:** `SessionHeader::keep_open` is `SessionHeader::mode`, and
+`SessionSummary::keep_open` is `SessionSummary::mode` (`Open` for a session with no header). **On the wire** a header carries
+`mode` and, for one release, the `keep_open` it means, so a worker of before still reads a header a worker of now wrote (a
+`sealed` session reads as kept open there, with no refusal of the person's write); a header of before, with only `keep_open`,
+reads as `of_keep_open` says, and one with neither is no header. Tests: the units of `src/session.rs`
+(`a_header_carries_its_mode_and_one_of_before_reads_as_the_mode_keep_open_meant`,
+`a_person_writes_to_an_open_session_or_their_own`).
 
 **Breaking:** cancelling a parent cancels its children. A subagent run stops after 30 minutes unless its file says
 otherwise (`limits.max_minutes`). Take the inbox in every step that can park, including the

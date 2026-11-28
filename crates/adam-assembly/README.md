@@ -550,7 +550,8 @@ tools and its skills' tools, in the order of the manifest (`AgentInfo::tools` li
   slice C1): round 1 of a session under the id the call derives, closed from its start. It has a session's conversation
   id (`<parent escaped>/s/<id>`), so `subagent_list`, `child-sessions/v1` and the exporter see it; the parent's
   `subagent_send` and a person's message are refused (it is closed); the model gets its answer once, as the call's
-  result. A remote subagent's tool is unchanged (it starts no child run). Tests: `tests/subagents.rs`
+  result. A remote subagent's tool is unchanged (it starts no child run; slice C2 keeps it so, see
+  [remote sessions](#remote-sessions)). The header is `mode: one_shot` and `closed` (`SessionHeader`). Tests: `tests/subagents.rs`
   (`a_subagents_call_is_a_one_shot_session_that_is_closed_after_its_round`,
   `two_calls_of_one_turn_are_two_sessions_with_their_own_conversations`,
   `a_child_started_before_it_was_a_session_is_found_by_the_call`);
@@ -723,6 +724,15 @@ rules are the same and the token is never journaled or logged. Only the root's r
 * **Time and cancel.** A round has the limit `AgentDef::remote_timeout`. A round that is cancelled sends the remote
   `CancelTask` (`Agent::on_cancelled` of `adam-runtime`), best effort. A process that registered only the starter sends none;
   the next round of the session cancels what the round before left working.
+* **`mode` and `wait`** ([ADR 0087](../../docs/decisions/0087-every-child-is-a-session-and-the-one-shot-subagent-tool-goes.md)
+  slice C2) work as on a local session, because the rounds are local runs carrying the session's header: `one_shot` closes
+  after its round, `sealed` stays idle and the A2A front refuses the person's message and steer, `open` takes both, and
+  `wait: true` parks the start on round 1 and answers the remote's report. The remote is told nothing of the mode (no A2A
+  field carries it; we enforce it). **The remote subagent's own tool stays as it was**: it calls the remote from the
+  parent's step (`ToolError::AwaitRemote`), so it starts no child run and has no session or conversation id. It shares a
+  `files: true` answer as the parent's artifacts, which a round does not, and it exists when the root has no session tools,
+  while a round agent does not; slice C4 removes it (its use becomes `subagent_start` with `mode: one_shot` and
+  `wait: true`).
 * **Dev reload** does not replace the round agents: a changed remote needs a restart.
 * **Breaking.** A root with only remote subagents now has five more tools; `Assembly::agents()` is unchanged and the runtime
   has one more registered name per remote subagent.
@@ -941,7 +951,8 @@ place each:
 * `tests/remote_sessions.rs`: remote sessions against an in-process A2A server whose backend records what it was asked: the
   context carried across rounds, a steer and a queued message, a restart, a lost send response, a failed round, a question, a
   closing round, and the four cancel cases (`CancelTask` on close with cancel, on a cancelled parent, at the time limit, and
-  from the next round after a lost one). Memory, and PostgreSQL when set.
+  from the next round after a lost one), and `a_remote_session_takes_mode_and_wait_as_a_local_one_does` (ADR 0087 slice C2:
+  `sealed` with `wait: true`). Memory, and PostgreSQL when set.
 * `tests/subagents.rs`: a parent calls a subagent which calls its own (root, researcher, summarizer) on a
   `MockModel` through a `Runtime`, on the memory store and on PostgreSQL when `ADAM_TEST_POSTGRES_URL` is
   set: each model request's prompt, tool list and history asserted, the answers coming back as tool results,

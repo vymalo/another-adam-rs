@@ -90,3 +90,42 @@ has no conversation id, it is not listed by conversation, so the exporter of ADR
 * `child-sessions/v1` gains a member, and the orchestration layer's ADR in vymalo/another-agentic-system follows it.
 * `Runtime::start_child` stays for hosts that start plain child runs. The assembly stops using it for subagents.
 * No `Store` or `Notifier` method changes.
+
+*Amended 2026-11-28, slice C2 built:* `subagent_start` takes `mode` (`one_shot`, the default, `sealed` or `open`) and `wait`
+(default `false`), for local and remote subagents alike. `mode` is a closed enum, `adam_runtime::SessionMode`, and the
+session's header holds it (`SessionHeader::mode`) in place of `keep_open`. A header of before reads as what its `keep_open`
+meant (`true` is `open`, `false` is `one_shot`), and a header of now still writes `keep_open` beside `mode` for one release,
+so a worker of before reads it (to such a worker a `sealed` session is only kept open). C1's header is `one_shot` and
+`closed` from its start: unlike a `subagent_start` with `mode: one_shot`, nobody can steer its round, not even the parent. A
+call's `keep_open` is read for one release and mapped the same way; beside a `mode` that disagrees it is an error result
+naming both. **Who may write:** the parent may send to a `sealed` session; a person's message to an agent's session that is
+not `open`, and their steer of its round, are refused (`UnsupportedOperation`, naming the mode), on the A2A front's three
+paths, a message to the child context, a steer by the round's `taskId` and `steer/v1`. The person may still close it,
+cancel a round, answer a question and resume a parked round. Only an `open` round may ask the person. Where C2 differs from or
+adds to the decision:
+
+* **A person's own session is theirs whatever its mode**: it names no root run, so the refusal does not apply to it (and a
+  header written before `root`, which names none either, reads as a person's). A person's `start` takes `mode` `one_shot` or
+  `open`; `sealed` is refused, since it would leave the session to an agent that does not exist. So `one_shot` refuses a
+  person's steer of an agent's working round, which it did not before C2: `one_shot` is narrower than `sealed` (decision 4).
+* **`wait: true` reuses `ToolError::AwaitSession`**, not `AwaitRun`: the call parks as `subagent_read` with `wait: true`
+  does, and its result is that read's first page, whose header line names the session, so the model can send a `sealed` or
+  `open` session more. The report is counted as read and is never told again as a report. Observers see `session.started`
+  at the park and `session.round.ended` at the settle (ADR 0050, amended the same day).
+* **`child-sessions/v1` carries `mode`** on every session object, the parent's `sessions` rows, the events and the round
+  stream, with `keepOpen` beside it, so a client knows whether the person may write. This was C4's in the table of slices;
+  it is additive, and it is built here.
+* **A remote subagent:** a remote session honours `mode` and `wait` as a local one does, because its rounds are local runs
+  carrying the header; the remote agent is told nothing of the mode. **The remote subagent's own tool is unchanged**: it
+  calls the remote from the parent's step and starts no child run, so it has no session or conversation id. It shares a
+  `files: true` answer as the parent's artifacts, which a round does not, and a round agent exists only for a root that has
+  session tools. C4, which removes the tool, replaces it with `subagent_start` with `mode: one_shot` and `wait: true`.
+* The tool's description and schema changed once (`mode` and `wait` in, `keep_open` out of the schema), so the prompt's
+  stable prefix moved once; `subagent_list` says `mode=<word>` where it said `keep_open=<bool>`.
+
+Proof: `crates/adam-llm-agent/tests/sessions.rs` (`each_mode_is_kept_in_the_header_and_decides_what_follows_the_round`,
+`a_start_that_waits_answers_its_first_report_once`, `keep_open_maps_onto_mode_and_a_disagreement_is_refused`,
+`a_model_started_session_asks_only_when_the_client_shows_child_sessions`), `crates/adam-a2a-runtime/tests/child_sessions.rs`
+(`a_sealed_or_one_shot_session_of_the_agent_refuses_the_persons_message_and_steer`),
+`crates/adam-assembly/tests/remote_sessions.rs` (`a_remote_session_takes_mode_and_wait_as_a_local_one_does`) and the units
+of `crates/adam-runtime/src/session.rs` and `crates/adam-a2a-runtime/src/child_sessions.rs`.

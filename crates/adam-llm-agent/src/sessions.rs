@@ -24,7 +24,7 @@ use adam_core::RunId;
 use adam_model::ToolSpec;
 use adam_runtime::{
     Inbound, MAX_SESSION_PAGE, RuntimeError, SESSION_CLOSE_KIND, SessionBounds, SessionConfig,
-    SessionHeader, SessionLimits, SessionState, SessionSummary, SessionView,
+    SessionHeader, SessionLimits, SessionMode, SessionState, SessionSummary, SessionView,
 };
 use async_trait::async_trait;
 use serde_json::{Value, json};
@@ -328,6 +328,46 @@ fn bool_arg(args: &Value, key: &str, default: bool) -> Result<bool, String> {
     }
 }
 
+/// The [`SessionMode`] a `subagent_start` call asks for ([ADR 0087] slice C2): its `mode`, else
+/// the `keep_open` of before (read for one release: `true` is `open`, `false` is `one_shot`), else
+/// `one_shot`. Both given and disagreeing is the sentence that names both, as is a mode that is
+/// none of the three.
+///
+/// [ADR 0087]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0087-every-child-is-a-session-and-the-one-shot-subagent-tool-goes.md
+pub(crate) fn mode_arg(args: &Value) -> Result<SessionMode, String> {
+    let asked = match args.get("mode") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(word)) => Some(SessionMode::parse(word).ok_or_else(|| {
+            format!(
+                "`mode` is one of: {}; not `{}`",
+                mode_words(),
+                escape_text(word.chars().take(80).collect::<String>().as_bytes())
+            )
+        })?),
+        Some(_) => return Err(format!("`mode` must be one of: {}", mode_words())),
+    };
+    let kept = match args.get("keep_open") {
+        None | Some(Value::Null) => None,
+        Some(Value::Bool(keep)) => Some(*keep),
+        Some(_) => return Err("`keep_open` must be true or false".to_owned()),
+    };
+    match (asked, kept) {
+        (Some(mode), Some(keep)) if mode != SessionMode::of_keep_open(keep) => Err(format!(
+            "`keep_open` ({keep}) and `mode` ({mode}) disagree: `keep_open` {keep} is mode {}; \
+             give `mode` alone",
+            SessionMode::of_keep_open(keep)
+        )),
+        (asked, kept) => Ok(asked
+            .or(kept.map(SessionMode::of_keep_open))
+            .unwrap_or_default()),
+    }
+}
+
+/// The modes, as a refusal lists them: `one_shot, sealed, open`.
+fn mode_words() -> String {
+    SessionMode::ALL.map(SessionMode::as_str).join(", ")
+}
+
 /// The integer a model wrote for `key`, if it wrote one.
 fn int_arg(args: &Value, key: &str) -> Result<Option<i64>, String> {
     match args.get(key) {
@@ -568,15 +608,15 @@ fn is_busy_or_finished(e: &RuntimeError) -> bool {
     e.is_busy() || matches!(e, RuntimeError::Finished { .. })
 }
 
-/// The header of round 1 of `session`, on `agent`, started by the call of `ctx`: not kept open,
-/// not closed, no config. `subagent_start` and a one-shot session ([`start_one_shot`]) build theirs
+/// The header of round 1 of `session`, on `agent`, started by the call of `ctx`: one-shot, not
+/// closed, no config. `subagent_start` and a one-shot session ([`start_one_shot`]) build theirs
 /// from it, so the two cannot disagree on what a session started by a run says.
 fn first_header(ctx: &ToolCtx, session: RunId, agent: &str, description: String) -> SessionHeader {
     SessionHeader {
         id: session,
         agent: agent.to_owned(),
         description,
-        keep_open: false,
+        mode: SessionMode::OneShot,
         closed: false,
         closing: false,
         round: 1,
@@ -612,10 +652,11 @@ fn one_shot_description(message: &str) -> String {
 /// Start `agent` as a **one-shot session** of the run of `ctx` ([ADR 0087] slice C1): round 1 of a
 /// session whose id is [`ToolCtx::child_run_id`], with `message` as its first user message, a
 /// session's conversation id (`<parent escaped>/s/<session>`), and a header that says it is
-/// **closed from the start**: it is not kept open, so it closes when its round ends, and nobody (the
-/// parent, the person) can send to it meanwhile. It is `subagent_start` with `mode: one_shot` and
-/// `wait: true`, except that the caller waits on it ([`ToolError::AwaitRun`] with the returned id)
-/// and no session limit applies, as none applied to a subagent's own tool before.
+/// [`SessionMode::OneShot`] and **closed from the start**: it closes when its round ends, and
+/// nobody (the parent, the person) can send to it meanwhile, not even a steer. It is
+/// `subagent_start` with `mode: one_shot` and `wait: true`, except that the caller waits on it
+/// ([`ToolError::AwaitRun`] with the returned id) and no session limit applies, as none applied to
+/// a subagent's own tool before.
 ///
 /// Idempotent, keyed by the call: a replay finds the round it started. A child this call started
 /// as a plain child run before C1 (no conversation) is found too: when the runtime refuses the round
@@ -669,9 +710,12 @@ impl Tool for Start {
              while it works. Use it instead of the subagent's own tool when you have other work to \
              do meanwhile or want to ask it again. The subagent does not see this conversation: put everything it \
              needs in `prompt`. Read its report with {SUBAGENT_READ} (pass wait: true to wait for \
-             it; never poll), and send it more with {SUBAGENT_SEND}. With keep_open false (the \
-             default) the session closes when its round has ended; set keep_open true only when \
-             another message will follow, and close what you kept open with {SUBAGENT_CLOSE}. Subagents:"
+             it; never poll), and send it more with {SUBAGENT_SEND}. `mode` says who may send the \
+             session more after its first round: nobody with one_shot (the default: it closes when \
+             its round has ended), only you with sealed, you and the person with open; keep it open \
+             only when another message will follow, and close what you kept open with \
+             {SUBAGENT_CLOSE}. With wait true the call waits for the first report and returns it, \
+             as {SUBAGENT_READ} with wait: true does. Subagents:"
         );
         for agent in &self.roster.agents {
             let text = one_line(&agent.description);
@@ -705,11 +749,19 @@ impl Tool for Start {
                         "maxLength": MAX_TEXT_CHARS,
                         "description": "The task, with everything the subagent needs to do it.",
                     },
-                    "keep_open": {
+                    "mode": {
+                        "type": "string",
+                        "enum": SessionMode::ALL.map(SessionMode::as_str),
+                        "default": SessionMode::OneShot.as_str(),
+                        "description": "Who may send the session more after its first round: \
+                                        nobody (one_shot: it closes), only you (sealed), or you \
+                                        and the person (open).",
+                    },
+                    "wait": {
                         "type": "boolean",
                         "default": false,
-                        "description": "Keep the session open after its first report, to send it \
-                                        more. By default it closes when its round has ended.",
+                        "description": "Wait for the first report and return it as this call's \
+                                        result, instead of the session id at once.",
                     },
                     "config": {
                         "type": "object",
@@ -789,8 +841,12 @@ impl Tool for Start {
                 prompt.chars().count()
             ));
         }
-        let keep = match bool_arg(&args, "keep_open", false) {
-            Ok(keep) => keep,
+        let mode = match mode_arg(&args) {
+            Ok(mode) => mode,
+            Err(why) => return refuse(why),
+        };
+        let wait = match bool_arg(&args, "wait", false) {
+            Ok(wait) => wait,
             Err(why) => return refuse(why),
         };
 
@@ -828,16 +884,21 @@ impl Tool for Start {
             "session": session,
             "agent": agent.name,
             "state": "working",
-            "keep_open": keep,
+            "mode": mode.as_str(),
         });
         // A repeat of this call (a retry after a lost record) finds the round it started.
-        if starter
+        if let Some(view) = starter
             .session(session)
             .await
             .map_err(|e| runtime_error(&e))?
-            .is_some()
         {
-            return Ok(ToolOutput::text(started.to_string()));
+            if !wait {
+                return Ok(ToolOutput::text(started.to_string()));
+            }
+            if view.state == SessionState::Working {
+                return Err(ToolError::AwaitSession { session });
+            }
+            return Ok(read_output(&self.roster, &view, None, None));
         }
         let listed = match starter
             .sessions(&self.roster.registered(), 0, MAX_SESSION_PAGE)
@@ -874,7 +935,7 @@ impl Tool for Start {
             ));
         }
         let mut header = first_header(ctx, session, &agent.agent, description);
-        header.keep_open = keep;
+        header.mode = mode;
         header.config = config;
         let input = round_message(ctx, prompt, &header);
         let within = round_within(agent, header.config.as_ref());
@@ -882,7 +943,16 @@ impl Tool for Start {
             .start_round(session, session, &agent.agent, input, None, within)
             .await
             .map_err(|e| runtime_error(&e))?;
+        // A start that waits parks on its round as a read that waits does: the report is the
+        // call's result, counted as read, so it is never told again as a report of the session.
+        if wait {
+            return Err(ToolError::AwaitSession { session });
+        }
         Ok(ToolOutput::text(started.to_string()))
+    }
+
+    async fn poll_remote(&self, ctx: &ToolCtx, task: &str) -> Result<RemotePoll, ToolError> {
+        poll_report(&self.roster, ctx, task).await
     }
 }
 
@@ -1039,7 +1109,7 @@ impl Tool for Send {
                 id: session,
                 agent: view.agent.clone(),
                 description: String::new(),
-                keep_open: true,
+                mode: SessionMode::Open,
                 closed: false,
                 closing: false,
                 round: 0,
@@ -1197,28 +1267,30 @@ impl Tool for Read {
     }
 
     async fn poll_remote(&self, ctx: &ToolCtx, task: &str) -> Result<RemotePoll, ToolError> {
-        let session = task
-            .parse::<uuid::Uuid>()
-            .map(RunId)
-            .map_err(|_| ToolError::Permanent(format!("`{task}` is not a session id")))?;
-        let Some(view) = ctx
-            .child_starter()?
-            .session(session)
-            .await
-            .map_err(|e| runtime_error(&e))?
-        else {
-            return Err(ToolError::Permanent(no_such_session(session)));
-        };
-        if view.state == SessionState::Working {
-            return Ok(RemotePoll::Working);
-        }
-        Ok(RemotePoll::Ready(read_output(
-            &self.roster,
-            &view,
-            None,
-            None,
-        )))
+        poll_report(&self.roster, ctx, task).await
     }
+}
+
+/// How the session a call waits on ([`ToolError::AwaitSession`], its id the `task`) stands: still
+/// working, or the first page of its report, as `subagent_read` gives it. What a read and a start
+/// that wait both answer.
+async fn poll_report(roster: &Roster, ctx: &ToolCtx, task: &str) -> Result<RemotePoll, ToolError> {
+    let session = task
+        .parse::<uuid::Uuid>()
+        .map(RunId)
+        .map_err(|_| ToolError::Permanent(format!("`{task}` is not a session id")))?;
+    let Some(view) = ctx
+        .child_starter()?
+        .session(session)
+        .await
+        .map_err(|e| runtime_error(&e))?
+    else {
+        return Err(ToolError::Permanent(no_such_session(session)));
+    };
+    if view.state == SessionState::Working {
+        return Ok(RemotePoll::Working);
+    }
+    Ok(RemotePoll::Ready(read_output(roster, &view, None, None)))
 }
 
 // ---------------------------------------------------------------------------
@@ -1326,7 +1398,7 @@ impl Tool for Close {
                 id: session,
                 agent: view.agent.clone(),
                 description: String::new(),
-                keep_open: true,
+                mode: SessionMode::Open,
                 closed: false,
                 closing: false,
                 round: 0,
@@ -1395,8 +1467,8 @@ impl Tool for List {
             description: format!(
                 "List the sessions of this conversation, the open ones first: working, then idle, \
                  then closed. Paged: `offset` and `limit` count sessions. Each line is the session \
-                 id, the subagent, the state, the round and whether it is kept open, then what it \
-                 is for. Use an id with {SUBAGENT_READ}, {SUBAGENT_SEND} or {SUBAGENT_CLOSE}."
+                 id, the subagent, the state, the round and its mode (who may send it more), then \
+                 what it is for. Use an id with {SUBAGENT_READ}, {SUBAGENT_SEND} or {SUBAGENT_CLOSE}."
             ),
             parameters: json!({
                 "type": "object",
@@ -1471,12 +1543,12 @@ impl Tool for List {
             };
             let name = self.roster.name_of(&s.agent);
             let line = format!(
-                "{} {} {} round {} keep_open={} \"{}\"",
+                "{} {} {} round {} mode={} \"{}\"",
                 s.id,
                 escape_text(name.as_bytes()),
                 state,
                 s.round,
-                s.keep_open,
+                s.mode,
                 escape_text(s.description.as_bytes()),
             );
             let line = match s.config.as_ref().and_then(config_words) {
@@ -1518,7 +1590,7 @@ mod tests {
             outcome: Some(RoundOutcome::Done),
             updated_at: Timestamp::now(),
             description: String::new(),
-            keep_open: true,
+            mode: SessionMode::Open,
             closed: false,
             closing: false,
             idle_expired: false,

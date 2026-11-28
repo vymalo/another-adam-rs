@@ -736,7 +736,9 @@ async fn a_subagents_call_is_a_one_shot_session_that_is_closed_after_its_round()
             (SessionState::Closed, true, 1)
         );
         let header = read.header.expect("a header");
-        assert!(header.closed && !header.keep_open && !header.closing);
+        assert!(
+            header.closed && header.mode == adam_runtime::SessionMode::OneShot && !header.closing
+        );
         assert_eq!(header.description, "work");
         // A listing shows it, as it shows any session.
         let listed = rt

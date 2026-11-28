@@ -178,7 +178,7 @@ pub const LOCALE_CONTEXT_KEY: &str = "vymalo.locale";
 /// The context key under which a message says its client **shows child sessions**
 /// (`child-sessions/v1` activated): `true`, written by the A2A front, and cleared by a message that
 /// did not activate the extension. It is what lets a session the model starts be one the person
-/// sees: a round of a kept-open session asks the person only when the header says they see it
+/// sees: a round of an `open` session asks the person only when the header says they see it
 /// ([`SessionHeader::visible`](adam_runtime::SessionHeader::visible), ADR 0045 decision 9). Not one
 /// of [`PROTECTED_CONTEXT_KEYS`]: a context too large to keep it makes a child unable to ask, which
 /// is the safe way to lose it.
@@ -1471,8 +1471,10 @@ impl Conversation {
     }
 
     /// Whether a tool of this run may **ask the person** ([`ToolError::NeedsInput`], ADR 0045
-    /// decision 9): a root run always; a round of a session only when the session is kept open and
-    /// a client shows it ([`SessionHeader::visible`](adam_runtime::SessionHeader::visible)); and no
+    /// decision 9): a root run always; a round of a session only when the session is `open`, so the
+    /// person may write to it ([`SessionMode::Open`](adam_runtime::SessionMode::Open), ADR 0087: a
+    /// `sealed` or `one_shot` round cannot be answered), and a client shows it
+    /// ([`SessionHeader::visible`](adam_runtime::SessionHeader::visible)); and no
     /// other child run at all, because nobody would answer it and it would wait for ever. A round
     /// of a session that carries no header (one an embedder made with
     /// `Runtime::start_child_continuing`) is no root either: nobody sees it.
@@ -1483,7 +1485,7 @@ impl Conversation {
     #[must_use]
     pub fn may_ask_person(&self, conversation_id: Option<&str>) -> bool {
         match &self.session {
-            Some(header) => header.keep_open && header.visible,
+            Some(header) => header.mode.takes_person_messages() && header.visible,
             None => {
                 self.root_run.is_none()
                     && conversation_id

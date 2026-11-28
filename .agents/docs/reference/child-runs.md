@@ -82,6 +82,8 @@ is read from the store, the notice is only a wake-up). The cases: [session inter
 | S17 | `each_limit_refuses_in_words`, `an_idle_expired_session_refuses_a_send_as_closed`, `an_expired_sessions_report_is_still_told_once` |
 | S18 | `a_persons_round_that_asks_the_person_is_blocked_and_the_answer_resumes_it`, `a_child_run_that_is_no_shown_session_cannot_ask`, `a_shown_round_asks_the_person_who_answers_it_in_the_child_context`; a hook's `Ask` in a child: `a_child_reads_ask_as_deny` (`crates/adam-llm-agent/tests/approval.rs`, a run whose start names a `root_run`; the predicate is `Conversation::may_ask_person` and `is_unattended`, read by `approvable` in `crates/adam-llm-agent/src/agent.rs`) |
 | S19 | `crates/adam-assembly/tests/subagents.rs`: `a_subagents_call_is_a_one_shot_session_that_is_closed_after_its_round`, `two_calls_of_one_turn_are_two_sessions_with_their_own_conversations`, `a_child_started_before_it_was_a_session_is_found_by_the_call`, `a_parent_restarted_mid_wait_still_gets_the_childs_answer`; `crates/adam-a2a-runtime/tests/child_sessions.rs`: `a_one_shot_session_is_listed_and_takes_no_message_from_the_person`; `crates/adam-export/tests/export.rs`: `a_subagents_run_is_a_record_of_its_own_linked_to_its_parent` |
+| S20 | `each_mode_is_kept_in_the_header_and_decides_what_follows_the_round`, `keep_open_maps_onto_mode_and_a_disagreement_is_refused`, `a_model_started_session_asks_only_when_the_client_shows_child_sessions` (a sealed round cannot ask); `crates/adam-a2a-runtime/tests/child_sessions.rs`: `a_sealed_or_one_shot_session_of_the_agent_refuses_the_persons_message_and_steer`; the header's decoding: `a_header_carries_its_mode_and_one_of_before_reads_as_the_mode_keep_open_meant`, `a_person_writes_to_an_open_session_or_their_own` (`crates/adam-runtime/src/session.rs`) |
+| S21 | `a_start_that_waits_answers_its_first_report_once` |
 
 ## Remote session interleavings
 
@@ -99,6 +101,7 @@ Each has a test in `crates/adam-assembly/tests/remote_sessions.rs` (memory, and 
 | R8 | `closing_a_remote_session_is_local` |
 | R9 | `cancelling_a_remote_session_sends_cancel_task`, `cancelling_the_parent_sends_cancel_task`, `a_round_past_its_limit_cancels_the_remote_task` |
 | R10 | `a_lost_cancel_is_sent_by_the_next_round` |
+| R11 | `a_remote_session_takes_mode_and_wait_as_a_local_one_does` |
 
 ## Remote tasks
 

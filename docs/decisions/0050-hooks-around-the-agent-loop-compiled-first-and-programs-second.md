@@ -567,3 +567,9 @@ and `adam-engine` takes them (`EngineBuilder::hooks`, `plugin`), shows a parked 
 `RunState::AwaitingApproval` with the call, and answers it with `Engine::approve`; see ADR 0047's note of the same day.
 `HookSet` is `Clone`, and the `input_required` event of an approval says its question through the agent's `StepIo`
 redactor. The A2A test that drives an approval end to end is still not built.
+
+*Amended 2026-11-28 (ADR 0087 slice C2):* `session.started` also carries `mode` (`one_shot`, `sealed` or `open`), beside the
+`keep_open` it means, which stays for the hooks of before. A `subagent_start` with `wait: true` says `session.started` when
+the call parks, from its arguments and with `wait: true`, and `session.round.ended` when its first report settles the call,
+as a `subagent_read` that waits does. Proof: `a_start_that_waits_answers_its_first_report_once` and
+`observers_see_a_child_and_a_session_in_order` in `crates/adam-llm-agent/tests/sessions.rs`.

@@ -252,6 +252,33 @@ fn has_effect(tool: &str) -> bool {
 /// Whether a round of the session is doing work somebody will want to read. A round that only
 /// closes the session is not: it calls no model, ends by itself and reports nothing new, so a run
 /// neither waits for it at the end of a turn nor cancels it when it ends.
+/// `event` with a session's `mode` (ADR 0087 slice C2) and the `keep_open` it means, which a hook
+/// of before reads.
+fn with_mode(
+    event: adam_plugin::HookEvent,
+    mode: adam_runtime::SessionMode,
+) -> adam_plugin::HookEvent {
+    event
+        .plain("mode", mode.as_str())
+        .plain("keep_open", mode.keeps_open())
+}
+
+/// `event` with the mode a session tool's answer names ([`with_mode`]); an answer of before names
+/// only `keep_open`, which is said as it is.
+fn with_answer_mode(event: adam_plugin::HookEvent, answer: &Value) -> adam_plugin::HookEvent {
+    match answer
+        .get("mode")
+        .and_then(Value::as_str)
+        .and_then(adam_runtime::SessionMode::parse)
+    {
+        Some(mode) => with_mode(event, mode),
+        None => match answer.get("keep_open").and_then(Value::as_bool) {
+            Some(keep) => event.plain("keep_open", keep),
+            None => event,
+        },
+    }
+}
+
 fn does_work(session: &SessionSummary) -> bool {
     session.does_work()
 }
@@ -286,9 +313,9 @@ pub const UNATTENDED: &str = "nobody answers this run: a schedule started it, no
 can be asked. Do what you can without asking, and say in your final answer what is still needed";
 
 /// The result a tool that asks the person gets in a child run that may not ask (ADR 0045 decision
-/// 9): only a round of a kept-open session that a client shows (`child-sessions/v1`) has somebody
-/// to answer it, so the model is told to go on and say what it needs in its report.
-pub const NOT_ASKABLE: &str = "nobody can answer this run: only a kept-open subagent session whose \
+/// 9): only a round of an `open` session (ADR 0087) that a client shows (`child-sessions/v1`) has
+/// somebody to answer it, so the model is told to go on and say what it needs in its report.
+pub const NOT_ASKABLE: &str = "nobody can answer this run: only an open subagent session whose \
 client shows child sessions may ask the person. Do what you can without asking, and say in your \
 final answer what is still needed";
 
@@ -5938,6 +5965,11 @@ impl LlmAgent {
         if !awaits_approval {
             self.observe_tool_ended(ctx, root, &call.name, &call.id, &outcome);
         }
+        if let Err(ToolError::AwaitSession { session }) = &outcome
+            && call.name == SUBAGENT_START
+        {
+            self.observe_waited_start(ctx, root, call, *session);
+        }
         // The custom events the step recorded (ADR 0050, decision 6), after `tool.completed` and in
         // the order the call emitted them: read from the record, so a replay says them again.
         if let Ok(hooked) = &outcome {
@@ -6120,8 +6152,8 @@ impl LlmAgent {
                 .await;
                 ToolResult::error(&call.id, backstop(&reason, &call.name, false).into_owned())
             }
-            // Only a round of a kept-open session a client shows may ask the person (ADR 0045
-            // decision 9): a child that cannot would wait for an answer nobody can give.
+            // Only a round of an `open` session a client shows may ask the person (ADR 0045
+            // decision 9, ADR 0087): a child that cannot would wait for an answer nobody can give.
             Err(ToolError::NeedsInput { question, .. }) if !may_ask => {
                 let reason = format!("{NOT_ASKABLE}. The question was: {question}");
                 say(
@@ -6350,9 +6382,10 @@ impl LlmAgent {
     ) -> Option<adam_plugin::HookEvent> {
         use adam_plugin::EventKind;
         let kind = match tool {
+            // A start that waited (ADR 0087 slice C2) settles as a read does: with the report.
+            SUBAGENT_START | SUBAGENT_READ if !reported.is_empty() => EventKind::SessionRoundEnded,
             SUBAGENT_START => EventKind::SessionStarted,
             SUBAGENT_SEND => EventKind::SessionRoundStarted,
-            SUBAGENT_READ if !reported.is_empty() => EventKind::SessionRoundEnded,
             SUBAGENT_CLOSE => EventKind::SessionClosed,
             _ => return None,
         };
@@ -6373,15 +6406,42 @@ impl LlmAgent {
                 if let Some(agent) = body.get("agent").and_then(Value::as_str) {
                     event = event.text("agent", agent, &scrub);
                 }
-                if let Some(keep) = body.get("keep_open").and_then(Value::as_bool) {
-                    event = event.plain("keep_open", keep);
-                }
+                event = with_answer_mode(event, &body);
                 if let Some(round) = body.get("round").and_then(Value::as_u64) {
                     event = event.plain("round", round);
                 }
             }
         }
         Some(event)
+    }
+
+    /// `session.started` for a `subagent_start` that waits for its first report (ADR 0087 slice
+    /// C2): it is said when the call parks, from the call's own arguments, since the answer that
+    /// settles it is the report (`session.round.ended`), not the start.
+    fn observe_waited_start(
+        &self,
+        ctx: &Ctx,
+        root: Option<RunId>,
+        call: &ToolCall,
+        session: RunId,
+    ) {
+        use adam_plugin::EventKind;
+        if self.hooks.is_empty() {
+            return;
+        }
+        let scrub = |s: &str| self.step_io.scrub(s);
+        let kind = EventKind::SessionStarted;
+        let header = self.event_header(ctx, root, &format!("tool:{}", call.id), kind);
+        let mut event = adam_plugin::HookEvent::new(kind, header)
+            .text("call_id", &call.id, &scrub)
+            .text("session", &session.to_string(), &scrub);
+        if let Some(agent) = call.arguments.get("agent").and_then(Value::as_str) {
+            event = event.text("agent", agent, &scrub);
+        }
+        // The call parked, so it accepted its mode: the default is never reached here.
+        let mode = crate::sessions::mode_arg(&call.arguments).unwrap_or_default();
+        event = with_mode(event, mode).plain("wait", true);
+        self.flush_events(vec![event]);
     }
 
     /// `child.started` or `child.ended`, for the one-shot child run a tool waits for.

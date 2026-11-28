@@ -510,7 +510,7 @@ parks the run and returns.
 
 | Tool | Arguments | Result |
 |---|---|---|
-| `subagent_start` | `agent` (enum), `description` (at most 80 characters), `prompt`, `keep_open` (default `false`), `config` (optional: `max_turns`, `max_tool_calls`, `max_output_tokens`, `context_window`, `max_parallel_tool_calls`, `time_limit`, `max_rounds`; [ADR 0054](../../docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md)) | `{"session", "agent", "state": "working", "keep_open"}` at once; the parent keeps working; a `config` above the subagent's bounds, or with an option that is not one of the seven, is an error result and starts nothing |
+| `subagent_start` | `agent` (enum), `description` (at most 80 characters), `prompt`, `mode` (`one_shot`, the default, `sealed` or `open`; [ADR 0087](../../docs/decisions/0087-every-child-is-a-session-and-the-one-shot-subagent-tool-goes.md) slice C2), `wait` (default `false`), `config` (optional: `max_turns`, `max_tool_calls`, `max_output_tokens`, `context_window`, `max_parallel_tool_calls`, `time_limit`, `max_rounds`; [ADR 0054](../../docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md)) | `{"session", "agent", "state": "working", "mode"}` at once, and the parent keeps working; with `wait: true` the first report instead, as `subagent_read` with `wait: true` gives it; a `config` above the subagent's bounds, or with an option that is not one of the seven, is an error result and starts nothing |
 | `subagent_send` | `session`, `message` | `{"session", "round", "state", "delivered": "new_round" \| "steered" \| "queued"}` (`queued`: the round's agent says in its state, `queues_messages: true`, that it keeps the message until its remote can take it); an error result when the session is closed |
 | `subagent_read` | `session`, `wait` (default `false`), `offset`, `limit` | a header line (and a `config:` line, `max_turns 20, time_limit 10`, when the session has a config), `report: done` or `failed` and the report as a numbered page (the paging convention), or `report: none yet` while the round works, or `report: blocked` and the question while the round waits for the person (`SessionView::waiting`) |
 | `subagent_close` | `session`, `cancel` (default `false`) | `{"session", "state": "closed"}` |
@@ -530,19 +530,31 @@ parks the run and returns.
   the header's config into round 2 **clamped to the bounds of that moment** (`SessionBounds::clamp`), before it checks the round
   limit, so a lowered deployment limit is obeyed and the session's own `max_rounds` is enforced. Tests:
   `tests/session_limits.rs`, `tests/compaction.rs` and `tests/sessions.rs`.
-* **Auto-close.** With `keep_open: false` the session is closed as soon as its round has ended (the report can still be read;
-  a send is refused, in words that tell the model to start a new one). With `keep_open: true` it stays idle for the next
-  `subagent_send`, whose round **continues the session's conversation** (round 2 sees round 1). Closing an idle session starts a
+* **`mode`: who may write after the first round** (ADR 0087 slice C2, `SessionMode` in `adam-runtime`, kept in
+  `SessionHeader::mode`). `one_shot` (the default): the session is closed as soon as its round has ended (the report can
+  still be read; a send is refused, in words that tell the model to start a new one). `sealed`: it stays idle for the next
+  `subagent_send`, and a person cannot write to it (the A2A front refuses their message and their steer, naming the mode;
+  `adam-a2a-runtime`). `open`: the same, and the person writes to it too. A round of `sealed` or `open` **continues the
+  session's conversation** (round 2 sees round 1). **`keep_open` is read for one release**: `true` is `open`, `false` is
+  `one_shot`, and `keep_open` beside a `mode` that disagrees is an error result naming both. The schema no longer
+  lists it. `subagent_list` says each session's `mode=<word>`.
+* **`wait: true`** parks the start on its round exactly as `subagent_read` with `wait: true` does
+  (`ToolError::AwaitSession`, and `subagent_start` answers `Tool::poll_remote` with the same read). The call's result is the
+  first report, with the session's id in its header line, so the model can send it more; it is counted as read
+  (`ToolOutput::reported`), so it is never told again as a report of the session. Observers see `session.started` when the call
+  parks (with `mode`, `keep_open` and `wait: true`, from its arguments) and `session.round.ended` when it settles. A replay that
+  finds the round ended answers the report at once. Closing an idle session starts a
   round that calls no model and ends with the last answer again; closing a working one leaves the round to finish (the
   session takes no more messages) unless `cancel: true`, which stops it. A closed session is never reopened. A remote
   (`a2a:`) subagent works like any other: `SessionAgent::remote` only says it is one, and its rounds are runs of the agent
   registered under `SessionAgent::agent`, which `adam-assembly` makes (`RemoteRoundAgent`). `subagent_send` reads
   `queues_messages` from such a round's state to say `queued` instead of `steered`.
-* **A round that asks the person.** A round of a **kept-open** session a client shows may end a call with
+* **A round that asks the person.** A round of an **`open`** session a client shows may end a call with
   `ToolError::NeedsInput` and park `input-required`; `SessionHeader::visible` says the person sees the session (the A2A
   front writes it for a round it starts, and `subagent_start` writes it when the run's context says the client shows child
-  sessions, `Conversation::shows_child_sessions`). Every other child run — a one-shot child, a session that is not kept
-  open, one a client does not show — is answered `adam_llm_agent::NOT_ASKABLE` and goes on (`Conversation::may_ask_person`).
+  sessions, `Conversation::shows_child_sessions`). Every other child run — a one-shot child, a `one_shot` or `sealed` session
+  (nobody but its agent writes to it), one a client does not show — is answered `adam_llm_agent::NOT_ASKABLE` and goes on
+  (`Conversation::may_ask_person`).
   `subagent_read` on a waiting round says `report: blocked` and the question; `wait: true` still waits, because the answer
   ends the round. `adam-assembly` no longer refuses an asking tool on a subagent (ADR 0045 decision 9).
 * **Waiting.** `subagent_read` with `wait: true` and a working round returns `ToolError::AwaitSession`: the loop parks with a
@@ -1515,3 +1527,5 @@ The default limit is `DEFAULT_MAX_HISTORY_TOKENS` (ADR 0086 slice W3): `the_defa
 and `a_known_smaller_window_wins_over_the_default_history_budget` in `src/compaction.rs`.
 
 New in slice 4 ([ADR 0045](../../docs/decisions/0045-a-subagent-can-run-in-the-background-as-a-session.md)): `SessionTools::with_limits(SessionLimits)` (default 16 open, 4 working, 20 rounds; the `MAX_*` constants are the defaults). A start refuses past `max_open` and `max_working`; **`subagent_send` now also refuses a send that would start a round past `max_working`** (a steer into a working round is not one); a send past `max_rounds` is refused and a close never. The specs do not mention the limits, so they stay byte-stable. A session that sat idle past the runtime's TTL refuses a send as closed and says why; its report, if still due, is told once. Tests in `tests/sessions.rs` (three stores): `each_limit_refuses_in_words`, `an_idle_expired_session_refuses_a_send_as_closed`, `an_expired_sessions_report_is_still_told_once`, `a_parent_that_fails_stops_its_rounds`, `a_cancel_frees_the_working_slots_for_the_next_task`, `limits_do_not_change_the_specs`.
+
+New in [ADR 0087](../../docs/decisions/0087-every-child-is-a-session-and-the-one-shot-subagent-tool-goes.md) slice C2: `subagent_start` takes `mode` (`one_shot`, the default, `sealed` or `open`) and `wait` (default `false`), and reads `keep_open` for one release (`true` is `open`, `false` is `one_shot`; disagreeing with `mode` is an error result naming both). See *Child sessions* above. The spec changed (`tests/fixtures/session-tools.json`), so the prompt's stable prefix moves once. `NOT_ASKABLE` names an open session. **Breaking** for a reader of the header: `SessionHeader::keep_open` is now `SessionHeader::mode` (`adam-runtime`). Tests in `tests/sessions.rs` (three stores): `each_mode_is_kept_in_the_header_and_decides_what_follows_the_round`, `a_start_that_waits_answers_its_first_report_once`, `keep_open_maps_onto_mode_and_a_disagreement_is_refused`, and `a_model_started_session_asks_only_when_the_client_shows_child_sessions` (a sealed round cannot ask).

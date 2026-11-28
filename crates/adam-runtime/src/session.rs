@@ -158,13 +158,91 @@ pub fn closing_round_payload(header: &SessionHeader) -> Value {
     Value::Object(payload)
 }
 
+/// Who may write to a session after it started, chosen when it starts ([ADR 0087] decision 2).
+/// Ordered from the narrowest to the widest, as ADR 0054 narrows an option: `OneShot` is narrower
+/// than `Sealed`, which is narrower than `Open`.
+///
+/// The enum is closed on purpose (Rule 3): a new mode must fail to compile in every consumer.
+///
+/// [ADR 0087]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0087-every-child-is-a-session-and-the-one-shot-subagent-tool-goes.md
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionMode {
+    /// The session closes when its first round has ended: nobody sends it a next round. The
+    /// default, and what `keep_open: false` meant.
+    #[default]
+    OneShot,
+    /// The session stays open after a round, and only the run of an agent sends to it: a person
+    /// sees it and cannot write to it.
+    Sealed,
+    /// The session stays open after a round, and both the agent and the person send to it: what
+    /// `keep_open: true` meant.
+    Open,
+}
+
+impl SessionMode {
+    /// Every mode, narrowest first: the words a refusal lists.
+    pub const ALL: [Self; 3] = [Self::OneShot, Self::Sealed, Self::Open];
+
+    /// The mode's word on the wire and in the tools: `one_shot`, `sealed` or `open`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::OneShot => "one_shot",
+            Self::Sealed => "sealed",
+            Self::Open => "open",
+        }
+    }
+
+    /// The mode named by `word` (`one_shot`, `sealed`, `open`), exactly; `None` for anything else.
+    pub fn parse(word: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|mode| mode.as_str() == word)
+    }
+
+    /// The mode the `keep_open` of before means: `true` is [`Open`](Self::Open), `false`
+    /// [`OneShot`](Self::OneShot). Read for one release (ADR 0087, amended 2026-11-27).
+    pub fn of_keep_open(keep_open: bool) -> Self {
+        if keep_open { Self::Open } else { Self::OneShot }
+    }
+
+    /// Whether the session waits for another message after a round: every mode but
+    /// [`OneShot`](Self::OneShot). The `keep_open` a reader of before reads.
+    pub fn keeps_open(self) -> bool {
+        match self {
+            Self::OneShot => false,
+            Self::Sealed | Self::Open => true,
+        }
+    }
+
+    /// Whether a person may write to a session an agent started: only to an [`Open`](Self::Open)
+    /// one.
+    pub fn takes_person_messages(self) -> bool {
+        match self {
+            Self::Open => true,
+            Self::OneShot | Self::Sealed => false,
+        }
+    }
+}
+
+impl std::fmt::Display for SessionMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// What a round of a session says about the session, in the state of the round's agent (ADR 0045).
 ///
 /// **The truth is the latest round's header** (nothing else stores a session). A session whose
 /// rounds carry no header, such as one an embedder made with `Runtime::start_child_continuing`, is
 /// kept open: it closes only when nobody has written to it for the runtime's idle TTL
 /// ([`Runtime::session_idle_ttl`](crate::Runtime::session_idle_ttl), ADR 0045 slice 4).
+///
+/// On the wire the header carries `mode` and, for one release, the `keep_open` a reader of before
+/// needs ([`SessionMode::keeps_open`]); a header that has only `keep_open`, written before `mode`
+/// existed, reads as [`SessionMode::of_keep_open`] says.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "HeaderWire", into = "HeaderWire")]
 pub struct SessionHeader {
     /// The session: round 1's run id.
     pub id: RunId,
@@ -172,9 +250,13 @@ pub struct SessionHeader {
     pub agent: String,
     /// What the session is for, in the words of whoever started it (a line, at most 80 characters).
     pub description: String,
-    /// Whether the session waits for another message after a round (`true`) or closes when its
-    /// round has ended (`false`, the default of the tools).
-    pub keep_open: bool,
+    /// Who may write to the session after its first round ([ADR 0087] decision 2): it closes when
+    /// its round has ended ([`SessionMode::OneShot`], the default of the tools), or it waits for a
+    /// message of its agent only ([`SessionMode::Sealed`]) or of the person too
+    /// ([`SessionMode::Open`]).
+    ///
+    /// [ADR 0087]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0087-every-child-is-a-session-and-the-one-shot-subagent-tool-goes.md
+    pub mode: SessionMode,
     /// The session takes no more messages: set by the round that closes it, or by a close request
     /// that a working round has read. Absent when `false`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -213,7 +295,7 @@ pub struct SessionHeader {
     pub workspace: Option<RunId>,
     /// A client that activated `child-sessions/v1` started or sent this session, so the person
     /// sees it and can answer a round of it: a round of a kept-open session may ask the person
-    /// only then (ADR 0045 decision 9, [`SessionHeader::keep_open`]). The A2A front writes it for
+    /// only then (ADR 0045 decision 9, [`SessionHeader::mode`]). The A2A front writes it for
     /// a round it starts, and the session tools write it for a session they start from a run whose
     /// client shows child sessions; a later round keeps it. Absent when `false`, which is what a
     /// header written before it existed reads.
@@ -227,6 +309,91 @@ pub struct SessionHeader {
     /// [ADR 0054]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub config: Option<SessionConfig>,
+}
+
+impl SessionHeader {
+    /// Whether a person may write to the session ([ADR 0087] decision 2): a session an agent
+    /// started takes the person's messages only when it is [`SessionMode::Open`]; a session a
+    /// person started is theirs, whatever its mode. A person's session names no root run
+    /// ([`root`](Self::root) is `None`), and neither does a header written before `root` existed,
+    /// which therefore reads as a person's, as every session did before modes.
+    ///
+    /// [ADR 0087]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0087-every-child-is-a-session-and-the-one-shot-subagent-tool-goes.md
+    pub fn takes_person_messages(&self) -> bool {
+        self.mode.takes_person_messages() || self.root.is_none()
+    }
+}
+
+/// [`SessionHeader`] as it is stored: `mode`, and `keep_open` beside it for one release, so a
+/// reader of before (which requires `keep_open`) still reads the header a round of now writes.
+#[derive(Serialize, Deserialize)]
+struct HeaderWire {
+    id: RunId,
+    agent: String,
+    description: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    mode: Option<SessionMode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    keep_open: Option<bool>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    closed: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    closing: bool,
+    #[serde(default)]
+    round: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    root: Option<RunId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    workspace: Option<RunId>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    visible: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    config: Option<SessionConfig>,
+}
+
+impl TryFrom<HeaderWire> for SessionHeader {
+    type Error = &'static str;
+
+    /// `mode` when the header has one, else what its `keep_open` meant. A header with neither is
+    /// not one a round wrote: it says nothing of whether the session stays open.
+    fn try_from(wire: HeaderWire) -> Result<Self, Self::Error> {
+        let mode = wire
+            .mode
+            .or_else(|| wire.keep_open.map(SessionMode::of_keep_open))
+            .ok_or("a session header has `mode` (or, written before it, `keep_open`)")?;
+        Ok(Self {
+            id: wire.id,
+            agent: wire.agent,
+            description: wire.description,
+            mode,
+            closed: wire.closed,
+            closing: wire.closing,
+            round: wire.round,
+            root: wire.root,
+            workspace: wire.workspace,
+            visible: wire.visible,
+            config: wire.config,
+        })
+    }
+}
+
+impl From<SessionHeader> for HeaderWire {
+    fn from(header: SessionHeader) -> Self {
+        Self {
+            id: header.id,
+            agent: header.agent,
+            description: header.description,
+            mode: Some(header.mode),
+            keep_open: Some(header.mode.keeps_open()),
+            closed: header.closed,
+            closing: header.closing,
+            round: header.round,
+            root: header.root,
+            workspace: header.workspace,
+            visible: header.visible,
+            config: header.config,
+        }
+    }
 }
 
 /// The header a round's agent state holds, if it holds one.
@@ -409,9 +576,9 @@ pub struct SessionSummary {
     pub updated_at: Timestamp,
     /// What the session is for (empty for a session with no header).
     pub description: String,
-    /// Whether the session waits for another message after a round (`true` for a session with no
-    /// header).
-    pub keep_open: bool,
+    /// Who may write to the session after its first round ([`SessionHeader::mode`]);
+    /// [`SessionMode::Open`] for a session with no header, which is kept open.
+    pub mode: SessionMode,
     /// Whether the session takes no more messages, even if its latest round still works (it was
     /// asked to close and is finishing).
     pub closed: bool,
@@ -1014,7 +1181,7 @@ fn read_latest(
     idle_ttl: Duration,
 ) -> Latest {
     let open = latest.status.is_open();
-    let keep_open = facts.header.as_ref().is_none_or(|h| h.keep_open);
+    let keep_open = facts.header.as_ref().is_none_or(|h| h.mode.keeps_open());
     let closed_already = facts.close_asked
         || facts.header.as_ref().is_some_and(|h| h.closed)
         || (!open && !keep_open);
@@ -1109,7 +1276,7 @@ pub(crate) fn page_of_sessions(
                     .as_ref()
                     .map(|h| h.description.clone())
                     .unwrap_or_default(),
-                keep_open: read.header.as_ref().is_none_or(|h| h.keep_open),
+                mode: read.header.as_ref().map_or(SessionMode::Open, |h| h.mode),
                 closed: read.closed,
                 closing: read.header.as_ref().is_some_and(|h| h.closing),
                 idle_expired: read.idle_expired,
@@ -1247,6 +1414,7 @@ mod tests {
     use proptest::prelude::*;
 
     use super::*;
+    use serde_json::json;
 
     proptest! {
         #[test]
@@ -1330,6 +1498,76 @@ mod tests {
         assert_eq!(back.root, Some(root));
     }
 
+    /// ADR 0087 slice C2: a header of before, with `keep_open` only, reads as the mode it meant; a
+    /// header of now writes `mode` and, for one release, the `keep_open` a reader of before needs;
+    /// and one with neither is no header.
+    #[test]
+    fn a_header_carries_its_mode_and_one_of_before_reads_as_the_mode_keep_open_meant() {
+        let id = RunId::new();
+        let of = |extra: serde_json::Value| {
+            let mut header = serde_json::json!({"id": id, "agent": "a", "description": "d"});
+            if let (Some(header), Some(extra)) = (header.as_object_mut(), extra.as_object()) {
+                header.extend(extra.clone());
+            }
+            serde_json::from_value::<SessionHeader>(header)
+        };
+        let mode = |extra| of(extra).map(|h| h.mode).ok();
+        assert_eq!(mode(json!({"keep_open": true})), Some(SessionMode::Open));
+        assert_eq!(
+            mode(json!({"keep_open": false})),
+            Some(SessionMode::OneShot)
+        );
+        // A one-shot session closed from its start (ADR 0087 slice C1) reads the same way.
+        let c1 = of(json!({"keep_open": false, "closed": true})).unwrap();
+        assert!(c1.mode == SessionMode::OneShot && c1.closed);
+        assert_eq!(mode(json!({"mode": "sealed"})), Some(SessionMode::Sealed));
+        assert_eq!(
+            mode(json!({"mode": "sealed", "keep_open": true})),
+            Some(SessionMode::Sealed),
+            "`mode` wins over `keep_open`"
+        );
+        assert!(
+            of(json!({})).is_err(),
+            "neither: not a header a round wrote"
+        );
+        assert!(of(json!({"mode": "ajar"})).is_err(), "an unknown mode");
+        for mode in SessionMode::ALL {
+            let header = SessionHeader {
+                mode,
+                ..of(json!({"keep_open": true})).unwrap()
+            };
+            let encoded = serde_json::to_value(&header).unwrap();
+            assert_eq!(encoded["mode"], mode.as_str());
+            assert_eq!(encoded["keep_open"], mode != SessionMode::OneShot, "{mode}");
+            assert_eq!(
+                serde_json::from_value::<SessionHeader>(encoded).unwrap(),
+                header
+            );
+            assert_eq!(SessionMode::parse(mode.as_str()), Some(mode));
+        }
+        assert_eq!(SessionMode::default(), SessionMode::OneShot);
+        assert!(
+            SessionMode::OneShot < SessionMode::Sealed && SessionMode::Sealed < SessionMode::Open
+        );
+    }
+
+    /// Who may write a session: the person writes to an `open` session of an agent, and to a
+    /// session of their own (it names no root run) whatever its mode.
+    #[test]
+    fn a_person_writes_to_an_open_session_or_their_own() {
+        let mut h = header(RunId::new(), true, false);
+        for (mode, root, person) in [
+            (SessionMode::Open, Some(RunId::new()), true),
+            (SessionMode::Sealed, Some(RunId::new()), false),
+            (SessionMode::OneShot, Some(RunId::new()), false),
+            (SessionMode::OneShot, None, true),
+        ] {
+            h.mode = mode;
+            h.root = root;
+            assert_eq!(h.takes_person_messages(), person, "{mode} {root:?}");
+        }
+    }
+
     /// The workspace a session's rounds read (ADR 0045 slice 7) is its own field, not `root`: it
     /// round-trips, it is absent when `None`, and a header without it decodes as one without.
     #[test]
@@ -1340,7 +1578,7 @@ mod tests {
             id: RunId::new(),
             agent: "helper".into(),
             description: "d".into(),
-            keep_open: true,
+            mode: SessionMode::Open,
             closed: false,
             closing: false,
             round: 1,
@@ -1377,7 +1615,7 @@ mod tests {
             id: RunId::new(),
             agent: "helper".into(),
             description: "d".into(),
-            keep_open: true,
+            mode: SessionMode::Open,
             closed: true,
             closing: true,
             round: 3,
@@ -1555,7 +1793,7 @@ mod tests {
             id,
             agent: "a".into(),
             description: "look".into(),
-            keep_open,
+            mode: SessionMode::of_keep_open(keep_open),
             closed,
             closing: false,
             round: 1,
@@ -1829,7 +2067,7 @@ mod tests {
         assert_eq!(summary.round, 20);
         assert_eq!(summary.latest_run, last);
         assert_eq!(summary.description, "look", "the header was read");
-        assert!(summary.keep_open && !summary.closed);
+        assert!(summary.mode == SessionMode::Open && !summary.closed);
         assert_eq!(summary.outcome, Some(RoundOutcome::Done));
         assert_eq!(summary.report.run, last);
     }
@@ -1860,7 +2098,8 @@ mod tests {
             vec![working, idle, closed]
         );
         assert_eq!(list.sessions[0].description, "look");
-        assert!(list.sessions[0].keep_open && !list.sessions[2].keep_open);
+        assert_eq!(list.sessions[0].mode, SessionMode::Open);
+        assert_eq!(list.sessions[2].mode, SessionMode::OneShot);
     }
 
     #[test]

@@ -100,7 +100,7 @@ pub trait Tool: Send + Sync + 'static {
     ///
     /// Declare it (`true`) on every tool that can: the loop reads it to run such a call alone.
     /// Whether the person can be asked is decided **per run** (ADR 0045 decision 9): a root run
-    /// asks, a round of a kept-open session a client shows asks, and any other child run is
+    /// asks, a round of an `open` session a client shows asks, and any other child run is
     /// answered that nobody can answer it (`NOT_ASKABLE`) instead of parking for ever. The default
     /// is `false`, which is what a tool written before this method existed declares.
     /// `#[tool(asks_user)]` and [`FnTool::asking_user`](crate::FnTool::asking_user) set it.

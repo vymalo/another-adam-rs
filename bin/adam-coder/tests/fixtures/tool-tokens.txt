@@ -35,9 +35,9 @@ start_command	2222	555
 start_scratch	1243	310
 stop_command	664	166
 subagent_close	709	177
-subagent_list	776	194
+subagent_list	784	196
 subagent_read	1115	278
 subagent_send	769	192
-subagent_start	2520	630
+subagent_start	2942	735
 ui_catalog	474	118
 write_file	975	243
