@@ -240,9 +240,17 @@ fn read_lines(stdout: ChildStdout, shared: Arc<Shared>) {
 }
 
 /// Write the lines the adapter queues, and close the program when its stdin refuses one.
+///
+/// Each queued event is one line of the protocol: the bytes are the JSON, and the terminator is this
+/// writer's job (ANR-1453). Without it the child's `lines()` never yields the event and the call
+/// waits for its deadline — every request of the suite timed out for exactly that reason.
 fn write_lines(mut stdin: ChildStdin, lines: Receiver<Vec<u8>>, shared: Arc<Shared>) {
     for line in lines {
-        if let Err(e) = stdin.write_all(&line).and_then(|()| stdin.flush()) {
+        if let Err(e) = stdin
+            .write_all(&line)
+            .and_then(|()| stdin.write_all(b"\n"))
+            .and_then(|()| stdin.flush())
+        {
             shared.close(Fault::Closed(format!(
                 "the program's stdin refused a line: {e}"
             )));
