@@ -417,8 +417,8 @@ every wait is bounded by `tokio::time::timeout`:
   up after two calls, not five;
 * `the_deployments_profiles_reach_an_engines_agent`: `EngineBuilder::models` with a profile that declares `low` and
   `high`, its own `reasoningEffort: low` and `maxOutputTokens: 100000` makes the model's first request ask for
-  `low`, and the cap is clamped to 80,000 by a 200,000-token window (200,000 − 20,000 margin − the 100,000 default
-  history); a hand-built profile (the loader refuses a file whose cap is above its limit) with
+  `low`, and the cap is clamped to 80,000 by a 200,000-token window (200,000 − 20,000 margin − half the window for
+  the history, which the 200,000 default does not fit); a hand-built profile (the loader refuses a file whose cap is above its limit) with
   `maxOutputTokens: 64000` and `maxOutputTokensLimit: 32000` asks for 32,000 (the mock used directly, not through
   `Rig`: `GateModel` forwards no `context_window`);
 * `the_builders_level_is_the_roots_and_the_file_wins`: `EngineBuilder::reasoning_effort(high)` with a folder

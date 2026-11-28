@@ -60,6 +60,30 @@ Tests: `profiles.rs` `a_context_window_is_one_to_two_to_the_53_minus_one_tokens`
 `the_budget_is_taken_from_the_window_of_the_models_profile`; `adam-assembly` `tests/cap.rs`
 `a_subagent_on_another_alias_has_its_own_profiles_window`.
 
+## The history budget's default (ADR 0086, slice W3)
+
+Built 2026-11-28. The invariants: **one constant is the default**, and **a history the window cannot hold never
+squeezes the output cap to nothing**.
+
+* The default: `adam_llm_agent::DEFAULT_MAX_HISTORY_TOKENS` = 200,000 (`crates/adam-llm-agent/src/agent.rs:918`), the
+  value of `Limits::default()` (`agent.rs:955`); a folder that omits `limits.max_history_tokens` takes it through
+  `def::limits` (`crates/adam-assembly/src/def.rs:1539`). No other crate writes the number: grep for `200_000` beside
+  `max_history_tokens` before adding one.
+* The compaction budget is unchanged: the smaller of the window's budget and the limit, `0` the window's alone
+  (`crates/adam-llm-agent/src/compaction.rs:241`).
+* The output cap's clamp (`crates/adam-assembly/src/assembly.rs:761`) reserves `min(max_history_tokens, window / 2)`,
+  and `window / 2` for `0`, for every alias. Before W3 only a model the agent does not run on itself had the half
+  bound; with the 200,000 default the agent's own model on a 131,072-token window (the dev stack) would have asked for
+  one output token. A folder's explicit history over half the window now gives way too, which amends ADR 0064
+  decision 4 (dated note there).
+* The coder's folder states the value (`bin/adam-coder/agent/instructions.md:11`) rather than leaving it to the
+  default, so its budget is read where its other limits are and a change of the library's default does not move it.
+
+Tests: `compaction.rs` `the_default_history_budget_is_the_budget_when_no_window_is_known`,
+`a_known_smaller_window_wins_over_the_default_history_budget`; `def.rs` `an_omitted_history_budget_is_the_loops_default`;
+`adam-assembly` `tests/cap.rs` `a_history_the_window_cannot_hold_leaves_the_output_half_the_window` and the cases
+before it; `adam-engine` `the_deployments_profiles_reach_an_engines_agent` (80,000 on a 200,000 window).
+
 ## The default window's variable (ADR 0086, slice W2)
 
 Built 2026-11-28. The invariant: **one variable answers the window outside the profiles, and two answers fail closed.**

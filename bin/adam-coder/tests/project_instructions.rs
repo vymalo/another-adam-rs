@@ -380,9 +380,9 @@ fn coder_with_history_and_summaries(
 fn history_coder(fx: &Fixture, model: DynModel, store: DynStore, max_history_tokens: u32) -> Coder {
     let folder = common::plain_folder();
     common::edit_instructions(&folder, |text| {
-        assert!(text.contains("max_history_tokens: 100000"));
+        assert!(text.contains("max_history_tokens: 200000"));
         text.replace(
-            "max_history_tokens: 100000",
+            "max_history_tokens: 200000",
             &format!("max_history_tokens: {max_history_tokens}"),
         )
     });

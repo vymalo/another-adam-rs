@@ -696,7 +696,7 @@ With `MODEL_INPUT_MODALITIES=text,image` (off by default, [environment](environm
 
 ## Limits and cancel
 
-`limits:` in `agent/instructions.md`: 200 model turns, 400 tool calls, 100,000 tokens of history, and no
+`limits:` in `agent/instructions.md`: 200 model turns, 400 tool calls, 200,000 tokens of history, and no
 output cap of its own: each call asks its model's profile's cap, else 128,000, clamped to the model's limit and
 window ([ADR 0064](../decisions/0064-model-profiles-reasoning-effort-and-output-cap-follow-the-model.md)). A run
 that reaches `max_turns` or `max_tool_calls` gets one closing model call in which it

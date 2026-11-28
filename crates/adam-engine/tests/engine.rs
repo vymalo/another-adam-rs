@@ -2187,7 +2187,8 @@ async fn say_to_the_end(engine: &Engine, text: &str) -> RunInfo {
 /// `GateModel` forwards no `context_window`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_deployments_profiles_reach_an_engines_agent() {
-    // The window leaves 200,000 − 20,000 margin − the 100,000 default history: 80,000.
+    // The window leaves 200,000 − 20,000 margin − 100,000 of history (the 200,000 default is more
+    // than half the window, so the window keeps half for it): 80,000.
     let mock = Arc::new(MockModel::new().with_context_window("m", 200_000));
     mock.push_text("done");
     let model: DynModel = mock.clone();

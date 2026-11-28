@@ -682,8 +682,11 @@ impl BoundDef {
     /// `maxOutputTokens`, else the profile's base preset, else
     /// [`DEFAULT_MAX_OUTPUT_TOKENS`]. The value is then clamped to the model's
     /// `maxOutputTokensLimit` and, when the window is known, to what the window leaves after
-    /// [`WINDOW_MARGIN_TOKENS`] and the history the agent keeps (`max_history_tokens`, or half the
-    /// window when it is `0`; an omitted key keeps the 100,000 default).
+    /// [`WINDOW_MARGIN_TOKENS`] and the history the agent keeps: `max_history_tokens` (an omitted
+    /// key is [`DEFAULT_MAX_HISTORY_TOKENS`](adam_llm_agent::DEFAULT_MAX_HISTORY_TOKENS)), at most
+    /// half the window, and half the window when it is `0`. A history larger than half the window
+    /// is one the window cannot hold anyway: the window wins (ADR 0086 decision 4), so a 200,000
+    /// default on a 131,072-token window leaves the output 45,536 tokens, not one.
     ///
     /// A preset above the model's limit is refused, not clamped: a preset is the deployment's
     /// promise about the model, where the folder's value is the agent's own choice. The folder's
@@ -692,8 +695,7 @@ impl BoundDef {
     ///
     /// With `own`, the cap of a model the agent does not run on itself (its fallback, a model a
     /// message picks): the folder's value and its preset's are for the agent's model and are left
-    /// out, the model's own profile decides, and the history the window leaves room for is at
-    /// most half of that model's window.
+    /// out, and the model's own profile decides.
     fn output_cap(
         &self,
         node: &Node,
@@ -757,11 +759,10 @@ impl BoundDef {
         }
         let window = model.context_window(alias);
         let history = window.map(|window| {
-            if node.limits.max_history_tokens > 0 {
-                let own_half = if own { window / 2 } else { u64::MAX };
-                u64::from(node.limits.max_history_tokens).min(own_half)
-            } else {
-                window / 2
+            let half = window / 2;
+            match node.limits.max_history_tokens {
+                0 => half,
+                kept => u64::from(kept).min(half),
             }
         });
         if let (Some(window), Some(history)) = (window, history) {

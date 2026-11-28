@@ -912,6 +912,11 @@ fn ask_end(
     }
 }
 
+/// The history budget of an agent whose `limits.max_history_tokens` is omitted, in tokens (ADR 0086):
+/// [`Limits::default`]'s. The budget a run compacts at is the smaller of this and what the model's
+/// window leaves, so a known smaller window still wins.
+pub const DEFAULT_MAX_HISTORY_TOKENS: u32 = 200_000;
+
 /// Bounds on one run. A run that reaches `max_turns` or `max_tool_calls` gets one closing model
 /// call in which it may call no tool, and ends with that answer marked `limited` (the output's
 /// `limited` and `limit`); if the closing call says nothing the run fails with a message naming the
@@ -936,7 +941,8 @@ pub struct Limits {
     /// down to three quarters of the budget (so that it happens rarely and each request starts with
     /// the one before: [`Conversation::shortenings`] says when); the results the model has not seen
     /// yet are never touched, and the journal still holds the original outputs. `0` disables
-    /// truncation.
+    /// truncation, and the window's budget alone decides when the run compacts. Default
+    /// [`DEFAULT_MAX_HISTORY_TOKENS`].
     pub max_history_tokens: u32,
 }
 
@@ -946,7 +952,7 @@ impl Default for Limits {
             max_turns: 50,
             max_tool_calls: 200,
             max_output_tokens: 4096,
-            max_history_tokens: 100_000,
+            max_history_tokens: DEFAULT_MAX_HISTORY_TOKENS,
         }
     }
 }

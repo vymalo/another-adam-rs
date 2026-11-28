@@ -1062,9 +1062,10 @@ fn has_expired(value: &Value, now: Timestamp) -> bool {
 ///
 /// Why a cap at all: every continuation copies the carried history into the new run's state, which
 /// is one JSON value in the store, so without a bound each task in a long-lived context would
-/// store, and each model call would re-read, everything said before. Why this size: it is about
-/// what `Limits::max_history_tokens` lets through to the model (100 000 tokens of about 4
-/// characters). Bytes of JSON, not tokens: the cap has to be checkable without a tokenizer, and it
+/// store, and each model call would re-read, everything said before. Why this size: it was about
+/// what `Limits::max_history_tokens` let through to the model at its first default (100 000 tokens
+/// of about 4 characters); the default is [`DEFAULT_MAX_HISTORY_TOKENS`](crate::DEFAULT_MAX_HISTORY_TOKENS)
+/// since ADR 0086, and the cap was not raised with it. Bytes of JSON, not tokens: the cap has to be checkable without a tokenizer, and it
 /// over-counts the JSON's own punctuation, which only makes it stricter.
 ///
 /// What is given up to meet it, in this order, and only as far as needed:

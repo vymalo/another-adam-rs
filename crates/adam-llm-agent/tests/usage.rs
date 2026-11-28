@@ -220,7 +220,7 @@ async fn a_call_without_usage_is_reported_with_zeros_and_no_provider() {
 
 /// ADR 0086 decision 3: each report carries the window of its own call's alias, as the client
 /// resolves it — the profile's `contextWindow` over the window configured for that alias
-/// (`MODEL_CONTEXT_WINDOW`), and a subagent on another alias its own profile's window, which no
+/// (`DEFAULT_MODEL_CONTEXT_WINDOW`), and a subagent on another alias its own profile's window, which no
 /// variable ever gave it.
 #[tokio::test]
 async fn each_report_carries_the_window_its_aliases_profile_names() {

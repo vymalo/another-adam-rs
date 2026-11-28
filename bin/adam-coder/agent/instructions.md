@@ -6,7 +6,9 @@ limits:
   # delegation, check and commit is a turn.
   max_turns: 200
   max_tool_calls: 400
-  max_history_tokens: 100000
+  # The coder's history budget, the LlmAgent default stated here (ADR 0086); a
+  # known smaller window still wins.
+  max_history_tokens: 200000
 vars:
   # The prompt tells the model the limit; the tools enforce it (see crate::tools).
   # The process passes CoderSettings::max_check_cycles, so this is only the default.

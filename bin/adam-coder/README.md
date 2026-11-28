@@ -1913,7 +1913,7 @@ greets from the persona lines gets the run to wait without any tool, editing the
 
 One file, [`agent/instructions.md`](agent/instructions.md), holds what describes the agent, in the format of
 [`docs/reference/agent-files.md`](../../docs/reference/agent-files.md): the frontmatter has `name` (`coder`, which must equal
-`AGENT_NAME`), `description`, `limits` (200 turns, 400 tool calls, 100000 tokens of history; no output cap, so the
+`AGENT_NAME`), `description`, `limits` (200 turns, 400 tool calls, 200000 tokens of history, the `LlmAgent` default stated in the folder, ADR 0086; no output cap, so the
 model's profile or the 128,000 fallback applies, ADR 0064),
 `vars.max_check_cycles` (the default, 3), `vars.scratch_check_cycles` (5), `vars.display_name` (`Adam`: the name the agent says), `vars.repository_creation` (what the prompt says about making a repository for the person: the default is the sentence for a deployment that allows it, and **when `CREATE_REPO_OWNERS` is empty `CoderAgent` replaces it with a note that there is no such tool**, that the person must create the repository and name it, and that "a new repository" is never an option of a question; a folder that does not declare the var keeps its own text) and `card:` (the A2A
 card: name `Adam`, the skills `explain`, `research`, `documents` and `coding-task`, each with tags and examples); the body is the system prompt.

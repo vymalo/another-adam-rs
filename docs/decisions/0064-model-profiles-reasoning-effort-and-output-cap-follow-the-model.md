@@ -456,3 +456,12 @@ Accepted when a served card lists `endpoint` on a choice whose profile names one
 profile names none, and omits it (rather than failing) when the label is malformed — unit-tested in
 `crates/adam-model/src/profiles.rs` and `crates/adam-a2a/src/{model_pick,extensions}.rs`, and on a
 served card in `crates/adam-service/tests/serve.rs`.
+
+## Amended 2026-11-28: the clamp keeps at most half the window for the history
+
+*Amended 2026-11-28:* **decision 4's clamp reserves at most half the window for the history**, for the agent's own
+model as for a fallback or a pick (amended 2026-11-23): `min(max_history_tokens, window / 2)`, and `window / 2` for
+`0`. An omitted key is 200,000 tokens since [ADR 0086](0086-the-context-window-follows-the-model-and-the-history-budget-is-200k.md)
+slice W3, which would otherwise leave one output token on any window up to 220,000. A folder whose explicit
+`max_history_tokens` is over half its window no longer squeezes the cap below what half the window leaves; its
+compaction budget is then the window's.

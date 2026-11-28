@@ -89,3 +89,15 @@ The chart's `config.modelContextWindow` renders `DEFAULT_MODEL_CONTEXT_WINDOW` a
 `bench/` keeps the old one until its pinned image is newer than this slice. Two limits, not decided here: an image
 built before W2 reads only the old name, so the chart and the image move together (as `image.tag` does); and the
 alias has no removal date beyond "one minor release", which a later amendment names.
+
+*Amended 2026-11-28:* **slice W3 is built.** The default is one constant, `adam_llm_agent::DEFAULT_MAX_HISTORY_TOKENS`
+(200,000): `Limits::default()`'s, so a folder that omits `limits.max_history_tokens` takes it. The coder's folder states
+`max_history_tokens: 200000` rather than omitting the key, so its budget is read beside its other limits and a later
+change of the library's default does not move the coder. The budget's rule is unchanged (the smaller of the window's
+budget and the limit; `0` the window's alone). One choice **for the owner to confirm**: the output cap's clamp
+([ADR 0064](0064-model-profiles-reasoning-effort-and-output-cap-follow-the-model.md) decision 4) now reserves at most
+half the window for the history, for every model, where it reserved the whole `max_history_tokens` for the agent's own
+model. Without it the 200,000 default leaves one output token on any window up to 220,000 (the dev stack's 131,072, a
+200,000-token model); with it a 200,000 window leaves 80,000 and 131,072 leaves 45,536. Decision 4's "a known smaller
+window still wins" is the reason, and it applies to a folder's explicit value over half the window too. The people's
+pages (`docs/reference/agent-files.md`, the architecture's compaction section) say 200,000.

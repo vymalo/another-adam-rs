@@ -1925,4 +1925,20 @@ mod tests {
         assert_eq!(got.max_tool_calls, Limits::default().max_tool_calls);
         assert_eq!(got.max_output_tokens, Limits::default().max_output_tokens);
     }
+
+    #[test]
+    fn an_omitted_history_budget_is_the_loops_default() {
+        let set = FileLimits {
+            max_turns: Some(7),
+            ..FileLimits::default()
+        };
+        assert_eq!(
+            limits(Some(&set)).max_history_tokens,
+            adam_llm_agent::DEFAULT_MAX_HISTORY_TOKENS
+        );
+        assert_eq!(
+            limits(None).max_history_tokens,
+            adam_llm_agent::DEFAULT_MAX_HISTORY_TOKENS
+        );
+    }
 }

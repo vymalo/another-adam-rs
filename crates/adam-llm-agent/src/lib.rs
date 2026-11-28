@@ -188,11 +188,11 @@ pub use adam_plugin::{
 };
 pub use adam_runtime::{Artifact, StepEvent, StepIcon, StepKind, StepOutput, StepState};
 pub use agent::{
-    BuildError, CLOSING_TURN, DEFAULT_MAX_PARALLEL, DEFAULT_WAIT_POLL, Limits, LlmAgent,
-    LlmAgentBuilder, LlmStarter, MAX_INTERFACE_LANGUAGE_BYTES, MAX_PARALLEL_LIMIT,
-    MAX_THINKING_CUTS, ModelBinding, NOT_APPROVABLE, NOT_ASKABLE, THINKING_CUT_TURN, UNATTENDED,
-    approval_step, approves, interface_language, interface_language_turn, is_unattended,
-    tool_retry_key,
+    BuildError, CLOSING_TURN, DEFAULT_MAX_HISTORY_TOKENS, DEFAULT_MAX_PARALLEL, DEFAULT_WAIT_POLL,
+    Limits, LlmAgent, LlmAgentBuilder, LlmStarter, MAX_INTERFACE_LANGUAGE_BYTES,
+    MAX_PARALLEL_LIMIT, MAX_THINKING_CUTS, ModelBinding, NOT_APPROVABLE, NOT_ASKABLE,
+    THINKING_CUT_TURN, UNATTENDED, approval_step, approves, interface_language,
+    interface_language_turn, is_unattended, tool_retry_key,
 };
 pub use compaction::{
     COMPACTION_TURN, Compaction, CompactionReason, MAX_COMPACTIONS, PromptSize,

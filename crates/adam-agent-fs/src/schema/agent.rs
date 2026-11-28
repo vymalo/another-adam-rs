@@ -301,7 +301,9 @@ pub struct Limits {
     /// 0064; `0` is refused). Absent: the model's profile's, then the 128,000 fallback.
     #[serde(skip_serializing_if = "Option::is_none", alias = "maxOutputTokens")]
     pub max_output_tokens: Option<u32>,
-    /// Budget for the history sent to the model.
+    /// Budget for the history sent to the model, in tokens: the run compacts at the smaller of
+    /// this and what the model's window leaves; `0` leaves the window's alone. Absent: the loop's
+    /// default, 200,000 (`adam_llm_agent::DEFAULT_MAX_HISTORY_TOKENS`, ADR 0086).
     #[serde(skip_serializing_if = "Option::is_none", alias = "maxHistoryTokens")]
     pub max_history_tokens: Option<u32>,
     /// The longest a run of this agent may take **as a subagent**, in minutes; `0` is no limit, at

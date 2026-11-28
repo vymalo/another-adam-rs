@@ -1201,8 +1201,26 @@ mod tests {
     }
 
     #[test]
+    fn the_default_history_budget_is_the_budget_when_no_window_is_known() {
+        let default = crate::Limits::default().max_history_tokens;
+        assert_eq!(default, crate::DEFAULT_MAX_HISTORY_TOKENS);
+        assert_eq!(budget(None, 4096, default), Some(200_000));
+        // A window large enough leaves the default as it is.
+        assert_eq!(budget(Some(400_000), 128_000, default), Some(200_000));
+    }
+
+    #[test]
+    fn a_known_smaller_window_wins_over_the_default_history_budget() {
+        // ADR 0086 decision 4: 131,072 - 20,000 - 4,096 is under the 200,000 default.
+        assert_eq!(
+            budget(Some(131_072), 4096, crate::DEFAULT_MAX_HISTORY_TOKENS),
+            Some(106_976)
+        );
+    }
+
+    #[test]
     fn a_known_window_with_no_room_does_not_fall_back_to_the_history_limit() {
-        // MODEL_CONTEXT_WINDOW=16384 with the output cap clamped to 1.
+        // DEFAULT_MODEL_CONTEXT_WINDOW=16384 with the output cap clamped to 1.
         assert_eq!(budget(Some(16_384), 1, 100_000), Some(1));
     }
 

@@ -876,7 +876,7 @@ stateDiagram-v2
 
 | Part | Rule |
 |---|---|
-| **Budget** | the smaller of the model's window (its profile's `contextWindow`, else `MODEL_CONTEXT_WINDOW` for the alias `MODEL` names; ADR 0086) less 20,000 less `max_output_tokens` (the cap resolved for the agent's model, ADR 0064), and `limits.max_history_tokens`; none when neither is set (a window with no room left counts as none) |
+| **Budget** | the smaller of the model's window (its profile's `contextWindow`, else `DEFAULT_MODEL_CONTEXT_WINDOW` for the alias `MODEL` names; ADR 0086) less 20,000 less `max_output_tokens` (the cap resolved for the agent's model, ADR 0064), and `limits.max_history_tokens` (200,000 when the key is omitted, ADR 0086; `0` leaves the window's alone), so a known smaller window wins; none when neither is set (a window with no room left is a budget of one token) |
 | **Estimate** | the last call's reported prompt tokens plus characters / 4 of what came after; with no report, characters / 4 of the instructions, the tools and every message |
 | **Cut** | at the start of a turn (an assistant message, never the first message), so a call is never parted from its result; the newest 1 to 8 turns worth at most a quarter of the budget stay verbatim; fewer than two turns to drop, eight compactions made by the run (a run that continues another carries the earlier ones as one record, which is not one of its eight), or a request that would still be over the budget with no summary, shortens instead |
 | **Summary** | the agent's own model, the request as it stands (same system, tools and history) plus one built-in instruction as the last message, `tool_choice: none`, `min(4,096, cap)` output tokens, or 4,096 when the cap is `0` (the run's resolved cap, ADR 0064), capped at 16 KiB; its usage is reported under an id of its own (`<run>-k<n>-<suffix>`); the person sees one step, "Summarise the conversation" |
@@ -884,7 +884,7 @@ stateDiagram-v2
 | **The marker's lines** | the summary, then lines **written by code** from what left: the plan, the **recap** of the loaded tools (one line per loaded group or tool, minus the journaled removals, and one per loader still available; at most 2 KiB and 50 lines, names only past either), the results a tool pinned, a pointer to each kept output (built from the call's own output id), the names of the skills loaded earlier, a line that sessions exist. Text that is copied has each line that starts with `[` written `\x5b`, so it cannot forge a loop line |
 | **Sessions** | a run whose `subagent_start` was cut still waits for, and cancels, the sessions it started (`Compaction::sessions`) |
 | **Trust** | the summary and the pinned results are in the first message, a user-role message: text a tool returned (a repository's instructions) has that standing from the first compaction on; it is labelled as the repository's, bounded and escaped, and the coder does not read it as the person's words. A `when` server's note in the recap is labelled `(the server's words: …)` for the same reason |
-| **A subagent** | compacts against its own limits; one on another alias has no window, so its `max_history_tokens` applies |
+| **A subagent** | compacts against its own limits and its own alias's window (its profile's `contextWindow`, ADR 0086); with no window known, its `max_history_tokens` applies |
 
 The summary request is the previous request plus one message, so the provider serves it from its cache
 (*unverified* without a provider: whether a changed `tool_choice` keeps the match). The request after a

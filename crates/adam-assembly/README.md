@@ -910,7 +910,9 @@ place each:
   unknown agents, syntax errors with their line, an error in an `instructions/*.md` part.
 * `tests/cap.rs`: the output cap's order and clamps (ADR 0064), and
   `a_subagent_on_another_alias_has_its_own_profiles_window` (ADR 0086: its profile's `contextWindow` clamps that
-  subagent's cap, not the root's).
+  subagent's cap, not the root's); `a_history_the_window_cannot_hold_leaves_the_output_half_the_window` (ADR 0086
+  slice W3: the 200,000 default on a 200,000-token window leaves 80,000). The unit
+  `an_omitted_history_budget_is_the_loops_default` (`src/def.rs`) holds the default.
 * `tests/model.rs`: alias resolution through three generations, alias errors, a deployment's alias list,
   missing state and state reaching a running tool, manifests by value and by reference, `from_source`
   for one agent, several agents and a directory with errors.

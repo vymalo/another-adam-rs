@@ -260,11 +260,11 @@ value that sets `config.modelContextWindow` now renders the new name (no golden 
 | `config.modelContextWindow` | `DEFAULT_MODEL_CONTEXT_WINDOW` | The window of `config.model` when its profile (`config.modelProfiles`) names no `contextWindow`, which wins ([ADR 0086](../../docs/decisions/0086-the-context-window-follows-the-model-and-the-history-budget-is-200k.md)), in tokens: a whole number from 1 to 9007199254740991, as a number or a string of digits (written in full, never `1e+06`). The chart refuses anything else, which the binary would refuse at startup (exit 78), and a value given beside `config.extraEnv.DEFAULT_MODEL_CONTEXT_WINDOW` or `config.extraEnv.MODEL_CONTEXT_WINDOW`. A subagent on another alias takes its own profile's window, or none; OpenCode reports none |
 
 **The output cap follows the window.** The coder's `agent/instructions.md` sets no output cap, so each call asks its
-model profile's cap, else 128,000, clamped to the window less 20,000 tokens and the history the agent keeps (ADR 0064).
-On the dev stack (`DEFAULT_MODEL_CONTEXT_WINDOW=131072`, the coder's `max_history_tokens: 100000`) that is
-`131072 − 20000 − 100000 = 11072`, not 128,000. A deployment that wants the full 128,000 for a long-context model
-declares a window of at least **248,000** (128,000 + 20,000 + 100,000); below that the cap is `window − 120,000`
-(a 200,000 window leaves 80,000). It also gives the model a profile with `maxOutputTokensLimit` when the provider
+model profile's cap, else 128,000, clamped to the window less 20,000 tokens and the history the agent keeps, at most
+half the window (ADR 0064, amended by ADR 0086). On the dev stack (`DEFAULT_MODEL_CONTEXT_WINDOW=131072`, the coder's
+`max_history_tokens: 200000`, more than half the window) that is `131072 − 20000 − 65536 = 45536`, not 128,000. A
+deployment that wants the full 128,000 for a long-context model declares a window of at least **296,000** (128,000 +
+20,000 + half of it); below that the cap is `window / 2 − 20,000` (a 200,000 window leaves 80,000). It also gives the model a profile with `maxOutputTokensLimit` when the provider
 documents a lower maximum.
 
 ## Model profiles

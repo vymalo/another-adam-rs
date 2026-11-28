@@ -113,6 +113,7 @@ limits:                        # LlmAgent Limits; Claude's `maxTurns` is read as
   max_turns: 200               # model calls that may be followed by tools, plus one closing turn in which it may call none (0: one call with no tools)
   max_tool_calls: 400          # over it, the turn's calls are answered "not run" and the closing turn follows
   max_output_tokens: 64000     # the output cap this agent asks for, at least 1; absent: its preset's, the model profile's, then 128,000, clamped to the model's limit and window (ADR 0064)
+  max_history_tokens: 200000   # the history budget: the run compacts at the smaller of this and what the window leaves; 0: the window's alone; absent: 200,000 (ADR 0086)
   max_minutes: 30              # subagent only: the longest one run may take; 0 = no limit, at most 1440
   max_parallel: 4              # tool calls of one turn that run at once, 1 to 32: lowers MAX_PARALLEL_TOOL_CALLS for this agent, never raises it
   max_processes: 2             # processes (commands) of the worker at once, 1 to 256: lowers MAX_PROCESSES, never raises it (read by adam-coder; ADR 0065)
@@ -171,10 +172,11 @@ You are the coder agent. Stop after at most {{max_check_cycles}} failed check cy
   without it the cap is its `model_preset`'s, else the model profile's `maxOutputTokens`, else the
   profile's base preset, else 128,000 (ADR 0064). The result is clamped to the model's
   `maxOutputTokensLimit` and, when the context window is known (the model profile's `contextWindow`, else
-  `MODEL_CONTEXT_WINDOW` for the alias `MODEL` names; [ADR 0086](../decisions/0086-the-context-window-follows-the-model-and-the-history-budget-is-200k.md)),
+  `DEFAULT_MODEL_CONTEXT_WINDOW` for the alias `MODEL` names; [ADR 0086](../decisions/0086-the-context-window-follows-the-model-and-the-history-budget-is-200k.md)),
   to what the window leaves after
-  20,000 tokens and the history the agent keeps (`max_history_tokens`, or half the window when it
-  is `0`; an omitted key keeps the 100,000 default). A **preset** above the model's limit is refused at startup, and a profile's own
+  20,000 tokens and the history the agent keeps: `max_history_tokens` (200,000 when the key is omitted), at most half
+  the window, and half the window when it is `0`. A history the window cannot hold gives way, so a 200,000-token
+  window leaves the output 80,000 tokens, not one (ADR 0086). A **preset** above the model's limit is refused at startup, and a profile's own
   `maxOutputTokens` above its limit is refused when the profiles file is read; the folder's own
   value is clamped. `0` is refused: leave the key out to take the profile and the fallback.
 * **The tools a root agent has without writing any** are the person's screen and a plan: `ask_user`, `show`,
