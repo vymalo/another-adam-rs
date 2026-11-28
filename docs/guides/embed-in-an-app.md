@@ -120,7 +120,7 @@ sequenceDiagram
 A tool call can wait for the person's yes ([ADR 0047](../decisions/0047-adam-rs-can-be-embedded-in-an-application.md)
 slice 5). The host installs a hook that asks, renders what it asks, and answers with a button.
 
-1. **Install the hook.** A `Plugin` whose `before_tool` answers `Verdict::Ask(question)` for the calls the person must
+1. **Install the hook.** A `Plugin` whose `before_tool` answers `Decision::Ask(question)` for the calls the person must
    approve, given with `EngineBuilder::plugin`. It runs in every agent the engine runs.
 2. **Render the approval.** The run is `RunState::AwaitingApproval`, not `Waiting`, and its stream says
    `EngineEvent::ApprovalAsked`. Both carry an `ApprovalRequest`: the call's id, the tool, the hook's question and the
