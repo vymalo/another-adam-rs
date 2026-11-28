@@ -44,7 +44,7 @@ adam-model.workspace = true
 adam-otel = { workspace = true, features = ["aws-lc"] }
 adam-runtime.workspace = true
 # The files' schedules: the scheduler and its `schedules` component (ADR 0060).
-adam-schedule = { path = "../../crates/adam-schedule", version = "0.7.0" } # x-release-please-version
+adam-schedule = { path = "../../crates/adam-schedule", version = "0.8.0" } # x-release-please-version
 adam-service = { workspace = true, features = ["mcp", "export"] }
 adam-ui.workspace = true
 adam-workspace.workspace = true

@@ -9,7 +9,7 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-adam-workspace = { path = "../adam-workspace", version = "0.7.0", default-features = false } # x-release-please-version
+adam-workspace = { path = "../adam-workspace", version = "0.8.0", default-features = false } # x-release-please-version
 async-trait.workspace = true
 # `setrlimit`, `getrlimit` and `setpriority` as safe functions: the only `unsafe` here is the
 # `pre_exec` call that runs them in the child.

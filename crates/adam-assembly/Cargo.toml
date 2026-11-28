@@ -37,9 +37,9 @@ a2a-client-lf = { workspace = true, optional = true }
 a2a-lf = { workspace = true, optional = true }
 # Without their defaults (the A2A server, push), so `sessions` alone brings no server or TLS; `a2a`
 # turns the defaults back on, and a server build is unchanged.
-adam-a2a = { path = "../adam-a2a", version = "0.7.0", default-features = false, optional = true } # x-release-please-version
+adam-a2a = { path = "../adam-a2a", version = "0.8.0", default-features = false, optional = true } # x-release-please-version
 adam-budget.workspace = true
-adam-a2a-runtime = { path = "../adam-a2a-runtime", version = "0.7.0", default-features = false, optional = true } # x-release-please-version
+adam-a2a-runtime = { path = "../adam-a2a-runtime", version = "0.8.0", default-features = false, optional = true } # x-release-please-version
 adam-agent-fs.workspace = true
 adam-core.workspace = true
 adam-error.workspace = true
@@ -67,15 +67,15 @@ adam-memory.workspace = true
 # depends on `adam`, which depends on this crate: a dev-dependency cycle, which cargo allows.
 adam-agent-fixture = { path = "../adam-agent-fixture" }
 # The in-process A2A server the remote-subagent tests talk to.
-adam-a2a = { path = "../adam-a2a", version = "0.7.0", features = ["test-util"] } # x-release-please-version
+adam-a2a = { path = "../adam-a2a", version = "0.8.0", features = ["test-util"] } # x-release-please-version
 # The A2A front the child-sessions tests start a session through (the feature `a2a` of this crate).
 adam-a2a-runtime.workspace = true
 adam-error.workspace = true
 adam-plugin-testkit.workspace = true
 # The MCP server the tests talk to (over HTTP: another package's binary is not available here).
 adam-mcp-testkit = { path = "../adam-mcp-testkit" }
-adam-store-mongodb = { path = "../adam-store-mongodb", version = "0.7.0" } # x-release-please-version
-adam-store-postgres = { path = "../adam-store-postgres", version = "0.7.0" } # x-release-please-version
+adam-store-mongodb = { path = "../adam-store-mongodb", version = "0.8.0" } # x-release-please-version
+adam-store-postgres = { path = "../adam-store-postgres", version = "0.8.0" } # x-release-please-version
 axum.workspace = true
 futures.workspace = true
 proptest.workspace = true
