@@ -1745,7 +1745,7 @@ impl SessionBounds {
             report_schema_admissible(schema)?;
         }
         if let Some(alias) = &requested.model
-            && !self.models.iter().any(|allowed| allowed == alias)
+            && !self.models.contains(alias)
         {
             let set = if self.models.is_empty() {
                 "this session may name none".to_owned()
