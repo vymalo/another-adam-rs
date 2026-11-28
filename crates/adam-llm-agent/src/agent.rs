@@ -8189,7 +8189,7 @@ impl LlmAgent {
                 state.compactions.len(),
             )
         };
-        if let Some(first) = record_shortenings_from(
+        if let Some(shortened) = record_shortenings_from(
             &mut state.messages,
             self.limits.max_history_tokens,
             &output_id_of,
@@ -8197,8 +8197,19 @@ impl LlmAgent {
         ) {
             // A shortened row's bytes changed, and every later row's `prv` with it: their turn
             // signatures no longer hold, and the commit signs them again (ADR 0068).
-            crate::signing::unsign_from(&mut state.messages, first);
+            crate::signing::unsign_from(&mut state.messages, shortened.first);
             state.shortenings.push(state.turns);
+            // Counted in the run's usage, which the task carries (ADR 0088): a deployment sees
+            // what moved the cached prompt prefix.
+            let chars_removed = u64::try_from(shortened.chars_removed).unwrap_or(u64::MAX);
+            state.shortening_usage.shortened(chars_removed);
+            tracing::info!(
+                run = %run,
+                turn = state.turns,
+                chars_removed,
+                "old tool results were shortened to fit the history budget; the cached prompt \
+                 prefix moves at the first one"
+            );
             state.last_prompt = None;
             // The images of a result that was shortened left the history with it.
             state.drop_unnamed_images();

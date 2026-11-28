@@ -781,6 +781,12 @@ has no `usage`: the commands were not measured, which is not zero. A report of a
 `{"environment": "devcontainer"}` (ADR 0052 removed it): readers keep the word, and this coder never writes it. A run that never asked for an
 environment has no `sandbox`.
 
+It has a `shortenings` member too ([ADR 0088](../decisions/0088-a-tool-result-is-bounded-when-it-is-made-and-a-command-that-succeeds-says-so.md))
+when the run shortened old tool results to keep its history within its budget: `{"count": 2, "charsRemoved": 412000}`, how many times
+and the characters that took out. Each shortening moves the cached prompt prefix, so a deployment can see how often that happens. It
+counts the run's own history (not its children's) and is written under the same rules as the totals. A run that never shortened has no
+`shortenings`, and its object is the one it always was.
+
 ## Images in
 
 A message may carry pictures as standard A2A file parts. **Off by default**: with no `MODEL_INPUT_MODALITIES=text,image` a model gets one line of text in an image's place and the task goes on ([environment](environment.md), [what the model is told](errors.md#an-image-the-model-is-not-sent)). Nothing here is specific to a client.

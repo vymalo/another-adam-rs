@@ -14,6 +14,11 @@
 //! [`SandboxUsage`] is the other cost of a run: the time its commands ran in a sandbox, weighted by the
 //! shape of the sandbox. A tool reports it through the tool context, the loop keeps it in the run's state
 //! beside the totals, and the A2A server writes it on the task beside them (ADR 0043).
+//!
+//! [`ShorteningUsage`] says how often a run's loop shortened old tool results to keep its history
+//! within its budget, and how many characters that took out: each shortening moves the cached
+//! prompt prefix, so a deployment sees what it cost (ADR 0088). The loop keeps it in the run's state,
+//! and the A2A server writes it on the task beside the totals.
 
 use adam_model::Usage;
 use serde::{Deserialize, Serialize};
@@ -327,6 +332,42 @@ impl SandboxUsage {
     }
 }
 
+/// The shortenings of one run's history: how many times its loop shortened old tool results to
+/// keep the history within its budget, and the characters they took out. A shortening rewrites the
+/// past of the conversation, so the request after it is read from the provider's cache only up to
+/// the first result it changed (ADR 0088, decision 1).
+///
+/// The loop keeps it in the run's state (the member `shortening_usage`), and the A2A server writes
+/// it on the task beside the `usage/v1` totals while it is not empty. It counts the run's **own**
+/// history: a child's is the child's. Serialized as `{"count": ..., "chars_removed": ...}`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+#[non_exhaustive]
+pub struct ShorteningUsage {
+    /// How many times old tool results were shortened.
+    pub count: u64,
+    /// The characters the shortenings took out of the history, less the markers they left.
+    pub chars_removed: u64,
+}
+
+impl ShorteningUsage {
+    /// Nothing shortened yet.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Whether the history was never shortened.
+    pub fn is_empty(&self) -> bool {
+        self.count == 0
+    }
+
+    /// Count one shortening that took `chars_removed` characters out of the history.
+    pub fn shortened(&mut self, chars_removed: u64) {
+        self.count = self.count.saturating_add(1);
+        self.chars_removed = self.chars_removed.saturating_add(chars_removed);
+    }
+}
+
 /// `text` cut to at most `max` bytes, on a character boundary.
 fn cut(text: &str, max: usize) -> String {
     let mut end = text.len().min(max);
@@ -379,6 +420,30 @@ mod tests {
             assert_eq!(text.len(), 128, "{text}");
             assert!(text.chars().all(|c| c == 'é'));
         }
+    }
+
+    #[test]
+    fn shortenings_count_and_sum_and_say_nothing_until_there_is_one() {
+        let mut usage = ShorteningUsage::new();
+        assert!(usage.is_empty());
+        usage.shortened(40_000);
+        usage.shortened(2_500);
+        assert!(!usage.is_empty());
+        assert_eq!(
+            serde_json::to_value(usage).unwrap(),
+            json!({"count": 2, "chars_removed": 42_500})
+        );
+        assert_eq!(
+            serde_json::from_value::<ShorteningUsage>(json!({})).unwrap(),
+            ShorteningUsage::new(),
+            "a state written before it existed reads as none"
+        );
+        let mut full = ShorteningUsage {
+            count: u64::MAX,
+            chars_removed: u64::MAX,
+        };
+        full.shortened(1);
+        assert_eq!((full.count, full.chars_removed), (u64::MAX, u64::MAX));
     }
 
     #[test]

@@ -28,6 +28,18 @@ pub const DEFAULT_MAX_CALL: Duration = Duration::from_secs(900);
 /// default of [`McpPolicy::thread_tools_max_call`]): one hour.
 pub const DEFAULT_THREAD_TOOLS_MAX_CALL: Duration = Duration::from_secs(3600);
 
+/// The most bytes of an MCP result the model reads whole when the deployment says nothing (the
+/// default of [`McpPolicy::result_bytes`]): 16 KiB, the default of the coder's
+/// `CHECK_OUTPUT_TAIL_BYTES`, so that a call costs the same whichever kind of tool made it
+/// ([ADR 0088](https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0088-a-tool-result-is-bounded-when-it-is-made-and-a-command-that-succeeds-says-so.md),
+/// decision 2). A longer result is kept and shown as a first page within the bound, which
+/// `read_output` pages on.
+pub const DEFAULT_RESULT_BYTES: usize = 16 * 1024;
+
+/// The least [`McpPolicy::result_bytes`] may be: room for the line that names a kept result and
+/// a line of it. The floor of `CHECK_OUTPUT_TAIL_BYTES` too.
+pub const MIN_RESULT_BYTES: usize = 256;
+
 /// The bearer token a deployment gives one MCP server, **one call at a time**: for a server that
 /// serves many accounts with one process (the credential that fits a call depends on what the call
 /// is about), a token fixed in `mcp.json` or in the environment at startup is the wrong shape.
@@ -118,6 +130,7 @@ pub struct McpPolicy {
     call_timeout: Duration,
     max_call: Duration,
     thread_tools_max_call: Duration,
+    result_bytes: usize,
     bindings: BTreeMap<String, Binding>,
 }
 
@@ -138,6 +151,7 @@ impl std::fmt::Debug for McpPolicy {
             .field("call_timeout", &self.call_timeout)
             .field("max_call", &self.max_call)
             .field("thread_tools_max_call", &self.thread_tools_max_call)
+            .field("result_bytes", &self.result_bytes)
             .field("bearer_per_call", &bound)
             .finish()
     }
@@ -154,6 +168,7 @@ impl Default for McpPolicy {
             call_timeout: DEFAULT_CALL_TIMEOUT,
             max_call: DEFAULT_MAX_CALL,
             thread_tools_max_call: DEFAULT_THREAD_TOOLS_MAX_CALL,
+            result_bytes: DEFAULT_RESULT_BYTES,
             bindings: BTreeMap::new(),
         }
     }
@@ -325,6 +340,23 @@ impl McpPolicy {
         self
     }
 
+    /// The most bytes of a tool's result the model reads whole: a longer success is **kept** and
+    /// shown as its first page within this bound (`read_output` reads the rest), a longer error
+    /// result is cut at it. Default 16 KiB ([`DEFAULT_RESULT_BYTES`]); less than
+    /// [`MIN_RESULT_BYTES`] is raised to it. **The deployment's, not the agent's:** the coder sets
+    /// it to its `CHECK_OUTPUT_TAIL_BYTES`, so an MCP result and a command's output have one bound
+    /// (ADR 0088).
+    #[must_use]
+    pub fn result_bytes(mut self, bytes: usize) -> Self {
+        self.result_bytes = bytes.max(MIN_RESULT_BYTES);
+        self
+    }
+
+    /// The bound of a tool's result ([`result_bytes`](Self::result_bytes)).
+    pub fn result_bytes_value(&self) -> usize {
+        self.result_bytes
+    }
+
     /// The connect timeout.
     pub fn connect_timeout_value(&self) -> Duration {
         self.connect_timeout
@@ -387,6 +419,18 @@ mod tests {
         // No binding: an empty list, not a missing field.
         let plain = format!("{:?}", McpPolicy::default());
         assert!(plain.contains("bearer_per_call: []"), "{plain}");
+    }
+
+    #[test]
+    fn the_result_bound_is_16_kib_unless_the_deployment_sets_one_and_never_under_its_floor() {
+        assert_eq!(McpPolicy::default().result_bytes_value(), 16 * 1024);
+        let set = McpPolicy::default().result_bytes(4096);
+        assert_eq!(set.result_bytes_value(), 4096);
+        assert!(format!("{set:?}").contains("result_bytes: 4096"));
+        assert_eq!(
+            McpPolicy::default().result_bytes(0).result_bytes_value(),
+            MIN_RESULT_BYTES
+        );
     }
 
     #[test]

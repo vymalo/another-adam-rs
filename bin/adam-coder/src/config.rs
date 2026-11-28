@@ -43,7 +43,7 @@
 //! | `LANGUAGE_SERVERS` | roles that run workers: `on` offers `file_diagnostics`, `find_definition` and `find_references` (a language server of the environment, kept between calls); `off` removes the three tools from the set; anything else is refused (exit 78) | `on` |
 //! | `LANGUAGE_SERVER_IDLE_SECS` | how long a language server that no call uses is kept before it is stopped, 30 to 86400; `0` is refused (exit 78) | `600` |
 //! | `LANGUAGE_SERVERS_MAX` | the most language servers this worker holds at once, for all its runs (the least recently used one that is not working is stopped for the next), 1 to 32; `0` is refused (exit 78) | `4` |
-//! | `CHECK_OUTPUT_TAIL_BYTES` | output tail `run_checks` returns | `16384` |
+//! | `CHECK_OUTPUT_TAIL_BYTES` | the bound of a tool result the model reads whole: the output tail `run_checks`, `run` and `run_command` show, and the most bytes of an MCP server's result shown before it is kept and paged ([`WorkerConfig::mcp_policy`], ADR 0088) | `16384` |
 //! | `GIT_AUTHOR_NAME`, `GIT_AUTHOR_EMAIL` | identity of the commits | `adam-coder`, `adam-coder@users.noreply.github.com` |
 //! | `PR_DRAFT` | open pull requests as drafts (`true`/`false`) | `false` |
 //! | `MCP_ALLOW_STDIO` | let an agent folder's `mcp.json` start local processes (`command` servers) | `false` |
@@ -899,6 +899,13 @@ impl Config {
 }
 
 impl WorkerConfig {
+    /// The policy of the MCP servers this worker connects: the deployment's `MCP_*` settings, and
+    /// `CHECK_OUTPUT_TAIL_BYTES` as the bound of a result, so that an MCP result and a command's
+    /// output are bounded alike (ADR 0088, decision 2).
+    pub fn mcp_policy(&self) -> adam::mcp::McpPolicy {
+        self.mcp.policy().result_bytes(self.check_output_tail)
+    }
+
     /// Whether a command a run starts can read the GitHub App's private key: the credentials are an
     /// App whose key is a **file** and the commands run in this container (`RUN_ENVIRONMENT=local`),
     /// as the user that holds the file. Then any access tier, a `plan` too, can mint an installation
@@ -1817,6 +1824,17 @@ mod tests {
                 "{error}"
             );
         }
+    }
+
+    /// ADR 0088: an MCP result is bounded as a command's output is, by `CHECK_OUTPUT_TAIL_BYTES`.
+    #[test]
+    fn the_mcp_result_bound_is_check_output_tail_bytes() {
+        assert_eq!(worker(&full()).mcp_policy().result_bytes_value(), 16 * 1024);
+        let mut vars = full();
+        vars.insert("CHECK_OUTPUT_TAIL_BYTES", "4096");
+        let w = worker(&vars);
+        assert_eq!(w.mcp_policy().result_bytes_value(), 4096);
+        assert!(!w.mcp_policy().stdio_allowed(), "the MCP_* settings stay");
     }
 
     #[test]

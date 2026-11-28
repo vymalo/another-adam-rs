@@ -154,6 +154,7 @@ impl McpServers {
             recipe,
             allow,
             call_timeout,
+            result_bytes,
             per_call,
             files,
             instructions: want_instructions,
@@ -212,6 +213,7 @@ impl McpServers {
                     target.clone(),
                     call_timeout,
                     connect_timeout,
+                    result_bytes,
                     files,
                     parallel,
                 ))
@@ -388,6 +390,8 @@ struct Plan {
     recipe: Recipe,
     allow: Option<Vec<String>>,
     call_timeout: std::time::Duration,
+    /// The most bytes of a result the model reads whole ([`McpPolicy::result_bytes`]).
+    result_bytes: usize,
     /// Set for a remote server the deployment bound to a bearer per call.
     per_call: Option<PerCall>,
     /// `files: true`: the files of its results are shared.
@@ -566,6 +570,7 @@ impl Plan {
             },
             allow,
             call_timeout,
+            result_bytes: policy.result_bytes_value(),
             per_call,
             files: server.shares_files(),
             instructions: server.settings().instructions,

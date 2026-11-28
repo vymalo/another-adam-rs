@@ -4,7 +4,7 @@ For people: [0088. A tool result is bounded when it is made, and a command that 
 which states the decision. This page holds where each slice is in the code, the invariants to check when it changes, and
 the tests that prove it.
 
-Slice T1 is built (2026-11-28, on `3d1e5b5`): [its proofs](#t1-built-2026-11-28). T2, T3 and T4 are not.
+Slices T1 and T2 are built (2026-11-28, on `3d1e5b5`): [T1's proofs](#t1-built-2026-11-28), [T2's](#t2-built-2026-11-28). T3 and T4 are not.
 
 ## T1, built 2026-11-28
 
@@ -53,3 +53,38 @@ Existing tests whose expected text changed (the default of `run` and `run_checks
 `run.rs`, the `RENDERED` constant became `rendered(ctx)` and `FULL`; in the coder's `command_results.rs`, the `run`
 expectations of a success (`hidden`, `NO_OUTPUT`), with `output: "full"` where a test is about the output itself; in
 `tools.rs` and `environment.rs`, `output: "full"` on the calls whose assertions read the output.
+
+## T2, built 2026-11-28
+
+The MCP bound follows the tool-result bound; shortenings counted in the run's usage.
+
+| What | Where |
+|---|---|
+| The bound, the deployment's | `McpPolicy::result_bytes` / `result_bytes_value` (`crates/adam-mcp/src/policy.rs:350`, `:356`), default `DEFAULT_RESULT_BYTES` = 16 KiB, floor `MIN_RESULT_BYTES` = 256 (`policy.rs:37`, `:41`); `MAX_RESULT_BYTES` is a deprecated alias of the default (`src/text.rs`) |
+| The coder sets it | `WorkerConfig::mcp_policy` = `mcp.policy().result_bytes(check_output_tail)` (`bin/adam-coder/src/config.rs:905`), used for the folder's servers and the thread-tools endpoint (`bin/adam-coder/src/serve.rs:229`, `:251`). `adam-agent` keeps the default |
+| Where a result is bounded | `Plan::result_bytes` (`crates/adam-mcp/src/servers.rs:573`) into `McpTool`; `keep_overflow(ctx, output, bound)` (`src/tool.rs:471`): an error is cut at `bound`, a success over it kept; `map_result(.., result_bytes, ..)` (`src/tool.rs:519`) pretty-prints structured content past it; `Endpoint` takes it from its policy (`src/once.rs:230`) |
+| The first page within the bound | `adam_llm_agent::keep_long_within` (`crates/adam-llm-agent/src/kept.rs:682`): the page is asked again with fewer lines (`fewer_lines`, `:768`, in proportion and strictly fewer, so it ends) until header, page and final line fit; `fitting_page` (`:750`) for the two cases with no store. `keep_long_cut` is `keep_long_within(.., usize::MAX)`: unchanged for every other caller |
+| The count | `adam_runtime::ShorteningUsage { count, chars_removed }` (`crates/adam-runtime/src/usage.rs:346`); `Conversation::shortening_usage` (`crates/adam-llm-agent/src/conversation.rs:657`); `history::Shortened { first, chars_removed }` returned by `record_shortenings_from` (`src/history.rs:362`, `:438`); counted with an `info` line where the shortening is recorded (`src/agent.rs:8265`) |
+| The report | `shortenings_report`, the `shortenings` member of the task's `usage/v1` object (`crates/adam-a2a-runtime/src/usage.rs:199`, `:152`) |
+
+### Invariants to check
+
+1. **What the model reads of an MCP result is at most the bound**, header and final line included, except that a page
+   always holds one line (folded at 2,000 characters), which matters only for a bound under about 8 KiB.
+2. **Paging is unchanged.** The final line of the shown page names the offset after the last line shown, so
+   `read_output` reads on from there and the pages give the whole text back (the tests reassemble it).
+3. **A run that never shortens writes the bytes it always did**: `shortening_usage` is
+   `skip_serializing_if = "ShorteningUsage::is_empty"`, and the `usage/v1` object has no `shortenings` member then.
+4. **The count is a function of the committed state**, like the shortening: a retried model call does not count again.
+5. **The run's own history only.** A child's `shortening_usage` is not merged into its parent's (the child-answer code is
+   ADR 0087's to change); a continuation starts with none.
+
+### Tests
+
+| Test | Proves |
+|---|---|
+| `adam-mcp` `src/tool.rs`: `a_result_over_16_kib_is_kept_and_a_first_page_within_16_kib_returned` (was `a_result_over_64_kib_is_kept_and_its_first_page_returned`), `a_configured_bound_is_the_one_a_result_is_kept_and_shown_within`, `a_result_over_the_bound_is_whole_until_it_is_kept`, `an_error_result_is_cut_as_it_always_was_and_a_short_one_is_untouched` (16 KiB and a set 4 KiB); `src/policy.rs`: `the_result_bound_is_16_kib_unless_the_deployment_sets_one_and_never_under_its_floor` | the default and a configured bound, for kept, unkept and error results |
+| `adam-mcp` `tests/http.rs`: `the_result_bound_the_policy_sets_is_the_one_a_result_is_shown_within`, `big_result_without_room_to_keep_it_shows_its_first_page_and_says_so` | end to end over streamable HTTP |
+| `adam-coder` `src/config.rs`: `the_mcp_result_bound_is_check_output_tail_bytes` | the coder's bound is `CHECK_OUTPUT_TAIL_BYTES` |
+| `adam-llm-agent` `tests/prefix.rs`: `a_shortening_is_counted_in_the_runs_usage` (the exact characters, from the requests), `without_a_budget_nothing_is_shortened_and_the_state_has_no_member_for_it`, `a_retried_model_call_sends_the_same_request_after_a_shortening` (counted once); `src/history.rs`: `the_first_changed_message_is_reported` (and the characters removed) | the count, and nothing new without one |
+| `adam-runtime` `src/usage.rs`: `shortenings_count_and_sum_and_say_nothing_until_there_is_one`; `adam-a2a-runtime` `src/usage.rs`: `shortenings_are_a_member_beside_the_totals_only_when_there_were_some`, `tokens_only_is_the_object_it_always_was` | the type and the `usage/v1` member |

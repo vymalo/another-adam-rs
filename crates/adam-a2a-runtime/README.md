@@ -515,6 +515,19 @@ pod that was asked for and ran no command. The object is written when there are 
 always in it (`[]` for a run that made no model call), because the orchestrator rejects an object without it. A task whose agent keeps
 neither carries no metadata, and a task with tokens only carries the object it always did, byte for byte.
 
+**`shortenings`, beside `totals`** ([ADR 0088](../../docs/decisions/0088-a-tool-result-is-bounded-when-it-is-made-and-a-command-that-succeeds-says-so.md)):
+how many times the run's loop shortened old tool results to keep its history within its budget, and the characters that took
+out, read from the `shortening_usage` the agent keeps in its state (`adam_runtime::ShorteningUsage`), under the same rules as the
+totals. Each shortening moves the cached prompt prefix, so a deployment sees what that cost:
+
+```json
+{"totals": [...], "shortenings": {"count": 2, "charsRemoved": 412000}}
+```
+
+Whole numbers of at most `MAX_TOKEN_COUNT`; the run's own history only (a child's is the child's). **Additive:** the member is
+written only when the history was shortened, so a task that never shortened carries the object it always did, byte for byte
+(unit test `shortenings_are_a_member_beside_the_totals_only_when_there_were_some`).
+
 ## The access tier
 
 `access-tier/v1` (the contract of `docs/api/access-tier-v1.md` of `vymalo/another-agentic-system`, ADR 0036 of this repository). With

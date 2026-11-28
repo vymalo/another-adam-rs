@@ -87,3 +87,13 @@ What adam does today (*verified 2026-11-27*):
 * The exporter's samples (ADR 0085) show the success line, which is what the model saw.
 * No `Store`, `Notifier` or `ModelClient` method changes.
 
+*Amended 2026-11-28:* slice T2 is built. The MCP bound is the deployment's, `McpPolicy::result_bytes`: 16 KiB by default
+(`DEFAULT_RESULT_BYTES`, so a folder agent served by `adam-agent` has it too), and the coder sets it to its
+`CHECK_OUTPUT_TAIL_BYTES`. A successful text over it is kept, and what the model is shown (the line that names it, a first
+page and the page's last line) fits the bound: the first page holds as many lines as fit, and always one. An error result
+is cut at the bound. `MAX_RESULT_BYTES` stays as a deprecated name of the default. Each shortening is counted in the run's
+state (`shortening_usage`: the count and the characters it took out) and written on the task as a `shortenings` member of
+the `usage/v1` object, `{"count": 2, "charsRemoved": 412000}`, with an `info` log line. Two choices the decision left open:
+the count is the run's own history, not its children's, and a task whose history was never shortened carries the object it
+always did. The evidence:
+[0088: the evidence and the slice proofs](../../.agents/docs/decisions/0088-a-tool-result-is-bounded-when-it-is-made-and-a-command-that-succeeds-says-so.md#t2-built-2026-11-28).

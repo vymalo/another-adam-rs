@@ -7,7 +7,8 @@ use adam_core::RunId;
 use adam_core::time::Timestamp;
 use adam_model::{Message, ToolCall, Usage};
 use adam_runtime::{
-    AgentError, Inbound, SESSION_STATE_KEY, SandboxUsage, SessionHeader, UsageTotals,
+    AgentError, Inbound, SESSION_STATE_KEY, SandboxUsage, SessionHeader, ShorteningUsage,
+    UsageTotals,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -646,6 +647,14 @@ pub struct Conversation {
     /// that continues another starts with none (a new task).
     #[serde(default, skip_serializing_if = "SandboxUsage::is_empty")]
     pub sandbox_usage: SandboxUsage,
+    /// How many times this run's history was shortened ([`shortenings`](Self::shortenings)) and the
+    /// characters that took out of it: what the A2A server writes on the task as the `shortenings`
+    /// member of the `usage/v1` totals when it ends or waits (ADR 0088), so a deployment sees what
+    /// moved the cached prompt prefix. This run's own history only, never a child's. Absent from
+    /// state written before it existed, and not written while empty, so a run that never shortens
+    /// writes the bytes it always did; a run that continues another starts with none.
+    #[serde(default, skip_serializing_if = "ShorteningUsage::is_empty")]
+    pub shortening_usage: ShorteningUsage,
     /// The long outputs this run keeps in its own state, by output id, for
     /// [`read_output`](crate::ReadOutput): what a tool handed back in
     /// [`ToolOutput::kept`](crate::ToolOutput::kept) when its agent has no

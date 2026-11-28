@@ -37,6 +37,16 @@
 //! command: a measured zero.
 //! `totals` is always there when the object is, `[]` for a run that made no model call.
 //!
+//! It carries a `shortenings` member when the run's loop shortened old tool results to keep its
+//! history within its budget (`state.shortening_usage`, [`ShorteningUsage`]; ADR 0088): how many
+//! times, and the characters that took out. Each one moves the cached prompt prefix. A run that
+//! never shortened has no member, so its object is the one it always was:
+//!
+//! ```json
+//! {"https://agents.vymalo.com/a2a/extensions/usage/v1": {"totals": [...],
+//!   "shortenings": {"count": 2, "charsRemoved": 412000}}}
+//! ```
+//!
 //! The counts are AG-UI 1.0's `TokenUsage` (parts never additions), each at most 2^53 - 1, and the
 //! labels at most 128 bytes (the contract is the orchestration layer's, `docs/api/usage-v1.md` of
 //! `vymalo/another-agentic-system`).
@@ -47,7 +57,7 @@ use a2a::{TaskState, TaskStatus, TaskStatusUpdateEvent};
 use adam_a2a::{TaskEvent, USAGE_EXTENSION};
 use adam_runtime::{
     MAX_SANDBOX_ENTRIES, MAX_USAGE_CALL_BYTES, MAX_USAGE_LABEL_BYTES, MAX_USAGE_TOTALS, RunView,
-    SandboxUsage, Usage, UsageEvent, UsageTotals,
+    SandboxUsage, ShorteningUsage, Usage, UsageEvent, UsageTotals,
 };
 use serde_json::{Map, Value};
 
@@ -95,8 +105,10 @@ pub(crate) fn report(call: &UsageEvent) -> Value {
 
 /// The task's `metadata` for the totals its agent keeps (`state.usage_totals`, the shape of
 /// [`UsageTotals`]), at most 32 entries, and for the sandbox usage it keeps (`state.sandbox_usage`),
-/// as `sandbox`; `None` when the state keeps neither (an agent that counts nothing, a task that made
-/// no model call and asked for no environment). `totals` is written whenever the object is.
+/// as `sandbox`, and for the shortenings of its history (`state.shortening_usage`), as
+/// `shortenings`; `None` when the state keeps none of them (an agent that counts nothing, a task
+/// that made no model call and asked for no environment). `totals` is written whenever the object
+/// is.
 pub(crate) fn totals_metadata(view: &RunView) -> Option<HashMap<String, Value>> {
     let totals: UsageTotals = view
         .state
@@ -108,7 +120,12 @@ pub(crate) fn totals_metadata(view: &RunView) -> Option<HashMap<String, Value>> 
         .get("sandbox_usage")
         .and_then(|usage| serde_json::from_value::<SandboxUsage>(usage.clone()).ok())
         .and_then(|usage| sandbox_report(&usage));
-    if totals.is_empty() && sandbox.is_none() {
+    let shortenings = view
+        .state
+        .get("shortening_usage")
+        .and_then(|usage| serde_json::from_value::<ShorteningUsage>(usage.clone()).ok())
+        .and_then(shortenings_report);
+    if totals.is_empty() && sandbox.is_none() && shortenings.is_none() {
         return None;
     }
     let entries: Vec<Value> = totals
@@ -130,6 +147,9 @@ pub(crate) fn totals_metadata(view: &RunView) -> Option<HashMap<String, Value>> 
     members.insert("totals".into(), entries.into());
     if let Some(sandbox) = sandbox {
         members.insert("sandbox".into(), sandbox);
+    }
+    if let Some(shortenings) = shortenings {
+        members.insert("shortenings".into(), shortenings);
     }
     Some(HashMap::from([(
         USAGE_EXTENSION.to_owned(),
@@ -171,6 +191,21 @@ fn sandbox_report(usage: &SandboxUsage) -> Option<Value> {
             .collect();
         report.insert("usage".into(), entries.into());
     }
+    Some(Value::Object(report))
+}
+
+/// The `shortenings` member: `count` and `charsRemoved`, each within 2^53 - 1. `None` while the
+/// history was never shortened.
+fn shortenings_report(usage: ShorteningUsage) -> Option<Value> {
+    if usage.is_empty() {
+        return None;
+    }
+    let mut report = Map::new();
+    report.insert("count".into(), usage.count.min(MAX_TOKEN_COUNT).into());
+    report.insert(
+        "charsRemoved".into(),
+        usage.chars_removed.min(MAX_TOKEN_COUNT).into(),
+    );
     Some(Value::Object(report))
 }
 
@@ -349,6 +384,31 @@ mod tests {
             object.as_object().unwrap().len(),
             1,
             "no other member: {object}"
+        );
+    }
+
+    /// ADR 0088: a run whose history was shortened says how often and how much, beside its totals;
+    /// a run that never shortened writes the object it always did (above).
+    #[test]
+    fn shortenings_are_a_member_beside_the_totals_only_when_there_were_some() {
+        let object = written(json!({
+            "usage_totals": TOKENS(),
+            "shortening_usage": {"count": 2, "chars_removed": 412_000}
+        }))
+        .unwrap();
+        assert_eq!(
+            object["shortenings"],
+            json!({"count": 2, "charsRemoved": 412_000})
+        );
+        assert_eq!(object["totals"][0]["totalTokens"], json!(11));
+        let never = written(json!({"usage_totals": TOKENS(), "shortening_usage": {}})).unwrap();
+        assert!(never.get("shortenings").is_none(), "{never}");
+        let huge =
+            written(json!({"shortening_usage": {"count": u64::MAX, "chars_removed": u64::MAX}}))
+                .unwrap();
+        assert_eq!(
+            huge,
+            json!({"totals": [], "shortenings": {"count": MAX_TOKEN_COUNT, "charsRemoved": MAX_TOKEN_COUNT}})
         );
     }
 

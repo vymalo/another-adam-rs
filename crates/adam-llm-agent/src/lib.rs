@@ -224,8 +224,8 @@ pub use kept::{
     KeptError, KeptInfo, KeptMap, KeptOutput, KeptOutputs, KeptStore, LineFolder, MAX_KEPT_BYTES,
     MAX_RUN_KEPT_BYTES, MemoryKept, READ_OUTPUT, ReadOutput, SCRUB_OVERLAP, StreamScrubber,
     call_key, canonical_pointer_id, count_lines, find_pointer, is_output_id, keep_long,
-    keep_long_cut, kept_header, kept_outputs_conformance, kept_view, output_id, output_id_of,
-    page_of, pointer_line, prepare, read_pointer, scrub_open_end, scrub_open_start,
+    keep_long_cut, keep_long_within, kept_header, kept_outputs_conformance, kept_view, output_id,
+    output_id_of, page_of, pointer_line, prepare, read_pointer, scrub_open_end, scrub_open_start,
     scrubbed_for_keeping, unkept_view,
 };
 pub use model_wait::{

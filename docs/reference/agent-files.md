@@ -368,11 +368,12 @@ so a mode's narrowing reaches the helpers too.
 }
 ```
 
-* **A long result is kept and paged, not cut.** A text answer over 64 KiB is kept and the model is shown its first
-  page and an output id; the agent gets a `read_output` tool (added when its tools include an MCP tool) that reads the rest by
+* **A long result is kept and paged, not cut.** A text answer over 16 KiB (the deployment's bound of a tool result,
+  `CHECK_OUTPUT_TAIL_BYTES` in the coder; [ADR 0088](../decisions/0088-a-tool-result-is-bounded-when-it-is-made-and-a-command-that-succeeds-says-so.md))
+  is kept and the model is shown a first page within that bound and an output id; the agent gets a `read_output` tool (added when its tools include an MCP tool) that reads the rest by
   lines. A folder agent has no volume, so it keeps the text **in the run's state, at most 4 MiB for the run** (as the tools gave it: a host that sets `ToolCtx::with_scrub` has it scrubbed before it is folded and at every read; the shipped `adam-agent` sets none and has no secrets registry, so it does not); a
   result that would go over is shown as its first page and `[not kept: ...]`. An error result is still cut at
-  64 KiB, and images and blobs are not paged. See [`adam-mcp`](../../crates/adam-mcp/README.md).
+  the bound, and images and blobs are not paged. See [`adam-mcp`](../../crates/adam-mcp/README.md).
 * Field names follow Claude Code's `.mcp.json` (*verified 2026-09-29*,
   <https://code.claude.com/docs/en/mcp.md>) and the draft SEP-2633 (*verified draft status 2026-09-29*,
   <https://github.com/modelcontextprotocol/modelcontextprotocol/pull/2633>; the field details are
@@ -951,7 +952,7 @@ sequenceDiagram
   B->>B: per agent: connected, same file, names fit its servers, no clash, tools: selects
   Note over J,S: at run time
   J->>S: tools/call (one call, within a timeout, dropped when the run is cancelled)
-  S-->>J: content, as text (cut at 64 KiB), isError kept
+  S-->>J: content, as text (over 16 KiB: kept, a first page shown), isError kept
 ```
 
 ```mermaid
@@ -1020,7 +1021,7 @@ tools, named after the server, loaded by one generated tool, `load__group__<serv
   another machine, a URL with credentials or a `${VAR}`, a bad header, a server that is down or refuses the
   credentials, an allow-list naming a tool the server lacks.
 * **Names and text.** `<server>__<tool>`; without an allow-list a tool whose name does not fit
-  `^[A-Za-z0-9_-]{1,64}$` is skipped with a warning. Descriptions are cut at 8 KiB, answers at 64 KiB; images
+  `^[A-Za-z0-9_-]{1,64}$` is skipped with a warning. Descriptions are cut at 8 KiB, an answer over 16 KiB is kept and paged; images
   and blobs are described, never included (unless the server has `files: true`, below); `isError` is an error
   result.
 * **At-least-once.** A call runs inside the journaled step, so a replay of a committed call does not call the
