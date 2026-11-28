@@ -1,30 +1,102 @@
 # Roadmap
 
-> The product roadmap to launch, with its milestones and issues, is in
-> [`ROADMAP.md` of another-agentic-system](https://github.com/vymalo/another-agentic-system/blob/main/ROADMAP.md).
-> The table below is this library's own roadmap.
+For agents: [the evidence and how to re-check it](../.agents/docs/roadmap.md)
 
-| # | Item | State |
+This is the library's own roadmap: what is built, what is missing, what is half done and what is big. The product
+roadmap, with its milestones, is
+[`ROADMAP.md` of another-agentic-system](https://github.com/vymalo/another-agentic-system/blob/main/ROADMAP.md).
+The feature table by area is in the [README](../README.md#features); every setting by surface is in
+[Parity](reference/parity.md).
+
+Each row names a card (`ANR-NNN`), a GitHub issue, or says "no card yet". Where a row says *proven*, it says what
+proves it. Everything else is built and not yet proven.
+
+## Where it stands (2026-11-28)
+
+* The library is wide and green on mocks: the durable loop, three stores, A2A 1.0, the coder and the folder agent are built.
+* Almost nothing here has run against a real model, a real GitHub or a real cluster, and no release has ever been published.
+* `v0.7.0` is tagged and its release run is queued, so the first signed image, chart and `adam-agent` binary do not exist yet.
+
+## Built and proven
+
+Proven means CI runs it. The list of features is in the [README](../README.md#features); these are the parts the rest
+stands on.
+
+| What | Proof |
+|---|---|
+| The durable loop: journaled steps, leases, a run resumed by any worker, state as a head and an append-only transcript ([ADR 0055](decisions/0055-a-runs-state-is-a-head-and-an-append-only-transcript.md)) | the store conformance suite on PostgreSQL 18, MongoDB 5.0 and 8.0, and SQLite |
+| The A2A 1.0 server and its extensions | the dev stack's end-to-end scripts, on a scripted model |
+| Folder agents, `#[tool]`, subagents, MCP servers | CI, on mocks |
+| The coder's tools: paged reads, plan, skills, commands that keep running, language servers ([ADR 0044](decisions/0044-paged-tools-a-stable-prompt-prefix-a-plan-skills-commands-and-project-context.md)) | CI, on mocks |
+| Run pods, the egress proxy and the git sandbox: the chart's objects on kind | the `run-pods` CI job on kind |
+
+## Missing: not started
+
+| What | Why it matters | Card |
 |---|---|---|
-| 1 | `Store` trait and its adapters (`adam-core`, PostgreSQL, MongoDB, SQLite) | built |
-| 2 | Run state machine and `ctx.step` journaling (`adam-runtime`) | built |
-| 3 | `#[tool]` macro (`adam-macros`, through the `adam` facade) | built: [Agent files](reference/agent-files.md#the-tool-contract) |
-| 4 | `build.rs` discovery of `agent/` (instructions, skills, subagents, `mcp.json`) | built: parser and validator (`adam-agent-fs`), binding to `LlmAgent`s (`adam-assembly`), subagents as child runs (local and remote A2A), dev reload, `mcp.json` tools, run-time folders (`ADAM_AGENT_DIR`) |
-| 5 | Parking, approvals, schedules | partly: parking and `ask_user` are built, and schedules run in `adam-agent` and the coder ([ADR 0060](decisions/0060-schedules-are-parked-runs.md)); approvals (`approval:`) are not |
-| 6 | Dev TUI (`cargo adam dev`) | not started |
-| 7 | Host adapters (axum/tower), channels, sandboxes | not started |
-| 8 | The A2A 1.0 server, complete | built, [ADR 0030](decisions/0030-a2a-push-notifications-list-tasks-extended-card-signatures.md): push notifications (durable, at least once, off unless a webhook allow-list is set), `ListTasks`, `GetExtendedAgentCard`, signed cards. Not done: encrypted webhook credentials, signed notifications (the specification asks for none), per-caller extended cards |
-| 9 | A coder as good as OpenCode, and above: paged tools, a stable prompt prefix, a plan, skills, commands and project context ([ADR 0044](decisions/0044-paged-tools-a-stable-prompt-prefix-a-plan-skills-commands-and-project-context.md), 16 slices) | built, **all but one on 2026-11-27**: slices 1 to 10, 11a and 11b (the kinds of question), 12 (commands), 13 (references), 14 (MCP timeouts, instructions and prompts), 15a (images in, off by default), 16 (commands that keep running) and 17 (diagnostics from a language server). 15b (images out, made by the model) is **deferred by the owner** until a provider is named. Of slice 9, the folder's `compaction` subagent and the `compacting` hook are not built |
-| 10 | A subagent in the background, as a session ([ADR 0045](decisions/0045-a-subagent-can-run-in-the-background-as-a-session.md), 8 slices) | partly, **7 of 8 on 2026-11-27**: built 1 (the runtime), 2 (the five `subagent_*` tools), 3 (reports during a turn), 4 (limits), 5 (remote sessions), 6 (the `child-sessions/v1` extension) and 8 (asking from a child); 7 (the coder's own sessions) is built in part: a session's rounds read the workspace of the task they were opened in, the coder's kept-open helpers are not built |
-| 11 | Hooks around the agent loop: compiled plugins, every loop event, custom events, then programs ([ADR 0050](decisions/0050-hooks-around-the-agent-loop-compiled-first-and-programs-second.md), H0 to P3) | partly, on 2026-11-27: the library's hooks — H1, H1b, H1c, H3, H4, H5, H7, H8 and H9 (a tool call, a person's message, a model request, the end of a run, a compaction, events after a commit, custom events, child and session events, and `Ask` that parks the run for the person's approval) — `plugins:` in agent files with `AgentDef::plugin` and the `Audit` plugin (H6a, H6b), and the `adam-hooks/1` program adapter (P1). **No shipped binary registers a plugin yet**, so `plugins:` in a folder `adam-agent` or `adam-coder` serves is exit 78. Not built: the coder's snapshot plugin (H11), `ExecHook` (H10), the deployment's file and switch for programs (P2) and the chart's volume (P3) |
-| 12 | No Podman: a repository's own environment is a run pod of its image, `use_repository_environment`, and the bench on the host's container runtime ([ADR 0052](decisions/0052-no-podman-a-repositorys-own-environment-is-a-run-pod-of-its-image.md), slices B1 and 1 to 6) | decided 2026-11-19; partly: the reader in `adam-workspace`, the port's image method, `use_repository_environment`, the chart's `runPods.repositoryImages`, the dev stack and CI, and the code (slice 3: the crate, the variables, the tool, the image's tools) are built (#368 and its slices), but for the configuration's lifecycle commands, its `containerEnv`/`remoteEnv` (listed as ignored), the pulled digest, the file-changed reset and the absent-tool step; B1 (the bench on the host's container runtime) is built too ([amended 2026-11-27](decisions/0052-no-podman-a-repositorys-own-environment-is-a-run-pod-of-its-image.md)); slices 4 to 6 belong to the system, the platform and the images repositories and are not checked here |
-| 13 | SQLite, a store service, a database per agent and a static coder ([ADR 0053](decisions/0053-sqlite-a-store-service-a-database-per-agent-and-a-static-coder.md), slices 1 to 7) | partly, on 2026-11-27: built 1 (the static musl image), 2 (PostgreSQL on `tokio-postgres`) and 3 (`adam-store-sqlite`, and `DATABASE_URL` choosing the store). Not built: the store service (4, 5), the bench's store (6b) and the platform's database per agent (7) |
-| 14 | A run's state is a head and an append-only transcript ([ADR 0055](decisions/0055-a-runs-state-is-a-head-and-an-append-only-transcript.md), slices S0 to S3) | built, **S0–S3 on 2026-11-20**: the measurement and the counting store, blobs and schema version 5 part 1, the shadow (the head and an append-only body per generation), the view (the observer reads the head; `Runtime::state` joins it) and the contract (the tombstone, every read serves the head, the PostgreSQL half) on Memory, MongoDB and PostgreSQL. The contract is a separate deploy: [deploy the coder](guides/deploy-the-coder.md#the-contract-release-a-one-time-window). S4 (drop the v4 read path and the `state` column) is a later contract |
-| 15 | A folder agent can sleep and wait on a named queue ([ADR 0074](decisions/0074-a-folder-agent-can-sleep-and-wait-on-a-named-queue.md), 8 slices) | proposed 2026-11-24; not started |
-| 16 | Versioned releases: one version for the crates and the chart, `X.Y.Z` images and an OCI chart, signed ([ADR 0084](decisions/0084-releases-are-cut-by-release-please-and-production-pins-a-version.md), [Releases](guides/releases.md)) | built on 2026-11-27; not run: no tag yet, and the GitHub App it needs is the owner's to set up |
+| The store service, so an agent's pod holds no database credential ([ADR 0053](decisions/0053-sqlite-a-store-service-a-database-per-agent-and-a-static-coder.md), slices 4 to 7) | no credential in an agent's pod | no card yet |
+| Replicated SQLite and a run resumed on a new machine ([ADR 0078](decisions/0078-a-sqlite-store-is-replicated-per-commit-and-a-new-machine-resumes-from-the-copies.md), proposed) | a device that is lost keeps its runs | no card yet |
+| A folder agent that sleeps and waits on a named queue ([ADR 0074](decisions/0074-a-folder-agent-can-sleep-and-wait-on-a-named-queue.md), proposed) | long waits without a held run | no card yet |
+| Metrics and traces for the whole runtime ([ADR 0075](decisions/0075-metrics-and-traces-are-off-by-default-and-say-nothing-about-a-person.md), proposed; two span kinds are built) | an operator sees what the runtime does | ANR-268 |
+| The memory's database adapters and its later slices ([ADR 0081](decisions/0081-an-agent-keeps-a-self-improvement-memory-near-it-and-what-holds-becomes-the-deployments-memory.md): PostgreSQL, MongoDB and Redis, then the promotion pass and the reviewer) | the memory survives a restart and is shared | ANR-1292, ANR-1293, ANR-1294 |
+| A coder's snapshot plugin, `ExecHook` and the chart's volume for hook programs ([ADR 0050](decisions/0050-hooks-around-the-agent-loop-compiled-first-and-programs-second.md), H10, H11, P3) | a run that can be reverted; programs that can veto a command | no card yet |
+| The dev TUI, host adapters (axum/tower) and sandboxes as adapters | none is planned yet | no card yet |
+| A folder's own `compaction` subagent ([ADR 0044](decisions/0044-paged-tools-a-stable-prompt-prefix-a-plan-skills-commands-and-project-context.md), slice 9) | compaction is a single summary today | no card yet |
+| Images out, made by the model | deferred by the owner until a provider is named | no card yet |
+| Editing workers and sub-agent worktrees | on hold | no card yet |
+| Encrypted webhook credentials and an extended card per caller | A2A push notifications ([ADR 0030](decisions/0030-a2a-push-notifications-list-tasks-extended-card-signatures.md)) | no card yet |
 
-Known gaps recorded in the docs: a pinned run whose worker never returns is stranded
-([Architecture](architecture.md#where-a-runs-files-and-processes-live)); subagent calls of one turn run one after the other
-([Child runs](reference/child-runs.md)); a cancel does not reach a remote A2A task a run started
-([Child runs](reference/child-runs.md#cancel-cascades-and-time-limits)); the
-chart has not been applied with more than one worker ([Deploy](guides/deploy-the-coder.md#known-risks)).
+## Incomplete: started but not done, or built but unproven
+
+| What | State | What would prove it | Card |
+|---|---|---|---|
+| The first release | `v0.6.0` was never published: its smoke test ran PostgreSQL 17, which the store refuses. `v0.7.0` is tagged; its release run is queued | the release run passes: an `X.Y.Z` image, a chart and signatures that resolve anonymously | no card yet |
+| The Homebrew path for `adam-agent` (#495) | built; never run. Four builds, the signed `SHA256SUMS`, the Homebrew installs and the tap pull request wait for the first release. #495 and #530 were merged without CI having run on them | the first release run, then a `brew install` from the tap | ANR-1203 |
+| The coder, chat to pull request | proven on a scripted model, a mock GitHub and a local git server; never on GitHub.com, never on a real model | a live run to a real pull request, and the bench on a real model ([bench](../bench/README.md)) | [#102](https://github.com/vymalo/another-adam-rs/issues/102) |
+| Model client and credentials | proven on mocks; the nightly live test skips without its secrets; the device sign-in and the injector have never met a real provider | the nightly job with secrets, and the human test of usage and reasoning against a real gateway | [#102](https://github.com/vymalo/another-adam-rs/issues/102) |
+| Run pods | the chart's objects run on kind; a run on a real model through a run pod is not proven | the same run on a real cluster | no card yet |
+| A run pod holds no model key ([ADR 0038](decisions/0038-the-coder-drops-opencode-and-adam-acp-stays-a-library.md)) | not built: every run pod still gets the key | a run pod with no Secret, shown by a test | [#119](https://github.com/vymalo/another-adam-rs/issues/119) |
+| The coder checks who the person is and their access ([ADR 0072](decisions/0072-the-coder-verifies-who-the-person-is-and-asks-github-before-it-touches-a-repository.md), proposed) | not built: one GitHub App acts for everyone | a person is refused a repository they cannot reach | [#121](https://github.com/vymalo/another-adam-rs/issues/121) |
+| A git mirror per person | not built: two people on one repository can read each other's unpushed work | a run pod cannot read another person's refs | [#122](https://github.com/vymalo/another-adam-rs/issues/122) |
+| The package cache | not built: any run can write what another's build reads | a run cannot change another's cache | [#123](https://github.com/vymalo/another-adam-rs/issues/123) |
+| The Helm chart | renders and goldens only; never applied with more than one worker; no database backups; `flock` on network volumes unverified | a rollout of several workers on a real cluster | [#127](https://github.com/vymalo/another-adam-rs/issues/127) |
+| The coder's database for scale and pruning of finished runs | not built: nothing deletes a finished run | a periodic sweep and chart values for several instances | [#127](https://github.com/vymalo/another-adam-rs/issues/127) |
+| The SQL adapters keep their rules in the database ([ADR 0082](decisions/0082-the-sql-adapters-keep-their-rules-in-the-database.md)) | P0 to P2 built; P3 to P7 and the two SQLite slices to do | the store suite after each slice | ANR-1148 |
+| The activity route for scaling ([ADR 0083](decisions/0083-the-activity-route-has-a-listener-and-tokens-of-its-own.md)) | the listener and its tokens are built; no scaler has used them on a cluster | the platform's operator reads it on a cluster | no card yet |
+| A run's signed requests ([ADR 0068](decisions/0068-adam-signs-its-own-history.md), [0086](decisions/0086-a-run-signs-its-model-requests-with-a-certificate.md)) | turns and heads are signed; the run certificate has its ports, a fake issuer and a suite, and no real issuer. The request signature follows the contract as first written, not as amended; `signed-turns/v1` is not built | the amended contract's vectors pass | [#445](https://github.com/vymalo/another-adam-rs/issues/445) |
+| A subagent in the background, as a session ([ADR 0045](decisions/0045-a-subagent-can-run-in-the-background-as-a-session.md)) | 7 of 8; the coder's kept-open helpers are built in part | the coder keeps a helper open across rounds | no card yet |
+| Hooks ([ADR 0050](decisions/0050-hooks-around-the-agent-loop-compiled-first-and-programs-second.md)) | the library's hooks, `plugins:`, the `audit` plugin and the program adapter are built, and so are the deployment's hooks file and switch; no shipped binary registers a plugin | a plugin the coder registers, and a program that vetoes `git push` on the dev stack | no card yet |
+| A repository's own environment ([ADR 0052](decisions/0052-no-podman-a-repositorys-own-environment-is-a-run-pod-of-its-image.md)) | lifecycle commands, `containerEnv` and the pulled digest are not built | the missing steps and their tests | no card yet |
+| Images in | built, off by default; the provider's wire shape is unverified | a real provider's answer | no card yet |
+| The memory ([ADR 0081](decisions/0081-an-agent-keeps-a-self-improvement-memory-near-it-and-what-holds-becomes-the-deployments-memory.md)) | the ports, the in-folder adapter, the in-process adapter and the two tools are built; no database adapter, no promotion, no defaults in the agents | the paired study in the bench | ANR-1292, ANR-1293, ANR-1294 |
+| The engine (`adam-engine`) | a chat agent on SQLite; phones are type-checked only; no MCP servers, no remote subagents, no access tier | an application on a phone | [#275](https://github.com/vymalo/another-adam-rs/issues/275), [#277](https://github.com/vymalo/another-adam-rs/issues/277), [#278](https://github.com/vymalo/another-adam-rs/issues/278) |
+| Parity gaps between surfaces | `uploads/v1` on no card, no access tier on the folder agent, reasoning effort not one setting everywhere | the [parity table](reference/parity.md) with no gap | [#274](https://github.com/vymalo/another-adam-rs/issues/274), [#282](https://github.com/vymalo/another-adam-rs/issues/282), [#284](https://github.com/vymalo/another-adam-rs/issues/284) |
+| Known defects | the model client drops a tool call's `extra_content` (every second Gemini call is a 400); the extra body's thinking members are not merged with the typed level; the folder-agent skill omits the reasoning settings; a rustdoc link does not resolve | each issue closed | [#322](https://github.com/vymalo/another-adam-rs/issues/322), [#330](https://github.com/vymalo/another-adam-rs/issues/330), [#318](https://github.com/vymalo/another-adam-rs/issues/318), [#249](https://github.com/vymalo/another-adam-rs/issues/249) |
+| Known gaps in the docs | a pinned run whose worker never returns is stranded; subagent calls of one turn run one after the other; a cancel does not reach a remote A2A task a run started | see [Child runs](reference/child-runs.md) | no card yet |
+
+## Needs more time
+
+| What | Why it is big |
+|---|---|
+| The first live run of the coder | It needs a real model, a real GitHub and a real cluster at once. Each has its own unknowns: the provider's wire shapes, a GitHub App on every account, the CNI that enforces the network policy. It also waits on the platform's operator and the orchestrator, which are other repositories. |
+| A coder safe for many people (#119, #121, #122, #123) | Four linked pieces: no key in a run pod, the person's identity, a mirror per person and a cache that a run cannot poison. The identity piece depends on the orchestrator and on a decision still open ([ADR 0072](decisions/0072-the-coder-verifies-who-the-person-is-and-asks-github-before-it-touches-a-repository.md) is proposed). |
+| Running the coder at scale (#127, the store service, replication) | It needs a database that is sized, backed up and pruned, and a load test that names the real limit before the store service is worth building. |
+| Moving the SQL rules into the database (ADR 0082) | Seven slices over two stores, each with a schema version step that is a one-way door for a deployed store. |
+| The memory (ADR 0081) | Eleven slices, three database adapters, a promotion rule and a paired study that needs a real model to say anything. |
+| Signed runs with a real issuer (ADR 0068, 0086) | It needs a certificate authority behind the issuer port and an agreement with the verifier on the contract's exact form (#445). |
+| The run's observability (ADR 0075) | A new pipeline that must say nothing about a person; the redaction rules are the work. |
+
+## Next
+
+1. Get the first release out: let the queued `v0.7.0` run finish, read its log, and fix what it stops on. Then check an anonymous pull of the image and the chart.
+2. Run the Homebrew path once for real, and run CI on what merged without it (#495, #530).
+3. Follow the amended request-signature contract ([#445](https://github.com/vymalo/another-adam-rs/issues/445)): a device's signature is refused today.
+4. Run the coder once against a real model and a real GitHub ([#102](https://github.com/vymalo/another-adam-rs/issues/102)), and the bench with it.
+5. Start the coder's safety for many people with [#119](https://github.com/vymalo/another-adam-rs/issues/119), then [#121](https://github.com/vymalo/another-adam-rs/issues/121).
+
+## How this page is kept
+
+It is updated in the same pull request as any change that moves a row: a slice built, a proof run, a gap found.
+A row moves down only with its proof named. The README's feature table and this page must agree; when they do not,
+this page is the one to fix first. The evidence behind each row, and how to check it, is on
+[the agent page](../.agents/docs/roadmap.md).
