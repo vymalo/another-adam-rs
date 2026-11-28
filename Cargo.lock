@@ -847,6 +847,7 @@ dependencies = [
 name = "adam-otel"
 version = "0.7.0"
 dependencies = [
+ "adam-core",
  "adam-error",
  "opentelemetry",
  "opentelemetry-otlp",

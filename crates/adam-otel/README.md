@@ -72,6 +72,8 @@ sequenceDiagram
 | `Settings::endpoint()`, `service_name()`, `is_enabled()` | what was read |
 | `Otel::start(&settings)` | `Ok(None)` when off; otherwise the provider, the bounded queue and the batch task, built inside the process's Tokio runtime |
 | `Otel::layer()` | the layer to compose beside `tracing_subscriber::fmt()` |
+| `Otel::meter()` | the meter a run's instruments are created from; its labels come from `labels` |
+| `labels::RunState`, `labels::Name` | the closed label sets: a value outside a set cannot be built |
 | `init(filter)` | installs the process's subscriber — JSON `fmt()` and, when an endpoint is set, the OTel layer
   beside it — and returns the running `Otel` (or `None` when off); every adam binary calls it |
 | `Otel::shutdown()` | flush and stop, bounded by `SHUTDOWN_TIMEOUT` |
@@ -111,6 +113,20 @@ if let Some(otel) = adam_otel::Otel::start(&settings)? {
 
 Both run inside the process's async `main` (Tokio): `Otel::start` builds a task on that runtime and
 answers `StartError::NoRuntime` elsewhere.
+
+## Metrics
+
+The same `Otel` carries the metrics half (ANR-1448). `Otel::meter()` gives the meter a run's instruments are created
+from; a periodic reader on the process's runtime posts to `{endpoint}/v1/metrics` every [`METRICS_INTERVAL`] (15 s),
+with [`EXPORT_TIMEOUT`] for one export. Recording a measurement is the SDK's own aggregation in the process, so it
+never blocks a run, and a failed export is the SDK's internal log line. With no endpoint nothing is built at all.
+
+**Labels are types.** [`labels`] holds the closed sets the instruments use: `RunState` (the four states of
+`adam_core::store::RunStatus`, held to them by a test) and a `Name` for the names a deployment declares (a tool, a
+model alias, a pool), which accepts only `[a-z0-9._-]`, at most 64 bytes. A value outside a set cannot be built, so a
+backend's cardinality is what the deployment planned for, and no id, token or amount can travel as a label by
+accident. The shape check is not a secret filter — a token can have a name's shape — so what keeps a secret out is the
+set, never a value at hand.
 
 ## Versions
 

@@ -29,6 +29,8 @@ tracing-subscriber = { workspace = true, features = ["registry", "fmt", "json", 
 url.workspace = true
 
 [dev-dependencies]
+# The drift test in `labels`: the label set must be the store's run states.
+adam-core = { path = "../adam-core", version = "0.7.0" } # x-release-please-version
 opentelemetry_sdk = { workspace = true, features = ["testing"] }
 tracing-subscriber = { workspace = true, features = ["fmt"] }
 
