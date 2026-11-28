@@ -286,6 +286,32 @@ mod tests {
         );
     }
 
+    /// The contract says counts are written as **whole numbers** (`docs/reference/a2a-server.md`,
+    /// *Usage*). A `Value` comparison cannot tell `100` from `100.0`, so this asserts the
+    /// serialised text — the only way the difference is visible (ANR-1470).
+    #[test]
+    fn the_counts_serialise_as_whole_numbers() {
+        let call = UsageEvent::new(
+            "c7",
+            "glm-5.3",
+            Usage::new(41_250, 812).with_cached_input_tokens(38_000),
+        )
+        .with_context_window(131_072);
+        let text = serde_json::to_string(&report(&call)).expect("the report serialises");
+        for (member, value) in [
+            ("inputTokens", 41_250),
+            ("outputTokens", 812),
+            ("totalTokens", 42_062),
+            ("cachedInputTokens", 38_000),
+            ("contextWindow", 131_072),
+        ] {
+            assert!(
+                text.contains(&format!("\"{member}\":{value}")),
+                "{member} is not the whole number {value} in {text}"
+            );
+        }
+    }
+
     #[test]
     fn the_report_rides_on_a_working_status_with_no_message() {
         let event = call_report("t1", "ctx", &UsageEvent::new("c1", "m", Usage::new(1, 2)));
