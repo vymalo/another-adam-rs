@@ -158,12 +158,14 @@ the fields, not the message.
 
 ## Dashboards
 
-[`catalogue`](src/catalogue.rs) is the list of instruments this workspace actually records — today
-`adam.runs`, with its kind, its unit and the labels it may carry. It is data, not a doc comment, so
-`crates/adam-otel/tests/dashboards.rs` can read it: the test loads `deploy/dashboards/*.json` and
-fails when a panel queries a metric that is not in the list, or groups or matches on a label the
-instrument does not declare. A metric a deployment cannot scrape cannot become a graph that quietly
-draws nothing.
+[`catalogue`](src/catalogue.rs) is the list of instruments this workspace creates from an OTel meter
+— today `adam.runs`, with its kind, its unit and the labels it may carry. It is data, not a doc
+comment, so `crates/adam-otel/tests/dashboards.rs` can read it: the test loads
+`deploy/dashboards/*.json` and fails when a panel queries a metric that is not in the list, or names
+a label the instrument does not declare — in any form PromQL has for one (`by`, `without`, `on`,
+`ignoring`, `group_left`, `group_right`, the four matchers), or in a templating variable's
+`label_values(…)`. A form the test does not read (`label_replace`, `label_join`) fails it outright.
+A metric a deployment cannot scrape cannot become a graph that quietly draws nothing.
 
 The dashboards are generated, not hand-written: `tools/dashboards/<name>.py` (standard library only)
 writes `deploy/dashboards/<name>.json`, `sh tools/dashboards/regenerate.sh` runs them all, and CI

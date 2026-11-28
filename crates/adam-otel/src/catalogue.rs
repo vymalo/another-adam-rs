@@ -8,9 +8,12 @@
 //! `deploy/dashboards/*.json` declares must be one of [`EMITTED`], and every label it declares must
 //! be one the instrument carries.
 //!
-//! An instrument is listed once it is **recorded somewhere in this workspace**, not when ADR 0075
-//! names it: the decision's table is the plan, this list is what a deployment can actually scrape.
-//! Adding a metric means adding its line here and in the crate that records it, in the same change.
+//! An instrument is listed once it is **created from an OTel meter**, not when ADR 0075 names it:
+//! the decision's table is the plan, this list is what a deployment can scrape from the exporter.
+//! Not every metric the process can print is here — `adam-service`'s `adam_admission_*` gauges are
+//! rendered as Prometheus text by `adam-service`'s `metrics::render`, from no meter at all, and no
+//! listener serves them yet; they are the next family to move here. Adding a metric means adding its
+//! line here and in the crate that records it, in the same change.
 //!
 //! [ADR 0075]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0075-metrics-and-traces-are-off-by-default-and-say-nothing-about-a-person.md
 

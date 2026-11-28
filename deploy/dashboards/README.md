@@ -8,12 +8,14 @@ drops the `otelMetrics`/`otelLabels` keys the test reads, and the next regenerat
 anyway.
 
 ```sh
-sh tools/dashboards/regenerate.sh     # every dashboard
+sh tools/dashboards/regenerate.sh     # every dashboard, and the assertions below
 python3 tools/dashboards/runs.py      # one, from any directory
 ```
 
 The scripts are Python's standard library only: a dashboard is data, and it belongs in a script a
-reviewer can read rather than in a Grafana export a person dragged.
+reviewer can read rather than in a Grafana export a person dragged. `regenerate.sh` also fails when
+a `*.json` here has no `<name>.py` (an orphan no regeneration can repair) and when no script ran at
+all.
 
 ## What is here
 
@@ -31,9 +33,15 @@ would be held back by the test below.
 ## How a panel is checked
 
 `crates/adam-otel/tests/dashboards.rs` reads these files and holds every panel to
-`adam_otel::catalogue::EMITTED` — the instruments the workspace actually records — and to the closed
-label sets of `adam_otel::labels`. A panel that queries a metric nobody emits, or groups by a label
-the instrument does not carry, fails a test rather than drawing a blank graph nobody notices.
+`adam_otel::catalogue::EMITTED` — the instruments the workspace creates from an OTel meter — and to
+the closed label sets of `adam_otel::labels`. A panel that queries a metric nobody emits, or names a
+label the instrument does not carry, fails a test rather than drawing a blank graph nobody notices.
+
+A label is found in every form PromQL has for one: `by`, `without`, `on`, `ignoring`, `group_left`,
+`group_right` (with or without a space before the parenthesis) and the four matcher operators. The
+forms the test does not read — `label_replace` and `label_join`, which mint a label — fail it
+outright, so a panel cannot use one unchecked. A templating variable is held to the same catalogue:
+`label_values(adam_runs_total, state)` names a metric and a label, and both are checked.
 
 To make that possible, each target carries two keys Grafana ignores:
 

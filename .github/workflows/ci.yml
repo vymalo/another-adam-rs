@@ -73,7 +73,8 @@ jobs:
       # ANR-1349: `deploy/dashboards/*.json` is generated from `tools/dashboards/*.py`, so a hand edit
       # is a difference. Regenerating writes the files the scripts produce; a diff is a dashboard that
       # no longer matches its script, and the untracked check catches a dashboard a script writes that
-      # nobody committed. The scripts need nothing but python3's standard library.
+      # nobody committed. The script itself refuses an orphan `*.json` and a run where no script ran.
+      # The scripts need nothing but python3's standard library.
       - name: The generated dashboards are up to date
         run: |
           sh tools/dashboards/regenerate.sh
