@@ -49,7 +49,6 @@ use std::fmt;
 use std::time::Duration;
 
 use adam_error::{BoxError, Classify, ErrorClass};
-use opentelemetry::logs::{LoggerProvider as _, LoggerProvider};
 use opentelemetry::metrics::{Meter, MeterProvider as _};
 use opentelemetry::trace::TracerProvider as _;
 use opentelemetry_otlp::WithExportConfig as _;
