@@ -7,11 +7,18 @@
 //! process's Tokio runtime, and [`Otel::layer`] gives the layer a host composes beside
 //! `tracing_subscriber::fmt()`.
 //!
+//! The **logs** half rides it too: the process's `tracing` events become OTLP log records through an
+//! allowlist ([`logs`]), so a record carries a class and a message. The allowlist governs **fields**;
+//! the message is the format string the macro wrote, so a call site that formats a value into it
+//! exports that value (as the JSON layer already does).
+//!
 //! The **metrics** half rides the same switch: [`Otel::meter`] gives the meter a run's instruments
 //! are created from, exported by a periodic reader on the same runtime, to `{endpoint}/v1/metrics`.
 //! Recording a measurement never blocks a run (the SDK aggregates in the process), a failed export
 //! is the SDK's internal log line, and a label is a type from [`labels`], so a value outside the set
-//! an instrument declares cannot be built.
+//! an instrument declares cannot be built. [`catalogue`] is the list of instruments the workspace
+//! actually records, and `crates/adam-otel/tests/dashboards.rs` holds every metric a panel of
+//! `deploy/dashboards/` queries to it.
 //!
 //! * **The closed set holds.** The layer's own extra attributes (`code.filepath`, `code.lineno`,
 //!   `busy_ns`, `idle_ns`, `thread.name`, `thread.id`) are switched off, so a span exports exactly
@@ -38,7 +45,10 @@ mod install;
 #[cfg(feature = "sdk")]
 mod sdk;
 
+pub mod catalogue;
 pub mod labels;
+#[cfg(feature = "sdk")]
+pub mod logs;
 
 #[cfg(feature = "sdk")]
 pub use install::init;

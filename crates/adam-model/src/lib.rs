@@ -108,7 +108,7 @@ pub use profiles::{
     resolve_context_window,
 };
 pub use prompt::{
-    MAX_PROMPT_JWS_BYTES, NoPromptId, NotAPromptStatement, PROMPT_STATEMENT_HEADER,
+    MAX_PROMPT_JWS_BYTES, NoPerson, NoPromptId, NotAPromptStatement, PROMPT_STATEMENT_HEADER,
     PROMPT_USER_SIGNATURE_HEADER, PromptStatement,
 };
 pub use signed::{KeySource, SignedRequests, TURN_SIGNATURE_HEADER, request_target};

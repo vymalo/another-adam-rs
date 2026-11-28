@@ -45,6 +45,7 @@ engine.shutdown().await?;
 | `set_device_state(device)`, `EngineBuilder::device_state(device)` | the host's `DynDeviceState` (`adam_device_state::DeviceState`): the four readings the report carries. The readings reach the report **and lower the admission** from the next ask on, by `adam_budget::DeviceRules` (battery below 20 % or low-power: one run at a time, never below one; hot device: new model and tool calls held); no new background command and no ask-first for a clone or large fetch on a metered network are **not enforced** (an `Ask` cannot say). Without one, the report carries no readings, which is not a device on mains and cool (ADR 0065 decision 8) | |
 | `EngineBuilder::hooks(HookSet)`, `EngineBuilder::plugin(plugin)` | the host's hooks around the agent loop (ADR 0050), as `LlmAgentBuilder::hooks`/`plugin` take them, for **every** agent the engine runs, the root and each subagent, before the plugins its file names (`adam_assembly::BoundDef::hooks`). A `before_tool` hook's `Decision::Ask` (the plugin's `Decision`, `adam_llm_agent::Decision`, not this crate's approval one) parks the run for the person's approval. Default none; `plugin` appends, `hooks` replaces | |
 | `EngineBuilder::step_io(StepIo)` | what a tool call's step shows of its input and output, and what is scrubbed first (`adam_llm_agent::StepIo`), for every agent; an approval shows its call through it too, never more than the step does. Default `StepIo::default()`: both shown, cut to the contract's bounds, no redactor | |
+| `EngineBuilder::local_agent(dir)` | a local agent over the person's directory `dir` ([ADR 0047] slice 7 part 2): the file and command tools of [`adam-code-tools`](../adam-code-tools/README.md) over an `adam_code_tools::PersonDir` (`read_file`, `read_files`, `write_file`, `edit_file`, `apply_patch`, `run_command`, `run`), with a host-side hook that asks before every write or command (reads are never asked; a missing or empty argument still asks, fail-closed). The directory is opened once at `start` (`PersonDir::new(&path, std::iter::empty::<&str>())`, no `&[]`) and shared with the tools through `State<PersonDir>`; the same `Engine::approve` answers the ask. The directory is **never owned, cleaned or restored**: a write stays, a command's changes stay, and the run's listing tells the model what changed. Additive: the screen's tools of an embedded agent and the host's own (`EngineBuilder::tools`) are still there. Exposed pieces for a host that wants its own composition: [`adam_engine::local_agent::tool_set`] (the `ToolSet`) and [`adam_engine::local_agent::plugin`] (the asking hook, named `asks-before-writing-or-command`). The embedded tree carries `adam-code-tools`, `adam-macros` and `adam-llm-agent`'s `schema` feature; `tools/embedded-deps/check.sh` is the gate (no binary refers to `adam_llm_agent::__private::schemars`) | `Invalid` for an unreadable directory (a missing path, a file or a symlink: the only error path at `start`) |
 | `EngineBuilder::device_rules(rules)`, `set_device_rules(rules)` | the person's switches, `adam_budget::DeviceRules`, every rule on by default; they act on the admission only | |
 | `admission()` | the admission as the engine asks it, device rules included, so a host's own run takes a seat the rules count; `None` without one | |
 | `shutdown()` | waits for the messages being written, then nothing new is claimed and the steps in flight finish and commit; it returns once the worker has stopped, and so does every concurrent or later call; every clone stops; reads and `cancel` still work. Dropping a `shutdown` before it is done (a timeout around it) aborts the worker, and so does dropping the last engine, as a killed process would: the next engine started with the same fixed worker id claims its runs at once, any other once their leases run out | what the worker ended with |
@@ -293,6 +294,9 @@ MODEL_BASE_URL=https://gateway.example.com/v1 MODEL_API_KEY=... MODEL=my-model c
   `[approved]` or `[refused]`.
 * `adam-model-openai`, `secrecy` and tokio's `io-std` and `io-util` are **dev-dependencies**: the embedded check reads
   normal dependencies only, so the engine's tree still holds no HTTP client and no TLS stack.
+* `--dir <path>` adds the local agent (ADR 0047 slice 7 part 2): the file and command tools over `path`, with the host's
+  `/approve` and `/deny [reason]` answering the asks for writes and commands. Without it, the chat is the screen's
+  tools only.
 
 ## The crates it is built from
 
@@ -304,12 +308,13 @@ re-exports them:
 | [`adam-a2a-runtime`](../adam-a2a-runtime/README.md), [`adam-a2a`](../adam-a2a/README.md) | `push`, and `server`: the backend port and the A2A types are data here |
 | [`adam-ui`](../adam-ui/README.md) | `thread-tools`: `Ui::embedded` and `Ui::screen` |
 | [`adam-assembly`](../adam-assembly/README.md) | `remote`: no remote (`a2a:`) subagents, so no A2A client, HTTP client or TLS; `bind` refuses one with `Error::RemoteNotEnabled` ([Without remote subagents](../adam-assembly/README.md#without-remote-subagents-feature-remote)) |
-| [`adam-runtime`](../adam-runtime/README.md), [`adam-llm-agent`](../adam-llm-agent/README.md), [`adam-core`](../adam-core/README.md), [`adam-agent-fs`](../adam-agent-fs/README.md), [`adam-model`](../adam-model/README.md), [`adam-error`](../adam-error/README.md), [`adam-budget`](../adam-budget/README.md), [`adam-device-state`](../adam-device-state/README.md) | nothing: they have no server parts |
+| [`adam-runtime`](../adam-runtime/README.md), [`adam-llm-agent`](../adam-llm-agent/README.md), [`adam-core`](../adam-core/README.md), [`adam-agent-fs`](../adam-agent-fs/README.md), [`adam-model`](../adam-model/README.md), [`adam-error`](../adam-error/README.md), [`adam-budget`](../adam-budget/README.md), [`adam-device-state`](../adam-device-state/README.md), [`adam-code-tools`](../adam-code-tools/README.md), [`adam-schedule`](../adam-schedule/README.md), [`adam-macros`](../adam-macros/README.md) (`#[tool]`, only the proc-macro crate: `proc-macro2`, `quote`, `syn`) | nothing: they have no server parts |
 
 It also depends on `a2a-lf` (the A2A types, data only: ADR 0047's confirmed decision 1), `tokio` (`rt`, `sync`,
 `time`), `futures` (the `Stream` of a run's events), `async-trait` (the engine's event sink), `serde_json` (what a
 withheld file says), `thiserror`, `uuid` and `tracing` (a firing whose state cannot be read is left out of
-`firings` with a warning, as `list` leaves out a task).
+`firings` with a warning, as `list` leaves out a task). `adam-llm-agent` is taken with the feature `schema`
+(`schemars` for `#[tool]`'s `JsonSchema` derive), which is otherwise opt-in.
 
 ## The phone targets
 

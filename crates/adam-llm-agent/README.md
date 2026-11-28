@@ -112,6 +112,17 @@ become descriptions and `Option<T>` fields are not required. The feature also en
 `#[derive(JsonSchema)]` works for whoever depends on it, and it is what `#[tool(crate = ::adam_llm_agent)]`
 needs from a crate that does not use the `adam` facade.
 
+## Metrics (ANR-1454)
+
+**`adam.tool.duration`**, a histogram of one tool call's latency in seconds, whose only label is `tool` — the
+name the model called, measured **only when a tool or a source actually answered it**, so a name no tool resolves
+(and that a model can invent) creates no series. The name must also pass
+[`adam_otel::labels::Name`](../adam-otel/README.md)'s alphabet; one that does not is not measured either.
+
+Off with the rest: the instrument comes from `opentelemetry::global::meter`, a no-op meter in a process where
+`adam_otel::init` found no endpoint (ADR 0075). The test asserts the exported data point carries `tool` and nothing
+else, and that a refused name produces no point.
+
 ## Continuing a conversation
 
 When the runtime starts a run as the continuation of another (`Runtime::start_with_id_continuing`; over A2A,

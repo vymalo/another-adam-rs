@@ -2618,9 +2618,14 @@ mod tests {
         );
         assert_eq!(
             merged.max_turns, None,
-            "a null member returns to the folder's"
+            "a member set to null returns to the folder's: the session keeps none, and the folder's \
+             applies at run time (ADR 0054 decision 11)"
         );
-        assert_eq!(merged.max_output_tokens, Some(512));
+        assert_eq!(
+            merged.max_output_tokens,
+            Some(512),
+            "a member with a value is the session's"
+        );
         let reset = config_of(&json!({"max_turns": null})).unwrap();
         assert_eq!(reset.apply(Some(&base)).max_turns, None, "null resets");
         assert!(config_of(&json!({"turbo": 1})).is_err(), "unknown refused");

@@ -16,16 +16,24 @@ path = "src/lib.rs"
 [[bin]]
 name = "adam-git-sandbox"
 path = "src/bin/adam-git-sandbox.rs"
+required-features = ["otel"]
 
 [[bin]]
 name = "adam-git"
 path = "src/bin/adam-git.rs"
 
+[features]
+# The server's OTel layer (`adam_otel::init`): on for the binary, off for a crate that takes the
+# library (adam-workspace), so adam-engine's embedded set links no HTTP client (ADR 0047).
+default = ["otel"]
+otel = ["adam-otel/sdk"]
+
 [dependencies]
 adam-error.workspace = true
-# The OTel layer (ADR 0075, ANR-1412). No TLS provider: this server is small and the collector of a
-# cluster is plain `http`; add the `aws-lc` feature here to export over `https`.
-adam-otel = { workspace = true, features = ["sdk"] }
+# The OTel layer (ADR 0075, ANR-1412), for the server binary only (feature `otel`). No TLS
+# provider: this server is small and the collector of a cluster is plain `http`; add `adam-otel`'s
+# `aws-lc` feature to export over `https`.
+adam-otel.workspace = true
 base64.workspace = true
 mimalloc.workspace = true
 # `kill_process_group`, `umask` and `openat` as safe functions, so the crate stays `forbid(unsafe_code)`.

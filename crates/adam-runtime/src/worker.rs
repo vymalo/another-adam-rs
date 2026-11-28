@@ -216,7 +216,7 @@ fn log_join(res: Result<(), tokio::task::JoinError>) {
     if let Err(e) = res
         && e.is_panic()
     {
-        tracing::error!("run task panicked: {e}");
+        tracing::error!(panic = %e, "run task panicked");
     }
 }
 

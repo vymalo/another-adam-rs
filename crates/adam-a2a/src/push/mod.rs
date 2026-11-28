@@ -6,7 +6,7 @@
 //! | Piece | What |
 //! |---|---|
 //! | [`PushPolicy`] | the allow-list and the address rules (SSRF) |
-//! | [`PushStore`] | the port the configs and each one's delivery progress live behind; [`InMemoryPushStore`] with `test-util`, the durable one is `adam-a2a-runtime`'s |
+//! | [`PushStore`] | the port the configs and each one's delivery progress live behind; `InMemoryPushStore` with `test-util`, the durable one is `adam-a2a-runtime`'s |
 //! | [`PushCursor`] | what a webhook has been told about a task |
 //! | [`PushSender`] | one request to one webhook, with the specification's headers |
 //! | [`PushDeliverer`] | the loop: claim due configs, send, retry with backoff, give up after a bound |

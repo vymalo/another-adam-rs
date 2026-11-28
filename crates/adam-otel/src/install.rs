@@ -15,6 +15,7 @@ use tracing_subscriber::layer::SubscriberExt as _;
 use tracing_subscriber::registry::LookupSpan;
 use tracing_subscriber::util::SubscriberInitExt as _;
 
+use crate::logs::Logs;
 use crate::{Otel, OtelLayer, Settings};
 
 /// Installs the process's subscriber and starts the exporter the environment names.
@@ -50,9 +51,22 @@ fn start() -> (Option<Otel>, Option<String>) {
 ///
 /// `otel` is `None` when tracing is off, and an `Option<Layer>` composes as no layer at all.
 fn compose(filter: EnvFilter, otel: Option<&Otel>) -> impl Subscriber + Send + Sync + 'static {
+    // The same filter on the logs layer: without it, a per-layer filter leaves `Logs` enabled for
+    // every event in the process, so the collector would receive TRACE-level events from every
+    // dependency whatever `RUST_LOG` says (and the message is not allowlisted).
     Registry::default()
-        .with(tracing_subscriber::fmt::layer().json().with_filter(filter))
+        .with(
+            tracing_subscriber::fmt::layer()
+                .json()
+                .with_filter(filter.clone()),
+        )
         .with(otel_layer(otel))
+        .with(logs_layer(otel).with_filter(filter))
+}
+
+/// The logs half of [`compose`]: `None` when tracing is off, so no record is built.
+fn logs_layer(otel: Option<&Otel>) -> Option<Logs> {
+    otel.map(|otel| Logs::new(otel.logger_provider()))
 }
 
 /// The OTel half of [`compose`]: `None` when tracing is off, so no layer is built.

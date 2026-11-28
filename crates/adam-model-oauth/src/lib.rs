@@ -150,8 +150,7 @@ impl SignInPrompt for LogPrompt {
             user_code = %code.user_code,
             verification_uri = %link,
             expires_in_secs = code.expires_in.as_secs(),
-            "sign in to use the model: open {link} and enter the code {}",
-            code.user_code
+            "sign in to use the model: open the verification URI and enter the code"
         );
     }
 
@@ -309,7 +308,8 @@ impl ModelCredentials for DeviceGrant {
                         Err(Renewal::Unreachable(error)) => {
                             if now < *valid_until {
                                 tracing::warn!(
-                                    "renewing the model's token failed, the current one is still valid: {error}"
+                                    problem = %error,
+                                    "renewing the model's token failed, the current one is still valid"
                                 );
                                 return Ok(CredentialHeaders::bearer(access));
                             }
@@ -452,11 +452,13 @@ impl Inner {
                 }
             }
             Err(Renewal::Refused(reason)) => {
-                tracing::warn!("the sign-in for the model ended: {reason}");
+                // The reason is free text from the provider (it can carry a URL): a field the
+                // allowlist drops, so the collector sees the class and the JSON log the detail.
+                tracing::warn!(reason = %reason, "the sign-in for the model ended");
                 Phase::SignedOut(reason)
             }
             Err(Renewal::Unreachable(error)) => {
-                tracing::warn!("the sign-in for the model could not start: {error}");
+                tracing::warn!(problem = %error, "the sign-in for the model could not start");
                 Phase::Idle
             }
         };

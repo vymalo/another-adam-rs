@@ -23,7 +23,7 @@ pub use config::McpSettings;
 pub use config::{
     A2aSettings, ActivitySettings, CardSigning, ConfigError, MAX_CONTEXT_WINDOW, ModelConfig,
     PromptCacheKey, PushSettings, ServiceConfig, SessionSettings, WorkerSettings, is_worker_id,
-    parse_file, parse_flag, parse_or,
+    parse_dir, parse_file, parse_flag, parse_or,
 };
 pub use exit::{
     EX_CONFIG, EX_GENERAL, EX_OSERR, EX_SOFTWARE, EX_UNAVAILABLE, exit_code, exit_code_with,

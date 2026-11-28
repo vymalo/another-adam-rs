@@ -189,7 +189,8 @@ pub(crate) fn join_sections(sections: &[(String, String)]) -> String {
         if out.len() + separator.len() + section.len() > MAX_INSTRUCTIONS_BYTES {
             tracing::warn!(
                 server = %server,
-                "the MCP servers' instructions are over {MAX_INSTRUCTIONS_BYTES} bytes together: \
+                limit = MAX_INSTRUCTIONS_BYTES,
+                "the MCP servers' instructions are over the limit together: \
                  this server's and the next ones' are left out"
             );
             break;

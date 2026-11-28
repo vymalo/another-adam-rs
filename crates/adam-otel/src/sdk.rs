@@ -1,4 +1,4 @@
-//! The SDK half: the settings, the exporters and the layer ([`crate::Otel`]), behind the `sdk`
+//! The SDK half: the settings, the exporters and the layers ([`crate::Otel`]), behind the `sdk`
 //! feature so a crate that only needs [`crate::labels`] links no HTTP client and no TLS stack.
 
 use std::fmt;
@@ -8,6 +8,8 @@ use adam_error::{BoxError, Classify, ErrorClass};
 use opentelemetry::metrics::{Meter, MeterProvider as _};
 use opentelemetry::trace::TracerProvider as _;
 use opentelemetry_otlp::WithExportConfig as _;
+use opentelemetry_sdk::logs::SdkLoggerProvider;
+use opentelemetry_sdk::logs::log_processor_with_async_runtime::BatchLogProcessor;
 use opentelemetry_sdk::metrics::SdkMeterProvider;
 use opentelemetry_sdk::metrics::exporter::PushMetricExporter;
 use opentelemetry_sdk::metrics::periodic_reader_with_async_runtime::PeriodicReader;
@@ -234,6 +236,7 @@ impl Classify for StartError {
 pub struct Otel {
     provider: SdkTracerProvider,
     metrics: SdkMeterProvider,
+    logs: SdkLoggerProvider,
 }
 
 impl fmt::Debug for Otel {
@@ -241,6 +244,7 @@ impl fmt::Debug for Otel {
         f.debug_struct("Otel")
             .field("provider", &self.provider)
             .field("metrics", &self.metrics)
+            .field("logs", &self.logs)
             .finish()
     }
 }
@@ -253,19 +257,21 @@ impl Otel {
     /// runtime: call this from an async `main`, never from a blocking one. Outside a Tokio runtime
     /// it answers [`StartError::NoRuntime`] instead of panicking.
     pub fn start(settings: &Settings) -> Result<Option<Self>, StartError> {
-        Self::start_with(settings, otlp_spans, otlp_metrics)
+        Self::start_with(settings, otlp_spans, otlp_metrics, otlp_logs)
     }
 
     /// [`Otel::start`] with the exporters as arguments: the seam the tests use to hand in in-memory
     /// exporters, and the only place an exporter is built.
-    fn start_with<E, M>(
+    fn start_with<E, M, L>(
         settings: &Settings,
         make_spans: impl FnOnce(&str) -> Result<E, BoxError>,
         make_metrics: impl FnOnce(&str) -> Result<M, BoxError>,
+        make_logs: impl FnOnce(&str) -> Result<L, BoxError>,
     ) -> Result<Option<Self>, StartError>
     where
         E: SpanExporter + 'static,
         M: PushMetricExporter + 'static,
+        L: opentelemetry_sdk::logs::LogExporter + 'static,
     {
         let Some(endpoint) = settings.endpoint() else {
             return Ok(None);
@@ -276,6 +282,7 @@ impl Otel {
         let exporter = make_spans(&traces_endpoint(endpoint)).map_err(StartError::Exporter)?;
         let metric_exporter =
             make_metrics(&metrics_endpoint(endpoint)).map_err(StartError::Exporter)?;
+        let log_exporter = make_logs(&logs_endpoint(endpoint)).map_err(StartError::Exporter)?;
         let batch = BatchConfigBuilder::default()
             .with_max_queue_size(MAX_QUEUE_SIZE)
             .with_max_export_batch_size(MAX_EXPORT_BATCH_SIZE)
@@ -306,7 +313,22 @@ impl Otel {
         // meter through every layer (ANR-1449): `opentelemetry::global::meter(..)` finds this one, and
         // answers a no-op meter in a process where nothing was started.
         opentelemetry::global::set_meter_provider(metrics.clone());
-        Ok(Some(Self { provider, metrics }))
+        let logs = SdkLoggerProvider::builder()
+            .with_resource(resource_for_logs(settings))
+            .with_log_processor(
+                BatchLogProcessor::builder(log_exporter, runtime::Tokio)
+                    .with_batch_config(log_batch())
+                    .build(),
+            )
+            .build();
+        // There is no global log provider in `opentelemetry` 0.33 (only traces and metrics have
+        // one), so the layer is composed into the subscriber by [`init`] and a host that builds its
+        // own subscriber takes [`Otel::logger_provider`].
+        Ok(Some(Self {
+            provider,
+            metrics,
+            logs,
+        }))
     }
 
     /// The layer to compose beside `tracing_subscriber::fmt()`.
@@ -326,6 +348,11 @@ impl Otel {
             .with_filter(SpansOnly)
     }
 
+    /// The logger provider the logs layer writes to.
+    pub fn logger_provider(&self) -> &SdkLoggerProvider {
+        &self.logs
+    }
+
     /// The meter a run's instruments are created from.
     ///
     /// Its labels come from [`labels`](crate::labels): a value outside the set an instrument declares cannot be
@@ -337,6 +364,7 @@ impl Otel {
     /// Flushes the queues and stops the exporters; each provider is bounded by [`SHUTDOWN_TIMEOUT`], so
     /// the call can wait up to twice it.
     pub fn shutdown(self) {
+        let _ = self.logs.shutdown_with_timeout(SHUTDOWN_TIMEOUT);
         let _ = self.metrics.shutdown_with_timeout(SHUTDOWN_TIMEOUT);
         let _ = self.provider.shutdown_with_timeout(SHUTDOWN_TIMEOUT);
     }
@@ -392,6 +420,37 @@ fn traces_endpoint(base: &str) -> String {
 /// The endpoint OTLP/HTTP metrics are posted to: the configured base URL plus `/v1/metrics`.
 fn metrics_endpoint(base: &str) -> String {
     signal_endpoint(base, "/v1/metrics")
+}
+
+/// The endpoint OTLP/HTTP logs are posted to: the configured base URL plus `/v1/logs`.
+fn logs_endpoint(base: &str) -> String {
+    signal_endpoint(base, "/v1/logs")
+}
+
+fn otlp_logs(endpoint: &str) -> Result<opentelemetry_otlp::LogExporter, BoxError> {
+    opentelemetry_otlp::LogExporter::builder()
+        .with_http()
+        .with_protocol(opentelemetry_otlp::Protocol::HttpBinary)
+        .with_endpoint(endpoint)
+        .with_timeout(EXPORT_TIMEOUT)
+        .build()
+        .map_err(|error| Box::new(error) as BoxError)
+}
+
+/// The logs queue, with the crate's documented bounds rather than the SDK's defaults.
+fn log_batch() -> opentelemetry_sdk::logs::BatchConfig {
+    opentelemetry_sdk::logs::BatchConfigBuilder::default()
+        .with_max_queue_size(MAX_QUEUE_SIZE)
+        .with_max_export_batch_size(MAX_EXPORT_BATCH_SIZE)
+        .with_scheduled_delay(EXPORT_INTERVAL)
+        .build()
+}
+
+/// The resource a log record carries: the same service name as the spans and the metrics.
+fn resource_for_logs(settings: &Settings) -> Resource {
+    Resource::builder()
+        .with_service_name(settings.service_name().to_owned())
+        .build()
 }
 
 fn signal_endpoint(base: &str, signal: &str) -> String {
@@ -481,6 +540,18 @@ mod tests {
             metrics_endpoint("http://collector:4318/v1/metrics"),
             "http://collector:4318/v1/metrics"
         );
+        assert_eq!(
+            logs_endpoint("http://collector:4318/"),
+            "http://collector:4318/v1/logs"
+        );
+        assert_eq!(
+            logs_endpoint("http://collector:4318/otlp"),
+            "http://collector:4318/otlp/v1/logs"
+        );
+        assert_eq!(
+            logs_endpoint("http://collector:4318/v1/logs"),
+            "http://collector:4318/v1/logs"
+        );
     }
 
     #[test]
@@ -488,6 +559,7 @@ mod tests {
         let started = Arc::new(AtomicBool::new(false));
         let span_marker = Arc::clone(&started);
         let metric_marker = Arc::clone(&started);
+        let log_marker = Arc::clone(&started);
         let otel = Otel::start_with(
             &Settings::disabled(),
             move |_| {
@@ -497,6 +569,10 @@ mod tests {
             move |_| {
                 metric_marker.store(true, Ordering::SeqCst);
                 Ok::<_, BoxError>(InMemoryMetricExporter::default())
+            },
+            move |_| {
+                log_marker.store(true, Ordering::SeqCst);
+                Ok::<_, BoxError>(opentelemetry_sdk::logs::InMemoryLogExporter::default())
             },
         )
         .expect("start");
@@ -524,6 +600,7 @@ mod tests {
             &Settings::enabled("http://collector.invalid:4318").expect("settings"),
             move |_| Ok::<_, BoxError>(sink),
             |_| Ok::<_, BoxError>(InMemoryMetricExporter::default()),
+            |_| Ok::<_, BoxError>(opentelemetry_sdk::logs::InMemoryLogExporter::default()),
         )
         .expect("start")
         .expect("an endpoint is set");
@@ -561,6 +638,7 @@ mod tests {
             &Settings::enabled("http://collector.invalid:4318").expect("settings"),
             |_| Ok::<_, BoxError>(InMemorySpanExporter::default()),
             move |_| Ok::<_, BoxError>(sink),
+            |_| Ok::<_, BoxError>(opentelemetry_sdk::logs::InMemoryLogExporter::default()),
         )
         .expect("start")
         .expect("an endpoint is set");
