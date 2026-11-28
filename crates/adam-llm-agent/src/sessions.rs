@@ -1959,6 +1959,12 @@ impl Tool for Edit {
                     view.state,
                 ));
             }
+            // An earlier try steered the edit into a round that was working then and has read it
+            // since: the edit is applied, and a retry that found the round ended must not apply it
+            // again as an editing round of its own.
+            if ctx.attempt() > 0 && round_read(starter, view.latest_run, ctx.call_id()).await {
+                return Ok(edited(session, view.round, &members, "steered", view.state));
+            }
             if view.closed {
                 return refuse(closed_words(session, view.idle_expired));
             }
@@ -2015,14 +2021,7 @@ impl Tool for Edit {
                     Ok(()) => {
                         // Read already? Then this is a repeat of this call. Otherwise the round
                         // that ended in the meantime gets the edit as a round of its own, below.
-                        let state = starter.round_state(view.latest_run).await;
-                        let read = state.ok().flatten().is_some_and(|state| {
-                            state
-                                .get("read_ids")
-                                .and_then(Value::as_array)
-                                .is_some_and(|ids| ids.iter().any(|id| id == ctx.call_id()))
-                        });
-                        if read {
+                        if round_read(starter, view.latest_run, ctx.call_id()).await {
                             return Ok(edited(
                                 session, view.round, &members, "steered", view.state,
                             ));
@@ -2038,6 +2037,14 @@ impl Tool for Edit {
                         // no editing round, as it takes no message.
                         if now.closed {
                             return refuse(closed_words(session, now.idle_expired));
+                        }
+                        // The round read the edit after the look above and before it ended: it is
+                        // applied, in the header the round ended with, so an editing round built on
+                        // that header would apply it twice. An ended round's reads are final.
+                        if now.state != SessionState::Working
+                            && round_read(starter, view.latest_run, ctx.call_id()).await
+                        {
+                            return Ok(edited(session, view.round, &members, "steered", now.state));
                         }
                         if now.state == SessionState::Working {
                             return Ok(edited(session, now.round, &members, "steered", now.state));
@@ -2074,7 +2081,16 @@ impl Tool for Edit {
             header.round = view.round + 1;
             header.closing = false;
             header.editing = true;
-            header.apply_edit(&request);
+            // An edit this call steered into the round, which ended without reading it, is in the
+            // view's header already (a view applies the edits its round left unread): applying it
+            // again would record it twice.
+            let pending = starter
+                .round_holds(view.latest_run, ctx.call_id())
+                .await
+                .unwrap_or(false);
+            if !pending {
+                header.apply_edit(&request);
+            }
             let input = Inbound::new(MESSAGE_KIND, adam_runtime::editing_round_payload(&header));
             let within = round_within(agent, header.config.as_ref());
             match starter
@@ -2105,6 +2121,22 @@ impl Tool for Edit {
             "session `{session}` kept changing while it was edited"
         )))
     }
+}
+
+/// Whether the round `run` has read the inbound `id` (its state's `read_ids`): an edit steered
+/// into it on an earlier try of the same call, when it was working.
+async fn round_read(starter: &adam_runtime::ChildStarter, run: RunId, id: &str) -> bool {
+    starter
+        .round_state(run)
+        .await
+        .ok()
+        .flatten()
+        .is_some_and(|state| {
+            state
+                .get("read_ids")
+                .and_then(Value::as_array)
+                .is_some_and(|ids| ids.iter().any(|read| read == id))
+        })
 }
 
 impl Edit {
