@@ -552,6 +552,14 @@ pub struct AgentFrontmatter {
     /// The model alias, or `inherit`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<ModelRef>,
+    /// The aliases a session of this agent may name ([ADR 0054] slice 11), on top of the
+    /// deployment's declared ones: a `config.model` outside both is refused with the set. Absent:
+    /// the deployment's aliases alone. The aliases are not resolved here — the assembly checks
+    /// them against the deployment's profiles, as it does the agent's own `model`.
+    ///
+    /// [ADR 0054]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub models: Option<Vec<String>>,
     /// The reasoning level this agent's model calls ask for by default (ADR 0063): one of
     /// `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`. The loader keeps the word as
     /// written; the assembly checks it against the levels of the model's profile and reports an

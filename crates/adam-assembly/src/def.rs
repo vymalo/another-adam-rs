@@ -194,6 +194,13 @@ pub struct AgentDef {
     files: SkillFiles,
     /// What the deployment decides about remote (`a2a:`) subagents.
     remote: RemoteSettings,
+    /// The deployment's declared model aliases ([ADR 0054] slice 11): a control plane that admits
+    /// a person's `start.config` without binding the agent checks a session's `model` against
+    /// them. Empty until [`model_aliases`](Self::model_aliases) says otherwise, and then every
+    /// pick is refused.
+    ///
+    /// [ADR 0054]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md
+    aliases: Vec<String>,
     /// The values and the source of the secrets the files name.
     secrets: Secrets,
     /// The MCP tools of each agent: connected from its `mcp.json`, or supplied by hand.
@@ -244,6 +251,7 @@ impl AgentDef {
         let files = manifest.skill_files();
         Ok(Self {
             manifest: manifest.into_manifest()?,
+            aliases: Vec::new(),
             values: BTreeMap::new(),
             files,
             remote: RemoteSettings::default(),
@@ -542,6 +550,22 @@ impl AgentDef {
         )
     }
 
+    /// The deployment's declared model aliases ([ADR 0054] slice 11), which a session's `model`
+    /// is checked against. Give the same list to the worker's
+    /// [`BoundDef::model_aliases`](crate::BoundDef::model_aliases) so both roles admit the same
+    /// configs.
+    ///
+    /// [ADR 0054]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md
+    #[must_use]
+    pub fn model_aliases<I, S>(mut self, aliases: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.aliases = aliases.into_iter().map(Into::into).collect();
+        self
+    }
+
     /// What a person's `start.config` on a helper of the root is held to ([ADR 0054] decision 2),
     /// as `(name, bounds)` in the order the card lists the helpers: the very bounds
     /// [`Assembly::session_bounds`](crate::Assembly::session_bounds) gives the session tools of a
@@ -575,6 +599,7 @@ impl AgentDef {
                     &target,
                     self.max_parallel,
                     max_rounds,
+                    self.aliases.clone(),
                     Vec::new(),
                     false,
                 );

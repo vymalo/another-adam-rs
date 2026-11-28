@@ -961,6 +961,14 @@ pub struct SessionConfig {
     /// [ADR 0054]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub instructions: Option<String>,
+    /// The model alias this session's rounds run on, from the aliases the session may name: its
+    /// folder's `models:` and the deployment's declared aliases ([ADR 0054] slice 11). `None`: the
+    /// agent's own model, exactly as a session that names none. An alias outside that set is
+    /// refused with the set in the message, never silently replaced.
+    ///
+    /// [ADR 0054]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
 }
 
 /// The most characters a session's `instructions` may hold ([ADR 0054], decision 4).
@@ -981,6 +989,7 @@ impl SessionConfig {
             && self.deny_tools.is_none()
             && self.report_schema.is_none()
             && self.instructions.is_none()
+            && self.model.is_none()
     }
 
     /// What a round's context carries of this config under `vymalo.session.tools`
@@ -1328,6 +1337,10 @@ pub struct SessionBounds {
     ///
     /// [ADR 0054]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md
     pub token_budget: Option<u64>,
+    /// The aliases a session of this subagent may name: the folder's `models:` and the
+    /// deployment's declared aliases ([ADR 0054] slice 11). A `model` outside it is refused with
+    /// the set, never replaced.
+    pub models: Vec<String>,
     /// The names of the tools the folder and the deployment can offer the subagent (its own, an MCP
     /// server's as `server__tool`, and what each of its sources declares:
     /// `ToolSource::declared`), **as far as the caller knows them**: a worker fills them from the
@@ -1378,6 +1391,7 @@ impl Default for SessionBounds {
             time_limit: 30,
             max_rounds: 20,
             token_budget: None,
+            models: Vec::new(),
             tools: Vec::new(),
             tools_complete: false,
         }
@@ -1522,6 +1536,22 @@ impl SessionBounds {
         }
         if let Some(schema) = &requested.report_schema {
             report_schema_admissible(schema)?;
+        }
+        if let Some(alias) = &requested.model
+            && !self.models.iter().any(|allowed| allowed == alias)
+        {
+            let set = if self.models.is_empty() {
+                "this session may name none".to_owned()
+            } else {
+                self.models.join(", ")
+            };
+            return Err(Refusal::new(
+                Some("model"),
+                format!(
+                    "config.model is {alias:?}, which is not one of the aliases this session may \
+                     use: {set}"
+                ),
+            ));
         }
         Ok(requested)
     }
@@ -1719,6 +1749,9 @@ impl SessionBounds {
             // Text has no bound to clamp to: `admit` already refused one that is too long, and a
             // later round keeps what the session was started with.
             instructions: config.instructions.clone(),
+            // The alias is a key, not a bound: `admit` refused one outside the set, so a later
+            // round keeps the one the session was started with.
+            model: config.model.clone(),
         }
     }
 }
@@ -3153,6 +3186,7 @@ mod tests {
             time_limit: 30,
             max_rounds: 12,
             token_budget: None,
+            models: Vec::new(),
             tools: Vec::new(),
             tools_complete: false,
         }
@@ -3578,6 +3612,7 @@ mod tests {
             time_limit: 10,
             max_rounds: 5,
             token_budget: Some(4_000),
+            models: Vec::new(),
             tools: Vec::new(),
             tools_complete: false,
         };
@@ -3976,6 +4011,39 @@ mod tests {
         assert!(
             why.message()
                 .contains("matches none of the names this agent declares: turn_output, *__*"),
+            "{why}"
+        );
+    }
+
+    /// A session names a model alias from the set it may use, and one outside it is refused with
+    /// the set in the message — never replaced by the agent's own.
+    #[test]
+    fn a_session_model_must_be_one_of_the_aliases_it_may_use() {
+        let allowed = SessionBounds {
+            models: vec!["coder-small".to_owned(), "coder-large".to_owned()],
+            ..bounds()
+        };
+        let ask = SessionConfig {
+            model: Some("coder-large".to_owned()),
+            ..SessionConfig::default()
+        };
+        assert_eq!(allowed.admit(ask.clone()).expect("an allowed alias"), ask);
+
+        let outside = SessionConfig {
+            model: Some("someone-elses".to_owned()),
+            ..SessionConfig::default()
+        };
+        let why = allowed
+            .admit(outside)
+            .expect_err("an alias outside the set");
+        assert!(why.message().contains("someone-elses"), "{why}");
+        assert!(why.message().contains("coder-small, coder-large"), "{why}");
+
+        let why = bounds()
+            .admit(ask)
+            .expect_err("no alias is declared, so none may be named");
+        assert!(
+            why.message().contains("this session may name none"),
             "{why}"
         );
     }

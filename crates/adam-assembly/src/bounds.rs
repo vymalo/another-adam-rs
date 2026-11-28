@@ -54,6 +54,21 @@ fn folder_limits<'a>(
     })
 }
 
+/// The folder's `models:` list of the root's local subagent that `target` names: the aliases a
+/// session of it may name, on top of the deployment's (ADR 0054 slice 11).
+fn folder_models<'a>(manifest: &'a AgentManifest, target: &SessionTarget) -> &'a [String] {
+    manifest
+        .subagents
+        .iter()
+        .find_map(|sub| match sub {
+            Subagent::Local(child) if !target.remote && child.name == target.name => {
+                child.frontmatter.models.as_deref()
+            }
+            _ => None,
+        })
+        .unwrap_or(&[])
+}
+
 /// Whether `target` names a local subagent of the root's manifest (a remote one, or a name the
 /// manifest does not have, runs under the loop's defaults).
 fn is_local(manifest: &AgentManifest, target: &SessionTarget) -> bool {
@@ -92,6 +107,7 @@ pub(crate) fn bounds_of(
     target: &SessionTarget,
     deployment_parallel: Option<usize>,
     max_rounds: u32,
+    models: Vec<String>,
     tools: Vec<String>,
     tools_complete: bool,
 ) -> SessionBounds {
@@ -116,6 +132,10 @@ pub(crate) fn bounds_of(
             DEFAULT_MAX_PARALLEL,
         )
     };
+    let mut models = models;
+    models.extend(folder_models(manifest, target).iter().cloned());
+    models.sort();
+    models.dedup();
     SessionBounds {
         max_turns,
         max_tool_calls,
@@ -126,6 +146,7 @@ pub(crate) fn bounds_of(
         // most the loop runs at once, and never "no bound", which would widen.
         max_parallel_tool_calls: u32::try_from(parallel).unwrap_or(MAX_PARALLEL_LIMIT as u32),
         // A round with no limit (`None`) is `0` here, which means the same: no limit.
+        models,
         time_limit: target.within.map_or(0, |within| {
             u32::try_from(within.as_secs() / 60).unwrap_or(u32::MAX)
         }),

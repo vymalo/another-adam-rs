@@ -836,6 +836,7 @@ impl BoundDef {
             target,
             self.max_parallel,
             self.session_limits.max_rounds(),
+            self.aliases.clone().unwrap_or_default(),
             names,
             complete,
         )
