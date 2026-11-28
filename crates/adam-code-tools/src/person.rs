@@ -634,6 +634,18 @@ mod tests {
             dir_m.path().join("by_make.txt").exists(),
             "make::run created the file on disk"
         );
+        // ANR-1455: the model is told which files it changed. `PersonDir::after_run` is what reports
+        // them, and it can only do so once the guard has settled — the entry it reads is what
+        // `settle` records. The report's own opening line, not the file name: the command is echoed
+        // in the result too, so a bare `by_make.txt` would match the echo.
+        assert!(
+            made.content.contains("The person's own directory changed"),
+            "make::run reports the files it changed: {made:?}"
+        );
+        assert!(
+            made.content.contains("by_make.txt"),
+            "the report names the file it added: {made:?}"
+        );
         let after_make =
             crate::inspect::run_command(&person_m, &ctx(), "true".to_owned(), None, None, None)
                 .await

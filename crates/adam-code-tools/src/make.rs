@@ -92,31 +92,22 @@ pub async fn run(
     .map_err(|e| run_error(redactor, &e))?;
     output::settle(ws, ctx, &mut outcome).await;
 
-    // The command ran: what follows it is done now, before git is checked, so it is done for a
-    // command the guard then undoes too. On an error the guard is settled all the same, so git is
-    // never left as the command changed it.
-    let published = match ws.after_run(ctx, &place).await {
-        Ok(text) => text,
-        Err(e) => {
-            let settled = guard.settle().await;
-            if matches!(
-                settled,
-                Settled::Undone { restored: false } | Settled::Unreadable { restored: false }
-            ) {
-                tracing::warn!(
-                    place = place.name(),
-                    "after a failed after_run, the guard could not restore the place exactly"
-                );
-            }
-            return Err(e);
-        }
-    };
-
+    // The guard settles **first**: a `Make` guard's report of the files is recorded there (the
+    // entry's `after`), and `after_run` is what reads it — called before this, it finds an entry with
+    // no report and answers nothing, so the model was told git saw no change and never learned which
+    // files the command added (ANR-1455). Settling first also keeps the order the guard documents.
+    //
     // Did it touch git? The files are its to change; HEAD, the branch, the refs, the
     // configuration and `.git` are not. A place whose git cannot be read after the command is not
     // known to be untouched, so it is undone as one that changed git would be; the model is told
     // which of the two it was.
-    let changed = match guard.settle().await {
+    let settled = guard.settle().await;
+
+    // The command ran: what follows it is done now, before git's verdict is applied, so it is done
+    // for a command the guard then undoes too.
+    let published = ws.after_run(ctx, &place).await?;
+
+    let changed = match settled {
         Settled::Unreadable { restored } => {
             ctx.emit_progress(format!("could not check git after: {shown}; undid it"))
                 .await;
