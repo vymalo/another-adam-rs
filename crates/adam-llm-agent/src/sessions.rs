@@ -472,8 +472,8 @@ const GUIDE: [GuideTool; 6] = [
     GuideTool {
         name: SUBAGENT_CLOSE,
         purpose: "close a session for good: it takes no more messages. A working round \
-                  finishes unless you pass `cancel`, and `delete` removes an idle session from \
-                  every listing.",
+                  finishes unless you pass `cancel`, and `delete` stops it and hides the session \
+                  from every listing at once.",
         args: &[("session", true), ("cancel", false), ("delete", false)],
     },
     GuideTool {
@@ -2247,7 +2247,7 @@ impl Tool for Close {
                     "delete": {
                         "type": "boolean",
                         "default": false,
-                        "description": "Delete the session: it is gone from every listing and every tool refuses it, and its runs stay in the store. It implies cancel: true — a working round is stopped, as a close with cancel does, and then the tombstone is written.",
+                        "description": "Delete the session: it is gone from every listing and every tool refuses it, and its runs stay in the store. It implies cancel: true — a working round is stopped and the tombstone is written in the same commit, so the session is gone the moment its round stops.",
                     },
                 },
                 "required": required_of(SUBAGENT_CLOSE),
@@ -2277,8 +2277,11 @@ impl Tool for Close {
             Ok(delete) => delete,
             Err(why) => return refuse(why),
         };
-        // `delete: true` implies `cancel: true` (ADR 0054 decision 10): it stops a working round as
-        // a close with cancel does, and the closing round it starts then writes the tombstone.
+        // `delete: true` implies `cancel: true` (ADR 0054 decision 10): a working round is stopped
+        // and the session's tombstone is written **in the same commit as the cancel**, so the
+        // session is already gone from every listing when its round stops and no report of the
+        // cancelled round is ever due to the parent. A closing round would write the tombstone
+        // after the cancel, and in between the cancelled round is listed and its report due.
         let cancel = cancel || delete;
         let starter = ctx.child_starter()?;
         let round_id = ctx.child_run_id();
@@ -2297,6 +2300,21 @@ impl Tool for Close {
                 return Ok(closed(session, note));
             }
             if view.state == SessionState::Working {
+                if delete {
+                    match starter.delete_round(&view, "the session was deleted").await {
+                        Ok(()) => return Ok(closed(session, None)),
+                        // The session changed under us (a send, another delete): read it again and
+                        // delete the round that is there now, as the busy case below does.
+                        Err(e)
+                            if is_busy_or_finished(&e)
+                                || matches!(e, RuntimeError::Contended(_)) =>
+                        {
+                            note = None;
+                            continue;
+                        }
+                        Err(e) => return Err(runtime_error(&e)),
+                    }
+                }
                 if cancel {
                     starter
                         .cancel_round(&view, "the session was closed with cancel")
@@ -2310,7 +2328,7 @@ impl Tool for Close {
                         Some(now) => view = now,
                         None => return refuse(no_such_session(session)),
                     }
-                    if view.closed && !delete {
+                    if view.closed {
                         return Ok(closed(session, None));
                     }
                 } else if view.closed {

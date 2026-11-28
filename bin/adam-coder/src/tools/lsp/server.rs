@@ -1213,6 +1213,10 @@ pub struct ServerInfo {
     pub root: PathBuf,
     /// Its process id.
     pub pid: Option<u32>,
+    /// Whether it is working through its index now: a `$/progress` is open, it said it is not
+    /// quiescent, or it said it reports its status and has not said it is quiescent yet. A test
+    /// that must observe a server *while* it indexes waits for this instead of sleeping.
+    pub indexing: bool,
 }
 
 /// What the probe of a program found.
@@ -1351,6 +1355,7 @@ impl Servers {
                 language: s.key.language,
                 root: s.key.root.clone(),
                 pid: s.pid,
+                indexing: s.shared.indexing(),
             })
             .collect()
     }

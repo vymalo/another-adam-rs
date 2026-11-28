@@ -30,8 +30,9 @@ use crate::notify::{DynNotifier, Notifier, Signal};
 use crate::retry::RetryPolicy;
 use crate::seal::{Seal, Sealer, chain_over};
 use crate::session::{
-    MAX_SESSION_CONVERSATION_BYTES, MAX_SESSION_ROUNDS_SCANNED, SessionList, SessionView,
-    page_of_sessions, parse_session_conversation_id, session_conversation_prefix, session_of,
+    MAX_SESSION_CONVERSATION_BYTES, MAX_SESSION_ROUNDS_SCANNED, SessionHeader, SessionList,
+    SessionView, page_of_sessions, parse_session_conversation_id, session_conversation_prefix,
+    session_of,
 };
 
 /// How often a commit that lost a CAS race is retried before giving up.
@@ -771,13 +772,32 @@ impl Inner {
     /// of a step of ours that is still running it). Also how a child run follows a parent that
     /// ended (`worker.rs`).
     pub async fn cancel_run(&self, run: RunId, reason: &str) -> Result<(), RuntimeError> {
+        self.cancel_run_with(run, reason, None).await
+    }
+
+    /// [`cancel_run`](Self::cancel_run) that also writes `tombstone` as the round's session header
+    /// in the same commit: how a working session is deleted (ADR 0054 decision 10, amended). One
+    /// commit, because the header's only home is the agent state the round's own step writes: a
+    /// tombstone committed before the cancel would be overwritten by a step that lands after it,
+    /// and one committed by a closing round after the cancel leaves the window in which the
+    /// cancelled round is still listed and its report is due to the parent.
+    ///
+    /// A run that ended before this call is tombstoned without a cancel: no step is left that could
+    /// overwrite the header.
+    pub async fn cancel_run_with(
+        &self,
+        run: RunId,
+        reason: &str,
+        tombstone: Option<&SessionHeader>,
+    ) -> Result<(), RuntimeError> {
         for _ in 0..MAX_COMMIT_RETRIES {
             let rec = self
                 .store
                 .load_run(run)
                 .await?
                 .ok_or(RuntimeError::NotFound(run))?;
-            if rec.status.is_terminal() {
+            let cancelling = !rec.status.is_terminal();
+            if !cancelling && tombstone.is_none() {
                 // Finished already (maybe cancelled elsewhere): a step of ours
                 // that is still running is pointless.
                 self.fire_cancel(run);
@@ -786,14 +806,19 @@ impl Inner {
             // S3: `load_run` returns the head; a cancel writes the head it read (this already
             // re-encodes the same `Stored` variant, so it survives the switch).
             let mut stored = Stored::decode(run, &rec.state)?;
-            let error = format!("cancelled: {reason}");
-            *stored.error_mut() = Some(error.clone());
-            // A request to close the session survives: a cancel must not reopen it. An edit does
-            // too: it belongs to the session, not to the round that was cancelled, and the next
-            // round carries it (ADR 0054, decision 11).
-            stored.inbox_mut().retain(|i| {
-                i.kind == crate::SESSION_CLOSE_KIND || i.kind == crate::SESSION_EDIT_KIND
-            });
+            if let Some(header) = tombstone {
+                crate::session::put_header(run, stored.agent_mut(), header)?;
+            }
+            let error = cancelling.then(|| format!("cancelled: {reason}"));
+            if let Some(error) = &error {
+                *stored.error_mut() = Some(error.clone());
+                // A request to close the session survives: a cancel must not reopen it. An edit does
+                // too: it belongs to the session, not to the round that was cancelled, and the next
+                // round carries it (ADR 0054, decision 11).
+                stored.inbox_mut().retain(|i| {
+                    i.kind == crate::SESSION_CLOSE_KIND || i.kind == crate::SESSION_EDIT_KIND
+                });
+            }
             // The head this cancel writes is the run's only copy: it must not keep naming an
             // inherited file whose bytes are gone (an S2a expand-release head can).
             if let Stored::Head(head) = &mut stored {
@@ -804,11 +829,12 @@ impl Inner {
             // that does not join is skipped: the cancel still lands, and the hook is best effort.
             // A process that registered no full agent has no hook to tell, so it reads no body.
             // In E `load_run` is the full state, so this join is inert; S3's head joins here.
-            let hook_state = if self
-                .agents
-                .get(&rec.agent)
-                .and_then(Registered::agent)
-                .is_some()
+            let hook_state = if cancelling
+                && self
+                    .agents
+                    .get(&rec.agent)
+                    .and_then(Registered::agent)
+                    .is_some()
             {
                 match self.join_stored(&rec, &stored).await {
                     Ok(joined) => joined.map(|(state, _)| state),
@@ -822,15 +848,31 @@ impl Inner {
             };
             self.reseal(&rec, &mut stored, false).await?;
             let (head, state) = carried(&self.store, &stored)?;
-            let mut update = RunUpdate::new(RunStatus::Failed, state);
+            let status = if cancelling {
+                RunStatus::Failed
+            } else {
+                rec.status
+            };
+            let mut update = RunUpdate::new(status, state);
             update.head = head;
             match self.store.commit_run(run, rec.version, update).await {
                 Ok(committed) => {
-                    // ANR-1449: a cancel is a transition to `failed`, and the family counts it.
-                    crate::metrics::record_run_status(
-                        &opentelemetry::global::meter(crate::metrics::SCOPE),
-                        committed.status,
-                    );
+                    // ANR-1449: a cancel is a transition to `failed`, and the family counts it. The
+                    // tombstone of a run that had ended is no transition: its status is the one it
+                    // already had, and counting it again would inflate the family on every delete of
+                    // an idle session (as a delivery to a runnable run is not counted).
+                    if cancelling {
+                        crate::metrics::record_run_status(
+                            &opentelemetry::global::meter(crate::metrics::SCOPE),
+                            committed.status,
+                        );
+                    }
+                    let Some(error) = error else {
+                        // The tombstone of a run that had ended: nothing to announce, but a step
+                        // of ours that is still running it is pointless all the same.
+                        self.fire_cancel(run);
+                        return Ok(());
+                    };
                     // First, and on a task of its own: firing the token below lets the step end,
                     // and the worker then drops the cancel watch that may be running this very
                     // call, so anything awaited after it can be cut short.
@@ -1963,7 +2005,9 @@ impl Runtime {
             Some((run, state)) => agent.init_continuing(input, state, run)?,
             None => agent.init(input)?,
         };
-        let mut envelope = Envelope::new(state);
+        // The journal epoch the run starts on (ADR 0076): the step list its starter is written
+        // against, so a worker of an older step list leaves it for its own epoch to finish.
+        let mut envelope = Envelope::new(state).with_epoch(agent.replay_epoch());
         if let Some(within) = within {
             envelope = envelope.with_limit(self.inner.clock.now(), within);
         }
@@ -2065,6 +2109,34 @@ impl Runtime {
     #[tracing::instrument(skip(self))]
     pub async fn cancel(&self, run: RunId, reason: &str) -> Result<(), RuntimeError> {
         self.inner.cancel_run(run, reason).await
+    }
+
+    /// Delete a session whose latest round is working ([ADR 0054] decision 10, amended): cancel
+    /// that round and write the session's tombstone ([`SessionView::tombstone`]) **in the same
+    /// commit**, so from the moment the round stops the session is gone from every listing and no
+    /// report of it can reach the parent. Its runs stay in the store.
+    ///
+    /// A round that has already ended is tombstoned without a cancel, and its status is left as it
+    /// was. `subagent_close` reaches that path only when a round it read as working ends meanwhile;
+    /// an idle or closed session it deletes with a closing round instead, whose header already says
+    /// `deleted` (one commit of its own, and no cancel to make).
+    ///
+    /// # Errors
+    ///
+    /// As [`cancel`](Self::cancel), and [`RuntimeError::Corrupt`] when the round's agent state is
+    /// not an object or the header does not encode.
+    ///
+    /// [ADR 0054]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md
+    #[tracing::instrument(skip(self, session))]
+    pub async fn delete_session_round(
+        &self,
+        session: &SessionView,
+        reason: &str,
+    ) -> Result<(), RuntimeError> {
+        let header = session.tombstone();
+        self.inner
+            .cancel_run_with(session.latest_run, reason, Some(&header))
+            .await
     }
 
     /// Snapshot of a run from its durable record (`None` if it does not exist).

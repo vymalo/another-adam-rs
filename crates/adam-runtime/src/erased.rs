@@ -13,6 +13,10 @@ use crate::ctx::Ctx;
 /// What starting a run needs: a name and the initial state.
 pub(crate) trait ErasedStarter: Send + Sync {
     fn name(&self) -> &str;
+    /// The journal epoch this starter writes into a run it starts ([ADR 0076]).
+    ///
+    /// [ADR 0076]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0076-a-run-records-the-journal-epoch-it-started-on.md
+    fn replay_epoch(&self) -> u32;
     fn init(&self, input: Inbound) -> Result<Value, AgentError>;
     /// The initial state of a run that continues `prior_run`, whose stored agent state is
     /// `prior`. A `prior` that does not decode as this agent's state is not an error: the run
@@ -37,6 +41,11 @@ pub(crate) trait ErasedStarter: Send + Sync {
 /// What stepping a run needs on top of starting it.
 #[async_trait]
 pub(crate) trait ErasedAgent: ErasedStarter {
+    /// The oldest journal epoch this agent can still replay ([ADR 0076]); a run below it ends
+    /// `Failed` naming both epochs.
+    ///
+    /// [ADR 0076]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0076-a-run-records-the-journal-epoch-it-started-on.md
+    fn min_replay_epoch(&self) -> u32;
     /// Step `state` and, when the agent splits it, return the head and the transcript it would
     /// keep beside it. `state` stays the whole state: the read path still serves the v4 format in
     /// the expand release, so a step never receives a head with empty rows.
@@ -89,6 +98,10 @@ impl<A: Agent> ErasedStarter for Erased<A> {
         self.0.name()
     }
 
+    fn replay_epoch(&self) -> u32 {
+        self.0.replay_epoch()
+    }
+
     fn init(&self, input: Inbound) -> Result<Value, AgentError> {
         encode(&self.0.init(input)?)
     }
@@ -127,6 +140,10 @@ pub(crate) struct StarterOnly<S>(pub S);
 impl<S: AgentStarter> ErasedStarter for StarterOnly<S> {
     fn name(&self) -> &str {
         self.0.name()
+    }
+
+    fn replay_epoch(&self) -> u32 {
+        self.0.replay_epoch()
     }
 
     fn init(&self, input: Inbound) -> Result<Value, AgentError> {
@@ -170,6 +187,10 @@ impl<S: AgentStarter> ErasedStarter for StarterOnly<S> {
 
 #[async_trait]
 impl<A: Agent> ErasedAgent for Erased<A> {
+    fn min_replay_epoch(&self) -> u32 {
+        self.0.min_replay_epoch()
+    }
+
     async fn step(&self, ctx: &mut Ctx, state: Value) -> Result<Stepped, AgentError> {
         let state: A::State = serde_json::from_value(state).map_err(|e| {
             // With a start-only front, a mismatch between the starter's and this agent's

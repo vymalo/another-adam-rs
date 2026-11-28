@@ -242,6 +242,7 @@ dependencies = [
  "adam-runtime",
  "adam-schedule",
  "adam-service",
+ "adam-store-mongodb",
  "adam-store-postgres",
  "adam-ui",
  "anyhow",

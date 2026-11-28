@@ -33,6 +33,10 @@ const NOW_STEP: &str = "ctx.now";
 /// recorded result instead of running again.
 pub struct Ctx {
     run: RunId,
+    /// The journal epoch the run started on ([ADR 0076]).
+    ///
+    /// [ADR 0076]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0076-a-run-records-the-journal-epoch-it-started-on.md
+    epoch: u32,
     conversation_id: Option<String>,
     attempt: u32,
     /// See [`Ctx::retries_left`].
@@ -154,6 +158,10 @@ pub(crate) struct CtxOutcome {
 
 pub(crate) struct CtxParts {
     pub run: RunId,
+    /// The journal epoch the run started on ([ADR 0076]); [`Ctx::epoch`].
+    ///
+    /// [ADR 0076]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0076-a-run-records-the-journal-epoch-it-started-on.md
+    pub epoch: u32,
     pub agent: String,
     pub conversation_id: Option<String>,
     pub attempt: u32,
@@ -170,9 +178,20 @@ pub(crate) struct CtxParts {
 }
 
 impl Ctx {
+    /// The journal epoch the run started on ([ADR 0076]): the step list its journal was written
+    /// against, as the agent declared it when the run began. A transition that changes its step
+    /// list may read it to keep an old run replayable.
+    ///
+    /// [ADR 0076]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0076-a-run-records-the-journal-epoch-it-started-on.md
+    #[must_use]
+    pub fn epoch(&self) -> u32 {
+        self.epoch
+    }
+
     pub(crate) fn new(p: CtxParts) -> Self {
         Self {
             run: p.run,
+            epoch: p.epoch,
             conversation_id: p.conversation_id,
             attempt: p.attempt,
             retries_left: p.retries_left,
@@ -1040,6 +1059,7 @@ mod tests {
             .expect("create run");
         Ctx::new(CtxParts {
             run: run.id,
+            epoch: 0,
             agent: "a".into(),
             conversation_id: None,
             attempt: 0,
@@ -1232,6 +1252,7 @@ mod tests {
     fn ctx_on(store: &DynStore, run: RunId, seq: u64) -> Ctx {
         Ctx::new(CtxParts {
             run,
+            epoch: 0,
             agent: "a".into(),
             conversation_id: None,
             attempt: 0,

@@ -69,6 +69,80 @@ fn faulty(store: DynStore) -> (Arc<FaultyStore>, DynStore) {
     (faulty, dynamic)
 }
 
+/// What the conversation's listing looked like at the moment a round was cancelled.
+#[derive(Clone, Debug)]
+struct CancelSeen {
+    detail: String,
+    /// How many sessions the listing held then.
+    listed: usize,
+    /// The state the listed session read as, when there was one.
+    state: Option<SessionState>,
+}
+
+#[derive(Clone)]
+struct Armed {
+    rt: Runtime,
+    conversation: String,
+    agents: Vec<String>,
+}
+
+/// A sink that lists the conversation's sessions on the status event of a cancelled round, so a
+/// test can say what a parent's listing would have found at that exact moment (a delete must leave
+/// the session already gone, or the cancelled round's report is due).
+#[derive(Default)]
+struct CancelWatch {
+    armed: std::sync::Mutex<Option<Armed>>,
+    seen: std::sync::Mutex<Vec<CancelSeen>>,
+}
+
+impl CancelWatch {
+    fn arm(&self, rt: Runtime, conversation: &str, agents: &[&str]) {
+        *self.armed.lock().unwrap() = Some(Armed {
+            rt,
+            conversation: conversation.to_owned(),
+            agents: agents.iter().map(|a| (*a).to_owned()).collect(),
+        });
+    }
+
+    fn seen(&self) -> Vec<CancelSeen> {
+        self.seen.lock().unwrap().clone()
+    }
+}
+
+#[async_trait]
+impl adam_runtime::EventSink for CancelWatch {
+    async fn emit(&self, _run: RunId, _agent: &str, event: adam_runtime::RunEvent) {
+        let adam_runtime::RunEvent::Status {
+            status: RunStatus::Failed,
+            detail: Some(detail),
+        } = &event
+        else {
+            return;
+        };
+        if !detail.starts_with("cancelled:") {
+            return;
+        }
+        let armed = self.armed.lock().unwrap().clone();
+        let Some(armed) = armed else {
+            return;
+        };
+        let names: Vec<&str> = armed.agents.iter().map(String::as_str).collect();
+        let list = armed
+            .rt
+            .list_sessions(&armed.conversation, &names, 0, 10)
+            .await;
+        let (listed, state) = match list {
+            Ok(list) => (list.sessions.len(), list.sessions.first().map(|s| s.state)),
+            Err(_) => (usize::MAX, None),
+        };
+        self.seen.lock().unwrap().push(CancelSeen {
+            detail: detail.clone(),
+            listed,
+            state,
+        });
+    }
+}
+
 fn uniq(prefix: &str) -> String {
     format!("{prefix}-{}", RunId::new())
 }
@@ -348,6 +422,8 @@ struct Rig {
     /// What `helper`'s file says of its sessions (`session:`, ADR 0089 slice C3).
     session: adam_llm_agent::SessionDefaults,
     sink: CollectingSink,
+    /// A sink that lists the sessions when a round is cancelled (`None`: the collecting one).
+    cancel_watch: Option<Arc<CancelWatch>>,
     clock: ManualClock,
 }
 
@@ -374,6 +450,7 @@ impl Rig {
             idle_ttl: None,
             session: adam_llm_agent::SessionDefaults::default(),
             sink: CollectingSink::new(),
+            cancel_watch: None,
             clock: ManualClock::new(),
         }
     }
@@ -427,6 +504,13 @@ impl Rig {
     fn without_reports(mut self) -> Self {
         self.reports_off = true;
         self
+    }
+
+    /// A sink that lists the sessions at the moment a round is cancelled.
+    fn watching_cancels(mut self) -> (Self, Arc<CancelWatch>) {
+        let watch = Arc::new(CancelWatch::default());
+        self.cancel_watch = Some(watch.clone());
+        (self, watch)
     }
 
     fn roster(&self) -> SessionTools {
@@ -537,7 +621,10 @@ impl Rig {
         };
         builder
             .worker_id(format!("{worker}-{}", RunId::new()))
-            .event_sink(self.sink.clone())
+            .event_sink(match &self.cancel_watch {
+                Some(watch) => watch.clone() as adam_runtime::DynEventSink,
+                None => Arc::new(self.sink.clone()) as adam_runtime::DynEventSink,
+            })
             .clock(self.clock.clone())
             .poll_interval(Duration::from_millis(20))
             .lease_ttl(Duration::from_secs(10))
@@ -702,6 +789,14 @@ fn close_call(id: &str, session: RunId, cancel: bool) -> ToolCall {
         id,
         "subagent_close",
         json!({"session": session.to_string(), "cancel": cancel}),
+    )
+}
+
+fn delete_call(id: &str, session: RunId) -> ToolCall {
+    call(
+        id,
+        "subagent_close",
+        json!({"session": session.to_string(), "delete": true}),
     )
 }
 
@@ -2105,6 +2200,129 @@ mod cases {
             .await
             .unwrap();
         assert_eq!(list.sessions[0].state, SessionState::Closed);
+    }
+
+    /// Deleting a working session cancels its round and writes the tombstone in the same commit:
+    /// the session is already gone from the listing at the moment the round stops, so the
+    /// cancelled round's report is never due to the parent (ADR 0054 decision 10, amended).
+    pub async fn deleting_a_working_session_hides_it_at_the_moment_it_stops(store: DynStore) {
+        let (rig, watch) = Rig::new().holding(0).watching_cancels();
+        rig.child_mock.push_text("never said");
+        let (parent_agent, child_agent) = (rig.parent(), rig.child());
+        let rt = rig.together(&store, &parent_agent, &child_agent);
+        let conv = conv_id();
+        let parent = rig.start(&rt, &conv).await;
+        let session = child_run_id(parent, "c1");
+        // The parent's listing, read from inside the runtime at the instant the round is
+        // cancelled: what the due rule would have seen.
+        watch.arm(rt.clone(), &conv, &[&rig.child_name]);
+        rig.parent_mock
+            .push_tool_calls(vec![start_call("c1", true)])
+            .push_tool_calls(vec![delete_call("c2", session)])
+            .push_tool_calls(vec![call("c3", "subagent_list", json!({}))])
+            .push_tool_calls(vec![read_call("c4", session, false)])
+            .push_text("deleted it");
+        let worker = spawn_worker(&rt);
+        let done = wait_done(&rt, parent).await;
+        assert_eq!(done.output.expect("output")["text"], "deleted it");
+        // The round the delete cancelled was held at its model call: it never answered.
+        rig.child_gate.release.notify_one();
+        worker.stop().await;
+
+        // (a) the round is cancelled, and its run stays in the store.
+        let round = rt
+            .view(session)
+            .await
+            .unwrap()
+            .expect("the round's run stays in the store");
+        assert_eq!(round.status, RunStatus::Failed);
+        assert_eq!(
+            round.error.as_deref(),
+            Some("cancelled: the session was deleted")
+        );
+
+        // (b) at the moment of the cancel the session was already gone, and it stays gone.
+        let seen = watch.seen();
+        assert_eq!(seen.len(), 1, "one cancel: {seen:?}");
+        assert_eq!(
+            seen[0].detail, "cancelled: the session was deleted",
+            "the cancel the sink saw is the delete's"
+        );
+        assert_eq!(
+            seen[0].listed, 0,
+            "at the moment its round was cancelled the session was still listed as {:?}, so the \
+             report of the cancelled round was due to the parent: {seen:?}",
+            seen[0].state
+        );
+        assert!(
+            rt.session_view(&conv, session).await.unwrap().is_none(),
+            "a deleted session is not a session"
+        );
+        let list = rt
+            .list_sessions(&conv, &[&rig.child_name], 0, 10)
+            .await
+            .unwrap();
+        assert!(list.sessions.is_empty(), "never listed again: {list:?}");
+
+        // (c) no report reaches the parent: the listing is empty, a read is refused, and the
+        // loop invented no report call for the cancelled round.
+        let state = state_of(&rt, parent).await;
+        let results = tool_results(&state);
+        let listing = &result_of(&results, "c3").1;
+        assert!(
+            listing.contains("no sessions"),
+            "the parent's own listing says so: {listing}"
+        );
+        let read = &result_of(&results, "c4");
+        assert!(read.2, "a read after the delete is refused: {read:?}");
+        assert!(read.1.contains("no session"), "{read:?}");
+        assert!(
+            !report_calls(&state.messages)
+                .iter()
+                .any(|c| c.id == report_id(session)),
+            "the cancelled round's report reached the parent: {:?}",
+            report_calls(&state.messages)
+        );
+    }
+
+    /// A delete of a session that has already closed still writes the tombstone: the closed
+    /// short-circuit is only for a close (`!delete`), and the closing round it starts carries the
+    /// tombstone from its first commit.
+    pub async fn deleting_a_closed_session_writes_the_tombstone(store: DynStore) {
+        let rig = Rig::new();
+        rig.child_mock.push_text("done already");
+        let (parent_agent, child_agent) = (rig.parent(), rig.child());
+        let rt = rig.together(&store, &parent_agent, &child_agent);
+        let conv = conv_id();
+        let parent = rig.start(&rt, &conv).await;
+        // A session that is not kept open closes when its round ends.
+        let session = child_run_id(parent, "c1");
+        rig.parent_mock
+            .push_tool_calls(vec![start_call("c1", false)])
+            .push_tool_calls(vec![read_call("c2", session, true)])
+            .push_tool_calls(vec![delete_call("c3", session)])
+            .push_tool_calls(vec![call("c4", "subagent_list", json!({}))])
+            .push_text("deleted a closed one");
+        let worker = spawn_worker(&rt);
+        let done = wait_done(&rt, parent).await;
+        assert_eq!(done.output.expect("output")["text"], "deleted a closed one");
+        worker.stop().await;
+
+        assert_eq!(
+            as_json(&result_of(&tool_results(&state_of(&rt, parent).await), "c3").1)["state"],
+            "closed"
+        );
+        assert!(
+            rt.session_view(&conv, session).await.unwrap().is_none(),
+            "a closed session a delete reaches is deleted"
+        );
+        let list = rt
+            .list_sessions(&conv, &[&rig.child_name], 0, 10)
+            .await
+            .unwrap();
+        assert!(list.sessions.is_empty(), "{list:?}");
+        // Its runs stay: round 1 worked, round 2 is the closing round that wrote the tombstone.
+        assert!(rt.view(session).await.unwrap().is_some());
     }
 
     /// The listing puts open sessions first (working, then idle, then closed) and pages with the
@@ -7123,6 +7341,8 @@ macro_rules! session_suite {
                 an_edit_of_instructions_applies_from_the_next_round,
                 closing_a_working_session_lets_the_round_finish,
                 closing_with_cancel_stops_the_round,
+                deleting_a_working_session_hides_it_at_the_moment_it_stops,
+                deleting_a_closed_session_writes_the_tombstone,
                 the_list_orders_open_sessions_first_and_pages,
                 a_session_that_is_not_ours_is_refused_in_words,
                 a_remote_subagent_starts_a_round_of_its_registered_agent,

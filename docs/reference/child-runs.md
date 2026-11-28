@@ -305,8 +305,10 @@ returns `ToolError::AwaitSession` and the parent parks on a `PendingWait::Sessio
 the last (`SESSION_CLOSE_KIND` in its inbox: it finishes, then the session takes no more) or, with `cancel`, cancels it; an idle
 session is closed by a round that calls no model (`header.closing`) and ends with the last answer again. `delete: true`
 closes it with a **tombstone** (`header.deleted`): a deleted session is never listed again and every tool refuses it as `no
-session`, while **its runs stay in the store**. It **implies `cancel: true`** (ADR 0054 decision 10): a working round is
-stopped as a close with cancel stops it, and the closing round then writes the tombstone.
+session`, while **its runs stay in the store**. It **implies `cancel: true`** (ADR 0054 decision 10, amended): a working round
+is stopped **with the tombstone in the same commit**, so the session is gone from every listing the moment its round stops and
+the cancelled round's report is never due to the parent; an idle or closed one is deleted by a closing round whose header
+already says `deleted`.
 `subagent_list` pages the sessions of the conversation. The sessions are reached by **the conversation**, not by the task: a
 later task finds the sessions an earlier one started, and no run reaches another conversation's (an id that is not one of
 this conversation's is "no session"). At most 16 sessions that are not closed and 20 rounds per session (decision 5's
@@ -419,7 +421,7 @@ stateDiagram-v2
     Idle --> Idle: subagent_edit starts a round that calls no model (header editing, no report)
     Idle --> Closed: subagent_close starts a round that calls no model
     Idle --> Closed: idle for idle_ttl (read, not written)
-    Working --> Deleted: subagent_close with delete (it cancels the round first)
+    Working --> Deleted: subagent_close with delete (the cancel and the tombstone are one commit)
     Idle --> Deleted: subagent_close with delete (a tombstone in the closing round)
     Closed --> Deleted: subagent_close with delete
     Closed --> [*]
@@ -521,6 +523,7 @@ answer has streamed, not before the call.
 | S21 | `subagent_start` with `wait: true` | The call parks on round 1 and its result is the first report, with the session id; the report is not told again; observers see `session.started` at the park and `session.round.ended` at the settle |
 | S22 | The subagent's file has `session:` (ADR 0089, slice C3) | A start that names no `mode` gets the file's, and one that names no `wait` the file's; a narrower `mode` (or `keep_open: false`) starts; a wider one (or `keep_open: true`) is an error result naming the mode asked, the ceiling and the subagent, and starts nothing; `wait: false` beats a filed `wait: true`. Only that subagent's roster line in `subagent_start` changes |
 | S23 | `subagent_edit` names a `mode` (or `keep_open`), or a person edits an agent's `sealed` session (ADR 0089, amended 2026-11-28) | An error result: past the file's ceiling in `subagent_start`'s words, else what the call wrote, then the mode the session keeps; nothing changes. The person's `edit` is `UnsupportedOperation` naming the mode, as their message is |
+| S24 | A working session is deleted, and the parent lists or reads between the cancel and anything that would follow it | The round is cancelled and the tombstone written in one commit: the session is already out of the listing when the round stops, so the cancelled round's report is never due; its runs stay in the store and a read or a send is refused as no session |
 
 **Tokens.** Each round a run started or sent to is counted once in the run's `usage_totals`: a journaled step `usage:<call id>` reads it when a report is given to the model and, at the latest, when the run ends (`sessions_end`), whether or not the report was read; a store error on the read is retried. **Known limit:** the checks scan every round of the conversation, and past 5,000 rounds of one subagent a start **and a send** are refused.
 

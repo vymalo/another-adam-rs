@@ -291,7 +291,7 @@
         "delete": {
           "type": "boolean",
           "default": false,
-          "description": "Delete the session: it is gone from every listing and every tool refuses it, and its runs stay in the store. It implies cancel: true — a working round is stopped, as a close with cancel does, and then the tombstone is written."
+          "description": "Delete the session: it is gone from every listing and every tool refuses it, and its runs stay in the store. It implies cancel: true — a working round is stopped and the tombstone is written in the same commit, so the session is gone the moment its round stops."
         }
       },
       "required": [
