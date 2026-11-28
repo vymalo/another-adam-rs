@@ -26,7 +26,7 @@ use tracing_subscriber::layer::Context;
 ///
 /// Every entry is a class or a number the code already computes: an error's class, a run's state, a
 /// count, the name of a declared tool or model alias, a worker id, an attempt number. A field
-/// outside this list is dropped by [`Fields`] before a record exists.
+/// outside this list is dropped before a record exists.
 pub const ALLOWED: &[&str] = &[
     "attempt",
     "count",
