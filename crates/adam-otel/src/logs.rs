@@ -26,7 +26,14 @@ use tracing_subscriber::layer::Context;
 ///
 /// Every entry is a class or a number the code already computes: an error's class, a run's state, a
 /// count, the name of a declared tool or model alias, a worker id, an attempt number. A field
-/// outside this list is dropped by [`Fields`] before a record exists.
+/// outside this list is dropped before a record exists.
+/// Every entry is a class or a number the code already computes: an error's **class**, a run's state,
+/// a count, the name of a declared tool or model alias, a worker id, an attempt number. A field
+/// outside this list is dropped before a record exists.
+///
+/// `error` is a class (`adam_error::Classify`'s), not an error's `Display`: a message or a source
+/// chain can carry a URL or a path, and those go in a field this list does not name — `problem`,
+/// `reason`, `panic`, `warning` — which the JSON log on stdout still prints.
 pub const ALLOWED: &[&str] = &[
     "attempt",
     "count",

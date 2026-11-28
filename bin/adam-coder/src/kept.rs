@@ -203,7 +203,7 @@ fn warn_once(run: &str, what: &str) {
             warned.clear();
         }
         warned.push(run.to_owned());
-        tracing::warn!(%run, "{what}");
+        tracing::warn!(%run, problem = %what, "a kept output could not be written");
     }
 }
 

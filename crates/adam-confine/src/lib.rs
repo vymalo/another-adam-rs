@@ -42,9 +42,9 @@ pub fn best_effort() -> DynConfine {
         Some(scope) if scope.enforces_memory() => Arc::new(scope),
         Some(scope) => {
             tracing::info!(
+                missing = scope.describe_missing(),
                 "the systemd user manager does not delegate the memory controller; \
-                 falling back to rlimits ({})",
-                scope.describe_missing()
+                 falling back to rlimits"
             );
             Arc::new(Rlimits::new())
         }

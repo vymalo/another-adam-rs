@@ -160,7 +160,8 @@ impl UsageTotals {
         if self.0.len() >= MAX_USAGE_TOTALS {
             tracing::warn!(
                 %model,
-                "a task's usage keeps {MAX_USAGE_TOTALS} providers and models; this call is not in its totals"
+                limit = MAX_USAGE_TOTALS,
+                "a task's usage keeps a limited set of providers and models; this call is not in its totals"
             );
             return;
         }
@@ -318,7 +319,8 @@ impl SandboxUsage {
                 mine.milliseconds = mine.milliseconds.saturating_add(entry.milliseconds);
             } else if self.usage.len() >= MAX_SANDBOX_ENTRIES {
                 tracing::warn!(
-                    "a task's sandbox usage keeps {MAX_SANDBOX_ENTRIES} shapes; these commands are not in it"
+                    limit = MAX_SANDBOX_ENTRIES,
+                    "a task's sandbox usage keeps a limited set of shapes; these commands are not in it"
                 );
             } else {
                 self.usage.push(*entry);
