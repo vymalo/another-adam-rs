@@ -760,6 +760,7 @@ mod tests {
             url: url.into(),
             auth: auth.map(|env| RemoteAuth::Bearer { env: env.into() }),
             files: false,
+            session: None,
             note: String::new(),
             path: "agent/subagents/billing.md".into(),
         }

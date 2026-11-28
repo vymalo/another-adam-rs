@@ -8,16 +8,16 @@ use std::time::Duration;
 
 use adam_agent_fs::{
     AgentManifest, Diagnostic, EmbeddedAgent, InstructionPart, Instructions, Limits as FileLimits,
-    ManifestSource, McpConfig, ModelRef, SiMemoryKey, SiMemoryOptions, SiMemoryWord,
-    SkillSelection, Strictness, Subagent, ToolList, ToolsLoading,
+    ManifestSource, McpConfig, ModelRef, SessionDef, SessionModeDef, SiMemoryKey, SiMemoryOptions,
+    SiMemoryWord, SkillSelection, Strictness, Subagent, ToolList, ToolsLoading,
 };
 use adam_core::{DynSecretSource, ProcessEnv};
 use adam_llm_agent::{
-    DynTool, DynToolSource, Limits, LlmStarter, SESSION_TOOLS, SessionTools, SiMemoryHandle,
-    ToolSet,
+    DynTool, DynToolSource, Limits, LlmStarter, SESSION_TOOLS, SessionDefaults, SessionTools,
+    SiMemoryHandle, ToolSet,
 };
 use adam_model::ReasoningEffort;
-use adam_runtime::{RuntimeBuilder, SessionLimits, glob};
+use adam_runtime::{RuntimeBuilder, SessionLimits, SessionMode, glob};
 use secrecy::SecretString;
 
 use crate::assembly::{BoundDef, Rounds};
@@ -583,6 +583,20 @@ impl AgentDef {
             .collect()
     }
 
+    /// What each subagent's file says of its sessions (`session:`, [ADR 0089] decision 4), by the
+    /// name the model writes in `agent`, in the order of the root's manifest: the `mode` and `wait`
+    /// a `subagent_start` naming none gets, and the widest `mode` one may name. A subagent whose
+    /// file has no block is [`SessionDefaults::default`]. The same list the session tools are made
+    /// with, and made without binding, as [`session_bounds`](Self::session_bounds) is.
+    ///
+    /// [ADR 0089]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0089-every-child-is-a-session-and-the-one-shot-subagent-tool-goes.md
+    pub fn session_defaults(&self) -> Vec<(String, SessionDefaults)> {
+        session_targets(&self.manifest, &self.manifest.name, &self.remote)
+            .into_iter()
+            .map(|target| (target.name, target.session))
+            .collect()
+    }
+
     /// What the root's A2A front serves `child-sessions/v1` for: each subagent of the root, local
     /// and remote, in the order of the manifest, with the time limit of its rounds, and the
     /// *effective* limits ([`effective_session_limits`](Self::effective_session_limits)). `None`
@@ -996,6 +1010,8 @@ pub(crate) struct SessionTarget {
     /// The time limit of each of its rounds (`None`: none).
     pub(crate) within: Option<Duration>,
     pub(crate) remote: bool,
+    /// The file's `session:`: the defaults and the ceiling of a start (ADR 0089 decision 4).
+    pub(crate) session: SessionDefaults,
 }
 
 /// A remote (A2A) subagent, found on the way: what [`Assembly::remotes`](crate::Assembly::remotes) lists.
@@ -1596,6 +1612,7 @@ fn session_targets(
                 description: child.frontmatter.description.clone().unwrap_or_default(),
                 within: run_limit(child.frontmatter.limits.as_ref()),
                 remote: false,
+                session: session_defaults(child.frontmatter.session),
             },
             Subagent::Remote(agent) => SessionTarget {
                 name: agent.name.clone(),
@@ -1603,6 +1620,7 @@ fn session_targets(
                 description: agent.description.clone(),
                 within: Some(remote.max_wait),
                 remote: true,
+                session: session_defaults(agent.session),
             },
         })
         .collect()
@@ -1657,6 +1675,28 @@ fn lowered_by_file(
         file.max_working_sessions,
         file.max_session_rounds,
     )
+}
+
+/// A subagent file's `session:` as `subagent_start` applies it (ADR 0089 decision 4): its `mode`,
+/// the default and the ceiling, and its `wait`, a default. No block is no default.
+fn session_defaults(file: Option<SessionDef>) -> SessionDefaults {
+    let Some(SessionDef { mode, wait }) = file else {
+        return SessionDefaults::default();
+    };
+    SessionDefaults {
+        mode: mode.map(session_mode),
+        wait,
+    }
+}
+
+/// The runtime's mode for a file's word. No wildcard: a mode added to either enum fails to compile
+/// here (Rule 3).
+fn session_mode(file: SessionModeDef) -> SessionMode {
+    match file {
+        SessionModeDef::OneShot => SessionMode::OneShot,
+        SessionModeDef::Sealed => SessionMode::Sealed,
+        SessionModeDef::Open => SessionMode::Open,
+    }
 }
 
 /// The time limit of a subagent's run: `limits.max_minutes` of its file, 30 minutes when it says
@@ -2134,5 +2174,21 @@ mod tests {
         assert_eq!(got.max_history_tokens, 0);
         assert_eq!(got.max_tool_calls, Limits::default().max_tool_calls);
         assert_eq!(got.max_output_tokens, Limits::default().max_output_tokens);
+    }
+
+    #[test]
+    fn an_omitted_history_budget_is_the_loops_default() {
+        let set = FileLimits {
+            max_turns: Some(7),
+            ..FileLimits::default()
+        };
+        assert_eq!(
+            limits(Some(&set)).max_history_tokens,
+            adam_llm_agent::DEFAULT_MAX_HISTORY_TOKENS
+        );
+        assert_eq!(
+            limits(None).max_history_tokens,
+            adam_llm_agent::DEFAULT_MAX_HISTORY_TOKENS
+        );
     }
 }

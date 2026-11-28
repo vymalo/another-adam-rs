@@ -6,6 +6,9 @@
 //! workers finish the steps they are in before the process exits; a step cut short by a hard kill
 //! is picked up by another replica when its lease expires. The work is done by
 //! [`adam_agent::serve`].
+//!
+//! `adam-agent export [...]` serves nothing: it writes the folder's runs as training records
+//! ([`adam_agent::export`], ADR 0087) and exits.
 
 use std::future::Future;
 use std::process::ExitCode;
@@ -24,20 +27,41 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 /// the same logger as everything else.
 #[tokio::main]
 async fn main() -> ExitCode {
+    // `adam-agent export ...` writes records to standard output, so its log goes to standard error.
+    let export = adam_agent::export::subcommand(std::env::args_os().skip(1));
+
     // Before the logger and the configuration: a package's `test do` runs `adam-agent --version`,
-    // and starting the server there would hang (or exit 78 without `ADAM_AGENT_DIR`).
-    if let Some(code) = early_exit(std::env::args().skip(1)) {
+    // and starting the server there would hang (or exit 78 without `ADAM_AGENT_DIR`). `export`
+    // answers its own `--help`.
+    if export.is_none()
+        && let Some(code) = early_exit(std::env::args().skip(1))
+    {
         return code;
     }
 
     // `RUST_LOG` when set, else `info` with the MCP client library quiet (`adam_service::logging`).
-    // The OTel layer joins it when `OTEL_EXPORTER_OTLP_ENDPOINT` is set, and nothing is built when
-    // it is not.
-    let telemetry = adam_otel::init(adam_service::logging::env_filter());
+    // `adam-agent export` writes its records to standard output, so its log goes to standard error,
+    // and a short offline command exports no traces; serving gets the OTel layer when
+    // `OTEL_EXPORTER_OTLP_ENDPOINT` is set, and nothing is built when it is not.
+    if export.is_some() {
+        tracing_subscriber::fmt()
+            .json()
+            .with_env_filter(adam_service::logging::env_filter())
+            .with_writer(std::io::stderr)
+            .init();
+    }
+    let telemetry = match export {
+        Some(_) => None,
+        None => adam_otel::init(adam_service::logging::env_filter()),
+    };
 
     // Before anything else is read: a same-user child (an MCP server's command) cannot read this
     // process's `/proc/<pid>/environ`, where the model key and the database URL are.
     adam_service::harden::make_non_dumpable();
+
+    if let Some(args) = export {
+        return export_runs(args).await;
+    }
 
     let code = run().await;
     // Flush the batch queue before the process exits, so the spans of the last runs are not lost.
@@ -58,6 +82,26 @@ async fn run() -> ExitCode {
     match adam_agent::serve(config, shutdown_signal()).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => fail(&anyhow::Error::from(e)),
+    }
+}
+
+/// `adam-agent export`: 0 when the records are written, 64 for a wrong command line, otherwise
+/// the code of the error, as for serving.
+async fn export_runs(args: Vec<std::ffi::OsString>) -> ExitCode {
+    use adam_service::export::{Command, EX_USAGE, parse_args, usage};
+    match parse_args(args) {
+        Ok(Command::Help) => {
+            println!("{}", usage("adam-agent"));
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            tracing::error!(error = %e, code = EX_USAGE, usage = %usage("adam-agent"), "adam-agent export: wrong command line");
+            ExitCode::from(EX_USAGE)
+        }
+        Ok(Command::Export(args)) => match adam_agent::export::run(&args).await {
+            Ok(_) => ExitCode::SUCCESS,
+            Err(e) => fail(&anyhow::Error::from(e)),
+        },
     }
 }
 
@@ -92,6 +136,9 @@ const USAGE: &str = concat!(
     "Configuration comes from the environment: `ADAM_AGENT_DIR` names the folder,\n",
     "`DATABASE_URL` the run store, `TURN_SIGNING_KEY_FILE` the turn key. Every variable is\n",
     "documented at https://github.com/vymalo/another-adam-rs/blob/main/docs/reference/environment.md\n",
+    "\n",
+    "Commands:\n",
+    "  export         Write the folder's runs as training records (`adam-agent export --help`).\n",
     "\n",
     "Options:\n",
     "  -h, --help     Print this help and exit.\n",

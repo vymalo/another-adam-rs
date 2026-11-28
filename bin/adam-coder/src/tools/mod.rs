@@ -179,6 +179,14 @@ pub struct CoderSettings {
     pub check_timeout: Duration,
     /// Bytes of output tail `run_checks` returns.
     pub check_output_tail: usize,
+    /// What `run_command` and `run` show of an output when a call gives no `output`: the tools'
+    /// own defaults ([`OutputDefaults::TOOLS`](adam_code_tools::OutputDefaults::TOOLS)) unless the
+    /// folder's `limits.output` sets others ([`set_output_defaults`](Self::set_output_defaults),
+    /// ADR 0090 slice T3).
+    pub command_output: adam_code_tools::OutputDefaults,
+    /// The same for `run_checks`: [`checks::DEFAULT_OUTPUT`] unless the folder's
+    /// `limits.output.run_checks` sets another.
+    pub checks_output: adam_code_tools::OutputMode,
     /// Author and committer of the commits.
     pub identity: GitIdentity,
     /// Open pull requests as drafts.
@@ -263,6 +271,18 @@ impl CoderSettings {
         !self.create_repo_owners.is_empty() || self.create_for_installed_owners
     }
 
+    /// Take the defaults of the folder's `limits.output` (ADR 0090 slice T3): each command tool it
+    /// names shows what it says when a call gives no `output`; a tool it leaves out keeps the
+    /// default it had. A call's `output` still wins.
+    pub fn set_output_defaults(&mut self, folder: &adam::agent_fs::OutputDef) {
+        let own = &mut self.command_output;
+        own.run_command = folder.run_command.map_or(own.run_command, output::mode_of);
+        own.run = folder.run.map_or(own.run, output::mode_of);
+        self.checks_output = folder
+            .run_checks
+            .map_or(self.checks_output, output::mode_of);
+    }
+
     /// Defaults: 3 check cycles in a repository and 5 in a scratch project, 15 minutes and 16 KiB per check run, the
     /// `adam-coder` identity, ready-for-review pull requests, `github.com` for `owner/name`, and no
     /// owner a repository may be created for.
@@ -272,6 +292,8 @@ impl CoderSettings {
             scratch_check_cycles: 5,
             check_timeout: Duration::from_secs(900),
             check_output_tail: 16 * 1024,
+            command_output: adam_code_tools::OutputDefaults::TOOLS,
+            checks_output: checks::DEFAULT_OUTPUT,
             identity: GitIdentity::new("adam-coder", "adam-coder@users.noreply.github.com"),
             draft_pull_requests: false,
             default_repo_host: named::DEFAULT_HOST.to_owned(),

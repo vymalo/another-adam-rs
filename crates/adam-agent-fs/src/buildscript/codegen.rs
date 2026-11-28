@@ -168,6 +168,7 @@ impl Gen<'_> {
                             }
                         ));
                         self.line(format!("files: {},", r.files));
+                        self.line(format!("session: {},", session(p, r.session)));
                         self.line(format!("note: {},", text(&r.note)));
                         self.line(format!("path: {},", self.rel(&r.path)?));
                         self.close("}),");
@@ -330,6 +331,26 @@ fn option(value: Option<&str>) -> String {
 }
 
 /// A string literal, escaped.
+/// A remote's `session:` as a literal of the crate at `p`: `None`, or the block with its two keys.
+fn session(p: &str, session: Option<crate::SessionDef>) -> String {
+    let Some(crate::SessionDef { mode, wait }) = session else {
+        return "None".to_owned();
+    };
+    let mode = match mode {
+        None => "None".to_owned(),
+        Some(mode) => {
+            let variant = match mode {
+                crate::SessionModeDef::OneShot => "OneShot",
+                crate::SessionModeDef::Sealed => "Sealed",
+                crate::SessionModeDef::Open => "Open",
+            };
+            format!("Some({p}::SessionModeDef::{variant})")
+        }
+    };
+    let wait = wait.map_or_else(|| "None".to_owned(), |wait| format!("Some({wait})"));
+    format!("Some({p}::SessionDef {{ mode: {mode}, wait: {wait} }})")
+}
+
 fn lit(s: &str) -> String {
     format!("{s:?}")
 }

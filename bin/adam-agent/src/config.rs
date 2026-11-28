@@ -148,27 +148,7 @@ impl Config {
         let mut problems = Vec::new();
         let service = ServiceConfig::parse(&lookup, &mut problems);
 
-        // No default and no embedded copy: a silent persona would hide a missing mount.
-        let agent_dir = match lookup(AGENT_DIR_ENV).filter(|v| !v.trim().is_empty()) {
-            None => {
-                problems.push(format!(
-                    "{AGENT_DIR_ENV} is required: the folder that holds `agent/` (or `agent/` itself); \
-                     this binary serves the agent that folder describes and has none of its own"
-                ));
-                PathBuf::new()
-            }
-            Some(raw) => {
-                let path = PathBuf::from(raw);
-                if !path.is_dir() {
-                    problems.push(format!(
-                        "{AGENT_DIR_ENV} {:?} is not a directory (name the folder that holds \
-                         `agent/`, or `agent/` itself)",
-                        path.display().to_string()
-                    ));
-                }
-                path
-            }
-        };
+        let agent_dir = parse_agent_dir(&lookup, &mut problems);
 
         // The workers' variables: a control plane neither needs nor validates them.
         let worker = service.worker.is_some().then(|| WorkerConfig {
@@ -205,6 +185,35 @@ impl Config {
             agent_dir,
             worker,
         })
+    }
+}
+
+/// `ADAM_AGENT_DIR`, required and an existing directory, read by every role and by `export`.
+/// A problem is added to `problems` and an empty path returned when it is not.
+pub(crate) fn parse_agent_dir(
+    lookup: &impl Fn(&str) -> Option<String>,
+    problems: &mut Vec<String>,
+) -> PathBuf {
+    // No default and no embedded copy: a silent persona would hide a missing mount.
+    match lookup(AGENT_DIR_ENV).filter(|v| !v.trim().is_empty()) {
+        None => {
+            problems.push(format!(
+                "{AGENT_DIR_ENV} is required: the folder that holds `agent/` (or `agent/` itself); \
+                 this binary serves the agent that folder describes and has none of its own"
+            ));
+            PathBuf::new()
+        }
+        Some(raw) => {
+            let path = PathBuf::from(raw);
+            if !path.is_dir() {
+                problems.push(format!(
+                    "{AGENT_DIR_ENV} {:?} is not a directory (name the folder that holds \
+                     `agent/`, or `agent/` itself)",
+                    path.display().to_string()
+                ));
+            }
+            path
+        }
     }
 }
 
@@ -552,8 +561,9 @@ mod tests {
         assert!(parse(&vars).unwrap().worker.is_none());
     }
 
-    /// `MODEL_CONTEXT_WINDOW` is read with the model: a count of tokens, or a startup error with the
-    /// configuration's exit code (78); a control plane runs no model and does not read it.
+    /// `DEFAULT_MODEL_CONTEXT_WINDOW` is read with the model: a count of tokens, or a startup error
+    /// with the configuration's exit code (78), as is a different value in its deprecated alias
+    /// `MODEL_CONTEXT_WINDOW` (ADR 0088); a control plane runs no model and does not read it.
     #[test]
     fn the_context_window_is_read_by_the_workers_and_a_bad_one_stops_the_start() {
         let dir = tempfile::tempdir().unwrap();
@@ -562,18 +572,30 @@ mod tests {
             parse(&vars).unwrap().worker.unwrap().model.context_window,
             None
         );
-        vars.insert("MODEL_CONTEXT_WINDOW".into(), "131072".into());
+        vars.insert("DEFAULT_MODEL_CONTEXT_WINDOW".into(), "131072".into());
         assert_eq!(
             parse(&vars).unwrap().worker.unwrap().model.context_window,
             Some(131_072)
         );
-        vars.insert("MODEL_CONTEXT_WINDOW".into(), "lots".into());
+        // Two answers to one question stop the start.
+        vars.insert("MODEL_CONTEXT_WINDOW".into(), "65536".into());
         let error = parse(&vars).unwrap_err();
         assert!(
             error
                 .problems
                 .iter()
-                .any(|p| p.starts_with("MODEL_CONTEXT_WINDOW")),
+                .any(|p| p.starts_with("DEFAULT_MODEL_CONTEXT_WINDOW and MODEL_CONTEXT_WINDOW")),
+            "{error}"
+        );
+        assert_eq!(adam_service::exit_code(&error), 78);
+        vars.remove("MODEL_CONTEXT_WINDOW");
+        vars.insert("DEFAULT_MODEL_CONTEXT_WINDOW".into(), "lots".into());
+        let error = parse(&vars).unwrap_err();
+        assert!(
+            error
+                .problems
+                .iter()
+                .any(|p| p.starts_with("DEFAULT_MODEL_CONTEXT_WINDOW")),
             "{error}"
         );
         assert_eq!(adam_service::exit_code(&error), 78);

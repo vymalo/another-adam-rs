@@ -20,7 +20,7 @@ use crate::manifest::{
     AgentManifest, Command, InstructionPart, Instructions, Layout, Mode, Package, RemoteAgent,
     RemoteAuth, Report, Schedule, Skill, SkillLayout, Subagent,
 };
-use crate::schema::{AgentFrontmatter, McpConfig};
+use crate::schema::{AgentFrontmatter, McpConfig, SessionDef};
 use crate::source::ManifestSource;
 use crate::{Diagnostic, Error};
 
@@ -353,6 +353,8 @@ pub struct EmbeddedRemote {
     pub auth: Option<EmbeddedAuth>,
     /// `files: true`: the file parts of the agent's answer are shared as files of the calling run.
     pub files: bool,
+    /// The frontmatter's `session:` (ADR 0089 decision 4).
+    pub session: Option<SessionDef>,
     /// The body of the file, which extends the tool description.
     pub note: &'static str,
     /// The file, relative to the source root.
@@ -371,6 +373,7 @@ impl EmbeddedRemote {
                     env: env.to_owned(),
                 }),
             files: self.files,
+            session: self.session,
             note: self.note.to_owned(),
             path: PathBuf::from(self.path),
         }
@@ -717,6 +720,10 @@ mod tests {
                 url: "https://billing.example.com/card.json",
                 auth: Some(EmbeddedAuth::Bearer { env: "TOKEN" }),
                 files: true,
+                session: Some(SessionDef {
+                    mode: Some(crate::SessionModeDef::Sealed),
+                    wait: None,
+                }),
                 note: "",
                 path: "agent/subagents/billing.md",
             })],
@@ -749,6 +756,10 @@ mod tests {
             })
         );
         assert!(r.files);
+        assert_eq!(
+            r.session.and_then(|session| session.mode),
+            Some(crate::SessionModeDef::Sealed)
+        );
         assert_eq!(agent.schedules[0].name, "daily");
     }
 }

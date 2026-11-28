@@ -116,6 +116,7 @@ impl CommandWorkspace for ToolEnv {
         CommandLimits {
             timeout: self.settings.check_timeout,
             output_tail: self.settings.check_output_tail,
+            output: self.settings.command_output,
         }
     }
 

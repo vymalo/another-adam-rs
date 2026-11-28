@@ -1,7 +1,7 @@
 [
   {
     "name": "subagent_start",
-    "description": "Start a subagent in the background and get its session id at once; you keep working while it works. Use it instead of the subagent's own tool when you have other work to do meanwhile or want to ask it again. The subagent does not see this conversation: put everything it needs in `prompt`. Read its report with subagent_read (pass wait: true to wait for it; never poll), and send it more with subagent_send. With keep_open false (the default) the session closes when its round has ended; set keep_open true only when another message will follow, and close what you kept open with subagent_close. Subagents:\n- explorer: Reads the repository and answers where and how.\n- reviewer: Reviews a diff.",
+    "description": "Start a subagent in the background and get its session id at once; you keep working while it works. Use it instead of the subagent's own tool when you have other work to do meanwhile or want to ask it again. The subagent does not see this conversation: put everything it needs in `prompt`. Read its report with subagent_read (pass wait: true to wait for it; never poll), and send it more with subagent_send. `mode` says who may send the session more after its first round: nobody with one_shot (the default: it closes when its round has ended), only you with sealed, you and the person with open; keep it open only when another message will follow, and close what you kept open with subagent_close. With wait true the call waits for the first report and returns it, as subagent_read with wait: true does. Subagents:\n- explorer: Reads the repository and answers where and how.\n- reviewer: Reviews a diff.",
     "parameters": {
       "type": "object",
       "properties": {
@@ -23,10 +23,20 @@
           "maxLength": 20000,
           "description": "The task, with everything the subagent needs to do it."
         },
-        "keep_open": {
+        "mode": {
+          "type": "string",
+          "enum": [
+            "one_shot",
+            "sealed",
+            "open"
+          ],
+          "default": "one_shot",
+          "description": "Who may send the session more after its first round: nobody (one_shot: it closes), only you (sealed), or you and the person (open)."
+        },
+        "wait": {
           "type": "boolean",
           "default": false,
-          "description": "Keep the session open after its first report, to send it more. By default it closes when its round has ended."
+          "description": "Wait for the first report and return it as this call's result, instead of the session id at once."
         },
         "config": {
           "type": "object",
@@ -292,7 +302,7 @@
   },
   {
     "name": "subagent_list",
-    "description": "List the sessions of this conversation, the open ones first: working, then idle, then closed. Paged: `offset` and `limit` count sessions. Each line is the session id, the subagent, the state, the round and whether it is kept open, then what it is for. Use an id with subagent_read, subagent_send or subagent_close.",
+    "description": "List the sessions of this conversation, the open ones first: working, then idle, then closed. Paged: `offset` and `limit` count sessions. Each line is the session id, the subagent, the state, the round and its mode (who may send it more), then what it is for. Use an id with subagent_read, subagent_send or subagent_close.",
     "parameters": {
       "type": "object",
       "properties": {

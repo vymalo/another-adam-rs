@@ -22,9 +22,9 @@
 //! | Request | Answer |
 //! |---|---|
 //! | a message to `C` with `start` | round 1 of a new session; no turn of the parent |
-//! | a message to `K`, no `taskId` | to a working session: delivered into its round; to an idle one: the next round; to a closed one: `UnsupportedOperation` |
-//! | a message to `K` with `close` | an idle session closes by a round of its own, a working one when its round ends (`cancel` first when asked) |
-//! | `taskId` of a round | the follow-up rules of any task, in context `K` |
+//! | a message to `K`, no `taskId` | to a working session: delivered into its round; to an idle one: the next round; to a closed one, or one the person may not write to (an agent's session that is not `open`, ADR 0089): `UnsupportedOperation` |
+//! | a message to `K` with `close` | an idle session closes by a round of its own, a working one when its round ends (`cancel` first when asked); a person may close any session they see, whatever its mode |
+//! | `taskId` of a round | the follow-up rules of any task, in context `K`; a working round of a closed session, or of one the person may not write to, takes no steer |
 //! | `GetTask`, `SubscribeToTask`, `CancelTask` of a round | the round as a task; cancel is `Runtime::cancel` |
 //! | `ListTasks {contextId: K}` | the rounds of the session; an unknown or foreign `K` is an empty page |
 //!
@@ -51,9 +51,9 @@ use adam_core::{ConversationScope, RunId, RunQuery, RunRecord, Timestamp};
 use adam_runtime::{
     Inbound, MAX_SESSION_PAGE, RoundOutcome, RunView, RuntimeError, SESSION_CLOSE_KIND,
     SESSION_EDIT_KIND, SESSION_STATE_KEY, SessionBounds, SessionConfig, SessionEditRequest,
-    SessionEditor, SessionHeader, SessionLimits, SessionPatch, SessionState, SessionSummary,
-    SessionView, closing_round_payload, editing_round_payload, parse_session_conversation_id,
-    session_conversation_id,
+    SessionEditor, SessionHeader, SessionLimits, SessionMode, SessionPatch, SessionState,
+    SessionSummary, SessionView, closing_round_payload, editing_round_payload,
+    parse_session_conversation_id, session_conversation_id,
 };
 use async_trait::async_trait;
 use serde_json::{Map, Value, json};
@@ -384,7 +384,8 @@ fn owned_session_conversation(
 pub(crate) struct Start {
     pub agent: String,
     pub description: String,
-    pub keep_open: bool,
+    /// `start.mode`, or what `start.keepOpen` meant: `one_shot` or `open`, never `sealed`.
+    pub mode: SessionMode,
     /// What the person asked of the session, already admitted by the helper's bounds; `None` when
     /// they asked nothing, which is the folder's settings.
     pub config: Option<SessionConfig>,
@@ -450,7 +451,7 @@ pub(crate) fn asked(message: &Message, sessions: &ChildSessions) -> Result<Asked
 fn parse_start(start: &Value, sessions: &ChildSessions) -> Result<Start, String> {
     let object = start
         .as_object()
-        .ok_or("`start` is not an object: {agent, description, keepOpen}")?;
+        .ok_or("`start` is not an object: {agent, description, mode}")?;
     let agent = object
         .get("agent")
         .and_then(Value::as_str)
@@ -479,11 +480,7 @@ fn parse_start(start: &Value, sessions: &ChildSessions) -> Result<Start, String>
             "`start.description` is {length} characters; at most {MAX_DESCRIPTION_CHARS}"
         ));
     }
-    let keep_open = match object.get("keepOpen") {
-        None | Some(Value::Null) => false,
-        Some(Value::Bool(keep)) => *keep,
-        Some(_) => return Err("`start.keepOpen` is true or false".into()),
-    };
+    let mode = start_mode(object)?;
     let config = match object.get("config") {
         None | Some(Value::Null) => None,
         Some(value) => {
@@ -496,8 +493,76 @@ fn parse_start(start: &Value, sessions: &ChildSessions) -> Result<Start, String>
     Ok(Start {
         agent: agent.to_owned(),
         description: description.trim().to_owned(),
-        keep_open,
+        mode,
         config,
+    })
+}
+
+/// The mode of a person's `start` ([ADR 0089] decision 2): `start.mode`, else what `start.keepOpen`
+/// meant (read for one release: `true` is `open`, `false` is `one_shot`), else `one_shot`; both
+/// given and disagreeing is refused naming both. `sealed` is refused: it leaves the session to the
+/// agent that started it, and a person's session has no such agent.
+///
+/// [ADR 0089]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0089-every-child-is-a-session-and-the-one-shot-subagent-tool-goes.md
+fn start_mode(start: &Map<String, Value>) -> Result<SessionMode, String> {
+    let words = || SessionMode::ALL.map(SessionMode::as_str).join(", ");
+    let asked = match start.get("mode") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(word)) => Some(SessionMode::parse(word).ok_or_else(|| {
+            format!(
+                "`start.mode` is one of: {}; not `{}`",
+                words(),
+                word.chars().take(80).collect::<String>().escape_debug()
+            )
+        })?),
+        Some(_) => return Err(format!("`start.mode` is one of: {}", words())),
+    };
+    let kept = match start.get("keepOpen") {
+        None | Some(Value::Null) => None,
+        Some(Value::Bool(keep)) => Some(*keep),
+        Some(_) => return Err("`start.keepOpen` is true or false".into()),
+    };
+    let mode = match (asked, kept) {
+        (Some(mode), Some(keep)) if mode != SessionMode::of_keep_open(keep) => {
+            return Err(format!(
+                "`start.keepOpen` ({keep}) and `start.mode` ({mode}) disagree: `keepOpen` {keep} \
+                 is mode {}; give `mode` alone",
+                SessionMode::of_keep_open(keep)
+            ));
+        }
+        (asked, kept) => asked
+            .or(kept.map(SessionMode::of_keep_open))
+            .unwrap_or_default(),
+    };
+    match mode {
+        SessionMode::Sealed => Err(
+            "`start.mode` sealed leaves a session to the agent that started it; a session a \
+             person starts is one_shot or open"
+                .into(),
+        ),
+        SessionMode::OneShot | SessionMode::Open => Ok(mode),
+    }
+}
+
+/// The session object's members that say who may write to it ([ADR 0089] decision 2): `mode`,
+/// and the `keepOpen` it means, which a client of before reads.
+///
+/// [ADR 0089]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0089-every-child-is-a-session-and-the-one-shot-subagent-tool-goes.md
+pub(crate) fn put_mode(object: &mut Value, mode: SessionMode) {
+    object["mode"] = json!(mode.as_str());
+    object["keepOpen"] = json!(mode.keeps_open());
+}
+
+/// The refusal of a person's message to `view`'s session when the person may not write to it
+/// ([`SessionHeader::takes_person_messages`], ADR 0089): an agent started it and it is not `open`.
+/// `None` when they may, and for a session with no header, which is kept open.
+fn refused_to_the_person(view: &SessionView) -> Option<BackendError> {
+    let header = view.header.as_ref()?;
+    (!header.takes_person_messages()).then(|| {
+        BackendError::UnsupportedOperation(format!(
+            "session {} is {}: only the agent that started it writes to it",
+            view.id, header.mode
+        ))
     })
 }
 
@@ -963,12 +1028,13 @@ impl RuntimeTaskBackend {
             "parentContextId": round.parent_context,
             "agent": name,
             "description": latest.map_or("", |h| h.description.as_str()),
-            "keepOpen": latest.is_some_and(|h| h.keep_open),
             "round": number,
             "by": if round.by_person { "person" } else { "agent" },
             "state": wire_state(session.state, latest.is_some_and(|h| h.closing && h.closed)),
             "closing": session.closed && session.state == SessionState::Working,
         });
+        // A round with no header says what a headerless session is: kept open, as `open`.
+        put_mode(&mut object, latest.map_or(SessionMode::Open, |h| h.mode));
         if let Some(config) = latest
             .and_then(|h| h.config.as_ref())
             .and_then(config_value)
@@ -1120,10 +1186,10 @@ impl RuntimeTaskBackend {
             "contextId": session_conversation_id(context, s.id),
             "agent": name,
             "description": s.description,
-            "keepOpen": s.keep_open,
             "state": wire_state(s.state, s.closes()),
             "round": {"number": s.round, "taskId": s.latest_run, "state": round_state},
         });
+        put_mode(&mut object, s.mode);
         if let Some(config) = s.config.as_ref().and_then(config_value) {
             object["config"] = config;
         }
@@ -1195,6 +1261,29 @@ impl RuntimeTaskBackend {
                 if crate::model_park::is_resume(message) {
                     let task = self.resume(caller, located, message, context_id).await?;
                     return Ok(Some(self.with_sessions(caller, task).await?));
+                }
+                // A round of a closed session takes no message, as the session itself takes none
+                // (a message to `K`, below): a subagent's one-shot session is closed from its start
+                // (ADR 0089 slice C1), so a person cannot steer it; nor can they steer a round of a
+                // session they may not write to (an agent's session that is not `open`, slice C2).
+                // The answer to a round's question and a round parked on the model still go
+                // through: those only unblock it.
+                if !located.1.waiting
+                    && !crate::model_park::parked_on_model(&located.1)
+                    && !task_state(&located.1).is_terminal()
+                    && let Some(view) = self
+                        .session_of(caller, &round.parent_context, round.session)
+                        .await?
+                {
+                    if view.closed {
+                        return Err(BackendError::UnsupportedOperation(format!(
+                            "session {} is closed and takes no more messages",
+                            round.session
+                        )));
+                    }
+                    if let Some(refusal) = refused_to_the_person(&view) {
+                        return Err(refusal);
+                    }
                 }
                 let mut inbound = (self.inbound)(message).map_err(BackendError::InvalidParams)?;
                 self.named_tier(caller, message, &mut inbound, false)?;
@@ -1390,7 +1479,7 @@ impl RuntimeTaskBackend {
             id: session,
             agent: helper.agent.clone(),
             description: start.description,
-            keep_open: start.keep_open,
+            mode: start.mode,
             closed: false,
             closing: false,
             deleted: false,
@@ -1513,6 +1602,12 @@ impl RuntimeTaskBackend {
                 return Err(BackendError::UnsupportedOperation(format!(
                     "session {session} is closed and takes no more messages{why}"
                 )));
+            }
+            // A sealed session takes no person's message, and no edit from them either: an edit
+            // starts a round or steers one, which is writing to it (ADR 0089 decision 2,
+            // amended 2026-11-28).
+            if let Some(refusal) = refused_to_the_person(&view) {
+                return Err(refusal);
             }
             // An edit of the session ([ADR 0054], decision 11): the same merge and the same
             // admission as the model's `subagent_edit`, against the bounds of the helper now and
@@ -1824,7 +1919,7 @@ fn next_header(view: &SessionView, session: RunId) -> SessionHeader {
         id: session,
         agent: view.agent.clone(),
         description: String::new(),
-        keep_open: false,
+        mode: SessionMode::OneShot,
         closed: false,
         closing: false,
         deleted: false,
@@ -2056,7 +2151,7 @@ mod tests {
             Asked::Start(Box::new(Start {
                 agent: "planner".into(),
                 description: "Plan it".into(),
-                keep_open: true,
+                mode: SessionMode::Open,
                 config: None,
             }))
         );
@@ -2069,7 +2164,7 @@ mod tests {
         .unwrap();
         assert!(matches!(
             default_close,
-            Asked::Start(start) if !start.keep_open
+            Asked::Start(start) if start.mode == SessionMode::OneShot
         ));
         let long = "x".repeat(81);
         for entry in [
@@ -2083,6 +2178,8 @@ mod tests {
             json!({"start": {"agent": "planner", "description": "a\tb"}}),
             json!({"start": {"agent": "planner", "description": long}}),
             json!({"start": {"agent": "planner", "description": "d", "keepOpen": "yes"}}),
+            json!({"start": {"agent": "planner", "description": "d", "mode": "ajar"}}),
+            json!({"start": {"agent": "planner", "description": "d", "mode": true}}),
             json!({"start": {"agent": "planner", "description": "d"}, "close": {}}),
             json!("start"),
         ] {
@@ -2304,7 +2401,7 @@ mod tests {
             id: RunId::new(),
             agent: "root/planner".into(),
             description: String::new(),
-            keep_open: true,
+            mode: SessionMode::Open,
             closed: false,
             closing: false,
             deleted: false,
@@ -2357,6 +2454,58 @@ mod tests {
         }
     }
 
+    /// ADR 0089 slice C2: a person's start names its mode, or the `keepOpen` of before, which maps
+    /// onto it; the two disagreeing are refused naming both, and `sealed` is refused, since it
+    /// leaves a session to an agent and a person's session has none.
+    #[test]
+    fn a_start_names_its_mode_and_keep_open_maps_onto_it() {
+        let s = sessions();
+        let mode_of = |start: Value| {
+            let mut start = start;
+            start["agent"] = json!("planner");
+            start["description"] = json!("d");
+            match asked(&message(Some(json!({ "start": start }))), &s) {
+                Ok(Asked::Start(start)) => Ok(start.mode),
+                Ok(other) => panic!("{other:?}"),
+                Err(why) => Err(why),
+            }
+        };
+        assert_eq!(mode_of(json!({})), Ok(SessionMode::OneShot));
+        assert_eq!(mode_of(json!({"mode": "open"})), Ok(SessionMode::Open));
+        assert_eq!(
+            mode_of(json!({"mode": "one_shot"})),
+            Ok(SessionMode::OneShot)
+        );
+        assert_eq!(mode_of(json!({"keepOpen": true})), Ok(SessionMode::Open));
+        assert_eq!(
+            mode_of(json!({"keepOpen": false})),
+            Ok(SessionMode::OneShot)
+        );
+        assert_eq!(
+            mode_of(json!({"keepOpen": true, "mode": "open"})),
+            Ok(SessionMode::Open),
+            "agreeing is fine"
+        );
+        let clash = mode_of(json!({"keepOpen": false, "mode": "open"})).unwrap_err();
+        assert!(
+            clash.contains("start.keepOpen") && clash.contains("start.mode"),
+            "{clash}"
+        );
+        let sealed = mode_of(json!({"mode": "sealed"})).unwrap_err();
+        assert!(sealed.contains("sealed"), "{sealed}");
+    }
+
+    /// The session object says the mode and the `keepOpen` it means, for a client of before.
+    #[test]
+    fn the_session_object_says_its_mode_and_what_keep_open_it_means() {
+        for mode in SessionMode::ALL {
+            let mut object = json!({});
+            put_mode(&mut object, mode);
+            assert_eq!(object["mode"], mode.as_str());
+            assert_eq!(object["keepOpen"], mode != SessionMode::OneShot);
+        }
+    }
+
     fn summary(state: SessionState, closed: bool, closing: bool, age: i64) -> SessionSummary {
         SessionSummary {
             id: RunId::new(),
@@ -2368,7 +2517,7 @@ mod tests {
             outcome: None,
             updated_at: adam_core::store::now() - jiff::SignedDuration::from_secs(age),
             description: String::new(),
-            keep_open: true,
+            mode: SessionMode::Open,
             closed,
             closing,
             idle_expired: false,
@@ -2430,7 +2579,7 @@ mod tests {
             id: RunId::new(),
             agent: "a".into(),
             description: "d".into(),
-            keep_open: true,
+            mode: SessionMode::Open,
             closed: false,
             closing: false,
             deleted: false,

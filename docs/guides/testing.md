@@ -110,10 +110,12 @@ cargo test --workspace --locked --features adam-llm-agent/schema,adam-assembly/d
   --exclude adam-store-mongodb -- no_server_on_path a_server_that diagnostics_are the_columns
 ```
 
-The real servers are a gated suite (`real_language_servers.rs`, `ADAM_TEST_LANGUAGE_SERVERS=1`): five tiny projects under
-`bin/adam-coder/tests/fixtures/language-servers/` (Rust, TypeScript, Python, Go, Dart), each with one deliberate error, driven through the
-tools with the production table: the error is reported at its line, the definition of `add` is found from its call, and its references hold
-the call. A language whose server is not on `PATH` is skipped; `ADAM_TEST_REQUIRE_LANGUAGE_SERVERS=1` makes that a failure. **The `image`
+The real servers are a gated suite (`real_language_servers.rs`, `ADAM_TEST_LANGUAGE_SERVERS=1`): tiny projects under
+`bin/adam-coder/tests/fixtures/language-servers/` (Rust, TypeScript, Python, Go, Dart; and C, shell, TOML, YAML, JSON and a Dockerfile, ADR
+0091), each with one deliberate error, driven through the tools with the production table: the error is reported at its line, and where
+the language has functions the definition of `add` is found from its call and its references hold the call. A language whose server is not on
+`PATH` is skipped; `ADAM_TEST_REQUIRE_LANGUAGE_SERVERS=1` makes that a failure for the servers the image has (the six of ADR 0091 join that
+list in its slice L2, when the workspace image installs them). **The `image`
 job of `.github/workflows/coder.yml` runs it in the built coder image**, whose workspace base has the four servers
 (vymalo/another-agentic-images#15), with `ADAM_TEST_REQUIRE_LANGUAGE_SERVERS=1`. Run on 2026-11-17 on a machine with `rust-analyzer`
 1.97.0 and `pyright-langserver`, both passed; the other two were not installed.

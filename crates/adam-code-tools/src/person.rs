@@ -38,14 +38,16 @@ use async_trait::async_trait;
 
 use crate::commands::{CommandGuard, CommandLimits, CommandWorkspace, Guarding, Settled};
 use crate::git::GitAt;
+use crate::output::OutputDefaults;
 use crate::sandbox::Meter;
 use crate::{CodeWorkspace, Intent, Outcome, Place, Redactor};
 
-/// The limits of a [`PersonDir`]'s commands unless it is given others: 30 seconds, and 16 KiB of
-/// output shown.
+/// The limits of a [`PersonDir`]'s commands unless it is given others: 30 seconds, 16 KiB of
+/// output shown, and each tool's own default `output` ([`OutputDefaults::TOOLS`]).
 pub const DEFAULT_LIMITS: CommandLimits = CommandLimits {
     timeout: Duration::from_secs(30),
     output_tail: 16 * 1024,
+    output: OutputDefaults::TOOLS,
 };
 
 /// The place a [`PersonDir`] gives when a tool names none, unless it is given another name.
@@ -592,7 +594,7 @@ mod tests {
         // Two `run_command` calls in a row: both must be accepted (the second is not refused
         // with "already running").
         let first =
-            crate::inspect::run_command(&person, &ctx(), "true".to_owned(), None, None, None)
+            crate::inspect::run_command(&person, &ctx(), "true".to_owned(), None, None, None, None)
                 .await
                 .expect("first run_command is Ok");
         assert!(
@@ -601,7 +603,7 @@ mod tests {
         );
 
         let second =
-            crate::inspect::run_command(&person, &ctx(), "true".to_owned(), None, None, None)
+            crate::inspect::run_command(&person, &ctx(), "true".to_owned(), None, None, None, None)
                 .await
                 .expect("second run_command is Ok");
         assert!(
@@ -625,6 +627,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .await
         .expect("make::run is Ok");
@@ -645,10 +648,17 @@ mod tests {
             made.content.contains("by_make.txt"),
             "the report names the file it added: {made:?}"
         );
-        let after_make =
-            crate::inspect::run_command(&person_m, &ctx(), "true".to_owned(), None, None, None)
-                .await
-                .expect("run_command after make is Ok");
+        let after_make = crate::inspect::run_command(
+            &person_m,
+            &ctx(),
+            "true".to_owned(),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("run_command after make is Ok");
         assert!(
             !after_make.is_error,
             "run_command after make is not an error: {after_make:?}"

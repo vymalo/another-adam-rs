@@ -590,7 +590,7 @@ follows each round as an ordinary task of a **child context**, and starts, talks
 `RuntimeTaskBackend::with_child_sessions` is the backend side (`crates/adam-a2a-runtime/src/child_sessions.rs`); the card entry is
 `ExtensionConfig::child_sessions`. The parent stream's events are `crates/adam-a2a-runtime/src/session_events.rs`. **Who lists it.** An agent whose root has a subagent, local or remote (the rule that gives the root the six session tools): `adam-agent` and `adam-coder`. `AgentDef::child_sessions` of `adam-assembly` computes the helpers and the limits from the files alone, so the same on every role; `adam_service::serve` hands them to the backend and adds the card entry **only when the backend accepted them** (a helper nobody registered is exit 78). The `worker` role serves no A2A and lists nothing. A root with no subagent lists nothing and refuses every request of the extension. There is no deployment switch.
 
-**A round may ask the person** (ADR 0045 decision 9): the round's task is `input-required` with the question, the session's round event reports `blocked`, and the person answers with a plain message in the child context (or a follow-up to the round's task), which the parked round reads as the asking tool's result. Only a round of a **kept-open** session a client shows may ask: the front writes `visible` into the header of a round it starts, and a request that did not activate the extension clears the run's `vymalo.childSessions` context key, so a session the model starts for a client that does not show sessions is one whose rounds are told `NOT_ASKABLE`. `docs/reference/child-runs.md` has the sequence.
+**A round may ask the person** (ADR 0045 decision 9): the round's task is `input-required` with the question, the session's round event reports `blocked`, and the person answers with a plain message in the child context (or a follow-up to the round's task), which the parked round reads as the asking tool's result. Only a round of an **`open`** session a client shows may ask: the front writes `visible` into the header of a round it starts, and a request that did not activate the extension clears the run's `vymalo.childSessions` context key, so a session the model starts for a client that does not show sessions is one whose rounds are told `NOT_ASKABLE`. `docs/reference/child-runs.md` has the sequence.
 
 ```mermaid
 sequenceDiagram
@@ -626,10 +626,10 @@ sequenceDiagram
 ```mermaid
 stateDiagram-v2
   [*] --> working: start
-  working --> idle: the round ended and the session is kept open
-  working --> closed: the round ended and the session is not kept open
-  working --> idle: CancelTask of the round and the session is kept open
-  working --> closed: CancelTask of the round and it is not kept open
+  working --> idle: the round ended, mode sealed or open
+  working --> closed: the round ended, mode one_shot
+  working --> idle: CancelTask of the round, mode sealed or open
+  working --> closed: CancelTask of the round, mode one_shot
   working --> closed: the round ended after a close (closing)
   working --> closed: a close with cancel
   idle --> working: a message to the child context
@@ -643,8 +643,9 @@ stateDiagram-v2
 * **Requests.** Without activation every request about `K` or a round is `InvalidParams` (`TaskNotFound` for another caller's
   round) before anything is written. Activated: a `start` on a message to `C` (no `taskId`) makes round 1 and no turn of the
   parent; a message to `K` is delivered into a working round, starts the next round of an idle session, or is
-  `UnsupportedOperation` for a closed one (a session idle for `SESSION_IDLE_DAYS` reads closed, and the words say so) or one
-  whose `tokenBudget` is spent (ADR 0054, decision 6); a `close` closes an idle session by a round that calls no model and a working one when
+  `UnsupportedOperation` for a closed one or one the person may not write to (`mode`, below) (a session idle for
+  `SESSION_IDLE_DAYS` reads closed, and the words say so) or one whose `tokenBudget` is spent (ADR 0054, decision 6); a
+  `close` closes an idle session by a round that calls no model and a working one when
   its round ends (`cancel` stops the round first); an `edit` changes the session's options, a working round or an idle one
   (ADR 0054, decision 11); `taskId` of a round follows the rules of any task (`steer/v1`);
   `ListTasks {contextId: K}` lists the rounds, an unknown or foreign `K` is an empty page.
@@ -659,13 +660,27 @@ stateDiagram-v2
   no model and has no report; both count toward `max_rounds`. The round event's session object reports the new `config` and the
   `edits`. A session on a remote helper takes `timeLimit` and `maxRounds` only, as a start does.
   **Limits.** `ChildSessions::with_limits(SessionLimits)` sets the card's `maxOpen`, `max_working` and `max_rounds`; without it the front uses the tools' defaults (16, 4, 20, `max_working` at most `max_open`). `AgentDef::child_sessions` calls it with the root's *effective* limits (`SESSION_MAX_OPEN`, `SESSION_MAX_WORKING`, `SESSION_MAX_ROUNDS`, which the root's `limits.max_open_sessions`, `max_working_sessions` and `max_session_rounds` may lower, never raise), the same value the session tools enforce, so the card's `maxOpen` is what a worker lets open. Each round's time limit is the tool's `within` (a local helper's `limits.max_minutes`, a remote one's `remote_timeout`). In a `control-plane` process the helpers are registered as start-only agents (`AgentDef::session_starters`) and a worker steps the rounds. A control plane holds no endpoint of a remote helper, so it cannot send the `CancelTask` of a remote round it cancels. Instead, whoever reads a session on a remote helper whose latest round was cancelled, or which expired idle (`SESSION_IDLE_DAYS`), starts a closing round (`ChildSessionAgent::remote`), which a worker steps and which cancels the remote task, including one that waits for an answer. In a session that is closed or expired the round closes it; in a kept-open session it only cancels and the session stays `idle`. The expiry does not wait for a reader: a round of such a session that ends leaves a timer run, parked until `SESSION_IDLE_DAYS` after it (the same value on every process), which a worker wakes to start the closing round if nobody wrote to the session meanwhile, and a cleanup round does not count toward `SESSION_MAX_ROUNDS` ([ADR 0045](../decisions/0045-a-subagent-can-run-in-the-background-as-a-session.md))). A person's `start`, and a message to an idle session that would start a round, past `SESSION_MAX_WORKING` working rounds is `UnsupportedOperation` with words ("N rounds are already working in this context"), as a start past `maxOpen` is; a round that only closes a session is not counted, and a steer into a working round and a close are never refused by it. *This adds a refusal case to the `child-sessions/v1` contract that the clients must handle.*
+* **Who may write: `mode`** ([ADR 0089](../decisions/0089-every-child-is-a-session-and-the-one-shot-subagent-tool-goes.md), slice C2).
+  Every session has one, chosen when it starts and said on every session object:
+
+  | `mode` | After a round | The person |
+  |---|---|---|
+  | `one_shot` (the default) | the session closes | sees it; writes to it only if they started it |
+  | `sealed` | it stays idle | sees it and cannot write to it: a message to `K`, an `edit` and a steer of its round are `UnsupportedOperation` naming the mode |
+  | `open` | it stays idle | writes to it |
+
+  A person's `start` takes `mode` `one_shot` or `open` (`sealed` is `InvalidParams`: it leaves a session to the agent that
+  started it). `keepOpen` is read for one release (`true` is `open`, `false` `one_shot`); beside a `mode` that disagrees it is
+  `InvalidParams` naming both. A person may still **close** a session they cannot write to, and an answer to a question and a
+  resume still pass. Only an `open` session's round may ask the person. An `edit`, the person's or the model's
+  `subagent_edit`, changes the config and never the `mode` (ADR 0089, amended 2026-11-28).
 * **A person's round is its own parent**, so no run's end cancels it and no run waits for it; its tasks say `by: person`.
 * **What a task says.** The parent's tasks: `metadata[URI].sessions`, open first then the 16 most recently closed. A round:
-  `{session, parentContextId, agent, description, keepOpen, round, by, state, closing}` (and `config`, the options the session runs
-  with, when it has one; and `edits`, the last 16 edits of that config — `{round, by, members}` — when there are any). The snapshot of a stream, `GetTask`, `ListTasks` and the answers carry them. **Events.** On the stream of a parent task, an
+  `{session, parentContextId, agent, description, mode, keepOpen, round, by, state, closing}` (and `config`, the options the session runs
+  with, when it has one; and `edits`, the last 16 edits of that config — `{round, by, members}` — when there are any). `mode` is new (additive); `keepOpen` is what it means, for a client of before. The snapshot of a stream, `GetTask`, `ListTasks` and the answers carry them. **Events.** On the stream of a parent task, an
   activated subscriber is sent one status update per change of a session (the task's state, no message), in the order `opened`,
   `round`, `reported` (`done`, `failed`, `canceled`, `blocked`), `closed`, with `session`, `contextId`, `agent`, `description`,
-  `keepOpen`, `by` and, except for `closed`, `round {number, taskId, state}` (the A2A JSON state, `TASK_STATE_COMPLETED`).
+  `mode`, `keepOpen`, `by` and, except for `closed`, `round {number, taskId, state}` (the A2A JSON state, `TASK_STATE_COMPLETED`).
   Sessions that existed at the start say nothing (one that starts in between may be told twice); the listing is read at most every
   200 ms when the parent's record changes, on the subscription's next poll once a second has passed (`SESSIONS_POLL`), and once
   more before the final event. **The real bound is `max(SESSIONS_POLL, poll)` — 2 s with the default 2 s fallback poll** —
@@ -777,7 +792,7 @@ orchestration layer's `docs/api/usage-v1.md`, [ADR 0032](../decisions/0032-usage
 in the event's `metadata` under the URI: `call` (unique within the task, the same on a resubscribe), `stepId` for a subagent's
 call (the `tool:<call id>` of the call that started it), `provider` (`openai`), `model` (the alias), `inputTokens`,
 `outputTokens`, `totalTokens`, and, when known, `reasoningTokens`, `cachedInputTokens`, `cacheWriteInputTokens`,
-`contextWindow` (`MODEL_CONTEXT_WINDOW`) and `effort`, the reasoning level the call named (`none`, `minimal`, `low`,
+`contextWindow` (the profile's, else `DEFAULT_MODEL_CONTEXT_WINDOW`) and `effort`, the reasoning level the call named (`none`, `minimal`, `low`,
 `medium`, `high`, `xhigh`, `max`: what the folder, the profile or the run's context asked for, [ADR 0063](../decisions/0063-a-reasoning-effort-is-one-setting.md) decision 7). A call that named no level
 has no `effort`, which is not `none`: `none` is a level of its own. Any other request gets nothing of it. A task that ended (`completed`, `failed`,
 `canceled`, `rejected`) or waits (`input-required`, `auth-required`) carries `metadata[URI] = {"totals": [...]}`, one entry
@@ -792,6 +807,12 @@ task ends or waits, cumulative, whoever reads it, `totals` always present, `[]` 
 has no `usage`: the commands were not measured, which is not zero. A report of an older coder may say
 `{"environment": "devcontainer"}` (ADR 0052 removed it): readers keep the word, and this coder never writes it. A run that never asked for an
 environment has no `sandbox`.
+
+It has a `shortenings` member too ([ADR 0090](../decisions/0090-a-tool-result-is-bounded-when-it-is-made-and-a-command-that-succeeds-says-so.md))
+when the run shortened old tool results to keep its history within its budget: `{"count": 2, "charsRemoved": 412000}`, how many times
+and the characters that took out. Each shortening moves the cached prompt prefix, so a deployment can see how often that happens. It
+counts the run's own history (not its children's) and is written under the same rules as the totals. A run that never shortened has no
+`shortenings`, and its object is the one it always was.
 
 ## Images in
 

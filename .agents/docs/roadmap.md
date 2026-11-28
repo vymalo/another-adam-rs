@@ -17,7 +17,7 @@ tags and workflow runs. GraphQL is not available from a session.
 | #495 and #530 merged without CI | the owner's brief of 2026-11-28; `gh api repos/vymalo/another-adam-rs/commits/<sha>/check-runs` for `1ad5b49c` and `430718b3` | stated by the owner; check-runs not read |
 | Homebrew path never run | `.github/workflows/release.yml` jobs `need: gate`; `node --test "tools/release/test/*.test.mjs"` | only the parts with no runner were run locally ([releases](guides/releases.md)) |
 | Open issues | `gh api 'repos/vymalo/another-adam-rs/issues?state=open&per_page=100'` | #445, #330, #322, #318, #284, #282, #278, #277, #275, #274, #249, #127, #123, #122, #121, #119, #102 |
-| Open pull requests | `gh api 'repos/vymalo/another-adam-rs/pulls?state=open'` | #532 (every tool source declares its tools, ANR-1319), #531 (release), #487 (runs exported as training records, ADR 0085) |
+| Open pull requests | `gh api 'repos/vymalo/another-adam-rs/pulls?state=open'` | #532 (every tool source declares its tools, ANR-1319), #531 (release), #487 (runs exported as training records, ADR 0087) |
 | ADR statuses | `grep -n '^Status' docs/decisions/00NN-*.md` | proposed: 0041 (amended), 0072, 0073, 0074, 0075; 0081 and 0082 accepted with slices open; 0086 accepted 2026-11-28, ports only |
 | ADR 0082 slices | the table in the ADR | P0, P1, P2 built; P3 to P7, S1, S2 to do |
 | Activity listener built | `docs/reference/environment.md` rows `ACTIVITY_LISTEN_ADDR` and `ACTIVITY_BEARER_TOKENS`; `crates/adam-service/src/activity.rs` | built; the README row said "not merged" and was corrected in this change |

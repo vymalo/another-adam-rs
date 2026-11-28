@@ -123,6 +123,15 @@ fn class_of(cause: &(dyn Error + 'static)) -> Option<ErrorClass> {
     if let Some(e) = cause.downcast_ref::<OpenAiConfigError>() {
         return Some(e.class());
     }
+    #[cfg(feature = "export")]
+    {
+        if let Some(e) = cause.downcast_ref::<crate::export::ExportCommandError>() {
+            return e.own_class();
+        }
+        if let Some(e) = cause.downcast_ref::<adam_export::ExportError>() {
+            return Some(e.class());
+        }
+    }
     cause.downcast_ref::<RuntimeError>().map(Classify::class)
 }
 

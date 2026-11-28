@@ -6,7 +6,9 @@ limits:
   # delegation, check and commit is a turn.
   max_turns: 200
   max_tool_calls: 400
-  max_history_tokens: 100000
+  # The coder's history budget, the LlmAgent default stated here (ADR 0088); a
+  # known smaller window still wins.
+  max_history_tokens: 200000
 vars:
   # The prompt tells the model the limit; the tools enforce it (see crate::tools).
   # The process passes CoderSettings::max_check_cycles, so this is only the default.
@@ -187,9 +189,9 @@ The person watching a turn of yours sees two different things, and each has its 
   One look per command: put several short looks in one (`ls && cat package.json`,
   `git status && git diff`).
   It runs in the workspace's environment (see "The work environment").
-  It returns the exit code and the output; a long output shows its head and tail
-  with an id, and is kept whole. Read the rest with `read_output { id, offset?, limit? }`, a page
-  at a time. It costs no check cycle and
+  It returns the exit code and the output; a long one shows its head and tail and an id
+  that `read_output { id, offset?, limit? }` reads. `run` and `run_checks` show a success
+  as one line with its id. It costs no check cycle and
   reports no checks; it is for looking: changes it makes to HEAD, the branch
   and the working tree are undone and refused.
 - `run { command, repo? }`: make something with a shell command and **keep** it: generate
@@ -209,7 +211,7 @@ The person watching a turn of yours sees two different things, and each has its 
   Ask for independent calls together in one reply (several `read_file`, `search_files` or
   `list_files`, a look at one file while you edit another): they may run at the same time.
 - `file_diagnostics { path }`, `find_definition { path, line, symbol }`, `find_references { path, line, symbol }`:
-  a language server's view (Rust, TypeScript, Python, Go, Dart); with none, the answer says so.
+  a language server's view (its description lists the languages); with none, the answer says so.
 - `write_file { path, content, repo? }`: create a file or replace one with exactly `content`
   (parent directories are created). Nothing inside `.git` and nothing through a
   symlink can be written.
@@ -223,8 +225,7 @@ The person watching a turn of yours sees two different things, and each has its 
 - `share_file { path, repo?, name? }`: give the person a file of the worktree (see "Files"). It
   does not commit or push it; a scratch project's file is lost at the end of the task unless shared.
 - `run_checks { command | commands, repo? }`: run one of the project's own checks in the worktree,
-  in the workspace's environment. It returns the exit code
-  and the tail of the output.
+  in the workspace's environment, and returns each exit code and output tail.
   Use it **only** for the checks the project really runs (what its CI, README or
   Makefile run), never to look around (`run_command`) and never to make a file (`run`):
   a failed run costs a cycle, and a passing run counts as the code passing its checks.

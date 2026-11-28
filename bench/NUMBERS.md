@@ -19,7 +19,7 @@ figure move.
 
 | Figure | What it means | Computed from | State |
 |---|---|---|---|
-| **Calls per task** | how many model calls an agent spends on a task it finished, and the ratio between two agents on the same tasks | the `call` records of phase `settled` of the runs that reached `Done`, over those runs, per agent | reproducible from any ledger; a ratio needs a ledger holding both agents |
+| **Calls per task** | how many model calls an agent spends on a task it finished, and the ratio between two agents on the same tasks | the `call` records of phase `settled` of the runs that reached `Done` (every attempt of a resumed run), over those runs, per agent | reproducible from any ledger; a ratio needs a ledger holding both agents |
 | **Cache share of the fixed prompt** | how much of the fixed (first) prompt a run re-reads from the cache instead of paying for again | `usage.cached / usage.input` over the settled calls that carried the run's **first** prompt fingerprint; a child session's prompt is another fingerprint and is left out | reproducible from any ledger that records `usage` |
 | **Checks step's share** | the share of the coder's work that the check tool takes | **not derivable**: the ledger records which tools an answer asked for (`toolNames`) and when a model call started and ended, never how long a tool ran | see below |
 
@@ -76,6 +76,63 @@ table above:
 3. the blind second reading of all 95 runs is attached to ANR-424 as `bench-deep-analysis.html`
    (with the plan pages as its other attachments) — it is prose over the same runs, not a ledger,
    so a figure that has to be *recomputed* comes from step 1, never from it.
+
+## ADR 0090: hidden outputs
+
+[ADR 0090](../docs/decisions/0090-a-tool-result-is-bounded-when-it-is-made-and-a-command-that-succeeds-says-so.md)
+hides a successful command's output behind one line and keeps it for `read_output`. Its decision 5
+keeps that only if it is measured: on the same tasks, before and after, compare calls per task,
+`read_output` calls, input tokens per task and the cache share of the prompt; **if hidden outputs make
+the model call `read_output` more often than they save, the default goes back to `full` for that
+tool.** It takes two ledgers of the same tasks and arm, one series with the coder pinned before slice
+T1 (every output shown) and one after, each from its own `$BENCH_HOME`:
+
+```sh
+node bench/bin/bench.mjs numbers --ledger /path/to/after/ledger.jsonl --against /path/to/before/ledger.jsonl
+```
+
+`--against` is the baseline (before), `--ledger` the series measured (after). Per agent, only the tasks
+**both** ledgers finished count, matched on the `task` of each run's `Planned` record; a task finished
+in one ledger only, a finished run with no task id and an agent in one ledger only are left out and
+listed under the tables. For each agent it prints one table, figure by figure, before, after and the
+change (the difference and, when the baseline is not zero, the relative change; a share in
+percentage points), then one line naming decision 5's case from which way the two figures moved:
+
+| `read_output` calls / task | Input tokens / task | Case |
+|---|---|---|
+| up | down | **weigh**: the tokens saved against the calls added, the owner's call |
+| up | same or up | **against `on_error`**: the default goes back to `full` |
+| same or down | down | **for `on_error`** |
+| same or down | same or up | **no saving** |
+
+There is no threshold: "up" is any increase, and the weighing is left to the reader with the numbers
+beside it. The command is read-only, like the single-ledger form.
+
+| Figure | Computed from |
+|---|---|
+| Calls per task | as above |
+| `read_output` calls per task | the `read_output` entries of the settled calls' `toolNames` (`adam_llm_agent::kept::READ_OUTPUT`), over the finished runs |
+| Input tokens per task | `usage.input` (cached tokens included) of every settled call, a child session's too, over the finished runs; a settled call without usage adds nothing and is counted apart, and the line under the table says the sum is then a lower bound |
+| Cache share of the prompt | the cache share of the fixed prompt, as above |
+
+What the ledger cannot say, so the command does not either:
+
+- **Whose output a `read_output` call read.** The meter keeps a tool call's name, never its arguments,
+  so the extra calls cannot be laid at `run_checks`, `run` or `run_command`, and decision 5 is per
+  tool. A case that points back to `full` does not say for which tool; telling them apart needs one
+  series per tool's default, or the harness recording the output id's tool.
+- **The tokens a hidden output saved, as such.** Input tokens per task is the whole prompt over the
+  run; it moves with the hidden outputs and with anything else that differs between the two series
+  (the coder's other changes between the pins, the model's own variance), so the two series should
+  differ by as little as the pins allow.
+- **More than 64 tool names in one answer**: the meter keeps the first 64 names of an answer, so a
+  count past that is short.
+
+The result, *to be filled from the owner's runs*:
+
+| Agent | Tasks in both | Calls / task (before → after) | `read_output` / task | Input tokens / task | Cache share | Case | Ledgers (series) | Date |
+|---|---|---|---|---|---|---|---|---|
+| adam | _to be filled from the owner's runs_ | | | | | | | |
 
 ## Where the epics' own figures are
 

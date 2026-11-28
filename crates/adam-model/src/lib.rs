@@ -103,8 +103,9 @@ pub use credentials::{
 pub use error::ModelError;
 pub use mock::{MockModel, RecordedCall};
 pub use profiles::{
-    DEFAULT_MAX_OUTPUT_TOKENS, ModelProfile, ModelProfiles, NotAWire, NotAnEffort, Preset,
-    RESERVED_EXTRA_BODY_KEYS, ReasoningEffort, ReasoningWire,
+    DEFAULT_MAX_OUTPUT_TOKENS, MAX_CONTEXT_WINDOW, ModelProfile, ModelProfiles, NotAWire,
+    NotAnEffort, Preset, RESERVED_EXTRA_BODY_KEYS, ReasoningEffort, ReasoningWire,
+    resolve_context_window,
 };
 pub use prompt::{
     MAX_PROMPT_JWS_BYTES, NoPerson, NoPromptId, NotAPromptStatement, PROMPT_STATEMENT_HEADER,

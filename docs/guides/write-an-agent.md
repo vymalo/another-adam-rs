@@ -61,6 +61,7 @@ agent/
 | `tools:` | optional selection among the agent's tools; `linear__*` takes a server's tools; an unknown name is refused with a suggestion |
 | `tools_loading:` | `eager` puts every tool in every request, as before the key existed, including a server whose `mcp.json` entry has a `when`; `lazy` (the default) starts lean and lets a run load tools in groups (ADR 0066). `searchable` is accepted and behaves as `lazy` until searchable groups land |
 | `skills:`, `preload_skills:` | which skills the model sees, and which are put in the prompt whole |
+| `session:` | subagent only: `mode` (`one_shot`, `sealed`, `open`) is what a `subagent_start` that names none gets and the widest it may ask; `wait` is a default only (ADR 0089; [agent files](../reference/agent-files.md#agent-and-subagent-files-instructionsmd-subagentsmd-agentmd)) |
 | `plugins:` | compiled hooks the deployment registered by name (`AgentDef::plugin`); a subagent inherits them, and a name nobody registered stops startup (exit 78) |
 
 Rules worth knowing:

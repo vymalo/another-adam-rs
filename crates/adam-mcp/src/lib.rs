@@ -38,10 +38,11 @@ pub use expand::Env;
 pub use once::{CallOptions, Endpoint, EndpointError, RemoteResult, RemoteTool};
 pub use policy::{
     CallBearer, DEFAULT_CALL_TIMEOUT, DEFAULT_CONNECT_TIMEOUT, DEFAULT_MAX_CALL,
-    DEFAULT_THREAD_TOOLS_MAX_CALL, McpPolicy,
+    DEFAULT_RESULT_BYTES, DEFAULT_THREAD_TOOLS_MAX_CALL, MIN_RESULT_BYTES, McpPolicy,
 };
 pub use prompts::{PromptCommand, PromptError};
 pub use servers::{MAX_INSTRUCTIONS_BYTES, MAX_SERVER_INSTRUCTIONS_BYTES, McpServers};
+#[allow(deprecated)] // the old name, kept for the consumers that still read it
 pub use text::MAX_RESULT_BYTES;
 pub use upload::{
     DEFAULT_PUT_TIMEOUT, REQUEST_UPLOAD, UploadError, UploadRequest, UploadSlot, Uploaded, Uploader,

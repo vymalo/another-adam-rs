@@ -573,8 +573,39 @@ async fn without_a_budget_nothing_is_shortened_and_the_state_has_no_member_for_i
     let (requests, state) = six_turns(0).await;
     assert_eq!(breaks(&requests, &state.tools_appended), Vec::<u32>::new());
     assert!(state.shortenings.is_empty());
+    assert!(state.shortening_usage.is_empty());
     let written = serde_json::to_value(&state).unwrap();
     assert!(written.get("shortenings").is_none(), "{written}");
+    // Nothing counted, nothing written: the state is the bytes it was before the count existed.
+    assert!(written.get("shortening_usage").is_none(), "{written}");
+}
+
+/// ADR 0090: each shortening is counted in the run's usage, with the characters it took out, so
+/// the task's `usage/v1` totals say that the cached prefix moved.
+#[tokio::test]
+async fn a_shortening_is_counted_in_the_runs_usage() {
+    let (requests, state) = six_turns(SIX_TURNS_BUDGET).await;
+    let [at] = state.shortenings[..] else {
+        panic!("one shortening: {:?}", state.shortenings);
+    };
+    let usage = state.shortening_usage;
+    assert_eq!(usage.count, 1, "{usage:?}");
+    // Only the outputs the request before carried are cut (the newest is never), so what was
+    // removed is what those messages lost between the request before and the one that shortened.
+    let at = at as usize;
+    let carried = requests[at - 1].messages.len();
+    let chars =
+        |messages: &[Message]| -> usize { messages.iter().map(|m| m.text().chars().count()).sum() };
+    assert_eq!(
+        usage.chars_removed,
+        (chars(&requests[at - 1].messages) - chars(&requests[at].messages[..carried])) as u64,
+        "{usage:?}"
+    );
+    assert!(usage.chars_removed > 1000, "{usage:?}");
+    assert_eq!(
+        serde_json::to_value(&state).unwrap()["shortening_usage"],
+        json!({"count": 1, "chars_removed": usage.chars_removed})
+    );
 }
 
 #[tokio::test]
@@ -675,6 +706,7 @@ async fn a_retried_model_call_sends_the_same_request_after_a_shortening() {
         [4],
         "recorded once, at the turn it was made"
     );
+    assert_eq!(state.shortening_usage.count, 1, "and counted once");
     assert!(
         state
             .messages
@@ -1108,7 +1140,7 @@ fn narrowed_session(tools: &[&str]) -> adam_runtime::SessionHeader {
         id: RunId::new(),
         agent: "llm".into(),
         description: "a narrowed round".into(),
-        keep_open: false,
+        mode: adam_runtime::SessionMode::OneShot,
         closed: false,
         closing: false,
         deleted: false,

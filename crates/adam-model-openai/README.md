@@ -17,8 +17,8 @@ never see this crate's types. Retries are not done here: failures map onto
 |---|---|
 | `OpenAiConfig` | `base_url`, `api_key: SecretString`, `timeout`, `extra_headers`; `OpenAiConfig::new(base_url, api_key)` |
 | `OpenAiCompatible::with_credentials(DynCredentials)` | the headers of every call come from this provider instead of `api_key` ([ADR 0058](../../docs/decisions/0058-the-models-credentials-come-from-a-provider-asked-for-each-call.md)); see *Credentials* below |
-| `OpenAiCompatible` | the client: `OpenAiCompatible::new(config)`, `.with_max_tokens_field(field)`, `.with_extra_body(map)` (members merged into every request), `.with_echo_reasoning(Some(field))` (send reasoning back), `.with_prompt_cache_key(true)` (send `ModelRequest::prompt_cache_key` as the body's `prompt_cache_key`; off by default; a `with_extra_body` member of the same name wins; whether every gateway accepts it is *unverified*; OpenAI's reference page could not be fetched on 2026-11-15, so the field name is *unverified* against a primary source too), `.with_context_window(alias, tokens)` (what `ModelClient::context_window` answers for that alias; nothing is sent) |
-| `OpenAiCompatible::with_profiles(ModelProfiles)` | the deployment's per-model profiles (`MODEL_ALIASES_FILE`): `ModelClient::profile` answers them, and a request's `reasoning_effort` goes out through the model's `reasoningWire`, after the extra body (*Reasoning effort*) |
+| `OpenAiCompatible` | the client: `OpenAiCompatible::new(config)`, `.with_max_tokens_field(field)`, `.with_extra_body(map)` (members merged into every request), `.with_echo_reasoning(Some(field))` (send reasoning back), `.with_prompt_cache_key(true)` (send `ModelRequest::prompt_cache_key` as the body's `prompt_cache_key`; off by default; a `with_extra_body` member of the same name wins; whether every gateway accepts it is *unverified*; OpenAI's reference page could not be fetched on 2026-11-15, so the field name is *unverified* against a primary source too), `.with_context_window(alias, tokens)` (what `ModelClient::context_window` answers for that alias when its profile names no `contextWindow`; nothing is sent) |
+| `OpenAiCompatible::with_profiles(ModelProfiles)` | the deployment's per-model profiles (`MODEL_ALIASES_FILE`): `ModelClient::profile` answers them, a request's `reasoning_effort` goes out through the model's `reasoningWire`, after the extra body (*Reasoning effort*), and a profile's `contextWindow` is what `ModelClient::context_window` answers for its alias, over `with_context_window` (`adam_model::resolve_context_window`, ADR 0088) |
 | `PROVIDER` | `"openai"`: what `ModelClient::provider` says for this client, whatever gateway is behind it |
 | `ReasoningField` | `ReasoningContent` (`reasoning_content`) or `Reasoning` (`reasoning`): the member that carries reasoning when a client echoes it |
 | `MaxTokensField` | `MaxTokens` (default) or `MaxCompletionTokens`, for models that want the newer field name |
@@ -327,7 +327,8 @@ adds roots to it. The crate reads no variable itself: `MODEL_CA_FILE` is read by
   `without_a_profile_a_wire_or_a_level_the_body_is_byte_identical`,
   `a_thinking_budget_with_no_budget_names_the_model_and_the_level` and
   `a_hand_built_thinking_budget_profile_refuses_none`; `src/lib.rs`'s
-  `the_profiles_are_answered_for_their_models_and_debug_shows_ids_only`; `crates/adam-model/src/profiles.rs`'s
+  `the_profiles_are_answered_for_their_models_and_debug_shows_ids_only` and
+  `a_profiles_window_wins_over_the_configured_one_alias_by_alias` (ADR 0088); `crates/adam-model/src/profiles.rs`'s
   `the_thinking_budget_wire_refuses_the_level_none`; and `tests/model_wire.rs` in `adam-service` for the end-to-end from
   `MODEL_ALIASES_FILE` through `ModelConfig::client()`.
 * Unit tests: `src/errors.rs` (`status_mapping`, `a_problem_type_is_read_by_its_last_segment`,

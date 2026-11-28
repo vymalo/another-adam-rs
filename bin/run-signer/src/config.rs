@@ -346,27 +346,27 @@ fn client(
     ca: Option<(&'static str, &[u8])>,
     problems: &mut Vec<String>,
 ) -> Option<(reqwest::Client, usize)> {
-    let mut builder = reqwest::Client::builder()
-        .connect_timeout(limits.connect_timeout)
-        // A black-holed gateway frees the request rather than pinning it until the process stops.
-        .read_timeout(limits.read_timeout)
-        // Never follow a redirect with a signed request: the signature covers this path, not another.
-        .redirect(reqwest::redirect::Policy::none())
-        // A signed request carries the prompt, the person's envelope and a valid `Turn-Signature`:
-        // a proxy from the environment would hand all three to another host.
-        .no_proxy()
-        .user_agent(concat!("adam-run-signer/", env!("CARGO_PKG_VERSION")));
-    let mut roots = 0;
+    let base = || {
+        reqwest::Client::builder()
+            .connect_timeout(limits.connect_timeout)
+            // A black-holed gateway frees the request rather than pinning it until the process stops.
+            .read_timeout(limits.read_timeout)
+            // Never follow a redirect with a signed request: the signature covers this path, not
+            // another.
+            .redirect(reqwest::redirect::Policy::none())
+            // A signed request carries the prompt, the person's envelope and a valid
+            // `Turn-Signature`: a proxy from the environment would hand all three to another host.
+            .no_proxy()
+            .user_agent(concat!("adam-run-signer/", env!("CARGO_PKG_VERSION")))
+    };
+    let mut certificates = Vec::new();
     if let Some((label, pem)) = ca {
         match reqwest::Certificate::from_pem_bundle(pem) {
             Ok(certs) if certs.is_empty() => {
                 problems.push(format!("{label} holds no certificate"));
                 return None;
             }
-            Ok(certs) => {
-                roots = certs.len();
-                builder = builder.tls_certs_merge(certs);
-            }
+            Ok(certs) => certificates = certs,
             Err(error) => {
                 problems.push(format!(
                     "{label} is not a PEM certificate bundle: {}",
@@ -376,7 +376,21 @@ fn client(
             }
         }
     }
-    match builder.build() {
+    let roots = certificates.len();
+    let merged = if certificates.is_empty() {
+        base()
+    } else {
+        base().tls_certs_merge(certificates.clone())
+    };
+    // A system with no roots (a slim base without `ca-certificates`) cannot give the platform
+    // verifier any: trust the given CA alone, or nothing. An `http` upstream still answers, and an
+    // `https` one is refused at its handshake, never trusted unverified.
+    match merged.build().or_else(|first| {
+        base()
+            .tls_certs_only(certificates)
+            .build()
+            .map_err(|_| first)
+    }) {
         Ok(client) => Some((client, roots)),
         Err(error) => {
             problems.push(format!(

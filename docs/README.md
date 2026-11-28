@@ -27,6 +27,7 @@ These pages are for people. The procedures and evidence that coding agents use l
 | Operate | [The egress proxy and the network of run pods](guides/egress-and-run-pod-network.md) | a build in a run pod cannot reach a host, or you want to let it |
 | Operate | [Read a run's state when it is stuck](guides/read-a-stuck-run.md) | a task does not finish: is it waiting, or is it stuck, and where to look in the store |
 | Operate | [Troubleshoot by error class](guides/troubleshoot-by-error-class.md) | a pod exited or a task failed: from the class of the error to what to do |
+| Operate | [Export runs for training](guides/export-runs-for-training.md) | you want adam's runs as training records (JSON Lines in the chat shape) to fine-tune a small model for one stack, and how to curate and evaluate it |
 | Operate | [Troubleshooting a local run](guides/run-locally.md#troubleshooting), [the chart's known risks](guides/deploy-the-coder.md#known-risks) | something does not work on your machine, or you want to know what can go wrong in a cluster |
 | Extend | [Embed adam](guides/embed-adam.md) | you host adam agents inside your own Rust program, a server |
 | Extend | [Embed adam in an application](guides/embed-in-an-app.md) | adam runs inside your application (a desktop or a phone), with no server and nothing on the network of its own |

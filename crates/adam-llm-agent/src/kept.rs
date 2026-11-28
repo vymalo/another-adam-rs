@@ -334,8 +334,13 @@ pub fn kept_view(id: &str, kept: &str, info: &KeptInfo, total_bytes: u64) -> Str
 /// What the model is shown of a text that could **not** be kept: its first page, and a last line
 /// that says why the rest is lost.
 pub fn unkept_view(kept: &str, why: &str) -> String {
+    unkept_view_of(kept, why, PAGE_LINES)
+}
+
+/// [`unkept_view`] with a first page of at most `limit` lines.
+fn unkept_view_of(kept: &str, why: &str, limit: u32) -> String {
     let mut view = String::new();
-    if let Ok(page) = page_lines(Cursor::new(kept.as_bytes()), 1, PAGE_LINES, false) {
+    if let Ok(page) = page_lines(Cursor::new(kept.as_bytes()), 1, limit, false) {
         for line in &page.lines {
             // As on a page: only the last line of the view may start with `[`.
             if let Some(rest) = line.text.strip_prefix('[') {
@@ -666,19 +671,40 @@ pub async fn keep_long_cut(
     text: &str,
     omitted: u64,
 ) -> (String, Option<Box<KeptOutput>>) {
+    keep_long_within(ctx, text, omitted, usize::MAX).await
+}
+
+/// [`keep_long_cut`], with what the model is shown at most `max_bytes` long: the first page holds as
+/// many lines as fit beside the line that names the kept text and the page's final line, so the
+/// next offset it names is where the shown lines end. A page always has one line, so a line longer
+/// than the room is shown whole (folded at [`MAX_LINE_CHARS`] characters). An MCP result is shown
+/// this way, within the deployment's bound of a tool result (ADR 0090).
+pub async fn keep_long_within(
+    ctx: &ToolCtx,
+    text: &str,
+    omitted: u64,
+    max_bytes: usize,
+) -> (String, Option<Box<KeptOutput>>) {
     let id = output_id_of(ctx);
     let total = text.len() as u64 + omitted;
     if let Some(store) = ctx.state::<KeptStore>() {
         let run = ctx.root_run_id().to_string();
-        return match store.0.keep(&run, &id, text, omitted).await {
-            Ok(info) => {
-                // The page is made from what was kept (and scrubbed by the keeper), never from `text`.
-                match store.0.page(&run, &id, 1, PAGE_LINES).await {
-                    Ok(first) => (kept_header(&id, &info, total) + &first, None),
-                    Err(e) => (lost_view(&e), None),
-                }
+        let info = match store.0.keep(&run, &id, text, omitted).await {
+            Ok(info) => info,
+            Err(e) => return (lost_view(&e), None),
+        };
+        let header = kept_header(&id, &info, total);
+        let room = max_bytes.saturating_sub(header.len());
+        // The page is made from what was kept (and scrubbed by the keeper), never from `text`.
+        let mut lines = PAGE_LINES;
+        return loop {
+            match store.0.page(&run, &id, 1, lines).await {
+                Ok(first) => match fewer_lines(&first, room) {
+                    Some(fewer) => lines = fewer,
+                    None => break (header + &first, None),
+                },
+                Err(e) => break (lost_view(&e), None),
             }
-            Err(e) => (lost_view(&e), None),
         };
     }
     // No keeper to scrub: the context's hook does it, before the fold, which could split a value
@@ -694,7 +720,11 @@ pub async fn keep_long_cut(
             lines: count_lines(&prepared),
             cut,
         };
-        let view = kept_view(&id, &prepared, &info, total);
+        let header = kept_header(&id, &info, total);
+        let room = max_bytes.saturating_sub(header.len());
+        let first =
+            fitting_page(room, |lines| page_of(&id, &prepared, 1, lines)).unwrap_or_default();
+        let view = header + &first;
         return (
             view,
             Some(Box::new(KeptOutput {
@@ -708,7 +738,43 @@ pub async fn keep_long_cut(
         MAX_RUN_KEPT_BYTES / (1024 * 1024),
         prepared.len()
     );
-    (unkept_view(&prepared, &why), None)
+    let view = fitting_page(max_bytes, |lines| {
+        Ok::<_, KeptError>(unkept_view_of(&prepared, &why, lines))
+    })
+    .unwrap_or_default();
+    (view, None)
+}
+
+/// The page `page` renders with as many lines as fit `room` bytes: [`PAGE_LINES`] when they do,
+/// else fewer, down to one. `page(lines)` renders the page of at most `lines` lines.
+fn fitting_page<E>(
+    room: usize,
+    mut page: impl FnMut(u32) -> Result<String, E>,
+) -> Result<String, E> {
+    let mut lines = PAGE_LINES;
+    loop {
+        let shown = page(lines)?;
+        match fewer_lines(&shown, room) {
+            Some(fewer) => lines = fewer,
+            None => return Ok(shown),
+        }
+    }
+}
+
+/// How many lines a page that rendered to `shown` should hold to fit `room` bytes: in proportion
+/// to what it holds, and always fewer, so that asking again ends. `None` when it fits, or holds a
+/// single line. A rendered page is its lines, each ended by a newline, then a final line that is
+/// not.
+fn fewer_lines(shown: &str, room: usize) -> Option<u32> {
+    if shown.len() <= room {
+        return None;
+    }
+    let held = shown.matches('\n').count();
+    if held <= 1 {
+        return None;
+    }
+    let fit = held.saturating_mul(room) / shown.len();
+    u32::try_from(fit.clamp(1, held - 1)).ok()
 }
 
 /// What a keeper makes of the `text` it is given, before it cuts and folds it: scrubbed with

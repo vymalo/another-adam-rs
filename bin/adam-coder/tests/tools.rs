@@ -600,8 +600,12 @@ async fn run_checks_runs_in_the_worktree_and_never_outside_it() {
     rig.prepare().await;
     let tool = RunChecks;
 
+    // `full`: a check that passes shows its output only when asked (ADR 0090).
     let ok = tool
-        .call(&rig.ctx, json!({"command": "cat README.md"}))
+        .call(
+            &rig.ctx,
+            json!({"command": "cat README.md", "output": "full"}),
+        )
         .await
         .unwrap();
     assert!(!ok.is_error, "{}", ok.content);
@@ -610,7 +614,10 @@ async fn run_checks_runs_in_the_worktree_and_never_outside_it() {
     std::fs::create_dir_all(rig.worktree().join("sub")).unwrap();
     std::fs::write(rig.worktree().join("sub/only-here.txt"), "x").unwrap();
     let sub = tool
-        .call(&rig.ctx, json!({"command": "ls", "cwd": "sub"}))
+        .call(
+            &rig.ctx,
+            json!({"command": "ls", "cwd": "sub", "output": "full"}),
+        )
         .await
         .unwrap();
     assert!(sub.content.contains("only-here.txt"), "{}", sub.content);
@@ -649,7 +656,10 @@ async fn run_checks_times_out_and_caps_its_output() {
     let out = tool
         .call(
             &rig.ctx,
-            json!({"command": "i=0; while [ $i -lt 500 ]; do echo line-$i; i=$((i+1)); done"}),
+            json!({
+                "command": "i=0; while [ $i -lt 500 ]; do echo line-$i; i=$((i+1)); done",
+                "output": "full"
+            }),
         )
         .await
         .unwrap();
@@ -713,15 +723,48 @@ async fn three_independent_checks_run_at_the_same_time() {
 }
 
 /// The output of every check is kept whole and in the caller's order, and the report names them in
-/// that order.
+/// that order. With the default `output` (`on_error`, ADR 0090) each passing command is one line
+/// whose output id is its own; with `full` its output is shown.
 #[tokio::test]
 async fn the_output_of_every_check_is_kept_in_the_callers_order() {
     let rig = Rig::new().await;
     rig.prepare().await;
-    let out = RunChecks
+    let quiet = RunChecks
         .call(
             &rig.ctx,
             json!({"commands": ["echo one", "echo two", "echo three"]}),
+        )
+        .await
+        .unwrap();
+    assert!(!quiet.is_error, "{}", quiet.content);
+    let mut ids: Vec<&str> = quiet
+        .content
+        .split("read_output {\"id\":\"")
+        .skip(1)
+        .filter_map(|rest| rest.split('"').next())
+        .collect();
+    assert_eq!(
+        ids.len(),
+        3,
+        "one kept output per command: {}",
+        quiet.content
+    );
+    ids.sort_unstable();
+    ids.dedup();
+    assert_eq!(
+        ids.len(),
+        3,
+        "each command keeps its own id: {}",
+        quiet.content
+    );
+    assert!(!quiet.content.contains("\none\n"), "{}", quiet.content);
+
+    // Other commands than the first call's: a repeat of a passed call on the same tree is
+    // answered from its record (ANR-247), not run again.
+    let out = RunChecks
+        .call(
+            &rig.ctx,
+            json!({"commands": ["echo one # full", "echo two # full", "echo three # full"], "output": "full"}),
         )
         .await
         .unwrap();
@@ -1156,7 +1199,13 @@ async fn a_pass_is_not_reused_after_write_file_wrote_an_ignored_file() {
         "the ignored file now says bad, so the pass is stale: {}",
         again.content
     );
-    assert_eq!(runs_of(&counter), 2, "the epoch moved: the check ran again");
+    // Three: the first gate, this one (the epoch moved, so the check ran again), and the base
+    // commit, which a failing command is also run on to tell a pre-existing failure (ADR 0026).
+    assert_eq!(
+        runs_of(&counter),
+        3,
+        "the epoch moved: the check ran again, and its failure was asked of the base"
+    );
     assert!(
         checks_of(&again).get("reused").is_none(),
         "{:?}",
@@ -1887,6 +1936,8 @@ async fn a_pull_request_opens_for_a_failure_the_base_has_too() {
         "{}",
         opened.content
     );
+    // Let in because the failure is the base's, not because its code passed: not verified.
+    assert_eq!(opened.artifacts[0].data["verified"], false);
     let pulls = rig.fx.created_pulls().await;
     let body = pulls[0]["body"].as_str().unwrap();
     assert!(
@@ -2349,6 +2400,21 @@ async fn commit_and_push_is_idempotent_and_refuses_an_empty_branch() {
     assert!(is_error(&empty));
 }
 
+/// The pull requests the exporter reads from `out`'s artifacts (ADR 0087, slice E4): the coder's
+/// `pull_request` artifact is the exporter's outcome contract.
+fn exported_pull_requests(out: &ToolOutput) -> Vec<adam_export::PullRequestOutcome> {
+    assert_eq!(
+        adam_coder::tools::publish::PULL_REQUEST_ARTIFACT,
+        adam_export::PULL_REQUEST_ARTIFACT
+    );
+    let artifacts: Vec<adam_export::RunArtifact> = out
+        .artifacts
+        .iter()
+        .map(|a| adam_export::RunArtifact::new(a.name.clone(), a.mime_type.clone(), a.data.clone()))
+        .collect();
+    adam_export::pull_requests_of(&artifacts, &adam_export::Pseudonyms::new(b"test"))
+}
+
 #[tokio::test]
 async fn open_pull_request_needs_a_push_and_green_checks_and_is_idempotent() {
     let rig = Rig::new().await;
@@ -2412,6 +2478,14 @@ async fn open_pull_request_needs_a_push_and_green_checks_and_is_idempotent() {
     );
     assert_eq!(opened.artifacts[0].name, "pull_request");
     assert_eq!(opened.artifacts[0].data["url"], PR_URL);
+    // What the gate saw, for the exporter's outcome contract (ADR 0087, slice E4): the head it
+    // let in, verified by the checks on exactly that code.
+    let head = head_of(&rig.worktree());
+    assert_eq!(opened.artifacts[0].data["commit"], head.as_str());
+    assert_eq!(opened.artifacts[0].data["verified"], true);
+    let delivered = exported_pull_requests(&opened);
+    assert_eq!(delivered.len(), 1, "{delivered:?}");
+    assert!(delivered[0].verified && delivered[0].repository.is_some());
 
     // Again (replay): the same PR, no second POST.
     let again = pr.call(&rig.ctx, args).await.unwrap();
@@ -2450,6 +2524,11 @@ async fn commit_and_push_opens_the_pull_request_in_the_same_call() {
         out.artifacts[1].data["commit"]
     );
     assert_eq!(out.artifacts[2].data["url"], PR_URL);
+    assert_eq!(
+        out.artifacts[2].data["commit"], out.artifacts[1].data["commit"],
+        "the pull request's head is the pushed commit"
+    );
+    assert_eq!(out.artifacts[2].data["verified"], true);
     assert!(out.content.starts_with("Committed "), "{}", out.content);
     assert!(out.content.contains(PR_URL), "{}", out.content);
     let branch = out.artifacts[1].data["branch"].as_str().unwrap().to_owned();
@@ -2632,6 +2711,9 @@ async fn a_commit_and_push_with_pull_request_refuses_red_or_stale_checks() {
         .unwrap();
     assert!(!accepted.is_error, "{}", accepted.content);
     assert_eq!(accepted.artifacts[2].data["url"], PR_URL);
+    // Red checks a person accepted are not verified work: the outcome says so.
+    assert_eq!(accepted.artifacts[2].data["verified"], false);
+    assert!(!exported_pull_requests(&accepted)[0].verified);
     let pulls = rig.fx.created_pulls().await;
     assert_eq!(pulls.len(), 1, "{pulls:?}");
     assert!(
@@ -3437,7 +3519,7 @@ async fn both_tools_run_bash_when_there_is_bash() {
         looked.content
     );
     let checked = RunChecks
-        .call(&rig.ctx, json!({ "command": command }))
+        .call(&rig.ctx, json!({ "command": command, "output": "full" }))
         .await
         .unwrap();
     assert!(!checked.is_error, "{}", checked.content);
@@ -7719,7 +7801,7 @@ async fn run_respects_the_timeout_the_cwd_rule_and_a_missing_tool() {
     let hidden = Run
         .call(
             &rig.ctx,
-            json!({"command": "echo \"[${GITHUB_TOKEN:-unset}]\""}),
+            json!({"command": "echo \"[${GITHUB_TOKEN:-unset}]\"", "output": "full"}),
         )
         .await
         .unwrap();

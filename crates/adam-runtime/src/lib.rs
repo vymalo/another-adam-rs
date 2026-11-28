@@ -111,7 +111,7 @@ pub use adam_error::{Classify, ErrorClass};
 pub use adam_model::Usage;
 pub use agent::{Agent, AgentError, AgentStarter, Inbound, Transition};
 pub use artifact_ref::{ArtifactRef, FileRef, FileSource};
-pub use blob::blob_id;
+pub use blob::{BlobWriter, blob_id};
 pub use cancel::CancelToken;
 pub use child::{
     CHILD_PARKED_KIND, CHILD_REPORTED_KIND, ChildLook, ChildStarter, ChildStatus, RESUME_KIND,
@@ -145,9 +145,10 @@ pub use session::{
     MAX_SESSION_TOOL_ENTRY_CHARS, MIN_SESSION_MAX_OUTPUT_TOKENS, MIN_SESSION_TOKEN_BUDGET, Refusal,
     ReportRound, RoundOutcome, SESSION_CLOSE_KIND, SESSION_CLOSE_ROUND_KEY, SESSION_EDIT_KIND,
     SESSION_EDIT_ROUND_KEY, SESSION_STATE_KEY, SessionBounds, SessionConfig, SessionEdit,
-    SessionEditRequest, SessionEditor, SessionHeader, SessionLimits, SessionList, SessionPatch,
-    SessionState, SessionSummary, SessionView, closing_round_payload, editing_round_payload, glob,
-    parse_session_conversation_id, session_conversation_id, session_conversation_prefix,
+    SessionEditRequest, SessionEditor, SessionHeader, SessionLimits, SessionList, SessionMode,
+    SessionPatch, SessionState, SessionSummary, SessionView, closing_round_payload,
+    editing_round_payload, glob, parse_session_conversation_id, session_conversation_id,
+    session_conversation_prefix,
 };
 pub use starter::{RunStarter, SCHEDULE_CONVERSATION_PREFIX, UNATTENDED_CONTEXT_KEY};
 pub use step::{
@@ -158,5 +159,6 @@ pub use step::{
 pub use text::{AGENT_TEXT_KIND, MAX_STREAM_ID_BYTES, MAX_TEXT_DELTA_BYTES, floor_boundary};
 pub use usage::{
     MAX_SANDBOX_ENTRIES, MAX_USAGE_CALL_BYTES, MAX_USAGE_LABEL_BYTES, MAX_USAGE_TOTALS,
-    SandboxEntry, SandboxEnvironment, SandboxUsage, UsageEvent, UsageTotal, UsageTotals,
+    SandboxEntry, SandboxEnvironment, SandboxUsage, ShorteningUsage, UsageEvent, UsageTotal,
+    UsageTotals,
 };

@@ -256,6 +256,7 @@ impl Rig {
             within: None,
             remote: false,
             bounds: adam_runtime::SessionBounds::default(),
+            session: adam_llm_agent::SessionDefaults::default(),
         }]);
         let mut builder = LlmAgent::builder(&root, model(&server, "root", keys), "m")
             .stream_text(false)
