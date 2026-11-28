@@ -36,8 +36,8 @@ proptest.workspace = true
 # The span tests of `worker` (ANR-1345): a subscriber that captures what a span renders.
 tracing-subscriber.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
-adam-store-mongodb = { path = "../adam-store-mongodb", version = "0.6.0" } # x-release-please-version
-adam-store-postgres = { path = "../adam-store-postgres", version = "0.6.0" } # x-release-please-version
+adam-store-mongodb = { path = "../adam-store-mongodb", version = "0.7.0" } # x-release-please-version
+adam-store-postgres = { path = "../adam-store-postgres", version = "0.7.0" } # x-release-please-version
 adam-store-testkit.workspace = true
 
 [lints]
