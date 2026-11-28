@@ -391,8 +391,8 @@ impl Sql {
                     name        TEXT    NOT NULL,
                     ok          INTEGER NOT NULL CHECK (ok IN (0, 1)),
                     payload     TEXT    NOT NULL,
-                    signature   TEXT,
                     recorded_at INTEGER NOT NULL,
+                    signature   TEXT,
                     PRIMARY KEY (run_id, seq)
                 )"
             ),
@@ -506,8 +506,9 @@ impl Store for SqliteStore {
             }
             // Schema version 2 (ADR 0068): a journal entry's signature. SQLite has no `ADD COLUMN
             // IF NOT EXISTS`, and a file of an earlier version has the table without the column (a
-            // fresh one gets it from its `CREATE TABLE`), so the column is asked for and added only
-            // when it is missing.
+            // fresh one gets it from its `CREATE TABLE`, **last**, because `ADD COLUMN` appends:
+            // both end with the same columns in the same order), so the column is asked for and
+            // added only when it is missing.
             if !has_column(&tx, &sql.journal, "signature")? {
                 execute(
                     &tx,

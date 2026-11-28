@@ -72,8 +72,8 @@ CREATE TABLE IF NOT EXISTS adam_journal (
                     name        TEXT        NOT NULL,
                     ok          BOOLEAN     NOT NULL,
                     payload     JSONB       NOT NULL,
-                    signature   TEXT,
                     recorded_at TIMESTAMPTZ NOT NULL,
+                    signature   TEXT,
                     PRIMARY KEY (run_id, seq)
                 );
 

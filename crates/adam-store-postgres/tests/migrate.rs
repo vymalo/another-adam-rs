@@ -95,6 +95,23 @@ async fn has_journal_signature_column(pool: &Pool, p: &str) -> bool {
     .await
 }
 
+/// The journal's columns, in the order the table has them.
+async fn journal_columns(pool: &Pool, table: &str) -> Vec<String> {
+    let table = table.to_owned();
+    let client = pool.get().await.unwrap();
+    client
+        .query(
+            "SELECT column_name::text FROM information_schema.columns
+              WHERE table_name = $1 ORDER BY ordinal_position",
+            &[&table],
+        )
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|row| row.get::<_, String>(0))
+        .collect()
+}
+
 #[tokio::test]
 async fn a_version_1_schema_migrates_to_the_current_one_and_keeps_its_runs() {
     let Some(url) = support::test_url() else {
@@ -132,6 +149,21 @@ async fn a_version_1_schema_migrates_to_the_current_one_and_keeps_its_runs() {
     assert!(
         has_journal_signature_column(&pool, &p).await,
         "the journal's signature column was added (ADR 0068)"
+    );
+    // It is the **last** column, as in a fresh database: `ADD COLUMN` appends, so the `CREATE
+    // TABLE` names it last and a fresh and an upgraded table end the same way (ADR 0068, T3a-4).
+    assert_eq!(
+        journal_columns(&pool, &format!("{p}journal")).await,
+        [
+            "run_id",
+            "seq",
+            "name",
+            "ok",
+            "payload",
+            "recorded_at",
+            "signature"
+        ],
+        "an upgraded journal has a fresh one's columns, in order"
     );
     assert_eq!(version(&pool, &p).await, SCHEMA_VERSION.to_string());
     assert_eq!(SCHEMA_VERSION, 11);

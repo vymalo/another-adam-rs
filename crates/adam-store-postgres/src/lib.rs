@@ -941,14 +941,15 @@ impl Sql {
                     name        TEXT        NOT NULL,
                     ok          BOOLEAN     NOT NULL,
                     payload     JSONB       NOT NULL,
-                    signature   TEXT,
                     recorded_at TIMESTAMPTZ NOT NULL,
+                    signature   TEXT,
                     PRIMARY KEY (run_id, seq)
                 )"
             ),
             // Schema version 11 (ADR 0068, decision 2): the runtime's signature of a journal entry,
             // nullable so a journal written before the feature replays as it is. A fresh database
-            // gets the column above; a version 10 one gets it here.
+            // gets the column above, **last**, because a version 10 one gets it here, at the end:
+            // a fresh and an upgraded table end with the same columns in the same order.
             format!("ALTER TABLE {journal} ADD COLUMN IF NOT EXISTS signature TEXT"),
         ]
         .into_iter()

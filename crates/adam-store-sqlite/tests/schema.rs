@@ -98,7 +98,8 @@ fn an_older_schema_is_upgraded_in_place() {
 }
 
 /// A file a version 1 release left gets the journal's signature column (schema version 2, ADR
-/// 0068): SQLite has no `ADD COLUMN IF NOT EXISTS`, so the upgrade adds it when it is missing.
+/// 0068): SQLite has no `ADD COLUMN IF NOT EXISTS`, so the upgrade adds it when it is missing, and
+/// a fresh file names it last so both tables have the same columns in the same order.
 #[test]
 fn a_version_1_file_gains_the_journal_signature_column() {
     let database = unique("journal-signature");
@@ -154,6 +155,31 @@ fn a_version_1_file_gains_the_journal_signature_column() {
         )
         .expect("read the signature");
     assert_eq!(signature, None);
+
+    // A fresh file ends with the same columns in the same order: `ADD COLUMN` appends, so the
+    // `CREATE TABLE` names the signature last (a read names its columns either way, but the two
+    // tables must be the same table).
+    let fresh = unique("journal-fresh");
+    runtime.block_on(async {
+        let store = SqliteStore::open(&fresh).expect("open a fresh file");
+        store.migrate().await.expect("migrate a fresh file");
+    });
+    let fresh_conn = rusqlite::Connection::open(&fresh).expect("a raw connection");
+    let mut fresh_statement = fresh_conn
+        .prepare("PRAGMA table_info(adam_journal)")
+        .expect("the journal's columns");
+    let fresh_columns: Vec<String> = fresh_statement
+        .query_map([], |row| row.get("name"))
+        .expect("read the columns")
+        .map(|name| name.expect("a column name"))
+        .collect();
+    assert_eq!(
+        columns, fresh_columns,
+        "a fresh and an upgraded journal are the same table"
+    );
+    drop(fresh_statement);
+    drop(fresh_conn);
+    let _ = std::fs::remove_file(&fresh);
 
     drop(statement);
     drop(conn);

@@ -395,7 +395,8 @@ it skips there).
 collected after the orphan grace, `Conflict`), and `tests/head_view.rs` counts the calls
 `Runtime::view` makes (one lease, one head, no body) and `Runtime::state`'s (one head, one body).
 `tests/migrate.rs` builds a version 1 schema by hand with a legacy run, migrates it and checks the
-column, the version row, the `memory_lesson` table of schema version 10, that the run survived and that pinning works on it; it also checks that an
+column, the version row, the `memory_lesson` table of schema version 10, that the journal's columns end in the order a
+fresh table has, that the run survived and that pinning works on it; it also checks that an
 older release does not lower the version. A version 2 schema migrates to the current one and gets the
 push table, a version 3 schema's `runs_list` is replaced by `runs_list_status` (valid, old one
 gone), a version 4 schema gets the blob tables and keeps its runs, a version 7 schema gets the
