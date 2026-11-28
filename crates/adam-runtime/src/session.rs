@@ -410,6 +410,30 @@ pub(crate) fn header_of(agent_state: &Value) -> Option<SessionHeader> {
     serde_json::from_value(agent_state.get(SESSION_STATE_KEY)?.clone()).ok()
 }
 
+/// Write `header` as the round `run`'s session header in `agent_state`: the member [`header_of`]
+/// reads. The header's only home is the agent state, so a writer that is not the round itself (a
+/// delete's cancel) changes it there.
+pub(crate) fn put_header(
+    run: RunId,
+    agent_state: &mut Value,
+    header: &SessionHeader,
+) -> Result<(), crate::RuntimeError> {
+    let Some(state) = agent_state.as_object_mut() else {
+        return Err(crate::RuntimeError::Corrupt {
+            run,
+            reason: "the round's agent state is not an object".into(),
+            source: None,
+        });
+    };
+    let encoded = serde_json::to_value(header).map_err(|e| crate::RuntimeError::Corrupt {
+        run,
+        reason: format!("the session header does not encode: {e}"),
+        source: None,
+    })?;
+    state.insert(SESSION_STATE_KEY.to_owned(), encoded);
+    Ok(())
+}
+
 /// What a listing reads from a round's record: what its state says about its session, the close
 /// and edit requests waiting in its inbox, and how the round ended. The envelope is **not** built:
 /// its `agent` member is the agent's whole state (for `LlmAgent`, the transcript), and a listing
@@ -1906,6 +1930,11 @@ pub(crate) fn page_of_sessions(
             let mut runs = ordered(runs);
             let round = u32::try_from(runs.len()).unwrap_or(u32::MAX);
             let (latest, facts) = runs.pop()?;
+            // A deleted session is gone from every listing (ADR 0054 decision 10): the tombstone
+            // is the latest round's header, so it is checked where the latest round is known.
+            if facts.header.as_ref().is_some_and(|h| h.deleted) {
+                return None;
+            }
             // The report is of the newest round that worked: all of them but a closing one, and one
             // that only edited the session.
             let worked = runs
@@ -2021,6 +2050,37 @@ impl SessionView {
     /// that is its own parent.
     pub fn started_outside_a_run(&self) -> bool {
         self.started_by == Some(self.latest_run)
+    }
+
+    /// The header that deletes this session ([ADR 0054] decision 10, amended): the latest round's
+    /// header, closed and deleted, or a minimal one for a session an embedder made with no header.
+    /// It is written into the round's agent state by the commit that cancels the round
+    /// ([`Runtime::delete_session_round`](crate::Runtime::delete_session_round)), so the session is
+    /// gone from every listing at the moment its round stops and no report of it is ever due.
+    ///
+    /// [ADR 0054]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md
+    pub fn tombstone(&self) -> SessionHeader {
+        let mut header = self.header.clone().unwrap_or_else(|| SessionHeader {
+            id: self.id,
+            agent: self.agent.clone(),
+            description: String::new(),
+            keep_open: false,
+            closed: true,
+            closing: false,
+            deleted: true,
+            round: self.round,
+            root: None,
+            workspace: None,
+            visible: false,
+            config: None,
+            spent: 0,
+            editing: false,
+            edits: Vec::new(),
+        });
+        header.closed = true;
+        header.deleted = true;
+        header.editing = false;
+        header
     }
 
     pub(crate) fn from_rounds(
@@ -2821,8 +2881,8 @@ mod tests {
     }
 
     /// A deleted session is not a session (ADR 0054 decision 10): `from_rounds` answers `None`, so
-    /// the listing drops it and every tool's `view` is `None`, which they refuse as
-    /// `no_such_session`. Its runs are still in the store — they are what was read here.
+    /// every tool's `view` is `None`, which they refuse as `no_such_session`. Its runs are still in
+    /// the store — they are what was read here.
     #[test]
     fn a_deleted_session_is_not_a_session() {
         let session = RunId::new();
@@ -2833,6 +2893,34 @@ mod tests {
         assert!(
             SessionView::from_rounds(session, vec![rec], t0(), idle_ttl()).is_none(),
             "a deleted session is gone"
+        );
+    }
+
+    /// The listing drops a deleted session as well, not only a view: the tombstone is read where
+    /// the latest round is known, so it counts in no page (ADR 0054 decision 10).
+    #[test]
+    fn a_deleted_session_is_not_listed() {
+        let session = RunId::new();
+        let mut h = header(session, false, true);
+        h.deleted = true;
+        let rec = with_header(session, Some(h), RunStatus::Failed, vec![]);
+        let list = page_of_sessions("p", rounds(vec![rec.clone()]), 0, 10, t0(), idle_ttl());
+        assert!(list.sessions.is_empty(), "{list:?}");
+        assert_eq!(list.total, 0, "it counts in no page");
+        // The positive control: the same round without the tombstone is listed.
+        let mut alive = rec;
+        assert!(
+            alive.state["agent"][SESSION_STATE_KEY]
+                .as_object_mut()
+                .expect("a header")
+                .remove("deleted")
+                .is_some(),
+            "the tombstone was there to remove"
+        );
+        let list = page_of_sessions("p", rounds(vec![alive]), 0, 10, t0(), idle_ttl());
+        assert_eq!(
+            list.total, 1,
+            "the same session without it is listed: {list:?}"
         );
     }
 
