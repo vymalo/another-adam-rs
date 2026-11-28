@@ -146,6 +146,11 @@ argument and a token beside a class, and asserts the exporter saw the class and 
 The coder's redactor holds per-run secrets this process-level layer cannot see; the allowlist is what makes that
 unnecessary, and it is why the log bridge is adam's own layer rather than a copy-everything appender.
 
+**The message is not filtered.** It is the format string the macro wrote, so a call site that formats a value into
+it puts that value in the record: eight sites do today (a startup warning, a panic payload, an OAuth error), and
+moving those values into fields — where the allowlist decides — is its own card. Until then the allowlist covers
+the fields, not the message.
+
 ## Versions
 
 `opentelemetry` 0.33.1, `opentelemetry_sdk` 0.33.1, `opentelemetry-otlp` 0.33.1 and
