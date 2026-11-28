@@ -14,7 +14,10 @@ use opentelemetry::metrics::Meter;
 pub const SCOPE: &str = "adam-runtime";
 
 /// The counter of committed transitions, one per state: `state` is its only label.
-pub const RUNS: &str = "adam.runs";
+///
+/// The name is the catalogue's ([`adam_otel::catalogue::RUNS`]), so the dashboards' test and the
+/// instrument cannot drift apart.
+pub use adam_otel::catalogue::RUNS;
 
 /// [`RunStatus`] as a label. Exhaustive on purpose: a state added to the store without a line here
 /// does not compile, which is what keeps the instrument's set closed.
