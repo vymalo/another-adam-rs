@@ -795,12 +795,16 @@ async fn session_settings_reach_the_agent_the_process_serves() {
             "{role}: {card}"
         );
         if role == "all" {
-            assert!(
-                p.stdout()
-                    .contains("`limits.max_open_sessions` is more than the deployment allows"),
-                "{}",
-                p.logs()
-            );
+            let warned = p
+                .stdout()
+                .lines()
+                .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+                .any(|l| {
+                    l["fields"]["message"].as_str().is_some_and(|m| {
+                        m.starts_with("a `limits` entry is more than the deployment allows")
+                    }) && l["fields"]["key"] == "max_open_sessions"
+                });
+            assert!(warned, "{}", p.logs());
         }
         p.stop_cleanly().await;
     }
