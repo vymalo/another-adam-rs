@@ -9,8 +9,6 @@ use std::process::ExitCode;
 use adam_egress::{Config, EgressError, exit_code};
 use tracing_subscriber::EnvFilter;
 
-mod telemetry;
-
 /// The process-wide allocator: mimalloc in place of musl's own, which is slow under many threads
 /// (ADR 0053 decision 11).
 #[global_allocator]
@@ -24,7 +22,7 @@ async fn main() -> ExitCode {
     // `RUST_LOG` when set, else `info`. The OTel layer joins it when
     // `OTEL_EXPORTER_OTLP_ENDPOINT` is set, and nothing is built when it is not.
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    let telemetry = telemetry::init(filter);
+    let telemetry = adam_otel::init(filter);
 
     let code = run().await;
     // Flush the batch queue before the process exits, so the spans of the last runs are not lost.

@@ -16,8 +16,8 @@ The crate is a library and two binaries, all in the coder image:
 | `adam-git` | the **relay**: stands in for `git`; sends its arguments, its directory, the variables the sandbox allows and its input over the socket, and ends with git's exit code. It never runs git itself |
 | `adam_git_sandbox` (the library) | the protocol, the environment allow-list, the directory check, the server and the **client** that [`adam-workspace`](../adam-workspace/README.md) uses in its own process |
 
-The library also composes the process's subscriber: `telemetry::init(filter)` installs the JSON log layer and, when
-`OTEL_EXPORTER_OTLP_ENDPOINT` is set, the OTel layer beside it ([ADR 0075](../../docs/decisions/0075-metrics-and-traces-are-off-by-default-and-say-nothing-about-a-person.md)).
+The server's binary composes the process's subscriber with `adam_otel::init(filter)`: the JSON log layer, and the
+OTel layer beside it when `OTEL_EXPORTER_OTLP_ENDPOINT` is set ([ADR 0075](../../docs/decisions/0075-metrics-and-traces-are-off-by-default-and-say-nothing-about-a-person.md)).
 
 It is **off unless the socket is configured** (`GIT_SANDBOX_SOCKET` in the coder). Which commands go where, and why a
 command that carries a token never does, is in [`adam-workspace`](../adam-workspace/README.md#where-git-runs-the-git-sandbox);
@@ -145,7 +145,7 @@ The server reads these once at startup, every problem at once (`invalid configur
 | `GIT_SANDBOX_GIT` | the server | the `git` to run: an absolute path of an executable file | the first `git` on `PATH`, found once at startup |
 | `GIT_SANDBOX_MAX_COMMANDS` | the server | commands run at once (1 to 4096); the next waits | `64` |
 | `RUST_LOG` | the server | log filter; JSON logs on stdout | `info` |
-| `OTEL_EXPORTER_OTLP_ENDPOINT` | the server | the OTLP/HTTP collector, an absolute `http` or `https` URL with no user, password, query or fragment: the spans this process writes are exported beside the JSON log ([ADR 0075](../../docs/decisions/0075-metrics-and-traces-are-off-by-default-and-say-nothing-about-a-person.md)); unset or blank means no exporter and no thread; a refused value is one warning at startup and tracing stays off | unset: off |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | the server | the OTLP/HTTP collector, an absolute `http` or `https` URL with no user, password, query or fragment: the spans this process writes are exported beside the JSON log ([ADR 0075](../../docs/decisions/0075-metrics-and-traces-are-off-by-default-and-say-nothing-about-a-person.md)); unset or blank means no exporter and no thread; a refused value is one warning at startup and tracing stays off | unset: off | This binary links **no TLS provider**, so the endpoint must be plain `http` (an in-cluster collector); the `aws-lc` feature on `adam-otel` adds `https`.
 | `OTEL_SERVICE_NAME` | the server | `service.name` of every exported span's resource | `adam` |
 | `GIT_SANDBOX_SOCKET` | the relay, and the coder | the server's socket, an absolute path | required by the relay; optional for the coder (unset: no sandbox) |
 
@@ -192,8 +192,8 @@ events and stay in the JSON log. A failed export is the SDK's own log line, neve
 
 `cargo nextest run -p adam-git-sandbox`. Real `git`, real Unix sockets and the real binaries; no network.
 
-* The subscriber (`src/telemetry.rs`): with no `OTEL_EXPORTER_OTLP_ENDPOINT` nothing is built and no OTel layer is
-  composed; with one, a run span reaches a loopback collector over OTLP/HTTP.
+* The subscriber is `adam_otel::init`; its two cases (no endpoint builds nothing; one reaches a loopback collector)
+  are tested in [`adam-otel`](../adam-otel/README.md), once for every binary.
 * In the modules: the frames (every one round-trips, a limit, a frame cut short, a kind of the other direction, a payload that
   is not what its kind says, a string that is not UTF-8), the environment allow-list (the token's variables are not in it),
   the directory check (a link at the end or on the way, a file, a sibling that shares a prefix, `..`), the subcommand of a log line,

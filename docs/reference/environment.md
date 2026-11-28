@@ -160,6 +160,10 @@ an agent fails. With the endpoint set, the spans the runtime writes (`adam.run`,
 failed export is the SDK's own log line and never a run's failure. `adam-egress` and `adam-git-sandbox` write
 events, not spans, so their log lines stay in the JSON layer.
 
+`adam-egress` and `adam-git-sandbox` link **no TLS provider** (they take `adam-otel` with `default-features = false`),
+so their exporter speaks plain `http` — an in-cluster collector. Exporting to an `https` collector from either
+needs the `aws-lc` feature on its `adam-otel` dependency, which adds `reqwest`/`rustls`/`aws-lc` to a small binary.
+
 ## Cross-process notifications (`adam-notify-postgres`)
 
 `adam-coder`, in every role (`all`, `control-plane`, `worker`): the `notify` component. Both binaries'

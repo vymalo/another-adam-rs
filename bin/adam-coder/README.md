@@ -2264,8 +2264,8 @@ devcontainer path ([ADR 0052](../../docs/decisions/0052-no-podman-a-repositorys-
 the runtime's `adam.run` and `adam.child` spans are exported beside the JSON log, and `OTEL_SERVICE_NAME` names
 the service (`adam` when unset). Unset or blank: no exporter and no thread, and the log is exactly what it was. A
 value the layer refuses is one warning at startup and tracing stays off; a failed export is the SDK's own log line,
-never a run's failure. The batch is flushed before the process exits. Source: `src/telemetry.rs`,
-[`adam-otel`](../../crates/adam-otel/README.md).
+never a run's failure. The batch is flushed before the process exits. Source: [`adam-otel`](../../crates/adam-otel/README.md)
+(`adam_otel::init`), which composes the subscriber for every binary.
 
 ### Workspace placement
 
@@ -2663,8 +2663,8 @@ Everything is offline (`cargo test -p adam-coder`; with
 `ADAM_TEST_POSTGRES_URL` set the Postgres variants run too, each case in a
 database of its own, so the role needs `CREATEDB`):
 
-* **The subscriber** (`src/telemetry.rs`): with no `OTEL_EXPORTER_OTLP_ENDPOINT` nothing is built and no
-  OTel layer is composed; with one, a run span reaches a loopback collector over OTLP/HTTP.
+* **The subscriber** is `adam_otel::init`; its two cases (no endpoint builds nothing; one reaches a loopback
+  collector) are tested in [`adam-otel`](../../crates/adam-otel/README.md), once for every binary.
 * **Language servers** (`tests/language_servers.rs`, real processes of the scripted server `adam-lsp-script`; `tests/real_language_servers.rs`, gated):
   no server on `PATH` (nothing started, the program named), diagnostics pushed and pulled and only errors and warnings, UTF-16 and UTF-8 columns,
   a secret in a diagnostic and in stderr, indexing past `wait` (a partial result, then the same pid answers), a crash (the scrubbed stderr tail, then a new

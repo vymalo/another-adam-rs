@@ -347,8 +347,8 @@ model, `tini` as PID 1, SIGTERM exits 0), then the compose scenarios.
 
 ## Tests
 
-* `src/telemetry.rs`: with no `OTEL_EXPORTER_OTLP_ENDPOINT` nothing is built and no OTel layer is composed; with
-  one, a run span reaches a loopback collector over OTLP/HTTP.
+* The subscriber is `adam_otel::init`; its two cases (no endpoint builds nothing; one reaches a loopback collector)
+  are tested in [`adam-otel`](../../crates/adam-otel/README.md), once for every binary.
 * `src/config.rs`: `ADAM_AGENT_DIR` required by every role and an existing directory, every problem at once,
   a control plane that needs no model, `MODEL_CONTEXT_WINDOW` read by the workers (a bad value is exit 78),
   `A2A_ALLOW_INSECURE_REMOTES` off by default, read by the workers and a boolean, secrets hidden from `Debug`;

@@ -62,7 +62,7 @@ thiserror.workspace = true
 tokio = { workspace = true, features = ["fs", "io-util", "net", "process", "signal"] }
 tokio-util.workspace = true
 tracing.workspace = true
-tracing-subscriber = { workspace = true, features = ["registry"] }
+tracing-subscriber.workspace = true
 url.workspace = true
 
 # The OS limits on a command (ADR 0065 slice 3): rlimits, and a systemd scope where there is one.

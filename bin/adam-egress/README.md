@@ -97,7 +97,7 @@ Read once at startup, the allow-list file too (a change to it is a restart); eve
 | `EGRESS_IDLE_SECS` | a tunnel with no byte for this long is closed (1 to 86400) | `300` |
 | `EGRESS_MAX_CONNECTIONS` | connections served at once (1 to 1000000) | `1024` |
 | `RUST_LOG` | log filter | `info` |
-| `OTEL_EXPORTER_OTLP_ENDPOINT` | the OTLP/HTTP collector, an absolute `http` or `https` URL with no user, password, query or fragment: the spans this process writes are exported beside the JSON log ([ADR 0075](../../docs/decisions/0075-metrics-and-traces-are-off-by-default-and-say-nothing-about-a-person.md)); unset or blank means no exporter and no thread; a refused value is one warning at startup and tracing stays off | unset: off |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | the OTLP/HTTP collector, an absolute `http` or `https` URL with no user, password, query or fragment: the spans this process writes are exported beside the JSON log ([ADR 0075](../../docs/decisions/0075-metrics-and-traces-are-off-by-default-and-say-nothing-about-a-person.md)); unset or blank means no exporter and no thread; a refused value is one warning at startup and tracing stays off | unset: off | This binary links **no TLS provider**, so the endpoint must be plain `http` (an in-cluster collector); the `aws-lc` feature on `adam-otel` adds `https`.
 | `OTEL_SERVICE_NAME` | `service.name` of every exported span's resource | `adam` |
 
 Not variables: the head limit (8 KiB), the head time (10 s), the resolve and each connect time (10 s), at most 4
@@ -149,8 +149,8 @@ events and stay in the JSON log. A failed export is the SDK's own log line, neve
 
 Offline: `cargo nextest run -p adam-egress`.
 
-* The subscriber (`src/telemetry.rs`): with no `OTEL_EXPORTER_OTLP_ENDPOINT` nothing is built and no OTel layer is
-  composed; with one, a run span reaches a loopback collector over OTLP/HTTP.
+* The subscriber is `adam_otel::init`; its two cases (no endpoint builds nothing; one reaches a loopback collector)
+  are tested in [`adam-otel`](../../crates/adam-otel/README.md), once for every binary.
 * In the modules: the address table and its edges and IPv4-mapped IPv6 (`ip.rs`), allow-list parsing and matching
   (`allow.rs`), head parsing, IP literals, oversized and slow heads (`head.rs`), every variable and each bad value
   (`config.rs`), the status and class of every refusal (`refusal.rs`).

@@ -13,8 +13,6 @@ use std::process::ExitCode;
 use adam_agent::{Config, exit_code};
 use anyhow::Context as _;
 
-mod telemetry;
-
 /// The process-wide allocator: mimalloc in place of musl's own, which is slow under many threads
 /// (ADR 0053 decision 11).
 #[global_allocator]
@@ -35,7 +33,7 @@ async fn main() -> ExitCode {
     // `RUST_LOG` when set, else `info` with the MCP client library quiet (`adam_service::logging`).
     // The OTel layer joins it when `OTEL_EXPORTER_OTLP_ENDPOINT` is set, and nothing is built when
     // it is not.
-    let telemetry = telemetry::init(adam_service::logging::env_filter());
+    let telemetry = adam_otel::init(adam_service::logging::env_filter());
 
     // Before anything else is read: a same-user child (an MCP server's command) cannot read this
     // process's `/proc/<pid>/environ`, where the model key and the database URL are.

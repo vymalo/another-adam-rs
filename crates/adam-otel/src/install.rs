@@ -1,9 +1,12 @@
-//! The process's tracing subscriber: JSON `fmt()`, and the OTel layer beside it when
-//! `OTEL_EXPORTER_OTLP_ENDPOINT` is set ([ADR 0075]).
+//! The process's tracing subscriber, composed once for every adam binary: JSON `fmt()`, and the
+//! OTel layer beside it when `OTEL_EXPORTER_OTLP_ENDPOINT` is set ([ADR 0075]).
+//!
+//! Four binaries wrote their own copy of this composition (ANR-1412); it lives here so that one
+//! behaviour — off unless an endpoint is set, a refused setting is a warning and never an exit —
+//! has one implementation and one pair of tests.
 //!
 //! [ADR 0075]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0075-metrics-and-traces-are-off-by-default-and-say-nothing-about-a-person.md
 
-use adam_otel::{Otel, OtelLayer, Settings};
 use tracing::Subscriber;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::Layer as _;
@@ -12,12 +15,17 @@ use tracing_subscriber::layer::SubscriberExt as _;
 use tracing_subscriber::registry::LookupSpan;
 use tracing_subscriber::util::SubscriberInitExt as _;
 
-/// Installs the subscriber and starts the exporter the environment names.
+use crate::{Otel, OtelLayer, Settings};
+
+/// Installs the process's subscriber and starts the exporter the environment names.
 ///
-/// `None` when `OTEL_EXPORTER_OTLP_ENDPOINT` is unset: no exporter, no task, and the subscriber is
-/// the `fmt()` layer alone. A setting the crate refuses, or an exporter it cannot build, is one
-/// warning line and tracing stays off: a trace is never a reason a run fails (ADR 0075).
-pub(crate) fn init(filter: EnvFilter) -> Option<Otel> {
+/// The subscriber is the JSON `fmt()` layer every binary already wrote, with the OTel layer beside
+/// it. `None` when `OTEL_EXPORTER_OTLP_ENDPOINT` is unset: no exporter, no task, and the `fmt()`
+/// layer alone. A setting this crate refuses, or an exporter it cannot build, is one warning line
+/// and tracing stays off: a trace is never a reason a run fails (ADR 0075).
+///
+/// Call it from an async `main`: the exporter's batch task runs on the process's Tokio runtime.
+pub fn init(filter: EnvFilter) -> Option<Otel> {
     let (otel, problem) = start();
     compose(filter, otel.as_ref()).init();
     if let Some(problem) = problem {
@@ -38,7 +46,7 @@ fn start() -> (Option<Otel>, Option<String>) {
     }
 }
 
-/// The subscriber: the `fmt()` layer the binary always wrote, and the OTel layer beside it.
+/// The subscriber: the `fmt()` layer, and the OTel layer beside it.
 ///
 /// `otel` is `None` when tracing is off, and an `Option<Layer>` composes as no layer at all.
 fn compose(filter: EnvFilter, otel: Option<&Otel>) -> impl Subscriber + Send + Sync + 'static {
@@ -64,12 +72,12 @@ mod tests {
 
     use super::*;
 
-    /// Off is off: with no endpoint the binary builds no exporter and composes no OTel layer.
+    /// Off is off: with no endpoint no exporter is built and no OTel layer is composed.
     #[test]
     fn without_an_endpoint_nothing_is_built_and_no_layer_is_composed() {
         // A blank endpoint is unset, and a name the crate does not read changes nothing.
         let settings = Settings::from_pairs([
-            (adam_otel::ENDPOINT_VAR, "  "),
+            (crate::ENDPOINT_VAR, "  "),
             ("OTEL_SOMETHING_ELSE", "http://collector:4318"),
         ])
         .expect("settings");
@@ -84,7 +92,7 @@ mod tests {
         );
     }
 
-    /// The other half: this binary's composition posts one run span to a collector over OTLP/HTTP.
+    /// The other half: the composition posts one run span to a collector over OTLP/HTTP.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_run_span_reaches_a_loopback_collector() {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind");

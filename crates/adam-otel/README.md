@@ -72,10 +72,29 @@ sequenceDiagram
 | `Settings::endpoint()`, `service_name()`, `is_enabled()` | what was read |
 | `Otel::start(&settings)` | `Ok(None)` when off; otherwise the provider, the bounded queue and the batch task, built inside the process's Tokio runtime |
 | `Otel::layer()` | the layer to compose beside `tracing_subscriber::fmt()` |
+| `init(filter)` | installs the process's subscriber — JSON `fmt()` and, when an endpoint is set, the OTel layer
+  beside it — and returns the running `Otel` (or `None` when off); every adam binary calls it |
 | `Otel::shutdown()` | flush and stop, bounded by `SHUTDOWN_TIMEOUT` |
 | `SettingsError`, `StartError` | `Classify`: `SettingsError` is `Invalid`; `StartError` is `Invalid`, or `Internal` for `NoRuntime` |
 
 ## Composing it
+
+Every adam binary calls one function, from its async `main`:
+
+```rust,no_run
+let telemetry = adam_otel::init(adam_service::logging::env_filter());
+// … the process runs …
+if let Some(otel) = telemetry {
+    otel.shutdown();
+}
+```
+
+`init` installs the process's subscriber — the JSON `fmt()` layer the binary always wrote, and the OTel
+layer beside it when `OTEL_EXPORTER_OTLP_ENDPOINT` is set — and returns the running `Otel` so the caller
+flushes it before exit. With no endpoint the log is exactly what it was, and nothing is built. A setting
+the crate refuses is one warning line and tracing stays off; it never exits a process.
+
+A host that wants its own subscriber composes the pieces itself:
 
 ```rust,no_run
 use tracing_subscriber::layer::SubscriberExt;
@@ -90,9 +109,8 @@ if let Some(otel) = adam_otel::Otel::start(&settings)? {
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
-The subscriber is the host's; this crate never installs one. That is what lets a binary keep its
-`fmt()` output unchanged when tracing is off. The block runs inside the process's async `main`
-(Tokio): `Otel::start` builds a task on that runtime and answers `StartError::NoRuntime` elsewhere.
+Both run inside the process's async `main` (Tokio): `Otel::start` builds a task on that runtime and
+answers `StartError::NoRuntime` elsewhere.
 
 ## Versions
 
