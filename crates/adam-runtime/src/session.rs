@@ -318,8 +318,10 @@ pub enum SessionEditor {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionEdit {
-    /// The round it took effect in: the working round that read it, or the editing round of an
-    /// idle session.
+    /// The round it was **delivered** to: the working round that read it at its next step, the
+    /// editing round of an idle session, or — for an edit that round ended before reading — the
+    /// round it sat in when a reader of the session applied it, which is that round and not the one
+    /// that runs next.
     pub round: u32,
     /// Who made it.
     pub by: SessionEditor,
@@ -408,9 +410,10 @@ pub(crate) fn header_of(agent_state: &Value) -> Option<SessionHeader> {
     serde_json::from_value(agent_state.get(SESSION_STATE_KEY)?.clone()).ok()
 }
 
-/// What a listing reads from a round's record: what its state says about its session, and how the
-/// round ended. The envelope is **not** built: its `agent` member is the agent's whole state (for
-/// `LlmAgent`, the transcript), and a listing never needs it.
+/// What a listing reads from a round's record: what its state says about its session, the close
+/// and edit requests waiting in its inbox, and how the round ended. The envelope is **not** built:
+/// its `agent` member is the agent's whole state (for `LlmAgent`, the transcript), and a listing
+/// never needs it.
 struct RoundFacts {
     /// The header the round's agent keeps under `agent.session`.
     header: Option<SessionHeader>,
@@ -447,8 +450,9 @@ struct ListedState {
 }
 
 /// The members of an inbox message a listing reads. `kind` is required, as it is in [`Inbound`]: a
-/// message without one is not a state the runtime wrote. `payload` is read only for an edit
-/// ([`SESSION_EDIT_KIND`]), and a message without one reads as an edit nothing applies.
+/// message without one is not a state the runtime wrote. `payload` is deserialised with the rest of
+/// the inbox but used for an edit alone ([`SESSION_EDIT_KIND`]); a message without one reads as an
+/// edit nothing applies.
 ///
 /// [`Inbound`]: crate::agent::Inbound
 #[derive(Deserialize)]

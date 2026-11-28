@@ -193,9 +193,10 @@ impl SessionNarrowing {
     }
 }
 
-/// What the run's session holds back of its tools: read from the **header** the state carries,
-/// which is the truth, and from the context's copy of the same lists. `own` are the names of the
-/// agent's own tools, loaders included ([`SessionNarrowing::of`]).
+/// What the run's session holds back of its tools: read from the config the round runs with
+/// ([`Conversation::config`], the header's unless an edit changed it mid-round, ADR 0054 decision
+/// 11) and from the context's copy of the same lists. `own` are the names of the agent's own tools,
+/// loaders included ([`SessionNarrowing::of`]).
 pub(crate) fn narrowing_of(
     state: &Conversation,
     context: Option<&Map<String, Value>>,

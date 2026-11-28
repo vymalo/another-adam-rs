@@ -1,7 +1,7 @@
 //! Child sessions seen from an `LlmAgent` parent (ADR 0045, slice 2): the six tools that run a
-//! subagent in the background (`subagent_start`, `_send`, `_read`, `_close`, `_list`), the wait a
-//! parent's turn makes for the sessions it started, and the interleavings that must not change what
-//! the model is told.
+//! subagent in the background (`subagent_start`, `_send`, `_read`, `_edit`, `_close`, `_list`), the
+//! wait a parent's turn makes for the sessions it started, and the interleavings that must not
+//! change what the model is told.
 //!
 //! Run against `MemoryStore` always, against PostgreSQL when `ADAM_TEST_POSTGRES_URL` is set and
 //! against MongoDB when `ADAM_TEST_MONGODB_URI` is set. Nothing here sleeps for a fixed time: the
@@ -1651,7 +1651,7 @@ mod cases {
             .push_tool_calls(vec![start_call_with_config(
                 "c1",
                 true,
-                json!({"maxOutputTokens": 2048}),
+                json!({"max_output_tokens": 2048}),
             )])
             .push_tool_calls(vec![edit_call(
                 "c2",
@@ -1857,6 +1857,90 @@ mod cases {
         let header = view.header.expect("a round of a session has a header");
         assert_eq!(header.edits.len(), 1, "one edit in the history");
         assert_eq!(rig.child_mock.requests().len(), 1, "no model call at all");
+    }
+
+    /// An edit of a working round keeps the *next round* options as the round has them
+    /// ([ADR 0054], decision 11): `instructions` reach the round after the one that read the edit,
+    /// never the request of the round that read it — which is what `Conversation::round_config`
+    /// exists for. The edit is delivered as the inbound itself, because `instructions` is not one of
+    /// the tool's options until its own slice lists it (ADR 0054, slice 7).
+    ///
+    /// [ADR 0054]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md
+    pub async fn an_edit_of_instructions_applies_from_the_next_round(store: DynStore) {
+        let (rig, _ran) = Rig::new().holding(0).with_child_tools();
+        rig.child_mock
+            .push_tool_calls(vec![call("r", "read_file", json!({}))])
+            .push_text("answer one")
+            .push_text("answer two");
+        let (parent_agent, child_agent) = (rig.parent(), rig.child());
+        let rt = rig.together(&store, &parent_agent, &child_agent);
+        let conv = conv_id();
+        let parent = rig.start(&rt, &conv).await;
+        let session = child_run_id(parent, "c1");
+        rig.parent_mock
+            .push_tool_calls(vec![start_call("c1", true)])
+            .push_tool_calls(vec![read_call("c2", session, true)])
+            .push_tool_calls(vec![send_call("c3", session, "and now this")])
+            .push_tool_calls(vec![read_call("c4", session, true)])
+            .push_text("two rounds");
+        let worker = spawn_worker(&rt);
+        reached(&rig.child_gate.reached, "the child's model call").await;
+        let request = adam_runtime::SessionEditRequest {
+            config: Some(
+                adam_runtime::SessionConfig::from_value(
+                    json!({"instructions": "Answer in French."}),
+                )
+                .expect("the edit's config"),
+            ),
+            by: adam_runtime::SessionEditor::Agent,
+            members: vec!["instructions".to_owned()],
+        };
+        rt.deliver(
+            session,
+            Inbound::new(
+                adam_runtime::SESSION_EDIT_KIND,
+                serde_json::to_value(&request).expect("the edit serialises"),
+            )
+            .with_id("e1"),
+        )
+        .await
+        .expect("the edit reaches the working round");
+        rig.child_gate.release.notify_one();
+        wait_done(&rt, parent).await;
+        worker.stop().await;
+        let requests = rig.child_mock.requests();
+        assert_eq!(
+            requests.len(),
+            3,
+            "round 1's two calls, then round 2's first"
+        );
+        let system = |n: usize| requests[n].system.clone().unwrap_or_default();
+        assert!(
+            !system(1).contains("Answer in French."),
+            "the round that read the edit keeps its own instructions: {}",
+            system(1)
+        );
+        assert!(
+            system(2).contains("Answer in French."),
+            "the next round runs with them: {}",
+            system(2)
+        );
+        let view = rt
+            .session_view(&conv, session)
+            .await
+            .unwrap()
+            .expect("the session");
+        let header = view.header.expect("a round of a session has a header");
+        assert_eq!(
+            header
+                .config
+                .and_then(|config| config.instructions)
+                .as_deref(),
+            Some("Answer in French."),
+            "the header carries it, so every later round does too"
+        );
+        assert_eq!(header.edits.len(), 1);
+        assert_eq!(header.edits[0].round, 1, "the round it was delivered to");
     }
 
     /// Closing an idle session takes one round that calls no model; the session is then closed.
@@ -2960,6 +3044,7 @@ mod cases {
                 "subagent_start",
                 "subagent_send",
                 "subagent_read",
+                "subagent_edit",
                 "subagent_close",
                 "subagent_list"
             ]
@@ -6570,6 +6655,7 @@ macro_rules! session_suite {
                 an_edit_of_an_idle_session_is_a_round_that_calls_no_model,
                 an_edit_past_a_bound_is_refused_and_changes_nothing,
                 a_retried_edit_applies_once,
+                an_edit_of_instructions_applies_from_the_next_round,
                 closing_a_working_session_lets_the_round_finish,
                 closing_with_cancel_stops_the_round,
                 the_list_orders_open_sessions_first_and_pages,

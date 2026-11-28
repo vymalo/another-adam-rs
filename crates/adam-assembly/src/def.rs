@@ -1520,7 +1520,7 @@ fn add_subagent_tools(
             });
         }
     }
-    // The five tools themselves are made at `BoundDef::build`, where the deployment's
+    // The six tools themselves are made at `BoundDef::build`, where the deployment's
     // `MAX_PARALLEL_TOOL_CALLS` and the model are known: each subagent's bounds need both (ADR
     // 0054 slice 1 part 2). Their names and order are fixed here, so a clash is still found
     // before a model is needed, and `AgentInfo::tools` names them.

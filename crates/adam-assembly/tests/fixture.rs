@@ -125,7 +125,7 @@ fn the_fixture_binds_each_agent_as_its_files_say() {
             "load_skill",
             "read_skill_file",
             // One tool per subagent, named after it, after everything else: `billing` is the
-            // fixture's remote (A2A) subagent, a tool of the same shape. Then the five that run a
+            // fixture's remote (A2A) subagent, a tool of the same shape. Then the six that run a
             // subagent in the background.
             "billing",
             "legacy",
@@ -134,6 +134,7 @@ fn the_fixture_binds_each_agent_as_its_files_say() {
             "subagent_start",
             "subagent_send",
             "subagent_read",
+            "subagent_edit",
             "subagent_close",
             "subagent_list"
         ]
@@ -259,6 +260,7 @@ async fn the_fixture_agent_runs_end_to_end_on_a_mock_model() {
             "subagent_start",
             "subagent_send",
             "subagent_read",
+            "subagent_edit",
             "subagent_close",
             "subagent_list"
         ]

@@ -115,7 +115,7 @@ pub struct SessionAgent {
     pub bounds: SessionBounds,
 }
 
-/// The five session tools, for the subagents of one agent.
+/// The six session tools, for the subagents of one agent.
 #[derive(Debug, Clone)]
 pub struct SessionTools {
     roster: Arc<Roster>,
@@ -1735,7 +1735,25 @@ impl Tool for Edit {
             }
             // The round has ended and the session is open: a round that only edits it. It calls no
             // model, has no report, and counts toward `max_rounds` as a close does (ADR 0054,
-            // decision 11).
+            // decision 11) — so a session that has had them all refuses the edit rather than spend
+            // one it does not have, in the words a send is refused with. A close stays exempt.
+            let limits = self.roster.limits;
+            let config = view
+                .header
+                .as_ref()
+                .and_then(|h| h.config.as_ref())
+                .map(|asked| agent.bounds.clamp(asked));
+            let capped = config
+                .as_ref()
+                .and_then(|config| config.max_rounds)
+                .map_or(limits.max_rounds(), |own| own.min(limits.max_rounds()));
+            if view.countable_rounds() >= capped {
+                return refuse(format!(
+                    "session `{session}` has had {} rounds, the most a session may have: close it \
+                     and start a new one with `{SUBAGENT_START}`",
+                    capped
+                ));
+            }
             let mut header = view.header.clone().unwrap_or_else(|| SessionHeader {
                 id: session,
                 agent: view.agent.clone(),

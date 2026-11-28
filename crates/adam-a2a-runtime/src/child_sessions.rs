@@ -668,7 +668,15 @@ fn parse_edit(edit: &Value) -> Result<SessionPatch, String> {
             ));
         }
     }
-    SessionPatch::from_value(config.clone()).map_err(|why| why.message().to_owned())
+    let patch = SessionPatch::from_value(config.clone()).map_err(|why| why.message().to_owned())?;
+    if patch.is_empty() {
+        return Err(
+            "`edit.config` names no option: name the ones to change, or set a member to null to \
+             return it to the helper's own"
+                .into(),
+        );
+    }
+    Ok(patch)
 }
 
 fn parse_close(close: &Value) -> Result<bool, String> {
@@ -1541,24 +1549,28 @@ impl RuntimeTaskBackend {
                          only timeLimit and maxRounds"
                     )));
                 }
+                // The bounds this process knows: a role that binds no agent knows none, and such a
+                // helper takes no config at all (a start's refusal, in an edit's words).
+                let Some(bounds) = &helper.bounds else {
+                    return Err(BackendError::InvalidParams(
+                        "`edit.config` is not available for this helper: its bounds are not known \
+                         here"
+                            .into(),
+                    ));
+                };
                 let base = view
                     .header
                     .as_ref()
                     .and_then(|h| h.config.as_ref())
-                    .map(|asked| helper.bounds.clamp(asked));
-                let admitted = helper
-                    .bounds
-                    .admit(patch.apply(base.as_ref()))
-                    .map_err(|why| {
-                        let mut words = why.message().to_owned();
-                        for (camel, snake) in CONFIG_OPTIONS {
-                            words = words.replace(
-                                &format!("config.{snake}"),
-                                &format!("edit.config.{camel}"),
-                            );
-                        }
-                        BackendError::InvalidParams(words)
-                    })?;
+                    .map(|asked| bounds.clamp(asked));
+                let admitted = bounds.admit(patch.apply(base.as_ref())).map_err(|why| {
+                    let mut words = why.message().to_owned();
+                    for (camel, snake) in CONFIG_OPTIONS {
+                        words = words
+                            .replace(&format!("config.{snake}"), &format!("edit.config.{camel}"));
+                    }
+                    BackendError::InvalidParams(words)
+                })?;
                 let request = SessionEditRequest {
                     config: (!admitted.is_empty()).then_some(admitted),
                     by: SessionEditor::Person,
