@@ -11,8 +11,8 @@ use std::time::Duration;
 use adam_error::{Classify, ErrorClass};
 use adam_hook_exec::{Config, DecidePoint, Error, HookExec, Points, SAFE_VARS};
 use adam_plugin::{
-    EventHeader, EventKind, HookEvent, HookSet, HookedCall, HookedCompaction, HookedEnd,
-    HookedMessage, HookedModelRequest, HookedText, MessageFile, ModelCallKind, Plugin, Verdict,
+    Decision, EventHeader, EventKind, HookEvent, HookSet, HookedCall, HookedCompaction, HookedEnd,
+    HookedMessage, HookedModelRequest, HookedText, MessageFile, ModelCallKind, Plugin,
 };
 use serde_json::json;
 
@@ -61,16 +61,16 @@ fn a_rewrite_of_a_tool_call_is_applied() {
             arguments: &mut arguments,
         })
         .unwrap();
-    assert_eq!(verdict, Verdict::Continue);
+    assert_eq!(verdict, Decision::Continue);
     assert_eq!(arguments, json!({"rewritten": true}));
 }
 
 #[test]
 fn a_deny_an_ask_and_a_stop_carry_their_reason() {
     for (mode, expected) in [
-        ("deny", Verdict::Deny("the test program denies".to_owned())),
-        ("ask", Verdict::Ask("the test program asks".to_owned())),
-        ("stop", Verdict::Stop("the test program stops".to_owned())),
+        ("deny", Decision::Deny("the test program denies".to_owned())),
+        ("ask", Decision::Ask("the test program asks".to_owned())),
+        ("stop", Decision::Stop("the test program stops".to_owned())),
     ] {
         let exec = HookExec::start(config(mode).points(only(DecidePoint::ToolBefore))).unwrap();
         let mut arguments = json!({});
@@ -159,7 +159,10 @@ fn a_run_ending_may_be_kept_going_but_never_rewritten() {
             continuations: 0,
         })
         .unwrap();
-    assert_eq!(verdict, Verdict::Deny("the test program denies".to_owned()));
+    assert_eq!(
+        verdict,
+        Decision::Deny("the test program denies".to_owned())
+    );
 
     let rewriting =
         HookExec::start(config("rewrite").points(only(DecidePoint::RunEnding))).unwrap();
@@ -405,7 +408,7 @@ fn a_program_that_dies_is_restarted_after_its_backoff() {
             arguments: &mut arguments,
         })
         .unwrap();
-    assert_eq!(verdict, Verdict::Continue, "the restarted program answers");
+    assert_eq!(verdict, Decision::Continue, "the restarted program answers");
 }
 
 #[test]
@@ -471,7 +474,7 @@ fn sixteen_calls_at_once_each_get_their_own_reply() {
         }));
     }
     for handle in handles {
-        assert_eq!(handle.join().unwrap().unwrap(), Verdict::Continue);
+        assert_eq!(handle.join().unwrap().unwrap(), Decision::Continue);
     }
     assert_eq!(requests(&log), 16, "each call was its own request");
 }
