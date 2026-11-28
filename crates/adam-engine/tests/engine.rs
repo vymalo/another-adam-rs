@@ -2253,7 +2253,15 @@ async fn the_deployments_profiles_reach_an_engines_agent() {
 async fn the_profiles_window_reaches_a_client_without_profiles() {
     let mock = Arc::new(MockModel::new().with_context_window("m", 1_000_000));
     mock.push_text("done");
-    let model: DynModel = mock.clone();
+    // The model waits at the gate until the test has subscribed: a run that ended first would
+    // give `Ended` alone, with no live usage report to read.
+    let gate = Arc::new(Gate::default());
+    let model: DynModel = Arc::new(GateModel {
+        inner: mock.clone(),
+        hold_on: Some(0),
+        calls: AtomicUsize::new(0),
+        gate: gate.clone(),
+    });
     let profiles = ModelProfiles::parse_json(
         r#"{"profiles": {"m": {"contextWindow": 200000, "maxOutputTokens": 100000}}}"#,
     )
@@ -2264,7 +2272,9 @@ async fn the_profiles_window_reaches_a_client_without_profiles() {
         .await
         .expect("the agent starts with its model's profile");
     let turn = engine.send(None, Say::new("hi")).await.unwrap();
+    gate.wait_reached().await;
     let mut events = engine.events(turn.run).await.unwrap();
+    gate.release.notify_one();
     let mut windows = Vec::new();
     let mut last = None;
     while let Some(event) = timeout(WAIT, events.next()).await.expect("an event") {

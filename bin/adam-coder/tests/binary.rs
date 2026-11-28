@@ -486,9 +486,8 @@ async fn a_removed_variable_is_logged_once_at_startup() {
             .lines()
             .filter_map(|line| serde_json::from_str::<Value>(line).ok())
             .filter(|log| {
-                log["fields"]["message"]
-                    .as_str()
-                    .is_some_and(|m| m.starts_with(&format!("{name} is set and ignored")))
+                log["fields"]["message"] == "a variable is set and ignored"
+                    && log["fields"]["variable"] == name
             })
             .collect();
         assert_eq!(warned.len(), 1, "{name}: one line:\n{out}");
@@ -2704,16 +2703,15 @@ async fn every_removed_devcontainer_variable_is_warned_about_once_without_its_va
             .lines()
             .filter_map(|line| serde_json::from_str::<Value>(line).ok())
             .filter(|log| {
-                log["fields"]["message"]
-                    .as_str()
-                    .is_some_and(|m| m.starts_with(&format!("{name} is set and ignored")))
+                log["fields"]["message"] == "a variable is set and ignored"
+                    && log["fields"]["variable"] == name
             })
             .collect();
         assert_eq!(warned.len(), 1, "{name}: one line:\n{out}");
         assert_eq!(warned[0]["level"], "WARN", "{name}");
         assert_eq!(warned[0]["fields"]["variable"], name);
         assert!(
-            warned[0]["fields"]["message"]
+            warned[0]["fields"]["reason"]
                 .as_str()
                 .unwrap()
                 .contains("ADR 0052"),
