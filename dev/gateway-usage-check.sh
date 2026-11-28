@@ -170,11 +170,9 @@ jq -r '"  call \(.call)  model \(.model)  in \(.inputTokens | round)  out \(.out
   + (if .contextWindow != null then "  window \(.contextWindow | round)" else "" end)
   + (if .effort != null then "  effort \(.effort)" else "  effort (none named)" end)' "$tmp/calls.jsonl"
 
-# The arithmetic is adam's own claim: input plus output is the total. A report that breaks it is a
-# bug, not a provider quirk.
-bad=$(jq -r 'select((.inputTokens + .outputTokens) != .totalTokens) | .call' "$tmp/calls.jsonl")
-[ -z "$bad" ] || fail "adam's own total does not add up for call(s): $bad"
-
+# The level each call names, when one was picked: a call that ignored the metadata is a failure of
+# the run, not a provider quirk. (`totalTokens` is `input + output` by construction in
+# `adam-a2a-runtime`'s `token_usage`, so re-adding them here would only restate the producer.)
 if [ "$effort" != "-" ]; then
   wrong=$(jq -r --arg e "$effort" 'select(.effort != $e) | "\(.call): \(.effort // "none")"' "$tmp/calls.jsonl")
   [ -z "$wrong" ] || fail "the call did not name $effort: $wrong"
@@ -183,7 +181,13 @@ fi
 
 state=$(jq -r '(.result.statusUpdate.status.state // .result.task.status.state) // empty' "$tmp/events.jsonl" | tail -n 1)
 [ -n "$state" ] || fail "the stream ended without a task state"
-ok "the task ended $state"
+case "$state" in
+  TASK_STATE_COMPLETED) ok "the task ended $state" ;;
+  TASK_STATE_FAILED | TASK_STATE_CANCELED | TASK_STATE_REJECTED)
+    fail "the task ended $state: the comparison below would be about a run that did not finish"
+    ;;
+  *) ok "the task ended $state" ;;
+esac
 
 # The gateway's own answer for one call of the same model and effort, when it is given: the other
 # side of the comparison ANR-75 asks for (does it return cached and reasoning tokens at all?).
@@ -204,6 +208,11 @@ if [ -n "$gateway_url" ] && [ -n "$gateway_key" ]; then
       -d "$request") || fail "the gateway call failed (curl exit $?)"
     if [ "$gcode" != 200 ]; then
       fail "the gateway answered HTTP $gcode: $(head -c 300 "$tmp/gateway.json")"
+    fi
+    # A gateway that answers 200 with no usage block would otherwise print `null` everywhere and
+    # pass, and the owner would read it as "the call cost nothing".
+    if [ "$(jq -r '.usage.prompt_tokens // .usage.total_tokens // empty' "$tmp/gateway.json")" = "" ]; then
+      fail "the gateway returned no usage block: $(head -c 300 "$tmp/gateway.json")"
     fi
     echo "the gateway's own usage for that call:"
     jq -r '"  in \(.usage.prompt_tokens)  out \(.usage.completion_tokens)  total \(.usage.total_tokens)"

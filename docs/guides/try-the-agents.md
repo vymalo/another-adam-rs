@@ -101,7 +101,7 @@ terminal shows as text).
 
 Leaving the override out (`docker compose --profile app up -d --wait`) goes back to the mocks.
 
-## Check what a model call cost
+## 7. Check what a model call cost
 
 ```sh
 dev/gateway-usage-check.sh
@@ -126,7 +126,7 @@ comparison ANR-75 asks for (are `cached_tokens` and `reasoning_tokens` returned 
 agree). `EFFORT` must be a level the agent's card lists; a deployment whose model has no profile lists no
 `reasoning/v1`, and the script says so instead of guessing.
 
-## 7. Stop
+## 8. Stop
 
 ```sh
 docker compose --profile app down          # keep the database and the git server's repositories
