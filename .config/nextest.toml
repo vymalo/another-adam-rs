@@ -41,3 +41,20 @@ test-group = "store-global-sweeps"
 [[profile.ci.overrides]]
 filter = 'test(/blob_|purge|push_configs_go_with_their_run|measure_the_transcript_write|measure_the_headless_transcript|events_and_durable_artifacts|a_run_continues_a_finished_run_from_a_start_only_front/)'
 test-group = "store-global-sweeps"
+
+# The remote-subagent cases of `adam-llm-agent`'s `sessions` suite all start a subagent their
+# agent definition **declares** as `far`; the name is the definition's, so a test cannot make it
+# unique, and the suite shares one store. A worker claims by agent name, so two of these cases
+# beside each other claim each other's `far` runs and one reads the other's answer. The libtest
+# path takes the suite's mutex (`crates/adam-llm-agent/tests/sessions.rs`, `FAR_SUITE`); nextest
+# gives each test its own process, so they are one group of one thread here.
+[test-groups.sessions-remote-far]
+max-threads = 1
+
+[[profile.default.overrides]]
+filter = 'test(/a_remote_subagent_starts_a_round_of_its_registered_agent|a_remote_subagent_refuses_every_option_but_time_limit_and_max_rounds|a_remote_subagent_refuses_a_report_schema/)'
+test-group = "sessions-remote-far"
+
+[[profile.ci.overrides]]
+filter = 'test(/a_remote_subagent_starts_a_round_of_its_registered_agent|a_remote_subagent_refuses_every_option_but_time_limit_and_max_rounds|a_remote_subagent_refuses_a_report_schema/)'
+test-group = "sessions-remote-far"
