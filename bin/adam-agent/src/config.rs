@@ -78,6 +78,8 @@ pub struct WorkerConfig {
 pub enum MemoryStore {
     /// A MongoDB deployment, by its connection string.
     Mongo(String),
+    /// A PostgreSQL database, by its connection string.
+    Postgres(String),
 }
 
 impl std::fmt::Debug for MemoryStore {
@@ -85,6 +87,7 @@ impl std::fmt::Debug for MemoryStore {
         // The URL may carry a password: never in a log.
         match self {
             Self::Mongo(_) => f.write_str("MemoryStore::Mongo(<url>)"),
+            Self::Postgres(_) => f.write_str("MemoryStore::Postgres(<url>)"),
         }
     }
 }
@@ -217,9 +220,13 @@ fn parse_memory_url(
     if url.starts_with("mongodb://") || url.starts_with("mongodb+srv://") {
         return Some(MemoryStore::Mongo(url.to_owned()));
     }
+    if url.starts_with("postgres://") || url.starts_with("postgresql://") {
+        return Some(MemoryStore::Postgres(url.to_owned()));
+    }
     problems.push(format!(
-        "{MEMORY_URL_ENV} must name a store this build has an adapter for: `mongodb://` or \
-         `mongodb+srv://` (a URL is never logged; unset it for L1 alone)"
+        "{MEMORY_URL_ENV} must name a store this build has an adapter for: `mongodb://`, \
+         `mongodb+srv://`, `postgres://` or `postgresql://` (a URL is never logged; unset it for \
+         L1 alone)"
     ));
     None
 }
@@ -494,6 +501,53 @@ mod tests {
             assert_eq!(adam_service::exit_code(&error), 78);
         }
         // A control plane binds no agent and does not read it.
+        vars.insert("ROLE".into(), "control-plane".into());
+        assert!(parse(&vars).unwrap().worker.is_none());
+    }
+
+    /// `MEMORY_URL` names the L2 store by the scheme its adapter takes (ADR 0081 decisions 4 and
+    /// 11): unset is no L2 and L1 alone, each known scheme selects its adapter, any other scheme is
+    /// a problem naming the variable and exit 78, and a control plane does not read it.
+    #[test]
+    fn memory_url_selects_the_adapter_its_scheme_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut vars = full(dir.path());
+        assert_eq!(parse(&vars).unwrap().worker.unwrap().memory, None);
+        for (url, want) in [
+            (
+                "mongodb://localhost:27017/adam",
+                MemoryStore::Mongo("mongodb://localhost:27017/adam".into()),
+            ),
+            (
+                "mongodb+srv://cluster.example/adam",
+                MemoryStore::Mongo("mongodb+srv://cluster.example/adam".into()),
+            ),
+            (
+                "postgres://localhost/adam",
+                MemoryStore::Postgres("postgres://localhost/adam".into()),
+            ),
+            (
+                "postgresql://localhost/adam",
+                MemoryStore::Postgres("postgresql://localhost/adam".into()),
+            ),
+        ] {
+            vars.insert(MEMORY_URL_ENV.into(), url.into());
+            assert_eq!(
+                parse(&vars).unwrap().worker.unwrap().memory,
+                Some(want),
+                "{url}"
+            );
+        }
+        vars.insert(MEMORY_URL_ENV.into(), "redis://localhost".into());
+        let error = parse(&vars).unwrap_err();
+        assert!(
+            error
+                .problems
+                .iter()
+                .any(|p| p.contains("MEMORY_URL") && p.contains("postgres://")),
+            "{error}"
+        );
+        assert_eq!(adam_service::exit_code(&error), 78);
         vars.insert("ROLE".into(), "control-plane".into());
         assert!(parse(&vars).unwrap().worker.is_none());
     }

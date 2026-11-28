@@ -164,6 +164,34 @@ fn for_workers(def: AgentDef, config: &Config) -> AgentDef {
     // refusal to serve (ADR 0081 decision 12).
     let handle = match &worker.memory {
         None => handle,
+        Some(crate::config::MemoryStore::Postgres(url)) => {
+            let settings =
+                adam_memory::LessonSettings::new(adam_memory::Scrubber::new(move |text: &str| {
+                    crate::redact::scrub(&secrets, text)
+                }));
+            match adam_store_postgres::PgMemory::connect(
+                url,
+                settings,
+                adam_memory::MemoryScope::new(name.clone()),
+            ) {
+                // The table is schema version 10 of the run store's database; a deployment that
+                // shares that database has it already. `migrate` is idempotent and takes the same
+                // advisory lock, so a process that serves memory alone can create it here.
+                Ok(l2) => match l2.migrate() {
+                    Ok(()) => {
+                        handle.with_l2(std::sync::Arc::new(l2), adam_memory::Audience::new(name))
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "the L2 memory table cannot be created; runs read L1 alone");
+                        handle
+                    }
+                },
+                Err(error) => {
+                    tracing::warn!(%error, "the L2 memory cannot be reached; runs read L1 alone");
+                    handle
+                }
+            }
+        }
         Some(crate::config::MemoryStore::Mongo(url)) => {
             let settings =
                 adam_memory::LessonSettings::new(adam_memory::Scrubber::new(move |text: &str| {

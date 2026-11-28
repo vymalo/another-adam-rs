@@ -335,7 +335,10 @@ fn optional_text(args: &Value, name: &str) -> Result<Option<String>, String> {
 
 #[cfg(test)]
 mod tests {
-    use adam_memory::{InProcessSiMemory, REDACTION_MARKER, Scrubber, Settings};
+    use adam_memory::{
+        Audience, InProcessMemory, InProcessSiMemory, LessonDraft, LessonProvenance,
+        LessonSettings, MemoryScope, REDACTION_MARKER, Scrubber, Settings,
+    };
     use serde_json::json;
 
     use super::*;
@@ -461,6 +464,40 @@ mod tests {
             read.content.matches("regenerate it").count(),
             1,
             "a retried call writes one attempt: {}",
+            read.content
+        );
+    }
+
+    /// `si_recall` appends the audience's approved lessons from the L2 store the handle carries,
+    /// after the L1 problems (ADR 0081 decisions 4 and 11): one tool answers for both tiers.
+    #[tokio::test]
+    async fn recall_appends_the_audiences_lessons_from_l2() {
+        let l2 = Arc::new(InProcessMemory::new(
+            LessonSettings::new(Scrubber::new(|text: &str| text.to_owned())),
+            MemoryScope::new("release-1"),
+        ));
+        l2.record(
+            LessonDraft::new(
+                Audience::new("adam-coder"),
+                "the lockfile was stale",
+                LessonProvenance::new(["scope-a"], "the reviewer"),
+            )
+            .remedy("regenerate the lockfile"),
+        )
+        .expect("a valid lesson");
+        let handle = handle(memory()).with_l2(l2, Audience::new("adam-coder"));
+        let read = SiRecall { handle }
+            .call(&ctx("call-1"), json!({}))
+            .await
+            .expect("a readable memory");
+        assert!(
+            read.content.contains("1 approved lesson(s)"),
+            "{}",
+            read.content
+        );
+        assert!(
+            read.content.contains("regenerate the lockfile"),
+            "{}",
             read.content
         );
     }
