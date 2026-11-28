@@ -32,12 +32,27 @@ fn only(point: DecidePoint) -> Points {
     }
 }
 
-/// How many requests the program logged.
+/// How many **requests** the program logged: every line it read but the hello.
+///
+/// The program appends every line of its stdin to the log, the handshake included, so counting lines
+/// counted the hello as a request — one too many for every assertion below (ANR-1453). A line that is
+/// not JSON still counts: the program read it, and that is the point of those tests.
 fn requests(log: &std::path::Path) -> usize {
     std::fs::read_to_string(log)
         .unwrap_or_default()
         .lines()
         .filter(|line| !line.trim().is_empty())
+        .filter(|line| {
+            serde_json::from_str::<serde_json::Value>(line)
+                .ok()
+                .and_then(|value| {
+                    value
+                        .get("type")
+                        .and_then(serde_json::Value::as_str)
+                        .map(|kind| kind != "hello")
+                })
+                .unwrap_or(true)
+        })
         .count()
 }
 
