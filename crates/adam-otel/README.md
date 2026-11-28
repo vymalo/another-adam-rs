@@ -119,4 +119,5 @@ answers `StartError::NoRuntime` elsewhere.
 versions the card measured on 2026-11-27). `opentelemetry-otlp` depends on `reqwest` 0.13.1 with
 `default-features = false`, so the workspace's `reqwest` is the one in the tree (*verified
 2026-11-28* in its normalized `Cargo.toml`). The crate adds no `-sys` package beyond the
-`aws-lc-sys` the workspace already links through `rustls`.
+`aws-lc-sys` the workspace already links through `rustls` — and none at all under `default-features = false`, which is how
+`adam-egress` and `adam-git-sandbox` build it.
