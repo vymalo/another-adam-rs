@@ -1,14 +1,20 @@
 name: ci
 
-# Push to main and every pull request: not both on every branch push. A newer
-# push to a pull request cancels the run it supersedes; runs on main finish.
+# Push to main and every pull request: not both on every branch push.
 on:
   push:
     branches: [main]
   pull_request:
 
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
+  # A merge on main is a verification, so a push gets a group of its own per
+  # commit: GitHub cancels a *pending* run when a newer one joins its group even
+  # with `cancel-in-progress: false`, so a per-ref group on a busy main meant a
+  # pending run was replaced by the next merge and never reached a verdict
+  # (ANR-1360: d3281289, dfc99a8e and 5178c56c all ended `cancelled`). A pull
+  # request keeps the per-ref group: its next head supersedes the previous run,
+  # which is the cheap behaviour, and `cancel-in-progress` cancels it outright.
+  group: ci-${{ github.workflow }}-${{ github.event_name == 'push' && github.sha || github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
@@ -411,6 +417,15 @@ jobs:
   # and still fails main, so the ratchet cannot silently drift.
   coverage:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    # ANR-1360: one coverage run at a time. Its steps open, comment on and close a
+    # single issue, so two commits' runs must not interleave — an older run
+    # finishing after a newer one would close the issue of a red `main`, or open
+    # one for a green `main`. `queue: max` keeps the waiting runs instead of
+    # replacing one, so each commit's run still reaches a verdict (up to 100 wait).
+    concurrency:
+      group: ci-coverage
+      cancel-in-progress: false
+      queue: max
     runs-on: ubuntu-latest
     timeout-minutes: 60
     # The gate is main-only, so a red main needs a follow-up: the last step opens an issue.

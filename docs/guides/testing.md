@@ -37,6 +37,15 @@ and a nightly live-model smoke and a live test of `adam-acp` against OpenCode
 (`.github/workflows/nightly.yml`, needs secrets). The CI jobs are the reference:
 `.github/workflows/ci.yml` and `coder.yml`.
 
+Each push to `main` that triggers `ci` gets a run with a concurrency group of its own (the pushed head sha), so a
+later push does not replace it; a pull request's runs share one group per PR (`refs/pull/N/merge`), where a new
+head cancels the run it supersedes. GitHub cancels a *pending* run as soon as a newer one joins its group, even
+with `cancel-in-progress: false`, which is why a group shared by a busy `main` left merges without a verdict
+([ADR 0084](../decisions/0084-releases-are-cut-by-release-please-and-production-pins-a-version.md)). The
+`coverage` job runs one at a time because its runs share that one issue on `main`, with `queue: max` so the waiting
+runs are kept and each commit's run still gets its verdict. `coder.yml` uses a per-sha group only for release
+commits and manual dispatches; its other pushes to `main` still share a group and skip to the newest.
+
 ## Tests that start a binary
 
 The git sandbox's tests start the real server (`adam-git-sandbox`) as a process and run `git` through it: the crate's own tests use
