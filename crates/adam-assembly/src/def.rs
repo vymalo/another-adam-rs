@@ -1101,7 +1101,8 @@ impl Walk<'_> {
             parent.is_none(),
             &catalog,
         )?;
-        let mut prompt = render_prompt(&origin, manifest, self.values.get(&name))?; // The servers whose `when` makes them groups: their tools are withheld by the source below
+        let mut prompt = render_prompt(&origin, manifest, self.values.get(&name))?;
+        // The servers whose `when` makes them groups: their tools are withheld by the source below
         // until the task holds a keyword or the run loads the group, and their instructions are the
         // group's note.
         //
@@ -1210,7 +1211,11 @@ impl Walk<'_> {
         // the same bytes (ADR 0054 slice 7, ADR 0044).
         let base = std::mem::take(&mut prompt);
         let registered = tools.len();
-        let (skills, preloaded, catalog) = add_skills(
+        let AgentSkills {
+            names: skills,
+            preloaded,
+            catalog,
+        } = add_skills(
             &origin,
             manifest,
             self.files,
@@ -1371,9 +1376,20 @@ impl Walk<'_> {
     }
 }
 
+/// What [`add_skills`] found for one agent: the skills its file selects, the preloaded ones, and
+/// the catalog the system prompt carries.
+struct AgentSkills {
+    /// The names it selects, preloaded included.
+    names: Vec<String>,
+    /// The ones whose body is in the prompt.
+    preloaded: Vec<String>,
+    /// The catalog, `None` for an agent with no skill.
+    catalog: Option<DynSkillCatalog>,
+}
+
 /// Give the agent its skills: the tools `load_skill` and `read_skill_file` after the agent's own,
-/// and the catalog its system prompt carries ([`PromptCatalog`]). Returns the names of the
-/// selected and of the preloaded skills, and the catalog (`None` for an agent without skills).
+/// and the catalog its system prompt carries ([`PromptCatalog`]). What it found — the selected and
+/// preloaded names and the catalog, `None` for an agent without skills — is an [`AgentSkills`].
 /// The catalog is **not** appended to the prompt here: the run renders it, with the session's
 /// selection when it has one (ADR 0054, slice 7).
 ///
@@ -1384,7 +1400,7 @@ fn add_skills(
     files: &SkillFiles,
     run: Option<&RunSkillsHandle>,
     tools: &mut Vec<(String, DynTool)>,
-) -> Result<(Vec<String>, Vec<String>, Option<DynSkillCatalog>), Error> {
+) -> Result<AgentSkills, Error> {
     // `skills: []` is off for everything: what the run finds too.
     let off = matches!(
         &manifest.frontmatter.skills,
@@ -1394,7 +1410,13 @@ fn add_skills(
     let set = match skills::resolve(origin, manifest, files)? {
         Some(set) => set,
         None if run.is_some() => SkillSet::empty(),
-        None => return Ok((Vec::new(), Vec::new(), None)),
+        None => {
+            return Ok(AgentSkills {
+                names: Vec::new(),
+                preloaded: Vec::new(),
+                catalog: None,
+            });
+        }
     };
     let set = Arc::new(set);
     let added = set.tools(run);
@@ -1412,7 +1434,11 @@ fn add_skills(
         set: Arc::clone(&set),
         run: run.is_some(),
     });
-    Ok((set.names(), set.preloaded(), Some(catalog)))
+    Ok(AgentSkills {
+        names: set.names(),
+        preloaded: set.preloaded(),
+        catalog: Some(catalog),
+    })
 }
 
 /// Where some of an agent's tools came from, so that a name clash can say whose tool it hit.
