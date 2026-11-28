@@ -9914,8 +9914,12 @@ mod call_span_tests {
         }
     }
 
-    /// What the span `make` makes renders, as text. The span is made under the capturing
-    /// subscriber: one made before it, with no subscriber at all, is disabled and renders nothing.
+    /// What the span `make` builds renders, as text.
+    ///
+    /// The span must be created **inside** the subscriber's scope: a span created with no
+    /// dispatcher installed is disabled at its callsite, and `in_scope` then writes nothing. That
+    /// is why the builder is a closure and not a `Span` — nextest runs each test in its own
+    /// process, so a test that relied on another test's global subscriber would fail there.
     fn rendered(make: impl FnOnce() -> tracing::Span) -> String {
         let sink = Captured::default();
         let subscriber = tracing_subscriber::fmt()

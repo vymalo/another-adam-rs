@@ -47,7 +47,8 @@ allow = [
     "MPL-2.0",
     "CC0-1.0",
     "CDLA-Permissive-2.0",
-    # Boost 1.0, permissive (OSI, FSF): `xxhash-rust`, under `redis` (adam-memory-redis).
+    # Boost 1.0: `xxhash-rust`, an unconditional dependency of `redis` (adam-memory-redis). Permissive,
+    # OSI-approved, no attribution in a binary. Allowed by the owner, 2026-11-28.
     "BSL-1.0",
 ]
 confidence-threshold = 0.9
