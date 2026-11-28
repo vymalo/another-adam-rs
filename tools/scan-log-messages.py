@@ -25,6 +25,13 @@ CALL = re.compile(r"(?:tracing::)?(?:" + "|".join(LEVELS) + r")!\(")
 def messages(path: Path) -> list[tuple[int, str]]:
     """Every message of a macro call in `path` that contains a `{` (an interpolation)."""
     text = path.read_text(encoding="utf-8", errors="replace")
+    # A test module renders messages on purpose; the rule is about what the process logs. Cut at a
+    # top-level `#[cfg(test)] mod`, not at the first `#[cfg(test)]`: a file may gate a *field* or a
+    # helper with it near the top and keep production code after (`adam-workspace/src/workspace.rs`
+    # does), and cutting there would hide that file's messages from the scan.
+    test_module = re.search(r"(?m)^#\[cfg\(test\)\]\s*\n(?:pub )?mod ", text)
+    if test_module:
+        text = text[: test_module.start()]
     found: list[tuple[int, str]] = []
     for match in CALL.finditer(text):
         i = match.end()

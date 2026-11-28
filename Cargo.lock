@@ -858,6 +858,7 @@ dependencies = [
  "opentelemetry_sdk",
  "reqwest",
  "rustls",
+ "serde_json",
  "thiserror",
  "tokio",
  "tracing",

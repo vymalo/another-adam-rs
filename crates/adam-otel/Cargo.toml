@@ -32,6 +32,8 @@ url.workspace = true
 # The drift test in `labels`: the label set must be the store's run states.
 adam-core = { path = "../adam-core" }
 opentelemetry_sdk = { workspace = true, features = ["testing"] }
+# `tests/dashboards.rs` reads the generated dashboards of `deploy/dashboards/`.
+serde_json.workspace = true
 tracing-subscriber = { workspace = true, features = ["fmt"] }
 
 [lints]

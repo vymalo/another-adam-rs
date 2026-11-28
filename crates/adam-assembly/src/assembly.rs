@@ -277,8 +277,8 @@ impl BoundDef {
                 agent = %node.name,
                 asked,
                 allowed,
-                "`limits.max_parallel` is more than the deployment allows (MAX_PARALLEL_TOOL_CALLS): \
-                 the agent runs {allowed} tool calls at once (ADR 0049, ADR 0054 decision 3)"
+                "`limits.max_parallel` is more than the deployment allows (MAX_PARALLEL_TOOL_CALLS); \
+                 the agent runs the allowed number of tool calls at once (ADR 0049, ADR 0054 decision 3)"
             );
         }
         parallel_limit(self.max_parallel, node.max_parallel)
