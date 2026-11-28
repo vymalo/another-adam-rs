@@ -408,3 +408,13 @@ Each is testable alone.
 4. **A large MCP result** is kept and paged.
 5. **The gateway is not fixed.** adam-rs assumes none, and each behaviour that depends on one is a setting.
 6. **Inline images** come later; image generation through an MCP server comes first.
+
+*Amended 2026-11-28 (ANR-243, `run_checks` with a list of commands):* a tool's limit may depend on the
+call's **arguments**, not only on the tool. `Tool::time_limit_for(&args)` is asked by the loop with the
+arguments the call will run with — a defaulted method, so no implementer breaks, and it answers
+`time_limit()` — and every wrapper forwards it. The coder's `run_checks` uses it:
+`environment + (waves + n) * CHECK_TIMEOUT_SECS + 30 s`, with `n` the number of commands and
+`waves = ceil(n / MAX_PARALLEL_TOOL_CALLS)`, because a failing command asks the base commit once more.
+For **one** command that is two command runs, not one: the 2026-11-14 note's "the deployment limit plus
+30 s" was already too small for a failing single command, which re-runs on the base. A call takes at
+most 16 commands, so the limit stays a bound.

@@ -1,12 +1,19 @@
 {
   "name": "run_checks",
-  "description": "Run one of the project's own checks in your worktree (the commands its CI, README or Makefile run: `cargo test`, `pnpm test`, `just ci`), in the workspace's environment (a run pod of the run's own when the deployment runs them), and get its exit code and the tail of its output. With several repositories in the workspace, say which with `repo`. Only exit code 0 counts as passing. Every failed run uses up one of your limited check cycles and is reported as a check: never use it to look around (use run_command) or to make a file or change the worktree (use run). A failed check asked again on exactly the same unchanged code is answered from the earlier run (no cycle, no new `checks` artifact, still a failure). A command the shell cannot find means the workspace lacks that tool: that is reported, costs no cycle, and is for the person to decide.",
+  "description": "Run one of the project's own checks in your worktree (the commands its CI, README or Makefile run: `cargo test`, `pnpm test`, `just ci`), in the workspace's environment (a run pod of the run's own when the deployment runs them), and get each one's exit code and the tail of its output. Give one command with `command`, or several independent ones with `commands`: they run at the same time, at most as many as the run runs tool calls, and the call passes only when every one of them passed. With several repositories in the workspace, say which with `repo`. Only exit code 0 counts as passing. Every failed call uses up one of your limited check cycles and is reported as a check: never use it to look around (use run_command) or to make a file or change the worktree (use run). A call that failed, asked again on exactly the same unchanged code, is answered from the earlier run (no cycle, no new `checks` artifact, still a failure). A command the shell cannot find means the workspace lacks that tool: that is reported, costs no cycle, and is for the person to decide.",
   "parameters": {
     "type": "object",
     "properties": {
       "command": {
         "type": "string",
-        "description": "Shell command, run with `bash -lc` (`sh -lc` without bash) in the worktree, in the workspace's environment"
+        "description": "One shell command, run with `bash -lc` (`sh -lc` without bash) in the worktree, in the workspace's environment. Give it or `commands`, not both"
+      },
+      "commands": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        },
+        "description": "Several independent shell commands, each run with `bash -lc` (`sh -lc` without bash) in the worktree: they run at the same time, at most as many as the run runs tool calls, and the call passes only when every one of them passed. Give it or `command`, not both. Example: {\"commands\":[\"cargo fmt --check\",\"cargo test\"]}"
       },
       "cwd": {
         "type": "string",
@@ -17,13 +24,10 @@
         "description": "The slot to run in: its name, or the repository's address. Leave out when the workspace has one."
       },
       "timeout": {
-        "description": "Seconds before the command is killed; at most the deployment's limit, which is also the default. Example: {\"command\":\"npm test\",\"timeout\":120}",
+        "description": "Seconds before each command is killed; at most the deployment's limit, which is also the default. Example: {\"commands\":[\"npm test\"],\"timeout\":120}",
         "format": "int64",
         "type": "integer"
       }
-    },
-    "required": [
-      "command"
-    ]
+    }
   }
 }

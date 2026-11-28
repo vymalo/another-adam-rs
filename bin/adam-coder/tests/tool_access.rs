@@ -662,6 +662,10 @@ impl Tool for Real {
         self.real.time_limit()
     }
 
+    fn time_limit_for(&self, args: &Value) -> Option<Duration> {
+        self.real.time_limit_for(args)
+    }
+
     async fn call(&self, ctx: &ToolCtx, args: Value) -> Result<ToolOutput, ToolError> {
         let id = ctx.call_id().to_owned();
         self.trace
