@@ -3545,16 +3545,29 @@ impl LlmAgent {
                     // The request races the run's cancellation: a cancel drops it, and with it the
                     // connection, instead of letting the provider finish an answer nobody will read.
                     let span = model_span(&request.model, false);
-                    let (recorded_request, answer) = tokio::join!(recording, async {
-                        tokio::select! {
+                    // ANR-1462: the call's tokens and latency, under the alias it was made to. The
+                    // timer is inside the joined future, so it measures the call and not the
+                    // request recording that runs beside it.
+                    let alias = request.model.clone();
+                    let (recorded_request, (answer, elapsed)) = tokio::join!(recording, async {
+                        let started = std::time::Instant::now();
+                        let answer = tokio::select! {
                             biased;
                             () = cancel.cancelled() => Err(ModelFailure::cancelled()),
                             answer = model.complete(request).instrument(span.clone()) => answer.map_err(ModelFailure::from),
-                        }
+                        };
+                        (answer, started.elapsed())
                     });
                     let answer = answer?;
                     span.record("input_tokens", answer.usage.input_tokens);
                     span.record("output_tokens", answer.usage.output_tokens);
+                    crate::metrics::record_model_call(
+                        &opentelemetry::global::meter(crate::metrics::SCOPE),
+                        &alias,
+                        answer.usage.input_tokens,
+                        answer.usage.output_tokens,
+                        elapsed,
+                    );
                     return Ok(Recorded {
                         response: unthought(&emitter, run, turn, false, answer).await,
                         stream: None,
@@ -3578,22 +3591,41 @@ impl LlmAgent {
                 // The notes are this turn's (a source's listing, read above): a source's call
                 // reports and is labelled as the turn says, not as the turn before it did.
                 let mut early = Early::new(agent, early_facts, notes.clone(), own_order.clone());
-                let (recorded_request, streamed) = tokio::join!(
+                // ANR-1462: the streamed turn is the default one, so it is measured like the
+                // unstreamed turn — the timer inside the joined future, so the request recording
+                // that runs beside it is not in the latency. A failed or cancelled stream returns
+                // before the recording, since its answer (and its usage) was dropped. The interval
+                // ends when the last piece is emitted, so it carries the emitter's writes too: the
+                // words are not otherwise separable from the call that produced them.
+                let alias = request.model.clone();
+                let (recorded_request, (streamed, elapsed)) = tokio::join!(
                     recording,
-                    text_stream::stream_response(
-                        &model,
-                        request,
-                        &emitter,
-                        &cancel,
-                        Some(&mut early),
-                        move || stream_id(run, turn),
-                        move || reasoning_stream_id(run, turn),
-                    )
+                    async {
+                        let started = std::time::Instant::now();
+                        let streamed = text_stream::stream_response(
+                            &model,
+                            request,
+                            &emitter,
+                            &cancel,
+                            Some(&mut early),
+                            move || stream_id(run, turn),
+                            move || reasoning_stream_id(run, turn),
+                        )
+                        .await;
+                        (streamed, started.elapsed())
+                    }
                 );
                 // The batch goes back to the turn, whatever the stream did with it: the calls that
                 // started are the turn's to settle (their steps are written only after it).
                 *slot.lock().unwrap_or_else(PoisonError::into_inner) = Some(early);
                 let streamed = streamed.map_err(ModelFailure::from)?;
+                crate::metrics::record_model_call(
+                    &opentelemetry::global::meter(crate::metrics::SCOPE),
+                    &alias,
+                    streamed.response.usage.input_tokens,
+                    streamed.response.usage.output_tokens,
+                    elapsed,
+                );
                 Ok(Recorded {
                     response: unthought(&emitter, run, turn, true, streamed.response).await,
                     stream: streamed.stream,
@@ -4316,6 +4348,8 @@ impl LlmAgent {
                     }
                 }
                 let span = model_span(&request.model, true);
+                let alias = request.model.clone();
+                let started = std::time::Instant::now();
                 let answer = tokio::select! {
                     biased;
                     () = cancel.cancelled() => return Err(ModelFailure::cancelled()),
@@ -4323,6 +4357,13 @@ impl LlmAgent {
                 };
                 span.record("input_tokens", answer.usage.input_tokens);
                 span.record("output_tokens", answer.usage.output_tokens);
+                crate::metrics::record_model_call(
+                    &opentelemetry::global::meter(crate::metrics::SCOPE),
+                    &alias,
+                    answer.usage.input_tokens,
+                    answer.usage.output_tokens,
+                    started.elapsed(),
+                );
                 let text = answer.message.text();
                 Ok(Summarised {
                     summary: (!text.trim().is_empty()).then_some(text),
