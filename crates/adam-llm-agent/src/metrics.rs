@@ -16,12 +16,15 @@ use opentelemetry::metrics::Meter;
 pub const SCOPE: &str = "adam-llm-agent";
 
 /// How long one tool call took, in seconds, one label: `tool`.
-pub const TOOL_DURATION: &str = "adam.tool.duration";
+///
+/// The name is the catalogue's ([`adam_otel::catalogue::TOOL_DURATION`]), so the list a dashboard is
+/// held to and the instrument recorded here cannot drift apart.
+pub const TOOL_DURATION: &str = adam_otel::catalogue::TOOL_DURATION;
 
 /// Records one tool call's latency, under the tool's registered name.
 ///
-/// The name comes from the agent's own registry, so the label set is the tools it declares; a name
-/// the alphabet refuses is skipped (no measurement, no invented label).
+/// The caller records only when a tool or a source answered the call, so the label set is the tools
+/// the agent declares; a name the alphabet refuses is skipped (no measurement, no invented label).
 pub fn record_tool_duration(meter: &Meter, tool: &str, elapsed: Duration) {
     let Ok(tool) = Name::new(tool) else {
         return;
