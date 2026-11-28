@@ -1963,7 +1963,9 @@ impl Runtime {
             Some((run, state)) => agent.init_continuing(input, state, run)?,
             None => agent.init(input)?,
         };
-        let mut envelope = Envelope::new(state);
+        // The journal epoch the run starts on (ADR 0076): the step list its starter is written
+        // against, so a worker of an older step list leaves it for its own epoch to finish.
+        let mut envelope = Envelope::new(state).with_epoch(agent.replay_epoch());
         if let Some(within) = within {
             envelope = envelope.with_limit(self.inner.clock.now(), within);
         }

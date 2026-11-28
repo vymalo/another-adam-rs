@@ -19,6 +19,16 @@ pub(crate) const VERSION: u32 = 1;
 pub(crate) struct Envelope {
     /// Layout version.
     pub v: u32,
+    /// The journal epoch the run started on ([ADR 0076]): the step list its journal was written
+    /// against, as the agent that started it declared it ([`Agent::replay_epoch`]).
+    ///
+    /// `0` for a run stored before the field existed, and for an agent that never bumps it: a
+    /// stored envelope without the field decodes as `0`, so an old run reads as the oldest epoch.
+    ///
+    /// [ADR 0076]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0076-a-run-records-the-journal-epoch-it-started-on.md
+    /// [`Agent::replay_epoch`]: crate::Agent::replay_epoch
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub epoch: u32,
     /// The agent's own state.
     ///
     /// `transition` takes this by move before stepping, leaving `Null` in the envelope it still
@@ -88,10 +98,18 @@ pub(crate) struct Envelope {
     pub signature: Option<String>,
 }
 
+/// Whether an epoch is the oldest one. It is left out of the JSON then, so an envelope written
+/// before the field existed re-encodes to **the same bytes** — its signature covers them
+/// (ADR 0068), and a re-encode that added `"epoch":0` would fail every old run's check.
+pub(crate) fn is_zero(epoch: &u32) -> bool {
+    *epoch == 0
+}
+
 impl Envelope {
     pub fn new(agent: Value) -> Self {
         Self {
             v: VERSION,
+            epoch: 0,
             agent,
             inbox: Vec::new(),
             seq: 0,
@@ -108,6 +126,14 @@ impl Envelope {
             hb: false,
             signature: None,
         }
+    }
+
+    /// Record the journal epoch the run starts on ([ADR 0076]), as its agent declares it.
+    ///
+    /// [ADR 0076]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0076-a-run-records-the-journal-epoch-it-started-on.md
+    pub fn with_epoch(mut self, epoch: u32) -> Self {
+        self.epoch = epoch;
+        self
     }
 
     /// Give the run a time limit of `within`, counted from `now`.
@@ -370,5 +396,33 @@ mod tests {
             serde_json::to_string(&env.encode().expect("encodes")).expect("serialises"),
             bytes
         );
+    }
+}
+
+/// The journal epoch of a run ([ADR 0076]): written once at start, read by every worker.
+///
+/// [ADR 0076]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0076-a-run-records-the-journal-epoch-it-started-on.md
+#[cfg(test)]
+mod epoch_tests {
+    use super::Envelope;
+    use adam_core::RunId;
+    use serde_json::json;
+
+    #[test]
+    fn a_stored_envelope_without_an_epoch_reads_as_the_oldest() {
+        let stored = json!({"v": 1, "agent": {}, "inbox": [], "seq": 0});
+        let env = Envelope::decode(RunId::new(), &stored).expect("an old envelope decodes");
+        assert_eq!(
+            env.epoch, 0,
+            "a run stored before the field existed is epoch 0"
+        );
+    }
+
+    #[test]
+    fn the_epoch_a_run_starts_on_survives_a_commit_and_a_reload() {
+        let env = Envelope::new(json!({})).with_epoch(3);
+        let encoded = env.encode().expect("encodes");
+        let back = Envelope::decode(RunId::new(), &encoded).expect("decodes");
+        assert_eq!(back.epoch, 3);
     }
 }
