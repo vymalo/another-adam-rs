@@ -1653,7 +1653,13 @@ impl Tool for Edit {
             };
             // The round this call started on an earlier try.
             if view.latest_run == round_id {
-                return Ok(edited(session, view.round, &members, "new_round"));
+                return Ok(edited(
+                    session,
+                    view.round,
+                    &members,
+                    "new_round",
+                    view.state,
+                ));
             }
             if view.closed {
                 return refuse(closed_words(session, view.idle_expired));
@@ -1694,7 +1700,11 @@ impl Tool for Edit {
                 by: SessionEditor::Agent,
                 members: members.clone(),
             };
-            if view.state == SessionState::Working {
+            // A round that only edits the session reads no inbox: an edit steered into it would be
+            // a no-op answered as delivered, so such a round is treated as ended, and the edit
+            // starts the next round (or the editing round) as it would after any other round.
+            let editing = view.header.as_ref().is_some_and(|h| h.editing);
+            if view.state == SessionState::Working && !editing {
                 // The open round reads it at its next step and journals it there (ADR 0054,
                 // decision 11). It is not counted as unread input: a round that finishes before
                 // reading it leaves it in its inbox, where a reader of the session finds it and the
@@ -1715,7 +1725,9 @@ impl Tool for Edit {
                                 .is_some_and(|ids| ids.iter().any(|id| id == ctx.call_id()))
                         });
                         if read {
-                            return Ok(edited(session, view.round, &members, "steered"));
+                            return Ok(edited(
+                                session, view.round, &members, "steered", view.state,
+                            ));
                         }
                         let Some(now) = starter
                             .session(session)
@@ -1724,8 +1736,13 @@ impl Tool for Edit {
                         else {
                             return refuse(no_such_session(session));
                         };
+                        // The round ended and the session closed in between: a closed session takes
+                        // no editing round, as it takes no message.
+                        if now.closed {
+                            return refuse(closed_words(session, now.idle_expired));
+                        }
                         if now.state == SessionState::Working {
-                            return Ok(edited(session, now.round, &members, "steered"));
+                            return Ok(edited(session, now.round, &members, "steered", now.state));
                         }
                         view = now;
                     }
@@ -1735,25 +1752,10 @@ impl Tool for Edit {
             }
             // The round has ended and the session is open: a round that only edits it. It calls no
             // model, has no report, and counts toward `max_rounds` as a close does (ADR 0054,
-            // decision 11) — so a session that has had them all refuses the edit rather than spend
-            // one it does not have, in the words a send is refused with. A close stays exempt.
-            let limits = self.roster.limits;
-            let config = view
-                .header
-                .as_ref()
-                .and_then(|h| h.config.as_ref())
-                .map(|asked| agent.bounds.clamp(asked));
-            let capped = config
-                .as_ref()
-                .and_then(|config| config.max_rounds)
-                .map_or(limits.max_rounds(), |own| own.min(limits.max_rounds()));
-            if view.countable_rounds() >= capped {
-                return refuse(format!(
-                    "session `{session}` has had {} rounds, the most a session may have: close it \
-                     and start a new one with `{SUBAGENT_START}`",
-                    capped
-                ));
-            }
+            // decision 11) — and, like a close, it is **not refused by the round cap**: it spends
+            // no model call, and the cap still bounds the rounds that do (a send's check), so an
+            // edit that raises `max_rounds` or the budget is exactly what a session at the cap
+            // needs. The A2A front makes the same round with the same rule.
             let mut header = view.header.clone().unwrap_or_else(|| SessionHeader {
                 id: session,
                 agent: view.agent.clone(),
@@ -1788,7 +1790,15 @@ impl Tool for Edit {
                 )
                 .await
             {
-                Ok(_) => return Ok(edited(session, header.round, &members, "new_round")),
+                Ok(_) => {
+                    return Ok(edited(
+                        session,
+                        header.round,
+                        &members,
+                        "new_round",
+                        view.state,
+                    ));
+                }
                 Err(e) if is_busy_or_finished(&e) => {}
                 Err(e) => return Err(runtime_error(&e)),
             }
@@ -1799,12 +1809,26 @@ impl Tool for Edit {
     }
 }
 
-fn edited(session: RunId, round: u32, members: &[String], how: &str) -> ToolOutput {
+/// The result of an edit: the session, the round it took effect in, the options it named, how it
+/// was delivered, and what the session is doing — `working` when the edit reached an open round,
+/// `idle` when it started the round that only edits it (which calls no model and ends at once, so
+/// nothing is working after it).
+fn edited(
+    session: RunId,
+    round: u32,
+    members: &[String],
+    how: &str,
+    state: SessionState,
+) -> ToolOutput {
+    let state = match state {
+        SessionState::Working => "working",
+        SessionState::Idle | SessionState::Closed => "idle",
+    };
     ToolOutput::text(
         json!({
             "session": session,
             "round": round,
-            "state": "working",
+            "state": state,
             "edited": members,
             "delivered": how,
         })

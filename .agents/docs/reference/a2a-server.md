@@ -63,14 +63,24 @@ that asks two of `start`, `close` and `edit`. `asked` answers `Asked::Edit {patc
 
 * A **working** round gets an `Inbound::new(SESSION_EDIT_KIND, SessionEditRequest {config, by: Person, members})` with the
   message id; an **idle** session gets a round of `editing_round_payload(&header)` through `next_round`. Both count toward
-  `max_rounds` (`countable_rounds` counts an editing round: it is not `closing && !closed`).
+  `max_rounds` (`countable_rounds` counts an editing round: it is not `closing && !closed`), and neither is refused by the
+  round cap — as a close is not: an editing round spends no model call, and the cap still bounds the rounds that do.
+* The edit is handled **above** the spent check: raising the `tokenBudget` of a session that spent it is what the option is
+  for, so a message to a spent session is `UnsupportedOperation` while an edit of it is accepted (a close is exempt there
+  too). An empty `edit.config` is `InvalidParams`, as the tool refuses it, so it records no edit and spends no round.
 * `SessionEditRequest` is the whole admitted config, so the round applies it and never merges; `by: Person` is what
   `SessionHeader.edits` records.
-* **Evidence:** `crates/adam-runtime/src/session.rs` tests `a_patch_sets_resets_and_leaves_the_rest`,
-  `an_edit_of_a_running_round_adopts_next_model_call_options_only`, `a_header_keeps_the_last_sixteen_edits`,
-  `an_edit_a_round_never_read_is_applied_by_its_reader`, `an_editing_round_says_edit_and_carries_its_header`;
-  `crates/adam-llm-agent/tests/sessions.rs` `an_edit_of_a_working_round_changes_its_next_model_call`,
-  `an_edit_of_an_idle_session_is_a_round_that_calls_no_model`,
-  `an_edit_past_a_bound_is_refused_and_changes_nothing`, `a_retried_edit_applies_once`.
-* **Not verified without a compiler:** the front's own `edit` tests are not written; the unit tests above are. The A2A
-  `Asked::Edit` path is exercised by no test yet (ANR-216's note says so).
+* **Evidence:** `crates/adam-a2a-runtime/tests/child_sessions.rs` `an_edit_of_an_idle_session_is_a_round_that_calls_no_model`
+  (the editing round, `header.config`, `edits[0].by == Person`, the next round runs with it),
+  `an_edit_of_a_working_session_is_delivered_into_its_round` (delivered, no new round, the reader applies it),
+  `an_edit_past_a_bound_is_refused_and_changes_nothing` (`InvalidParams` naming `edit.config.maxTurns`),
+  `an_edit_that_asks_two_things_or_names_no_option_is_refused` (two of three, and `config: {}`),
+  `an_edit_raises_the_budget_of_a_session_that_spent_it`; `crates/adam-runtime/src/session.rs`
+  `a_patch_sets_resets_and_leaves_the_rest`, `an_edit_of_a_running_round_adopts_next_model_call_options_only`,
+  `a_header_keeps_the_last_sixteen_edits`, `an_edit_a_round_never_read_is_applied_by_its_reader`,
+  `an_editing_round_says_edit_and_carries_its_header`; `crates/adam-llm-agent/tests/sessions.rs`
+  `an_edit_of_a_working_round_changes_its_next_model_call`, `an_edit_of_an_idle_session_is_a_round_that_calls_no_model`,
+  `an_edit_past_a_bound_is_refused_and_changes_nothing`, `a_retried_edit_applies_once`,
+  `an_edit_of_instructions_applies_from_the_next_round`.
+* **Not verified without a compiler:** the five front tests above were written but not run (ANR-216); the runtime and
+  `adam-llm-agent` cases are the same.

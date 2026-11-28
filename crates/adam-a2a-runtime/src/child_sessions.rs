@@ -1514,21 +1514,13 @@ impl RuntimeTaskBackend {
                     "session {session} is closed and takes no more messages{why}"
                 )));
             }
-            // A session that spent its token budget takes no more messages (ADR 0054, decision 6),
-            // and the header the view already carries says so: no second store read.
-            if let Some(header) = view.header.as_ref().filter(|h| h.is_spent()) {
-                return Err(BackendError::UnsupportedOperation(format!(
-                    "session {session} has spent its token budget ({} of {} tokens) and takes no \
-                     more messages",
-                    header.spent,
-                    header.token_budget().unwrap_or_default()
-                )));
-            }
             // An edit of the session ([ADR 0054], decision 11): the same merge and the same
             // admission as the model's `subagent_edit`, against the bounds of the helper now and
             // the person's own grant (which is the message's tier, already the ceiling of the
             // round). A working round reads it at its next step; an idle session gets a round that
-            // calls no model.
+            // calls no model. It is handled **before** the spent check below: raising the budget of
+            // a session that spent it is one of the things an edit is for, as the model's tool says,
+            // and a close is exempt there for the same reason.
             //
             // [ADR 0054]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md
             if let Some(patch) = edit {
@@ -1597,6 +1589,16 @@ impl RuntimeTaskBackend {
                     Next::Started => return self.answer_round(caller, &next).await,
                     Next::Busy => continue,
                 }
+            }
+            // A session that spent its token budget takes no more messages (ADR 0054, decision 6),
+            // and the header the view already carries says so: no second store read.
+            if let Some(header) = view.header.as_ref().filter(|h| h.is_spent()) {
+                return Err(BackendError::UnsupportedOperation(format!(
+                    "session {session} has spent its token budget ({} of {} tokens) and takes no \
+                     more messages",
+                    header.spent,
+                    header.token_budget().unwrap_or_default()
+                )));
             }
             let mut inbound = inbound
                 .clone()
