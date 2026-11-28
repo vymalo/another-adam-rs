@@ -113,7 +113,7 @@ the adam crates pinned in `orchestrator/Cargo.toml`.
 4. **Configuration** is the host's: `adam-host` never reads the environment. With
    `adam-service` the variables are `ROLE`, `DATABASE_URL`, `A2A_BEARER_TOKENS` (fail closed:
    none, no A2A server), `PUBLIC_URL`, `LISTEN_ADDR`, `WORKERS`, `WORKER_ID`, `MODEL_BASE_URL`,
-   `MODEL_API_KEY`, `MODEL`, and the optional `MODEL_CONTEXT_WINDOW` (the window a `usage/v1` report says for the alias
+   `MODEL_API_KEY`, `MODEL`, and the optional `DEFAULT_MODEL_CONTEXT_WINDOW` (the window a `usage/v1` report says for the alias
    `MODEL`) (`crates/adam-service/README.md`, "Environment"). Parse yours with
    `parse_or`, `parse_flag` into the same list of problems.
 5. **Exit codes**: map a failed `serve` with `adam_service::exit_code` (78 configuration, 69

@@ -76,3 +76,16 @@ Three facts made that budget wrong for current models:
   prompt cache most of that is cache reads, but a call without a cache costs more.
 * A deployment that set `MODEL_CONTEXT_WINDOW` keeps working for a release and is told to rename it.
 * No `Store`, `Notifier` or `ModelClient` method changes.
+
+*Amended 2026-11-28:* **slice W2 is built.** `DEFAULT_MODEL_CONTEXT_WINDOW` is read with the model
+(`crates/adam-service/src/config.rs`, 1 to 2^53 − 1, else exit 78) and is the window of the alias `MODEL` names when
+its profile has no `contextWindow`, as `MODEL_CONTEXT_WINDOW` was. `MODEL_CONTEXT_WINDOW` is the deprecated alias:
+read only when the new variable is unset, and one warning at startup names the new variable whenever it is set. Both
+set to the same value (compared as numbers) is that value with the warning; to different values one problem names
+both variables and neither value (exit 78); a value one of them refuses is that variable's problem, not a conflict.
+The chart's `config.modelContextWindow` renders `DEFAULT_MODEL_CONTEXT_WINDOW` and is refused beside either name in
+`config.extraEnv`; no golden of the chart sets the value, so none changed, and the platform's parity note is
+[gap 35](../reference/parity.md#gaps) (its operator renders the old name). The compose files moved to the new name;
+`bench/` keeps the old one until its pinned image is newer than this slice. Two limits, not decided here: an image
+built before W2 reads only the old name, so the chart and the image move together (as `image.tag` does); and the
+alias has no removal date beyond "one minor release", which a later amendment names.

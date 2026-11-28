@@ -96,7 +96,7 @@ call is a stream) to a client that activates `text-stream/v1`: chunks while the 
 stream's id, and the whole reply with the turn to one that does not (the same ADR; `adam-a2a-runtime`'s README says how).
 **The tokens of every model call are reported** to a client that activates `usage/v1`, a subagent's under its step, and the
 task carries its totals when it ends or waits ([ADR 0032](../../docs/decisions/0032-usage-per-model-call.md)): the provider is
-`openai`, the model the alias, and the context window `MODEL_CONTEXT_WINDOW`.
+`openai`, the model the alias, and the context window (its profile's `contextWindow`, else `DEFAULT_MODEL_CONTEXT_WINDOW`).
 
 A folder that follows the **persona convention** (the body opens with `Your name is {{display_name}}.` and a line
 `In one sentence: <summary>.`, the summary without `"` and ending at its first period) is greeted by the mock
@@ -217,7 +217,8 @@ same way; every problem is reported at once at startup):
 | `MODEL_EXTRA_BODY` | a JSON object merged into every chat-completions request of the agent's model, for a flag that makes a gateway or model emit its reasoning: `{"reasoning_effort":"medium"}`, `{"thinking":{"type":"enabled"}}`, `{"chat_template_kwargs":{"enable_thinking":true}}`. **Not a secret** (it shows in the pod's environment). A request's typed reasoning level wins over the members its model's `reasoningWire` would duplicate (ADR 0063 decision 6). Not JSON, not an object, or a member the runtime owns (`model`, `messages`, `tools`, `tool_choice`, `stream`): exit 78 at startup, the message names the variable and never repeats the value | unset: nothing is added |
 | `MODEL_ECHO_REASONING` | `reasoning_content` or `reasoning`: keep the model's reasoning in the run's history and send it back under that member name. For a provider that requires it (DeepSeek's thinking mode with tools answers a request without it with a 400); `false` or unset sends none, which is what almost every model wants. Anything else: exit 78 | unset: never sent |
 | `MODEL_PROMPT_CACHE_KEY` | `off` or `conversation`: send each request's `prompt_cache_key` (a hash of the conversation id cut to 32 characters), so a gateway with a prompt cache routes one conversation's requests together; a `MODEL_EXTRA_BODY` member of that name wins. Anything else: exit 78 | `off` |
-| `MODEL_CONTEXT_WINDOW` | the context window of the model `MODEL` names, in tokens (1 to 9007199254740991): what each `usage/v1` call report of a call on that alias says as `contextWindow`; a subagent whose `model:` names another alias reports none. Anything else: exit 78 | unset: reports carry no window |
+| `DEFAULT_MODEL_CONTEXT_WINDOW` | the context window of the model `MODEL` names, in tokens (1 to 9007199254740991), used only when its profile in `MODEL_ALIASES_FILE` names no `contextWindow` ([ADR 0086](../../docs/decisions/0086-the-context-window-follows-the-model-and-the-history-budget-is-200k.md)): what each `usage/v1` call report of a call on that alias says as `contextWindow`; a subagent whose `model:` names another alias takes its own profile's window, or reports none. Anything else: exit 78 | unset: the profile's window, else none |
+| `MODEL_CONTEXT_WINDOW` | **deprecated** alias of `DEFAULT_MODEL_CONTEXT_WINDOW`: read only when that is unset, with one warning at startup; both set to different values is exit 78 | unset |
 | `MCP_ALLOW_STDIO`, `MCP_ALLOW_INSECURE`, `MCP_ALLOW_URL_VARS` | what the folder's MCP servers may be (see above) | `false` each |
 | `A2A_ALLOW_INSECURE_REMOTES` | roles that run workers: a remote subagent (`a2a:` in a subagent file) may be at plain `http` on another machine, such as a service of the same cluster (`AgentDef::allow_insecure_remotes`); without it such a URL is exit 78. **The messages and the bearer then cross the pod network in clear text**: protect it (a NetworkPolicy that admits only the caller, or mesh mTLS); plain `http` goes only to the card's own host, never from an `https` card. The subagent's token is `auth: bearer:VAR`, a variable of this process ([remote subagents](../../docs/reference/agent-files.md#remote-subagents-a2a)) | `false` |
 | `MCP_MAX_CALL_SECS` | the longest one MCP server is waited for, a call and a connection each: what `timeoutSecs` and `connectTimeoutSecs` ask for and the defaults (60 s and 30 s) are lowered to it, and a value the file asks for is at least 1 s in `mcp.json` or the extra file (1 to 86400); a larger value is lowered to it, with a warning at startup | `900` |
@@ -380,7 +381,7 @@ model, `tini` as PID 1, SIGTERM exits 0), then the compose scenarios.
 ## Tests
 
 * `src/config.rs`: `ADAM_AGENT_DIR` required by every role and an existing directory, every problem at once,
-  a control plane that needs no model, `MODEL_CONTEXT_WINDOW` read by the workers (a bad value is exit 78),
+  a control plane that needs no model, `DEFAULT_MODEL_CONTEXT_WINDOW` read by the workers (a bad value, or a different one in its deprecated alias `MODEL_CONTEXT_WINDOW`, is exit 78),
   `A2A_ALLOW_INSECURE_REMOTES` off by default, read by the workers and a boolean, secrets hidden from `Debug`;
   `src/serve.rs`: the switch reaches the binding of the folder's remote subagents (off: refused; on: bound). The
   `schedules` component is `adam_schedule::reconcile_until_stopped`, tested in `adam-schedule`.

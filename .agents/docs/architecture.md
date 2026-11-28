@@ -36,13 +36,13 @@ bindings ([ADR 0031](../../docs/decisions/0031-swagger-ui-and-the-a2a-rest-bindi
 Built 2026-11-27. The invariant: **one rule answers a model alias's window**, and every reader asks the client.
 
 * The rule: `adam_model::resolve_context_window` (`crates/adam-model/src/profiles.rs:221`): the profile's
-  `contextWindow`, else the window configured for that alias outside the profiles (`MODEL_CONTEXT_WINDOW`), else
+  `contextWindow`, else the window configured for that alias outside the profiles (`DEFAULT_MODEL_CONTEXT_WINDOW`), else
   `None`; a hand-built `0` falls through. The loader refuses `0` and anything above `MAX_CONTEXT_WINDOW` (2^53 − 1,
   `profiles.rs:211`) in `window` (`profiles.rs:624`), like a cap of `0`. A preset has no window: it is a fact of the
   model, and a preset carries no limit of the model either.
 * The clients answer through it: the trait default (`crates/adam-model/src/client.rs:44`, the profile only),
   `MockModel` (`crates/adam-model/src/mock.rs:203`) and `OpenAiCompatible` (`crates/adam-model-openai/src/lib.rs:985`);
-  `GateModel` and `Arc<T>` forward. `ModelConfig::client` gives the client both `MODEL_CONTEXT_WINDOW` for `MODEL`
+  `GateModel` and `Arc<T>` forward. `ModelConfig::client` gives the client both `DEFAULT_MODEL_CONTEXT_WINDOW` for `MODEL`
   and the profiles (`crates/adam-service/src/config.rs:1347`, `:1358`).
 * The readers ask the client per alias: the compaction budget of the live alias
   (`crates/adam-llm-agent/src/agent.rs:3741`, narrowed by a session's `context_window` in
@@ -55,10 +55,37 @@ Built 2026-11-27. The invariant: **one rule answers a model alias's window**, an
 Tests: `profiles.rs` `a_context_window_is_one_to_two_to_the_53_minus_one_tokens`,
 `the_profiles_window_wins_over_the_configured_one`; `client.rs` `the_default_window_is_the_profiles`; `mock.rs`
 `a_profiles_window_wins_over_the_told_one`; `adam-model-openai` `a_profiles_window_wins_over_the_configured_one_alias_by_alias`;
-`adam-service` `a_profiles_context_window_wins_over_model_context_window`; `adam-llm-agent` `tests/usage.rs`
+`adam-service` `a_profiles_context_window_wins_over_default_model_context_window`; `adam-llm-agent` `tests/usage.rs`
 `each_report_carries_the_window_its_aliases_profile_names` and `tests/compaction.rs`
 `the_budget_is_taken_from_the_window_of_the_models_profile`; `adam-assembly` `tests/cap.rs`
 `a_subagent_on_another_alias_has_its_own_profiles_window`.
+
+## The default window's variable (ADR 0086, slice W2)
+
+Built 2026-11-28. The invariant: **one variable answers the window outside the profiles, and two answers fail closed.**
+
+* The reader: `parse_default_context_window` in `crates/adam-service/src/config.rs`, called once by
+  `ModelConfig::parse` (so once at startup per binary): `DEFAULT_MODEL_CONTEXT_WINDOW`, else the deprecated
+  `MODEL_CONTEXT_WINDOW`. A set alias logs one `WARN` naming the new variable, whether or not the new one is set.
+  Both set: equal (as numbers, so `" 131072 "` equals `131072`) is the value; different is one problem naming both
+  variables and neither value, which the binaries turn into a `ConfigError` (exit 78). A value one of them refuses is
+  that variable's problem alone, not a conflict. Blank is unset (`not_blank`).
+* Both are held to `MAX_CONTEXT_WINDOW` by `parse_context_window(name, ..)`, whose problem starts with the name.
+* The result is still `ModelConfig::context_window`, the `configured` argument of `resolve_context_window`: W1's
+  rule is unchanged, the profile's `contextWindow` wins.
+* The chart: `coder.modelContextWindow` (`deploy/coder/templates/_helpers.tpl`) renders `DEFAULT_MODEL_CONTEXT_WINDOW`
+  in `templates/statefulset.yaml`; `templates/_validate.tpl` refuses the value beside either name in
+  `config.extraEnv`. No golden sets the value, so no golden changed; `tests/render-check.sh` holds the name.
+* Every in-repository writer moved: `compose.yaml`, `dev/compose.real-model.yaml`. `bench/` did not: it starts the
+  coder image pinned in `bench/pins.json` (`sha-9a9e6c5`, 2026-11-21), which reads only the old name; it moves with the pin.
+* The alias is removed in a later minor release, with a dated *Amended* note on ADR 0086.
+
+Tests: `adam-service` `model_context_window_is_a_deprecated_alias_of_default_model_context_window` (new alone, old
+alone with one warning, equal, different, one invalid, blank alias; the `WARN` lines captured with a
+`tracing_subscriber` writer), `the_context_window_is_a_positive_count_for_the_models_alias` (both names' bounds);
+`adam-agent` `src/config.rs` `the_context_window_is_read_by_the_workers_and_a_bad_one_stops_the_start` (exit 78 for
+a conflict). For people: [Environment](../../docs/reference/environment.md), the chart's
+[README](../../deploy/coder/README.md#the-models-context-window).
 
 ## Signed turns on re-entry (ADR 0068, slice T3a-3)
 

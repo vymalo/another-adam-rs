@@ -506,7 +506,7 @@ Both agents clone that bare repository; patch collection leaves the links out (`
 | `ADAM_AGENT_DIR` | `/etc/adam/agent`, mounted read-only from the image's revision (`git archive`), **without `mcp.json`**: no GitHub MCP server, as OpenCode has none |
 | `WORKSPACE_SWEEP_SECS` | `0`: the worktree stays until it is copied |
 | `RUN_ENVIRONMENT`, `DEVCONTAINER_RUNTIME` | `local`, `off`: a run's commands run in the coder's own container, which is the task image |
-| `MODEL_BASE_URL`, `MODEL_API_KEY`, `MODEL`, `MODEL_CONTEXT_WINDOW` | the meter's address with the run's token, a dummy, `bench-model`, the configured window |
+| `MODEL_BASE_URL`, `MODEL_API_KEY`, `MODEL`, `MODEL_CONTEXT_WINDOW` | the meter's address with the run's token, a dummy, `bench-model`, the configured window. The window keeps the old name, now the deprecated alias of `DEFAULT_MODEL_CONTEXT_WINDOW` (ADR 0086), because the pinned image predates the new one: it moves with the pin |
 | `A2A_BEARER_TOKENS` | a random value for each run |
 | `GIT_SANDBOX_SOCKET`, `DEVCONTAINER_DEPLOYMENT_ID` | the git sandbox's socket on the work directory; `bench-slot-N` |
 | the turn limit | the agent folder's `max_turns` is set to `limits.steps`, the value OpenCode's `steps` gets |

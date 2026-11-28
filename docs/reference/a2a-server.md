@@ -765,7 +765,7 @@ orchestration layer's `docs/api/usage-v1.md`, [ADR 0032](../decisions/0032-usage
 in the event's `metadata` under the URI: `call` (unique within the task, the same on a resubscribe), `stepId` for a subagent's
 call (the `tool:<call id>` of the call that started it), `provider` (`openai`), `model` (the alias), `inputTokens`,
 `outputTokens`, `totalTokens`, and, when known, `reasoningTokens`, `cachedInputTokens`, `cacheWriteInputTokens`,
-`contextWindow` (`MODEL_CONTEXT_WINDOW`) and `effort`, the reasoning level the call named (`none`, `minimal`, `low`,
+`contextWindow` (the profile's, else `DEFAULT_MODEL_CONTEXT_WINDOW`) and `effort`, the reasoning level the call named (`none`, `minimal`, `low`,
 `medium`, `high`, `xhigh`, `max`: what the folder, the profile or the run's context asked for, [ADR 0063](../decisions/0063-a-reasoning-effort-is-one-setting.md) decision 7). A call that named no level
 has no `effort`, which is not `none`: `none` is a level of its own. Any other request gets nothing of it. A task that ended (`completed`, `failed`,
 `canceled`, `rejected`) or waits (`input-required`, `auth-required`) carries `metadata[URI] = {"totals": [...]}`, one entry

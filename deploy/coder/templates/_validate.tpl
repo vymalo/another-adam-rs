@@ -240,8 +240,11 @@ from service.yaml, which every render contains, so they always run.
 {{- if or (not (regexMatch "^[1-9][0-9]{0,15}$" .)) (gt (int64 .) 9007199254740991) -}}
 {{- fail (printf "config.modelContextWindow must be a whole number of tokens from 1 to 9007199254740991, like 1000000, got %q" .) -}}
 {{- end -}}
-{{- if hasKey $.Values.config.extraEnv "MODEL_CONTEXT_WINDOW" -}}
-{{- fail "config.modelContextWindow is set and config.extraEnv sets MODEL_CONTEXT_WINDOW: set one" -}}
+{{- /* The variable it renders, or its deprecated alias, in extraEnv too: two answers to one question (ADR 0086). */ -}}
+{{- range list "DEFAULT_MODEL_CONTEXT_WINDOW" "MODEL_CONTEXT_WINDOW" -}}
+{{- if hasKey $.Values.config.extraEnv . -}}
+{{- fail (printf "config.modelContextWindow is set and config.extraEnv sets %s: set one" .) -}}
+{{- end -}}
 {{- end -}}
 {{- end -}}
 {{- /* config.maxParallelToolCalls: a whole number from 1 to 32, which the binary would otherwise refuse with exit 78. */ -}}

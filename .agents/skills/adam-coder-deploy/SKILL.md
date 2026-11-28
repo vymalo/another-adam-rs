@@ -141,9 +141,14 @@ https://github.com/vymalo/another-adam-rs/blob/main/deploy/coder/README.md.
      run parks up to `MODEL_PARK_LIMIT` (`NOTES.txt` warns when the placeholder is still there). Workers only.
      `MODEL_CA_FILE` has no chart value yet (ADR 0067 decision 9, a later slice). Chart only, no image dependency
      (chart README, "Model authentication").
-   * `config.modelContextWindow` (null): `MODEL_CONTEXT_WINDOW`, the model's window in tokens, said by each usage
-     report, and the output cap's window: the cap is clamped to the window less 20,000 and the coder's history
-     (ADR 0064; `deploy/coder/README.md`, "The model's context window").
+   * `config.modelContextWindow` (null): `DEFAULT_MODEL_CONTEXT_WINDOW` (ADR 0086; it rendered `MODEL_CONTEXT_WINDOW`,
+     now the binary's deprecated alias, before 2026-11-28), the model's window in tokens when its profile names no
+     `contextWindow`, said by each usage report, and the output cap's window: the cap is clamped to the window less
+     20,000 and the coder's history (ADR 0064). Refused beside either name in `config.extraEnv`; the binary exits 78
+     when both names are set to different values. **Image dependency**: an image built before the rename reads only
+     the old name, so the new chart with an older `image.tag` reports no window. The render changed for this value,
+     which another-agentic-platform's parity goldens read: say so in the pull request (`deploy/coder/README.md`,
+     "The model's context window").
    * `mcp.websearch.url` (our web search MCP Service, in cluster) and `mcp.context7.enabled` (hosted
      Context7), both off by default and byte-for-byte invisible when off. With either on, the chart renders
      ONE file of servers (a ConfigMap in the shape of `mcp.json`, no copy of the agent's prompt) and sets

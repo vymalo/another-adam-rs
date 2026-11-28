@@ -247,7 +247,8 @@ spec:
               value: {{ . | quote }}
             {{- end }}
             {{- with include "coder.modelContextWindow" . }}
-            - name: MODEL_CONTEXT_WINDOW
+            {{- /* config.modelContextWindow: the window of a model whose profile names none (ADR 0086). */}}
+            - name: DEFAULT_MODEL_CONTEXT_WINDOW
               value: {{ . | quote }}
             {{- end }}
             {{- if include "coder.modelProfiles" . }}

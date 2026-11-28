@@ -342,8 +342,9 @@ mod tests {
         assert!(parse(&vars).is_ok());
     }
 
-    /// `MODEL_CONTEXT_WINDOW` is read with the model: a count of tokens, or a startup error with the
-    /// configuration's exit code (78); a control plane runs no model and does not read it.
+    /// `DEFAULT_MODEL_CONTEXT_WINDOW` is read with the model: a count of tokens, or a startup error
+    /// with the configuration's exit code (78), as is a different value in its deprecated alias
+    /// `MODEL_CONTEXT_WINDOW` (ADR 0086); a control plane runs no model and does not read it.
     #[test]
     fn the_context_window_is_read_by_the_workers_and_a_bad_one_stops_the_start() {
         let dir = tempfile::tempdir().unwrap();
@@ -352,18 +353,30 @@ mod tests {
             parse(&vars).unwrap().worker.unwrap().model.context_window,
             None
         );
-        vars.insert("MODEL_CONTEXT_WINDOW".into(), "131072".into());
+        vars.insert("DEFAULT_MODEL_CONTEXT_WINDOW".into(), "131072".into());
         assert_eq!(
             parse(&vars).unwrap().worker.unwrap().model.context_window,
             Some(131_072)
         );
-        vars.insert("MODEL_CONTEXT_WINDOW".into(), "lots".into());
+        // Two answers to one question stop the start.
+        vars.insert("MODEL_CONTEXT_WINDOW".into(), "65536".into());
         let error = parse(&vars).unwrap_err();
         assert!(
             error
                 .problems
                 .iter()
-                .any(|p| p.starts_with("MODEL_CONTEXT_WINDOW")),
+                .any(|p| p.starts_with("DEFAULT_MODEL_CONTEXT_WINDOW and MODEL_CONTEXT_WINDOW")),
+            "{error}"
+        );
+        assert_eq!(adam_service::exit_code(&error), 78);
+        vars.remove("MODEL_CONTEXT_WINDOW");
+        vars.insert("DEFAULT_MODEL_CONTEXT_WINDOW".into(), "lots".into());
+        let error = parse(&vars).unwrap_err();
+        assert!(
+            error
+                .problems
+                .iter()
+                .any(|p| p.starts_with("DEFAULT_MODEL_CONTEXT_WINDOW")),
             "{error}"
         );
         assert_eq!(adam_service::exit_code(&error), 78);

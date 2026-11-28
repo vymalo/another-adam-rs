@@ -191,9 +191,11 @@ every agent a `ModelBinding` for each other profiled model, for `Say::with_model
 `limits.max_output_tokens`, the preset its `model_preset` names, the profile's `maxOutputTokens`, the profile's base
 preset, then `adam_model::DEFAULT_MAX_OUTPUT_TOKENS` (128,000). It is then the smallest of that, the model's
 `maxOutputTokensLimit` and, when the client knows the alias's context window (`ModelClient::context_window`: the
-profile's `contextWindow`, else `MODEL_CONTEXT_WINDOW` for the alias `MODEL` names; ADR 0086), what the window leaves after
-`adam_llm_agent::WINDOW_MARGIN_TOKENS` (20,000) and the history the agent keeps (`max_history_tokens`, or half the
-window when it is `0`; an omitted key keeps the 100,000 default; at least 1). A lowered cap is logged once per agent and model. A **preset** above the
+profile's `contextWindow`, else `DEFAULT_MODEL_CONTEXT_WINDOW` for the alias `MODEL` names; ADR 0086), what the window leaves after
+`adam_llm_agent::WINDOW_MARGIN_TOKENS` (20,000) and the history the agent keeps: `max_history_tokens`
+(`adam_llm_agent::DEFAULT_MAX_HISTORY_TOKENS`, 200,000, when the key is omitted), at most half the window, and half the
+window when it is `0` (ADR 0086: a history the window cannot hold gives way, so the 200,000 default on a 131,072-token
+window leaves 45,536, not one; at least 1). A lowered cap is logged once per agent and model. A **preset** above the
 model's limit is `Error::OutputCap` (a preset is the deployment's promise); the folder's value is clamped, and a
 profile's own cap above its limit is refused when the profiles file is read. The resolved cap is
 `AgentInfo::limits.max_output_tokens` and the loop's `Limits`, so the request, the

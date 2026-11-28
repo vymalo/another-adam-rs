@@ -48,7 +48,8 @@
 //! | `MODEL_ALIASES_FILE` | the per-model profiles (ADR 0063, ADR 0064): **JSON only for now**, one object with `profiles` and `presets`; a file that cannot be read or does not parse is a startup error naming the file and the key ([`ModelConfig::profiles`]) | unset (no profile) |
 //! | `MODEL_EXTRA_BODY` | a JSON object merged into every chat-completions request, to make a gateway or a model emit its reasoning (`{"reasoning_effort":"medium"}`); **not secret**; an invalid value is a startup error ([`ModelConfig::extra_body`]) | unset (nothing added) |
 //! | `MODEL_ECHO_REASONING` | send the reasoning of earlier turns back, under this member name (`reasoning_content` or `reasoning`), for a provider that requires it (DeepSeek's thinking mode with tools); `false` or unset sends none ([`ModelConfig::echo_reasoning`]) | unset (never sent) |
-//! | `MODEL_CONTEXT_WINDOW` | the context window of the model `MODEL` names, in tokens (1 to 9007199254740991), used only when that model's profile names no `contextWindow` (ADR 0086): the window its history budget, its output cap and each `usage/v1` call report on that alias take; an invalid value is a startup error ([`ModelConfig::context_window`]) | unset (the profile's, else none) |
+//! | `DEFAULT_MODEL_CONTEXT_WINDOW` | the context window of the model `MODEL` names, in tokens (1 to 9007199254740991), used only when that model's profile names no `contextWindow` (ADR 0086): the window its history budget, its output cap and each `usage/v1` call report on that alias take; an invalid value is a startup error ([`ModelConfig::context_window`]) | unset (the profile's, else none) |
+//! | `MODEL_CONTEXT_WINDOW` | **deprecated** alias of `DEFAULT_MODEL_CONTEXT_WINDOW`, read only when that is unset, with one warning at startup naming it; both set to different values is a startup error (two answers to one question), to equal values the value and the warning (ADR 0086 decision 2) | unset |
 //! | `MODEL_PROMPT_CACHE_KEY` | `off` or `conversation`: with `conversation` each request carries a `prompt_cache_key` that is the same for every request of one conversation (a SHA-256 of its id cut to 32 hex digits), so that a gateway with a prompt cache routes them together; anything else is a startup error ([`ModelConfig::prompt_cache_key`]) | `off` |
 //! | `MODEL_INPUT_MODALITIES` | `text` or `text,image`: what the model `MODEL` names can read. With `image`, an image the person sends or a tool returns reaches the model, within the four limits below; without it a request carries a line of text in the image's place. Never guessed from a model name ([`ModelConfig::images`]) | `text` |
 //! | `MODEL_IMAGE_MAX_BYTES` | the most bytes of one image sent to the model (1 to 4194304); needs `image` in `MODEL_INPUT_MODALITIES` | `1048576` |
@@ -1140,8 +1141,8 @@ pub struct ModelConfig {
     /// `MODEL_ECHO_REASONING`: the member name under which the reasoning of earlier turns is sent
     /// back; `None` (the default) sends none.
     pub echo_reasoning: Option<ReasoningField>,
-    /// `MODEL_CONTEXT_WINDOW`: the context window, in tokens, of the model [`alias`](Self::alias)
-    /// names. The client says it for that alias only ([`OpenAiCompatible::with_context_window`]),
+    /// `DEFAULT_MODEL_CONTEXT_WINDOW` (or its deprecated alias `MODEL_CONTEXT_WINDOW`): the
+    /// context window, in tokens, of the model [`alias`](Self::alias) names. The client says it for that alias only ([`OpenAiCompatible::with_context_window`]),
     /// and only when the alias's profile names no `contextWindow`, which wins (ADR 0086): an agent
     /// whose files name another alias has its own profile's window, or none. `None` when unset.
     pub context_window: Option<u64>,
@@ -1265,7 +1266,7 @@ impl ModelConfig {
         };
         let model_aliases_file = parse_file(&get, "MODEL_ALIASES_FILE", problems);
         let profiles = parse_profiles(model_aliases_file.as_deref(), problems);
-        let context_window = parse_context_window(&get("MODEL_CONTEXT_WINDOW"), problems);
+        let context_window = parse_default_context_window(&get, problems);
         // The window the client will answer for `MODEL` (ADR 0086): the profile's, else the variable's.
         let window = adam_model::resolve_context_window(profiles.profile(&alias), context_window);
         if warns_no_output_limit(model_aliases_file.as_deref(), &profiles, &alias) {
@@ -1691,18 +1692,60 @@ fn parse_extra_body(
     Some(map).filter(|map| !map.is_empty())
 }
 
-/// The largest `MODEL_CONTEXT_WINDOW`: the largest count a `usage/v1` report may carry (2^53 - 1,
-/// the largest integer a JSON number keeps exactly), the same bound as a profile's `contextWindow`.
+/// The largest `DEFAULT_MODEL_CONTEXT_WINDOW`: the largest count a `usage/v1` report may carry
+/// (2^53 - 1, the largest integer a JSON number keeps exactly), the same bound as a profile's
+/// `contextWindow`.
 pub use adam_model::MAX_CONTEXT_WINDOW;
 
-/// `MODEL_CONTEXT_WINDOW`: a whole number of tokens from 1 to [`MAX_CONTEXT_WINDOW`], or a problem.
-fn parse_context_window(raw: &Option<String>, problems: &mut Vec<String>) -> Option<u64> {
-    let raw = raw.as_deref()?.trim();
-    match raw.parse::<u64>() {
+/// The variable of the window of the model `MODEL` names when its profile names none (ADR 0086).
+const DEFAULT_CONTEXT_WINDOW_VAR: &str = "DEFAULT_MODEL_CONTEXT_WINDOW";
+
+/// The deprecated alias of [`DEFAULT_CONTEXT_WINDOW_VAR`], kept for one minor release (ADR 0086
+/// decision 2).
+const DEPRECATED_CONTEXT_WINDOW_VAR: &str = "MODEL_CONTEXT_WINDOW";
+
+/// `DEFAULT_MODEL_CONTEXT_WINDOW`, else its deprecated alias `MODEL_CONTEXT_WINDOW` (ADR 0086
+/// decision 2). The alias is read only when the new variable is unset, and warns once (this runs
+/// once, at startup). Both set to different values is a problem naming both: two answers to one
+/// question fail closed. Both set to the same value is that value, with the warning.
+fn parse_default_context_window(
+    get: &impl Fn(&str) -> Option<String>,
+    problems: &mut Vec<String>,
+) -> Option<u64> {
+    let current = get(DEFAULT_CONTEXT_WINDOW_VAR);
+    let Some(deprecated) = get(DEPRECATED_CONTEXT_WINDOW_VAR) else {
+        return current
+            .and_then(|raw| parse_context_window(DEFAULT_CONTEXT_WINDOW_VAR, &raw, problems));
+    };
+    tracing::warn!(
+        "{DEPRECATED_CONTEXT_WINDOW_VAR} is deprecated: rename it {DEFAULT_CONTEXT_WINDOW_VAR} \
+         (ADR 0086)"
+    );
+    let alias = parse_context_window(DEPRECATED_CONTEXT_WINDOW_VAR, &deprecated, problems);
+    let Some(current) = current else {
+        return alias;
+    };
+    let window = parse_context_window(DEFAULT_CONTEXT_WINDOW_VAR, &current, problems);
+    if let (Some(window), Some(alias)) = (window, alias)
+        && window != alias
+    {
+        problems.push(format!(
+            "{DEFAULT_CONTEXT_WINDOW_VAR} and {DEPRECATED_CONTEXT_WINDOW_VAR} (its deprecated \
+             alias) give different windows: set {DEFAULT_CONTEXT_WINDOW_VAR} alone"
+        ));
+        return None;
+    }
+    window
+}
+
+/// The variable `name` (`DEFAULT_MODEL_CONTEXT_WINDOW` or its alias): a whole number of tokens
+/// from 1 to [`MAX_CONTEXT_WINDOW`], or a problem.
+fn parse_context_window(name: &str, raw: &str, problems: &mut Vec<String>) -> Option<u64> {
+    match raw.trim().parse::<u64>() {
         Ok(window) if (1..=MAX_CONTEXT_WINDOW).contains(&window) => Some(window),
         _ => {
             problems.push(format!(
-                "MODEL_CONTEXT_WINDOW must be a whole number of tokens from 1 to {MAX_CONTEXT_WINDOW}, like 131072"
+                "{name} must be a whole number of tokens from 1 to {MAX_CONTEXT_WINDOW}, like 131072"
             ));
             None
         }
@@ -3155,7 +3198,7 @@ mod tests {
             ("1", 1),
             ("9007199254740991", MAX_CONTEXT_WINDOW),
         ] {
-            vars.insert("MODEL_CONTEXT_WINDOW", value);
+            vars.insert("DEFAULT_MODEL_CONTEXT_WINDOW", value);
             let (model, problems) = model_problems(&vars);
             assert!(problems.is_empty(), "{value}: {problems:?}");
             assert_eq!(model.context_window, Some(want), "{value}");
@@ -3167,7 +3210,7 @@ mod tests {
             assert_eq!(client.provider(), Some("openai"));
         }
         // Blank is unset.
-        vars.insert("MODEL_CONTEXT_WINDOW", "  ");
+        vars.insert("DEFAULT_MODEL_CONTEXT_WINDOW", "  ");
         assert!(model_problems(&vars).1.is_empty());
 
         for bad in [
@@ -3179,18 +3222,140 @@ mod tests {
             "9007199254740992",
             "99999999999999999999999",
         ] {
-            vars.insert("MODEL_CONTEXT_WINDOW", bad);
-            let (model, problems) = model_problems(&vars);
-            assert_eq!(problems.len(), 1, "{bad}: {problems:?}");
-            assert!(mentions(&problems, "MODEL_CONTEXT_WINDOW"), "{problems:?}");
-            assert_eq!(model.context_window, None, "{bad}");
+            // The new variable and its deprecated alias are held to the same bound.
+            for name in ["DEFAULT_MODEL_CONTEXT_WINDOW", "MODEL_CONTEXT_WINDOW"] {
+                let mut vars = model_vars();
+                vars.insert(name, bad);
+                let (model, problems) = model_problems(&vars);
+                assert_eq!(problems.len(), 1, "{name}={bad}: {problems:?}");
+                assert!(problems[0].starts_with(name), "{problems:?}");
+                assert_eq!(model.context_window, None, "{name}={bad}");
+            }
         }
     }
 
-    /// ADR 0086 decision 1: a profile's `contextWindow` is its alias's window, over
-    /// `MODEL_CONTEXT_WINDOW`, and an alias `MODEL` does not name (a subagent's) has its own.
+    /// The `warn`-and-above logs of the current thread while `f` runs.
+    fn warnings_of<T>(f: impl FnOnce() -> T) -> (T, String) {
+        #[derive(Clone, Default)]
+        struct Sink(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Sink {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Sink {
+            type Writer = Sink;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+        let sink = Sink::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(sink.clone())
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .finish();
+        let out = tracing::subscriber::with_default(subscriber, f);
+        let logs = String::from_utf8_lossy(&sink.0.lock().unwrap()).into_owned();
+        (out, logs)
+    }
+
+    /// ADR 0086 decision 2: `MODEL_CONTEXT_WINDOW` is the deprecated alias of
+    /// `DEFAULT_MODEL_CONTEXT_WINDOW`: read only when that is unset, with one warning that names
+    /// the new variable; both set agree or are a problem naming both, never their values.
     #[test]
-    fn a_profiles_context_window_wins_over_model_context_window() {
+    fn model_context_window_is_a_deprecated_alias_of_default_model_context_window() {
+        use adam_model::ModelClient as _;
+        const DEPRECATION: &str =
+            "MODEL_CONTEXT_WINDOW is deprecated: rename it DEFAULT_MODEL_CONTEXT_WINDOW";
+        let with = |pairs: &[(&'static str, &'static str)]| {
+            let mut vars = model_vars();
+            vars.extend(pairs.iter().copied());
+            warnings_of(|| model_problems(&vars))
+        };
+
+        // The new variable alone: its value, no warning.
+        let ((model, problems), logs) = with(&[("DEFAULT_MODEL_CONTEXT_WINDOW", "131072")]);
+        assert!(problems.is_empty(), "{problems:?}");
+        assert_eq!(model.context_window, Some(131_072));
+        assert!(!logs.contains("deprecated"), "{logs}");
+
+        // The alias alone still works: its value, for the alias `MODEL` names, and one warning.
+        let ((model, problems), logs) = with(&[("MODEL_CONTEXT_WINDOW", "65536")]);
+        assert!(problems.is_empty(), "{problems:?}");
+        assert_eq!(model.context_window, Some(65_536));
+        assert_eq!(logs.matches(DEPRECATION).count(), 1, "{logs}");
+        let client = model.client().expect("a usable client");
+        assert_eq!(client.context_window("large"), Some(65_536));
+        assert_eq!(client.context_window("small"), None);
+
+        // Both, equal (as numbers): the value, and the warning.
+        let ((model, problems), logs) = with(&[
+            ("DEFAULT_MODEL_CONTEXT_WINDOW", "131072"),
+            ("MODEL_CONTEXT_WINDOW", " 131072 "),
+        ]);
+        assert!(problems.is_empty(), "{problems:?}");
+        assert_eq!(model.context_window, Some(131_072));
+        assert_eq!(logs.matches(DEPRECATION).count(), 1, "{logs}");
+
+        // Both, different: one problem naming both variables and neither value, and no window.
+        let ((model, problems), _) = with(&[
+            ("DEFAULT_MODEL_CONTEXT_WINDOW", "131072"),
+            ("MODEL_CONTEXT_WINDOW", "65536"),
+        ]);
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(
+            mentions(&problems, "DEFAULT_MODEL_CONTEXT_WINDOW"),
+            "{problems:?}"
+        );
+        assert!(
+            problems[0].contains(" MODEL_CONTEXT_WINDOW"),
+            "{problems:?}"
+        );
+        assert!(
+            !problems[0].contains("131072") && !problems[0].contains("65536"),
+            "{problems:?}"
+        );
+        assert_eq!(model.context_window, None);
+
+        // Both, one of them invalid: that one's problem alone, not a conflict.
+        let ((_, problems), _) = with(&[
+            ("DEFAULT_MODEL_CONTEXT_WINDOW", "128k"),
+            ("MODEL_CONTEXT_WINDOW", "65536"),
+        ]);
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(
+            problems[0].starts_with("DEFAULT_MODEL_CONTEXT_WINDOW must be"),
+            "{problems:?}"
+        );
+        let ((_, problems), _) = with(&[
+            ("DEFAULT_MODEL_CONTEXT_WINDOW", "131072"),
+            ("MODEL_CONTEXT_WINDOW", "0"),
+        ]);
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(
+            problems[0].starts_with("MODEL_CONTEXT_WINDOW must be"),
+            "{problems:?}"
+        );
+
+        // A blank alias is unset: no warning.
+        let ((model, problems), logs) = with(&[
+            ("DEFAULT_MODEL_CONTEXT_WINDOW", "8192"),
+            ("MODEL_CONTEXT_WINDOW", "  "),
+        ]);
+        assert!(problems.is_empty(), "{problems:?}");
+        assert_eq!(model.context_window, Some(8192));
+        assert!(!logs.contains("deprecated"), "{logs}");
+    }
+
+    /// ADR 0086 decision 1: a profile's `contextWindow` is its alias's window, over
+    /// `DEFAULT_MODEL_CONTEXT_WINDOW`, and an alias `MODEL` does not name (a subagent's) has its own.
+    #[test]
+    fn a_profiles_context_window_wins_over_default_model_context_window() {
         use adam_model::ModelClient as _;
         let dir = std::env::temp_dir().join(format!("adam-service-windows-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -3200,7 +3365,7 @@ mod tests {
             std::fs::write(&file, profiles).unwrap();
             let mut vars = model_vars();
             vars.insert("MODEL_ALIASES_FILE", shown);
-            vars.insert("MODEL_CONTEXT_WINDOW", "131072");
+            vars.insert("DEFAULT_MODEL_CONTEXT_WINDOW", "131072");
             let (model, problems) = model_problems(&vars);
             assert!(problems.is_empty(), "{problems:?}");
             model.client().expect("a usable client")
@@ -3221,7 +3386,7 @@ mod tests {
         );
         assert_eq!(client.context_window("other"), None, "nobody said");
 
-        // A profile without a window leaves `MODEL_CONTEXT_WINDOW` for its alias.
+        // A profile without a window leaves `DEFAULT_MODEL_CONTEXT_WINDOW` for its alias.
         let client = client_with(r#"{"profiles": {"large": {}}}"#);
         assert_eq!(client.context_window("large"), Some(131_072));
 

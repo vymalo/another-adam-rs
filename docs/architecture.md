@@ -500,7 +500,7 @@ per model: the folder's `limits.max_output_tokens`, its preset's, the profile's,
 128,000, then the smallest of that, the model's `maxOutputTokensLimit` and what the window leaves after 20,000 tokens
 and the agent's history (`crates/adam-assembly/src/assembly.rs`, `output_cap`; the margin and the compaction budget
 are `crates/adam-llm-agent/src/compaction.rs`). The window is the profile's `contextWindow`, else
-`MODEL_CONTEXT_WINDOW` for the alias `MODEL` names, alias by alias, so a subagent on another model has its own
+`DEFAULT_MODEL_CONTEXT_WINDOW` (its deprecated alias `MODEL_CONTEXT_WINDOW`) for the alias `MODEL` names, alias by alias, so a subagent on another model has its own
 (`adam_model::resolve_context_window`, [ADR 0086](decisions/0086-the-context-window-follows-the-model-and-the-history-budget-is-200k.md);
 the evidence is on [the page for agents](../.agents/docs/architecture.md#the-models-window-adr-0086-slice-w1)). A profile's `endpoint` is the deployment's own **endpoint label**
 for the model — a label only, never a provider, a host, a URL or a key — which a served `model-pick/v1` choice

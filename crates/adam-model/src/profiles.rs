@@ -207,12 +207,12 @@ pub const MAX_ENDPOINT_LABEL_LEN: usize = 128;
 
 /// The largest context window a model may be said to have, in tokens: 2^53 − 1, the largest whole
 /// number a JSON reader is sure to hold exactly. A profile's `contextWindow` above it refuses the
-/// document, and `MODEL_CONTEXT_WINDOW` above it refuses to start.
+/// document, and `DEFAULT_MODEL_CONTEXT_WINDOW` above it refuses to start.
 pub const MAX_CONTEXT_WINDOW: u64 = 9_007_199_254_740_991;
 
 /// The context window of a model, in tokens ([ADR 0086](https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0086-the-context-window-follows-the-model-and-the-history-budget-is-200k.md)
 /// decision 1): its profile's `contextWindow`, else `configured` (the window the deployment set for
-/// that alias outside the profiles, `MODEL_CONTEXT_WINDOW`), else `None`.
+/// that alias outside the profiles, `DEFAULT_MODEL_CONTEXT_WINDOW`), else `None`.
 ///
 /// This is the one rule every [`ModelClient::context_window`](crate::ModelClient::context_window)
 /// answers by, so the compaction budget, the clamp of the output cap and each `usage/v1` report
@@ -287,7 +287,7 @@ pub struct ModelProfile {
     pub max_output_tokens_limit: Option<u32>,
     /// The model's context window, in tokens, 1 to [`MAX_CONTEXT_WINDOW`] (ADR 0086): the window
     /// the history budget, the output cap and each `usage/v1` report use for this model, over
-    /// `MODEL_CONTEXT_WINDOW` ([`resolve_context_window`]). A fact of the model, so no preset sets it.
+    /// `DEFAULT_MODEL_CONTEXT_WINDOW` ([`resolve_context_window`]). A fact of the model, so no preset sets it.
     pub context_window: Option<u64>,
     /// Members merged into this model's requests only; never one the runtime owns
     /// ([`RESERVED_EXTRA_BODY_KEYS`]).
@@ -1224,7 +1224,7 @@ mod tests {
         );
     }
 
-    /// ADR 0086 decision 1: a window is 1 to 2^53 − 1 tokens, as `MODEL_CONTEXT_WINDOW` is; `0` and
+    /// ADR 0086 decision 1: a window is 1 to 2^53 − 1 tokens, as `DEFAULT_MODEL_CONTEXT_WINDOW` is; `0` and
     /// anything larger refuse the document, naming the profile and the key. Absent is no window.
     #[test]
     fn a_context_window_is_one_to_two_to_the_53_minus_one_tokens() {

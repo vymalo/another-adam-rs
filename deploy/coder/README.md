@@ -235,7 +235,15 @@ from the logs would be a Rust change; none is made here. Keep the credential, `M
 
 Each model call's `usage/v1` report can say the model's window, so a screen shows how full the context is
 ([ADR 0032](../../docs/decisions/0032-usage-per-model-call.md)). Rendered only for the roles that run workers; `null` by default
-(nothing is rendered, and the default render is byte for byte `tests/golden/combined.yaml`):
+(nothing is rendered, and the default render is byte for byte `tests/golden/combined.yaml`).
+
+**The variable was renamed** (ADR 0086): `config.modelContextWindow` renders `DEFAULT_MODEL_CONTEXT_WINDOW`, where it rendered
+`MODEL_CONTEXT_WINDOW`. The binary still reads the old name as a deprecated alias for one minor release, with a warning at
+startup, and exits 78 when both are set to different values, so a `config.extraEnv.MODEL_CONTEXT_WINDOW` keeps working
+until it is renamed. **The render is a contract**: another-agentic-platform renders its parity goldens from this chart, and a
+value that sets `config.modelContextWindow` now renders the new name (no golden of this chart sets it, so none changed).
+**Image dependency**: an image built before the rename reads only `MODEL_CONTEXT_WINDOW`, so this chart with an older
+`image.tag` gives the binary no window; keep the chart and the image together, as `image.tag` does by default:
 
 | Value | Variable | What |
 |---|---|---|
@@ -249,11 +257,11 @@ Each model call's `usage/v1` report can say the model's window, so a screen show
 | `config.maxGitProcesses` | `MAX_GIT_PROCESSES` | The most git processes of a worker at once: a whole number from 1 to 64. `null` (default) renders nothing and the binary runs 2. Refused outside 1 to 64 and beside `config.extraEnv.MAX_GIT_PROCESSES`; a control plane renders none |
 | `config.commandMemoryMax` | `COMMAND_MEMORY_MAX` | The memory one command may use: bytes, or a size such as `2GB` or `512MiB`, at least 64 MiB. `null` (default) renders nothing and the binary takes a quarter of the RAM, at most 8 GB. The chart passes the text as it is: a bad one is the binary's exit 78. Refused beside `config.extraEnv.COMMAND_MEMORY_MAX` |
 | `config.commandCpuMax` | `COMMAND_CPU_MAX` | The CPU one command may use: cores (`2`, `1.5`) or millicores (`500m`), at least `100m`. `null` (default) renders nothing and the binary takes half the cores. The chart passes the text as it is. Refused beside `config.extraEnv.COMMAND_CPU_MAX` |
-| `config.modelContextWindow` | `MODEL_CONTEXT_WINDOW` | The window of `config.model`, in tokens: a whole number from 1 to 9007199254740991, as a number or a string of digits (written in full, never `1e+06`). The chart refuses anything else, which the binary would refuse at startup (exit 78), and a value given beside `config.extraEnv.MODEL_CONTEXT_WINDOW`. A subagent on another alias and OpenCode report no window |
+| `config.modelContextWindow` | `DEFAULT_MODEL_CONTEXT_WINDOW` | The window of `config.model` when its profile (`config.modelProfiles`) names no `contextWindow`, which wins ([ADR 0086](../../docs/decisions/0086-the-context-window-follows-the-model-and-the-history-budget-is-200k.md)), in tokens: a whole number from 1 to 9007199254740991, as a number or a string of digits (written in full, never `1e+06`). The chart refuses anything else, which the binary would refuse at startup (exit 78), and a value given beside `config.extraEnv.DEFAULT_MODEL_CONTEXT_WINDOW` or `config.extraEnv.MODEL_CONTEXT_WINDOW`. A subagent on another alias takes its own profile's window, or none; OpenCode reports none |
 
 **The output cap follows the window.** The coder's `agent/instructions.md` sets no output cap, so each call asks its
 model profile's cap, else 128,000, clamped to the window less 20,000 tokens and the history the agent keeps (ADR 0064).
-On the dev stack (`MODEL_CONTEXT_WINDOW=131072`, the coder's `max_history_tokens: 100000`) that is
+On the dev stack (`DEFAULT_MODEL_CONTEXT_WINDOW=131072`, the coder's `max_history_tokens: 100000`) that is
 `131072 − 20000 − 100000 = 11072`, not 128,000. A deployment that wants the full 128,000 for a long-context model
 declares a window of at least **248,000** (128,000 + 20,000 + 100,000); below that the cap is `window − 120,000`
 (a 200,000 window leaves 80,000). It also gives the model a profile with `maxOutputTokensLimit` when the provider

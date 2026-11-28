@@ -98,7 +98,7 @@ impl MockModel {
     }
 
     /// Say `window` as the [`ModelClient::context_window`] of the alias `model`, as
-    /// `MODEL_CONTEXT_WINDOW` does for the real client: a profile's `contextWindow`
+    /// `DEFAULT_MODEL_CONTEXT_WINDOW` does for the real client: a profile's `contextWindow`
     /// ([`with_profiles`](Self::with_profiles)) wins over it.
     #[must_use]
     pub fn with_context_window(mut self, model: impl Into<String>, window: u64) -> Self {

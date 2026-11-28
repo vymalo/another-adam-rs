@@ -418,7 +418,7 @@ impl OpenAiCompatible {
     }
 
     /// Say that the model the alias `model` names has a context window of `window` tokens, as the
-    /// deployment knows it (`MODEL_CONTEXT_WINDOW`): what [`ModelClient::context_window`] answers
+    /// deployment knows it (`DEFAULT_MODEL_CONTEXT_WINDOW`): what [`ModelClient::context_window`] answers
     /// for that alias when its profile ([`with_profiles`](Self::with_profiles)) names no
     /// `contextWindow`, and nothing for any other (ADR 0086). The client sends nothing of it; the
     /// history budget and the output cap are taken from it, and a report of a call says it, so a
@@ -1096,8 +1096,8 @@ mod tests {
     }
 
     /// ADR 0086 decision 1: the profile's window for an alias wins, then the window the deployment
-    /// gave that alias (`MODEL_CONTEXT_WINDOW`), then none; another alias with a profile has its
-    /// own window, which `MODEL_CONTEXT_WINDOW` never gave.
+    /// gave that alias (`DEFAULT_MODEL_CONTEXT_WINDOW`), then none; another alias with a profile has its
+    /// own window, which `DEFAULT_MODEL_CONTEXT_WINDOW` never gave.
     #[test]
     fn a_profiles_window_wins_over_the_configured_one_alias_by_alias() {
         let profiles = ModelProfiles::parse_json(

@@ -78,7 +78,7 @@ nothing on a machine without the databases. Use a fresh database for absolute si
 | File | What it adds |
 |---|---|
 | `dev/compose.github-app.yaml` | the coder as a **GitHub App**: an init service makes a throwaway RSA key into a volume (none is committed), `GITHUB_TOKEN` is off, the coder gets `GITHUB_APP_ID`, `GITHUB_APP_OWNERS` (`local,scratch,other-org`, no pin) and `GITHUB_APP_PRIVATE_KEY_PATH`, and `ALLOW_COMMANDS_NEXT_TO_SECRETS=true`, because the stack runs the commands in the coder's own container beside a key file, which the coder refuses (exit 78) otherwise. It finds each owner's installation at `mock-github` (every owner on installation 67890, `other-org` on 67891), trades its JWT and uses the installation token for `git`, REST and MCP calls. WireMock cannot check an RS256 signature; that is `cargo test -p adam-workspace --test github_app`. |
-| `dev/compose.real-model.yaml` | the `agent` and the `coder` on a **real model**: `MODEL_BASE_URL` and `MODEL` come from your shell (required, the stack refuses to start without them), with either `MODEL_API_KEY` or `MODEL_AUTH=device` and `MODEL_OAUTH_ISSUER`, `MODEL_OAUTH_CLIENT_ID` (each service then signs in on its own: its code is in its log); `MODEL_CONTEXT_WINDOW` defaults to `131072`. Nothing else changes: the coder still uses `mock-github`, `mock-github-mcp` and `git-server`, the painter `mock-image-mcp`. The key is never in a file; `docker compose config` prints it, so do not paste that output. [Try the agents](../guides/try-the-agents.md#6-on-a-real-model) |
+| `dev/compose.real-model.yaml` | the `agent` and the `coder` on a **real model**: `MODEL_BASE_URL` and `MODEL` come from your shell (required, the stack refuses to start without them), with either `MODEL_API_KEY` or `MODEL_AUTH=device` and `MODEL_OAUTH_ISSUER`, `MODEL_OAUTH_CLIENT_ID` (each service then signs in on its own: its code is in its log); `DEFAULT_MODEL_CONTEXT_WINDOW` defaults to `131072`. Nothing else changes: the coder still uses `mock-github`, `mock-github-mcp` and `git-server`, the painter `mock-image-mcp`. The key is never in a file; `docker compose config` prints it, so do not paste that output. [Try the agents](../guides/try-the-agents.md#6-on-a-real-model) |
 
 There is no override that gives a run an environment of its own: here the coder's commands run in its
 own container. A repository's own environment is a run pod of the image its `devcontainer.json` names,
@@ -185,7 +185,7 @@ screen has something to show growing), a tool call in a few argument deltas, the
 scripted answer says its usage the way OpenAI does, in both forms: `prompt_tokens`, `completion_tokens`, and the details
 `prompt_tokens_details.cached_tokens` (64 of 100 prompt tokens) and `completion_tokens_details.reasoning_tokens` (5 of 20),
 which the agents report over `usage/v1` ([ADR 0032](../decisions/0032-usage-per-model-call.md)); the coder's
-`MODEL_CONTEXT_WINDOW` is `131072` in `compose.yaml`. The off-script
+`DEFAULT_MODEL_CONTEXT_WINDOW` is `131072` in `compose.yaml`. The off-script
 404 and the error scenarios are plain HTTP errors, which a stream request gets as well. `cargo test -p adam-model-openai --test
 wiremock_compose` (CI's `compose` job, `ADAM_TEST_MOCK_OPENAI_URL`) plays every script from the first request to the final
 answer **both ways** and requires the same response (text, tool calls, finish reason, usage), so a twin cannot drift from
