@@ -399,6 +399,10 @@ jobs:
       # the same three again with the coder as a GitHub App installation.
       # The job's own Postgres service holds 5432, so the stack's Postgres
       # moves to POSTGRES_PORT.
+      # Last, dev/resume-e2e.sh proves A3 (docs/architecture/05-runtime.md §21a row A3): a fresh
+      # coder must reach `/healthz` 200 and claim a waiting run under the script's ceilings. It
+      # asserts A2's invariant first (the run is `runnable` and the lease is NULL after the
+      # SIGTERM), so a violation of A2 is not misread as a violation of A3.
       # A pull request runs the default and the first App scenarios; the full set when it carries the e2e-full label
       # or changes the compose stack (dev/, docker/coder/ or compose.yaml). main and workflow_dispatch run everything.
       - name: Does this pull request need the full compose e2e?
@@ -487,6 +491,13 @@ jobs:
             SCENARIO=create-repo ANSWER=yes sh dev/coder-e2e.sh
             SCENARIO=create-repo ANSWER=no sh dev/coder-e2e.sh
           fi
+          # Resume budget (spec row A3 of docs/architecture/05-runtime.md): a fresh coder must reach
+          # `/healthz` 200 and claim a waiting run under the script's ceilings. The script recreates
+          # the coder (down + remove the coder-work volume + up), so it is last in this step: the
+          # teardown that follows does not depend on the coder's state, and a pull request that
+          # touches `dev/` runs it as part of the always-on check.
+          unset GITHUB_AUTH
+          sh dev/resume-e2e.sh
       - name: Compose e2e logs
         if: failure() && steps.guard.outputs.ready == 'true'
         run: docker compose -f compose.yaml -f dev/compose.github-app.yaml --profile app logs --no-color
