@@ -532,6 +532,14 @@ impl Stored {
         }
     }
 
+    /// The agent state, to change a member of it (a session's tombstone, which a cancel writes).
+    pub(crate) fn agent_mut(&mut self) -> &mut Value {
+        match self {
+            Self::Full(envelope) => &mut envelope.agent,
+            Self::Head(head) => &mut head.agent,
+        }
+    }
+
     /// The inbox, in the variant's own document.
     pub(crate) fn inbox_mut(&mut self) -> &mut Vec<Inbound> {
         match self {
