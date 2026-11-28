@@ -554,7 +554,7 @@ parks the run and returns.
   neither option. **A group's loader goes with the tools of its server** (ANR-1304): a lazy MCP server's group is loaded by
   an own tool named `load__group__<server>` (ADR 0066), which `github__*` does not match, so a session that names any tool of
   that server keeps its loader — and one that names none of them keeps none, because a loader that can load nothing is not
-  handed out. The decision is read from the config and the agent's fixed tool set, never from a turn's state, so the tools
+  handed out. The decision is read from the header's config, the context's copy of the same lists and the agent's fixed tool set — all fixed for the round — so the tools
   array does not move between turns (ADR 0044); `deny_tools` still wins over it, and once loaded the group's members go
   through the same lists, so nothing widens.
 * **`report_schema`** (ADR 0054 slice 9, local subagents only). The round's final answer must be one JSON value that matches

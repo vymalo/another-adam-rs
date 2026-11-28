@@ -118,8 +118,9 @@ amendment is the owner's to make there.
    (`<server>__<tool>`), and keeps none when they name none of them, because a loader that can load nothing is not handed
    out. `deny_tools` is still checked first, and once the group is loaded its members go through the same lists, so nothing
    widens: the loader is a means to the tools the list names, not an extra tool the session may use. The decision reads the
-   session's config and the agent's fixed tool set (`LlmAgent::own_names`), never a turn's state, so the tools array does not
-   move between turns (ADR 0044).
+   header's config, the context's copy of the same lists and the agent's fixed tool set (`LlmAgent::own_names`) — all fixed
+   for the round — so the tools array does not move between the turns of one round (ADR 0044). It is exact for a `when` MCP
+   server's group, whose members are `<server>__<tool>`; a group whose members do not share its name prefix is not covered.
 
    *Amended 2026-11-21 (ADR 0063)*: for `reasoning_effort` only, the declaration is the **model entry** in
    `MODEL_ALIASES_FILE` (the alias's `reasoning` object: its levels and its wire), not a global variable. A folder or

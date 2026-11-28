@@ -77,9 +77,9 @@ fn names(value: Option<&Value>) -> Option<Result<Vec<String>, ()>> {
 /// and a deny-list is applied after this, so a denied loader stays withheld (ANR-1304).
 ///
 /// `own` are the names of the agent's own tools: a group's members are its own tools, and its
-/// loader is one too ([`GROUP_LOADER_PREFIX`]). Read from the session's config and the agent's
-/// fixed tool set only, never from a turn's state, so the offered array does not move between
-/// turns (ADR 0044).
+/// loader is one too ([`GROUP_LOADER_PREFIX`]). Read from the header's config, the context's copy
+/// of the same lists and the agent's fixed tool set — all fixed for the round, so the offered
+/// array does not move between the turns of one round (ADR 0044).
 fn kept_loaders(allows: &[Vec<String>], own: &[&str]) -> Vec<String> {
     if allows.is_empty() {
         // No allow-list: nothing to keep, and no loader is held back either.
@@ -96,7 +96,11 @@ fn kept_loaders(allows: &[Vec<String>], own: &[&str]) -> Vec<String> {
         let selected = allows.iter().all(|allow| {
             allow.iter().any(|entry| glob(entry, loader))
                 || own.iter().copied().any(|tool| {
-                    tool.starts_with(&members) && allow.iter().any(|entry| glob(entry, tool))
+                    // A loader is never a member of another group: a group named `load` would
+                    // otherwise make every `load__group__*` look like one of its tools.
+                    !tool.starts_with(GROUP_LOADER_PREFIX)
+                        && tool.starts_with(&members)
+                        && allow.iter().any(|entry| glob(entry, tool))
                 })
         });
         if selected {
