@@ -21,7 +21,7 @@ path = "src/main.rs"
 adam-error.workspace = true
 # The OTel layer (ADR 0075, ANR-1412). No TLS provider: this binary is a small proxy and the
 # collector of a cluster is plain `http`; add the `aws-lc` feature here to export over `https`.
-adam-otel = { workspace = true, default-features = false }
+adam-otel = { workspace = true, features = ["sdk"] }
 async-trait.workspace = true
 httparse.workspace = true
 mimalloc.workspace = true
