@@ -116,12 +116,15 @@ async fn problem(response: reqwest::Response, status: u16) -> String {
     );
     let body = response.text().await.unwrap();
     let value: Value = serde_json::from_str(&body).unwrap();
-    let members: Vec<&str> = value
+    // The members, as a set: JSON object order is not part of the contract, and it depends on
+    // whether a crate in the tree turns on `serde_json`'s `preserve_order`.
+    let mut members: Vec<&str> = value
         .as_object()
         .unwrap()
         .keys()
         .map(String::as_str)
         .collect();
+    members.sort_unstable();
     assert_eq!(members, ["detail", "status", "title", "type"], "{body}");
     assert_eq!(value["status"], json!(status), "{body}");
     body
