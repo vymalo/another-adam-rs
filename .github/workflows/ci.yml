@@ -64,6 +64,10 @@ jobs:
       # back — #495 re-added actions/checkout@v4 after ANR-62 had moved every pin (ANR-1410).
       - name: Every workflow action pin is at or above its recorded major
         run: sh tools/check-workflow-pins.sh
+      # ANR-1456: a log record's body is its format string, which the collector's allowlist cannot
+      # drop; a value belongs in a field. Eight sites had it the other way round.
+      - name: Every tracing message is static
+        run: sh tools/check-log-messages.sh
       # ADR 0084: every version a release moves is marked for release-please, and the Cargo lines agree.
       - name: The release's version lines are marked and agree
         run: sh tools/release/check-versions.sh
