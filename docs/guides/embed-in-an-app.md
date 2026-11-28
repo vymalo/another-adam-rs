@@ -25,6 +25,7 @@ The calls, their refusals and their defaults: the [crate README](../../crates/ad
 | the root's reasoning level | `ReasoningEffort` (`EngineBuilder::reasoning_effort`) | none: nothing is sent unless the folder, the preset or the profile sets a level; the folder's own `reasoning_effort` wins over the builder's, and the builder's wins over the agent's `model_preset` and the profile; a level the root model's profile does not take is refused at `start` (`Agent`, `Invalid`) when it applies — when the root's file sets none (a file's own level is validated instead) |
 | its own tools | `ToolSet` (`EngineBuilder::tools`): an `FnTool`, or `#[tool]` functions with `adam = { default-features = false, features = ["macros"] }` | none: the catalog is the screen's tools (`ask_user`, `show`, `ui_catalog`, the plan tools); the files' `tools:` selects from it; a file a tool returns is read with `Engine::files` and `Engine::file` |
 | hooks around the agent loop | `HookSet` or one `Plugin` at a time (`EngineBuilder::hooks`, `plugin`), and what a step shows of a call (`EngineBuilder::step_io`) | none: no hook runs. The host's hooks run in every agent, before any its files name; a hook that asks parks the run for the person's approval ([Approvals](#approvals)) |
+| a local agent over the person's directory | `EngineBuilder::local_agent(dir)` ([ADR 0047] slice 7 part 2) | none: the agent has the screen's tools only. With one, the file and command tools (`read_file`, `read_files`, `write_file`, `edit_file`, `apply_patch`, `run_command`, `run`) run over the directory, with a hook that asks before every write or command. The directory is **never owned, cleaned or restored**: a write stays, a command's changes stay, and the run's listing tells the model what changed. See [A local agent over the person's directory](#a-local-agent-over-the-persons-directory) |
 | secrets the agent's files name | `SecretSource` (`EngineBuilder::secrets`) | none: `default_secrets()` refuses every name |
 | a tokio runtime | the current one at `start` | the worker runs on it |
 | the process's pools | `DynAdmission` (`EngineBuilder::admission`) | none: nothing is admitted, so every model call and tool call runs. With one ([`adam-admission-local`](../../crates/adam-admission-local/README.md), or your own), every model call takes a seat of `Pool::ModelCalls` and every tool call one of `Pool::ToolCalls` ([ADR 0065](../decisions/0065-resource-governance-admission-pools-and-os-limits.md)): a model call waits five seconds and then parks the run at the refusal's `retry_after`, a tool call waits a minute and then runs anyway with a warning |
@@ -65,11 +66,15 @@ let engine = Engine::builder(store, AgentDef::from_manifest(AGENT)?, model, alia
 ```sh
 MODEL_BASE_URL=https://gateway.example.com/v1 MODEL_API_KEY=... MODEL=my-model \
   cargo run -p adam-engine --example chat
+# With the local agent over a directory (ADR 0047 slice 7 part 2):
+... cargo run -p adam-engine --example chat -- --dir /path/to/dir
 ```
 
 A plain line is `send` to the conversation; `/steer <text>`, `/answer <text>`, `/approve`, `/deny [reason]`, `/cancel`,
 `/list` and `/quit` are the other calls. The example's host gives a tool of its own, `save_note`, and a hook that asks
-before every call of it, so "remember to buy milk" prints an approval to answer. A send while the run waits is its answer, and one while it works steers it (`Turn::delivered` says which).
+before every call of it, so "remember to buy milk" prints an approval to answer. With `--dir <path>`, the chat is also
+a local agent over `<path>`: writes (`write_file`, `edit_file`, `apply_patch`) and commands (`run_command`, `run`) print
+an approval to answer; reads pass without asking. A send while the run waits is its answer, and one while it works steers it (`Turn::delivered` says which).
 When the input ends (`printf 'hi\n' | ...`), the example follows the run to its end or its question, then shuts down.
 
 ::: in-depth How events work, in full
@@ -173,10 +178,42 @@ The ask is recorded in the call's step, so neither a restart of the application 
 approved call never runs twice. A run nobody can answer, a schedule's firing or a child run, reads the ask as a refusal.
 Approvals do not reach A2A clients yet: that is a new extension, not built.
 
+## A local agent over the person's directory
+
+[ADR 0047](../decisions/0047-adam-rs-can-be-embedded-in-an-application.md) slice 7 part 2: the engine can give the
+agent the file and command tools over a person's own directory, with a hook that asks before every write or command
+and the host answers with the same `approve` as for any other hook.
+
+```rust
+let engine = Engine::builder(store, agent, model, alias)
+    .local_agent("/path/to/persons/dir")   // opens the directory once at start
+    .start()
+    .await?;
+```
+
+[`EngineBuilder::local_agent`](../../crates/adam-engine/README.md#the-api) opens the directory at `start` and refuses
+an unreadable one with `EngineError::Invalid`. The directory is **never owned, cleaned or restored**: a write stays,
+a command's changes stay, and the run's listing tells the model what a command changed (the listing is the same one
+`PersonDir` keeps for every command; nothing is undone). Reads pass without asking; writes (`write_file`,
+`edit_file`, `apply_patch`) and commands (`run_command`, `run`) park the run in `RunState::AwaitingApproval`. The
+hook's question names the tool, the path (or the patch's paths) or the shell line.
+
+The seven tools are the same `adam-code-tools` bodies the coder uses (`read_file`, `read_files`, `write_file`,
+`edit_file`, `apply_patch`, `run_command`, `run`), with the coder's `repo` (slot/repo) argument dropped: a
+`PersonDir` is one place, so the model never picks one. Their schemas and doc comments are the coder's (the tool
+contract the model sees), so the model sees the same tool description here as on a coder run.
+
+A host that wants its own composition registers the pieces by hand:
+[`adam_engine::local_agent::tool_set`](../../crates/adam-engine/src/local_agent.rs) is the `ToolSet`, and
+[`adam_engine::local_agent::plugin`](../../crates/adam-engine/src/local_agent.rs) is the asking hook. Add them to
+the builder the same way you would any host tool or hook.
+
+The example (`crates/adam-engine/examples/chat`) takes the directory as `--dir <path>`. With it, `remember to buy
+milk` writes `notes.txt` (after the host's `/approve`), and `ls` runs (after the host's `/approve`); without it,
+the example is the chat-only one.
+
 ## Not there yet
 
-* **The person's directory** (slice 7): the file and command tools are a library now (slice 6), but the engine does not
-  give them to its agent yet, which has the screen's tools only (`ask_user`, `show`, `ui_catalog`, `plan_*`).
 * **Reading a file an agent made**: `RunInfo` carries no artifacts yet, and an event withholds a file's bytes.
 * MCP servers and remote (`a2a:`) subagents: `start` refuses an agent that names them.
 

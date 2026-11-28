@@ -1,9 +1,10 @@
 # Embed adam in an application: the evidence
 
 For people: [Embed adam in an application](../../../docs/guides/embed-in-an-app.md). That page decides; this one gives
-the code each claim stands on, the invariants to check and the proofs. It covers the approvals of ADR 0047 slice 5 so
-far; the rest of the engine's evidence is in `crates/adam-engine/README.md` (*Tests*). Checked on 2026-11-27 on the
-branch that built slice 5, over ADR 0050 slice H8.
+the code each claim stands on, the invariants to check and the proofs. It covers the approvals of ADR 0047 slice 5
+and the local agent of slice 7 part 2; the rest of the engine's evidence is in `crates/adam-engine/README.md` (*Tests*).
+Checked on 2026-11-27 on the branch that built slice 5, over ADR 0050 slice H8, and on 2026-11-28 on the branch that
+built the local agent.
 
 ## Approvals: where the code is
 
@@ -54,3 +55,25 @@ class), and `crates/adam-engine/tests/example.rs` `the_example_asks_before_savin
   the transition that read it, which may be after the model's next words; the example's test allows both places.
 * **A race between two answers.** `approve` reads the approval, then submits: an answer delivered by another call in
   between is read first, and the second is the run's next message, as for `answer`.
+
+## Local agent: where the code is (slice 7 part 2)
+
+| Claim | Code |
+|---|---|
+| the builder option `EngineBuilder::local_agent(dir)` adds file and command tools on top of the screen's tools | `EngineBuilder::local_agent` (`crates/adam-engine/src/engine.rs:286`); the path is opened at `start` (`:423`) and shared with the tools as `State<PersonDir>` (`:450`); the `ToolSet` of the local agent's seven tools (`crates/adam-engine/src/local_agent.rs:319`) is appended to the host's (`:602`) |
+| reads pass without asking; writes and commands ask | `AsksBeforeWritingOrCommand::before_tool` (`crates/adam-engine/src/local_agent.rs:48`); reads (`read_file`, `read_files`) fall through to `Verdict::Continue`, the five mutating tools return `Verdict::Ask` with the path or command as the question |
+| the directory is never owned, cleaned or restored | `PersonDir`'s `CodeWorkspace::after_write` returns empty (`crates/adam-code-tools/src/person.rs:186`) and its guard settles `FilesChanged` or `Unchanged`, never `Undone` (`crates/adam-code-tools/src/person.rs:269`) |
+| the same `Engine::approve` answers the ask | the hook is appended to the host's `HookSet` (`crates/adam-engine/src/engine.rs:603`); the run parks as `RunState::AwaitingApproval` and is answered as any other hook (the approvals of slice 5) |
+
+## Local agent: the proofs
+
+`crates/adam-engine/tests/local_agent.rs`:
+
+| Test | Holds | Red against |
+|---|---|---|
+| `a_yes_writes_the_file_and_nothing_restores_it` (`:81`) | a yes on a scripted `write_file` writes the file, the file is on disk with the content, and after `shutdown` (engine dropped) the file is still there | a `restore` that puts the file back; a snapshot undo |
+| `a_refusal_does_not_write_the_file` (`:135`) | a no on the same scripted `write_file` does not create the file | the hook returning `Continue` (the red proof, see `without_the_asking_hook_a_write_runs_without_approval`) |
+| `a_read_does_not_ask` (`:180`) | a scripted `read_file` runs to `Done` with no `RunInfo::approval`; no `ApprovalAsked` is asked | the hook returning `Ask` for reads |
+| `a_yes_runs_the_command_and_a_refusal_does_not` (`:206`) | a `run_command` parks on an ask; a yes runs the command and the file appears; a refusal leaves it absent | a `restore` that puts the file back; the hook returning `Continue` |
+| `an_approval_for_a_run_that_awaits_none_is_refused` (`:281`) | `approve` of a finished run is `Rejected` (`ErrorClass::Rejected`) | no check that the run awaits |
+| `without_the_asking_hook_a_write_runs_without_approval` (`:334`) | with `AlwaysContinue` as the only hook (the local agent's asking hook is not installed), the same `write_file` runs without ever parking: the run goes straight to `Done`, the file exists | `Verdict::Continue` refused |
