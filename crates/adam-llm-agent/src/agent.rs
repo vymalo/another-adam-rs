@@ -9810,20 +9810,23 @@ mod session_instructions_tests {
             .prompt_tail("Child sessions guide.")
             .build();
         let root = agent.system_for(None).expect("a prompt");
-        assert_eq!(
-            root,
-            "You are the coder.\n\ncatalog: alpha, beta\n\nChild sessions guide."
-        );
+        assert!(root.starts_with("You are the coder."), "{root}");
+        assert!(root.contains("catalog: alpha, beta"), "{root}");
+        assert!(root.ends_with("Child sessions guide."), "{root}");
         let config = adam_runtime::SessionConfig::from_value(serde_json::json!({
             "skills": ["alpha"],
             "instructions": "Answer in one paragraph."
         }))
         .expect("a config");
         let out = agent.system_for(Some(&config)).expect("a prompt");
-        assert!(
-            out.starts_with("You are the coder.\n\ncatalog: alpha\n\nChild sessions guide."),
-            "{out}"
-        );
+        // ADR 0044's prefix: everything the root's prompt holds before the catalog is the
+        // session's too, unchanged, and only the catalog differs after it.
+        let before_catalog = root
+            .split("catalog:")
+            .next()
+            .expect("the root has a catalog");
+        assert!(out.starts_with(before_catalog), "{out}");
+        assert!(out.contains("catalog: alpha\n"), "{out}");
         assert!(!out.contains("beta"), "{out}");
         assert!(out.ends_with("Answer in one paragraph."), "{out}");
         assert!(
