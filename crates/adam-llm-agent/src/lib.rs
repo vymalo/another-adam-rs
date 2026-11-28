@@ -176,10 +176,10 @@ pub use access::{ToolAccess, Use, UseMode, path_scope};
 ///
 /// [ADR 0050]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0050-hooks-around-the-agent-loop-compiled-first-and-programs-second.md
 pub use adam_plugin::{
-    COMPACTION_BEFORE, EventHeader, EventKind, EventQueue, FlushReport, HookError, HookEvent,
-    HookLimits, HookResult, HookSet, HookedCall, HookedCompaction, HookedEnd, HookedMessage,
-    HookedModelRequest, HookedText, MESSAGE_RECEIVED, MODEL_REQUEST, MessageFile, ModelCallKind,
-    ObserveLimits, Plugin, Verdict,
+    COMPACTION_BEFORE, Decision, EventHeader, EventKind, EventQueue, FlushReport, HookAction,
+    HookError, HookEvent, HookLimits, HookResult, HookSet, HookedCall, HookedCompaction, HookedEnd,
+    HookedMessage, HookedModelRequest, HookedText, MESSAGE_RECEIVED, MODEL_REQUEST, MessageFile,
+    ModelCallKind, ObserveLimits, Plugin,
 };
 /// Custom events (ADR 0050, slice H5): what a tool or an agent declares ([`EventSpec`]), who may see
 /// it ([`Visibility`]), how an observer subscribes ([`Subscriptions`]), and why a declaration is

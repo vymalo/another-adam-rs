@@ -16,8 +16,8 @@ use std::time::Duration;
 
 use adam_error::ErrorClass;
 use adam_plugin::{
-    HookError, HookEvent, HookResult, HookedCall, HookedMessage, HookedText, Plugin, Subscriptions,
-    Verdict,
+    Decision, HookError, HookEvent, HookResult, HookedCall, HookedMessage, HookedText, Plugin,
+    Subscriptions,
 };
 
 /// A plugin that lets every call through, counting how often it was asked.
@@ -38,22 +38,22 @@ impl Plugin for Allows {
 
     fn message_received(&self, _message: &mut HookedMessage<'_>) -> HookResult {
         self.messages.fetch_add(1, Ordering::SeqCst);
-        Ok(Verdict::Continue)
+        Ok(Decision::Continue)
     }
 
     fn before_tool(&self, _call: &mut HookedCall<'_>) -> HookResult {
         self.before.fetch_add(1, Ordering::SeqCst);
-        Ok(Verdict::Continue)
+        Ok(Decision::Continue)
     }
 
     fn after_tool(&self, _call: &HookedCall<'_>, _output: &mut HookedText<'_>) -> HookResult {
         self.after.fetch_add(1, Ordering::SeqCst);
-        Ok(Verdict::Continue)
+        Ok(Decision::Continue)
     }
 }
 
 /// A plugin that answers `verdict` at `before_tool`, again and again.
-pub struct Answers(pub Verdict);
+pub struct Answers(pub Decision);
 
 impl Plugin for Answers {
     fn name(&self) -> &str {
@@ -66,7 +66,7 @@ impl Plugin for Answers {
 }
 
 /// A plugin that answers `verdict` at `message_received`, again and again.
-pub struct AnswersMessage(pub Verdict);
+pub struct AnswersMessage(pub Decision);
 
 impl Plugin for AnswersMessage {
     fn name(&self) -> &str {
@@ -113,7 +113,7 @@ impl Plugin for Fails {
         if seen < self.remaining {
             Err(HookError::new("fails", self.class, "on purpose"))
         } else {
-            Ok(Verdict::Continue)
+            Ok(Decision::Continue)
         }
     }
 }
@@ -143,7 +143,7 @@ impl Plugin for Rewrites {
         if let Some(object) = call.arguments.as_object_mut() {
             object.insert("rewritten".into(), serde_json::Value::Bool(true));
         }
-        Ok(Verdict::Continue)
+        Ok(Decision::Continue)
     }
 }
 
@@ -157,7 +157,7 @@ impl Plugin for Sleeps {
 
     fn before_tool(&self, _call: &mut HookedCall<'_>) -> HookResult {
         std::thread::sleep(self.0);
-        Ok(Verdict::Continue)
+        Ok(Decision::Continue)
     }
 }
 
@@ -297,7 +297,7 @@ macro_rules! plugin_conformance {
             };
             assert_eq!(
                 set.before_tool(&mut call).expect("no plugin, no failure"),
-                adam_plugin::Verdict::Continue
+                adam_plugin::Decision::Continue
             );
         }
 
@@ -311,24 +311,24 @@ macro_rules! plugin_conformance {
                 tool: "ls",
                 arguments: &mut arguments,
             };
-            assert_eq!(set.before_tool(&mut call).expect("all continue"), adam_plugin::Verdict::Continue);
+            assert_eq!(set.before_tool(&mut call).expect("all continue"), adam_plugin::Decision::Continue);
             assert_eq!(first.before.load(std::sync::atomic::Ordering::SeqCst), 1);
             assert_eq!(second.before.load(std::sync::atomic::Ordering::SeqCst), 1);
 
             // A deny stops the set: the plugin after it is not asked.
-            let denying = std::sync::Arc::new($crate::Answers(adam_plugin::Verdict::Deny("no".into())));
+            let denying = std::sync::Arc::new($crate::Answers(adam_plugin::Decision::Deny("no".into())));
             let after = std::sync::Arc::new($crate::Allows::default());
             let set = ($make)().with(denying).with(after.clone());
             assert_eq!(
                 set.before_tool(&mut call).expect("a verdict, not a failure"),
-                adam_plugin::Verdict::Deny("no".into())
+                adam_plugin::Decision::Deny("no".into())
             );
             assert_eq!(after.before.load(std::sync::atomic::Ordering::SeqCst), 0);
         }
 
         #[test]
         fn ask_and_stop_are_verdicts_too() {
-            for verdict in [adam_plugin::Verdict::Ask("may I?".into()), adam_plugin::Verdict::Stop("enough".into())] {
+            for verdict in [adam_plugin::Decision::Ask("may I?".into()), adam_plugin::Decision::Stop("enough".into())] {
                 let set = ($make)().with(std::sync::Arc::new($crate::Answers(verdict.clone())));
                 let mut arguments = a_call();
                 let mut call = adam_plugin::HookedCall {
@@ -344,7 +344,7 @@ macro_rules! plugin_conformance {
             // An ask does not end the set (slice H8): the plugin after it is asked, and its denial wins.
             let after = std::sync::Arc::new($crate::Allows::default());
             let set = ($make)()
-                .with(std::sync::Arc::new($crate::Answers(adam_plugin::Verdict::Ask("may I?".into()))))
+                .with(std::sync::Arc::new($crate::Answers(adam_plugin::Decision::Ask("may I?".into()))))
                 .with(after.clone());
             let mut arguments = a_call();
             let mut call = adam_plugin::HookedCall {
@@ -353,26 +353,26 @@ macro_rules! plugin_conformance {
             };
             assert_eq!(
                 set.before_tool(&mut call).expect("a verdict"),
-                adam_plugin::Verdict::Ask("may I?".into()),
+                adam_plugin::Decision::Ask("may I?".into()),
                 "an ask that no plugin after it refuses is the set's"
             );
             assert_eq!(after.before.load(std::sync::atomic::Ordering::SeqCst), 1, "the plugin after the ask is asked");
 
             let set = ($make)()
-                .with(std::sync::Arc::new($crate::Answers(adam_plugin::Verdict::Ask("may I?".into()))))
-                .with(std::sync::Arc::new($crate::Answers(adam_plugin::Verdict::Deny("no".into()))));
+                .with(std::sync::Arc::new($crate::Answers(adam_plugin::Decision::Ask("may I?".into()))))
+                .with(std::sync::Arc::new($crate::Answers(adam_plugin::Decision::Deny("no".into()))));
             assert_eq!(
                 set.before_tool(&mut call).expect("a verdict"),
-                adam_plugin::Verdict::Deny("no".into()),
+                adam_plugin::Decision::Deny("no".into()),
                 "a denial after an ask wins"
             );
 
             let set = ($make)()
-                .with(std::sync::Arc::new($crate::Answers(adam_plugin::Verdict::Ask("first?".into()))))
-                .with(std::sync::Arc::new($crate::Answers(adam_plugin::Verdict::Ask("second?".into()))));
+                .with(std::sync::Arc::new($crate::Answers(adam_plugin::Decision::Ask("first?".into()))))
+                .with(std::sync::Arc::new($crate::Answers(adam_plugin::Decision::Ask("second?".into()))));
             assert_eq!(
                 set.before_tool(&mut call).expect("a verdict"),
-                adam_plugin::Verdict::Ask("first?".into()),
+                adam_plugin::Decision::Ask("first?".into()),
                 "the first question stands"
             );
         }
@@ -385,7 +385,7 @@ macro_rules! plugin_conformance {
                 tool: "ls",
                 arguments: &mut arguments,
             };
-            assert_eq!(set.before_tool(&mut call).expect("a rewrite continues"), adam_plugin::Verdict::Continue);
+            assert_eq!(set.before_tool(&mut call).expect("a rewrite continues"), adam_plugin::Decision::Continue);
             assert_eq!(call.arguments["rewritten"], serde_json::json!(true));
         }
 
@@ -424,7 +424,7 @@ macro_rules! plugin_conformance {
             };
             assert_eq!(
                 set.before_tool(&mut call).expect("retried once, then continues"),
-                adam_plugin::Verdict::Continue
+                adam_plugin::Decision::Continue
             );
         }
 
@@ -465,7 +465,7 @@ macro_rules! plugin_conformance {
             let mut output = adam_plugin::HookedText { text: &mut text };
             assert_eq!(
                 set.after_tool(&call, &mut output).expect("allows"),
-                adam_plugin::Verdict::Continue
+                adam_plugin::Decision::Continue
             );
             assert_eq!(plugin.after.load(std::sync::atomic::Ordering::SeqCst), 1);
         }
@@ -486,7 +486,7 @@ macro_rules! plugin_conformance {
             );
             assert_eq!(plugin.messages.load(std::sync::atomic::Ordering::SeqCst), 1);
 
-            let set = ($make)().with(std::sync::Arc::new($crate::AnswersMessage(adam_plugin::Verdict::Deny("no".into()))));
+            let set = ($make)().with(std::sync::Arc::new($crate::AnswersMessage(adam_plugin::Decision::Deny("no".into()))));
             let mut text = String::from("hello");
             let decided = set
                 .message_received(&mut adam_plugin::HookedMessage {
@@ -495,7 +495,7 @@ macro_rules! plugin_conformance {
                 })
                 .expect("a verdict")
                 .expect("a refusal");
-            assert_eq!(decided.verdict, adam_plugin::Verdict::Deny("no".into()));
+            assert_eq!(decided.verdict, adam_plugin::Decision::Deny("no".into()));
             assert_eq!(decided.plugin, "answers-message");
         }
     };

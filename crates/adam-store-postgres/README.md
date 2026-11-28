@@ -2,14 +2,20 @@
 
 `adam_core::Store` on PostgreSQL 18 or later through `tokio-postgres`, pooled by `deadpool-postgres`
 ([ADR 0053](../../docs/decisions/0053-sqlite-a-store-service-a-database-per-agent-and-a-static-coder.md),
-decision 1: the driver changed, the schema and the statements did not).
+decision 1: the driver changed, the schema and the statements did not), and — behind the `memory`
+feature — the PostgreSQL L2 memory adapter `PgMemory` ([ADR
+0081](../../docs/decisions/0081-an-agent-keeps-a-self-improvement-memory-near-it-and-what-holds-becomes-the-deployments-memory.md),
+slice M2b).
 
 ## Where it sits
 
 An **adapter** of the store port in [`adam-core`](../adam-core/README.md),
 checked by [`adam-store-testkit`](../adam-store-testkit/README.md). Nothing in
 `adam-core` or `adam-runtime` names it; a binary chooses it at composition
-time (for example [`adam-coder`](../../bin/adam-coder/README.md)).
+time (for example [`adam-coder`](../../bin/adam-coder/README.md)). The `memory`
+feature adds `PgMemory`, an adapter of the L2 [`Memory`](../adam-memory/README.md) port checked by
+[`adam-memory-testkit`](../adam-memory-testkit/README.md); with the feature off the crate is the
+store alone (the one table the feature needs is still in the schema, below).
 
 ## API at a glance
 
@@ -25,7 +31,7 @@ time (for example [`adam-coder`](../../bin/adam-coder/README.md)).
 * `PgStore::from_pool(pool)`: reuse your application's `deadpool_postgres::Pool`.
 * `PgStore::with_table_prefix(prefix)`: table-name prefix (default `adam_`,
   only `[a-z0-9_]`, at most 40 characters).
-* `PgStore::pool()`, `SCHEMA_VERSION` (9), `MIN_SERVER_VERSION_NUM` (`180000`: `migrate()` refuses an older server).
+* `PgStore::pool()`, `SCHEMA_VERSION` (10), `MIN_SERVER_VERSION_NUM` (`180000`: `migrate()` refuses an older server).
 * `create_run` and `commit_run` return the record with `state` set to `null`: the caller supplied the
   state, and the state is the largest column, so a `RETURNING` that echoed it would parse it back on
   every transition. `load_run`, `load_head`, the claim, `open_run_for_conversation` and the listings
@@ -64,7 +70,8 @@ Tables are `<prefix>runs` (state as `JSONB`), `<prefix>journal` (primary key
 key `(run_id, id)`, `ON DELETE CASCADE`, schema version 3; a partial index on
 `(agent, next_attempt_at)` for active configs is the claim scan; `config` holds the webhook
 credentials as the client gave them), `<prefix>blob` and `<prefix>run_blob` (file bytes out of a
-run, schema version 5 part 1: see below) and `<prefix>meta`. Claiming is
+run, schema version 5 part 1: see below), `<prefix>memory_lesson` (the L2 memory's lessons, schema
+version 10: see below) and `<prefix>meta`. Claiming is
 `FOR UPDATE SKIP LOCKED`, and it leaves out the runs the caller says it is stepping (`AND id <> ALL($busy)`,
 see [`adam-core`](../adam-core/README.md#runs-the-caller-is-stepping)); one open run per conversation is a partial unique
 index. No transaction is held open while agent code runs. `JSONB` cannot hold
@@ -255,6 +262,41 @@ same rules. The function reads `created_at`, `updated_at`, `status` and the othe
 returns: a migration that alters one of them must drop and recreate it in the same transaction
 (a test that alters one calls `support::drop_claim_function` first).
 
+## Schema version 10: the L2 memory's lessons (feature `memory`)
+
+[ADR 0081](../../docs/decisions/0081-an-agent-keeps-a-self-improvement-memory-near-it-and-what-holds-becomes-the-deployments-memory.md)
+slice M2b is the PostgreSQL adapter of `adam-memory`'s L2 `Memory` port, `PgMemory`, behind this
+crate's `memory` feature. The table is `<prefix>memory_lesson` — one row per lesson, primary key
+`(scope, audience, root_cause)`, `state` `proposed`/`active`/`retired`, `anchors` and `sources` as
+`JSONB`, `created`/`updated`/`retired_at` as `TIMESTAMPTZ` — with the partial index
+`<prefix>memory_lesson_active` on `(scope, audience, updated DESC, root_cause)` where
+`state = 'active'`, the recall scan. **Every migration creates it, whatever the `memory` feature
+says** (schema version 10 is bumped for it although the store alone never reads it): a binary built
+without the feature that stamps version 10 must not leave a feature-enabled binary on a schema with
+no table. `PgStore::migrate()` creates it; `PgMemory::migrate()` runs the same DDL alone, for a
+process that migrates no store.
+
+`PgMemory` mirrors the store's shape: `connect(url, settings, scope)`, `from_pool(pool, settings,
+scope)`, `with_table_prefix(prefix)`, `pool()`, `scope()` and `migrate()`. The first two build a
+[`DEFAULT_POOL_SIZE`](#pool) pool (`connect` opens a connection at once). Its constructors and
+`migrate` answer `adam_core::StoreError` with the store's classes (a bad URL or prefix is
+`InvalidInput`, class `Invalid`, never retried; an unreachable database is `Transient`; a runtime
+that cannot start is `Internal`); only the port's `record`, `recall` and `retire` answer
+`MemoryError`. Timestamps are `TIMESTAMPTZ`, so they keep microseconds where the in-process
+reference keeps nanoseconds: two writes less than a microsecond apart are ordered by root cause, the
+port's stable tie-break. A `PgMemory` is
+configured with one `MemoryScope` and every key and query carries it, so two scopes on one database
+never see each other's lessons; its `record`, `recall` and `retire` have the in-process reference's
+semantics exactly (the port's own preparation, the served-lesson bound, an upsert that keeps the
+creation time, `active` lessons served the freshest first, a retirement kept for ever).
+
+`adam_memory::Memory` is synchronous and `deadpool_postgres` is not, so a `PgMemory` owns a small
+multi-thread Tokio runtime and bridges every call with it: outside a runtime it blocks on the owned
+one, inside a multi-thread runtime it uses `block_in_place` with the caller's `Handle`, inside a
+current-thread runtime it runs the future on the owned runtime from a scoped thread and joins it.
+Never call `Runtime::block_on` from async code directly; the adapter is `Send + Sync + 'static` and
+holds no transaction open while caller code runs.
+
 ## Schema version and the owner column
 
 The owner column is schema version 2. Version 2 adds `<prefix>runs.owner TEXT`, the worker a pinned claim
@@ -320,11 +362,16 @@ serialization failure are `Transient`, a bad statement is `Internal` (needs the
 server), and an unreachable server is `Transient` (offline).
 `tests/fixtures/schema-v5.sql` is the schema exactly as the `sqlx` build emitted it: `tests/fixture.rs`
 applies it with `batch_execute`, opens the store and takes a create/load round trip with **no
-migration**, then migrates to the current version and commits a head and a body. `tests/fixtures/schema-v9.sql` is the
-current schema; a unit test (`the_statements_equal_the_version_9_fixture`) compares the live
+migration**, then migrates to the current version and commits a head and a body. `tests/fixtures/schema-v10.sql` is the
+current schema; a unit test (`the_statements_equal_the_version_10_fixture`) compares the live
 statements with it whitespace-normalised, so they cannot drift; `ADAM_WRITE_FIXTURE=1` regenerates it.
 The fixture is named for its version: a change to a statement, a function's included, without a bump
 of `SCHEMA_VERSION` shows as an edit of a released version's file.
+With the feature on, `tests/memory.rs` runs
+[`memory_conformance!`](../adam-memory-testkit/README.md) against `PgMemory` — the two-scope case on
+one database included — and one explicit test that two scopes on one pool never see each other's
+lessons; it reads `ADAM_TEST_POSTGRES_URL` through `adam_core::testing`, so `ADAM_TEST_REQUIRE_DB=1`
+makes a missing URL a failure.
 `tests/functions.rs` is ADR 0082's fresh-database test: it migrates a database of its own prefix,
 compares the functions in `pg_proc` with its list `FUNCTIONS` (the claim since P2; a slice that adds a
 function adds it there with a call) and calls each; it also checks that the comparison reports an
@@ -338,7 +385,7 @@ it skips there).
 collected after the orphan grace, `Conflict`), and `tests/head_view.rs` counts the calls
 `Runtime::view` makes (one lease, one head, no body) and `Runtime::state`'s (one head, one body).
 `tests/migrate.rs` builds a version 1 schema by hand with a legacy run, migrates it and checks the
-column, the version row, that the run survived and that pinning works on it; it also checks that an
+column, the version row, the `memory_lesson` table of schema version 10, that the run survived and that pinning works on it; it also checks that an
 older release does not lower the version. A version 2 schema migrates to the current one and gets the
 push table, a version 3 schema's `runs_list` is replaced by `runs_list_status` (valid, old one
 gone), a version 4 schema gets the blob tables and keeps its runs, a version 7 schema gets the

@@ -13,7 +13,6 @@
 //! Every case gets its own **collection** per process, shared by the two scopes of
 //! `two_scopes_never_see_each_other` (they must sit on one store) and thrown away with the
 //! process, so a second run starts from an empty store.
-// The port is behind the `memory` feature: without it there is nothing here to build.
 #![cfg(feature = "memory")]
 #![allow(clippy::unwrap_used, clippy::expect_used)] // integration tests assert by unwrapping
 

@@ -16,8 +16,8 @@ use adam_model::{
     PromptStatement, ReasoningEffort, ToolCall, ToolChoice, ToolSpec,
 };
 use adam_plugin::{
-    DeclarationError, EventSpec, HookSet, HookedCall, HookedCompaction, HookedEnd, HookedMessage,
-    HookedModelRequest, HookedText, MessageFile, ModelCallKind, Plugin, Verdict,
+    Decision, DeclarationError, EventSpec, HookSet, HookedCall, HookedCompaction, HookedEnd,
+    HookedMessage, HookedModelRequest, HookedText, MessageFile, ModelCallKind, Plugin,
 };
 use adam_runtime::{
     AGENT_TEXT_KIND, Agent, AgentError, AgentStarter, CHILD_PARKED_KIND, CHILD_REPORTED_KIND,
@@ -959,9 +959,10 @@ fn ask_end(
         plugin: Some(plugin.into()),
     };
     match hooks.run_ending(&end) {
+        // An action is a decision with nothing to perform yet (slice H1d): the end is allowed.
         Ok(None)
         | Ok(Some(adam_plugin::Decided {
-            verdict: Verdict::Continue,
+            verdict: Decision::Continue | Decision::Act(_),
             ..
         })) => Ok(EndDecision {
             verdict: "allow".into(),
@@ -969,9 +970,9 @@ fn ask_end(
             plugin: None,
         }),
         Ok(Some(d)) => Ok(match d.verdict {
-            Verdict::Deny(reason) if continuations >= cap => one("capped", Some(reason), d.plugin),
-            Verdict::Deny(reason) => one("continue", Some(reason), d.plugin),
-            Verdict::Stop(reason) => one("stop", Some(reason), d.plugin),
+            Decision::Deny(reason) if continuations >= cap => one("capped", Some(reason), d.plugin),
+            Decision::Deny(reason) => one("continue", Some(reason), d.plugin),
+            Decision::Stop(reason) => one("stop", Some(reason), d.plugin),
             _ => one(
                 "failed",
                 Some("the hook gave a verdict run.ending does not have".into()),
@@ -3497,7 +3498,7 @@ impl LlmAgent {
                         metadata: &mut metadata,
                     });
                     match verdict {
-                        Ok(Verdict::Continue) => {
+                        Ok(Decision::Continue | Decision::Act(_)) => {
                             apply_hooked(
                                 &mut request,
                                 temperature,
@@ -3508,13 +3509,13 @@ impl LlmAgent {
                                 metadata,
                             )?;
                         }
-                        Ok(Verdict::Stop(reason)) => {
+                        Ok(Decision::Stop(reason)) => {
                             return Err(ModelFailure::by_hook(
                                 format!("stopped by a plugin: {reason}"),
                                 false,
                             ));
                         }
-                        Ok(Verdict::Deny(_) | Verdict::Ask(_)) => {
+                        Ok(Decision::Deny(_) | Decision::Ask(_)) => {
                             return Err(ModelFailure::by_hook(
                                 "a hook may only continue or stop at model.request".to_owned(),
                                 false,
@@ -4233,8 +4234,8 @@ impl LlmAgent {
                     match hooks.compaction_before(&mut HookedCompaction {
                         context: &mut context,
                     }) {
-                        Ok(Verdict::Continue) => {}
-                        Ok(Verdict::Deny(reason)) => {
+                        Ok(Decision::Continue | Decision::Act(_)) => {}
+                        Ok(Decision::Deny(reason)) => {
                             return Ok(Summarised {
                                 summary: None,
                                 cut: at,
@@ -4243,13 +4244,13 @@ impl LlmAgent {
                                 vetoed: Some(reason),
                             });
                         }
-                        Ok(Verdict::Stop(reason)) => {
+                        Ok(Decision::Stop(reason)) => {
                             return Err(ModelFailure::by_hook(
                                 format!("stopped by a plugin: {reason}"),
                                 false,
                             ));
                         }
-                        Ok(Verdict::Ask(_)) => {
+                        Ok(Decision::Ask(_)) => {
                             return Err(ModelFailure::by_hook(
                                 "a hook may only continue, deny or stop at compaction.before"
                                     .to_owned(),
@@ -4283,7 +4284,7 @@ impl LlmAgent {
                         max_output_tokens: &mut max_output_tokens,
                         metadata: &mut metadata,
                     }) {
-                        Ok(Verdict::Continue) => {
+                        Ok(Decision::Continue | Decision::Act(_)) => {
                             apply_hooked(
                                 &mut request,
                                 temperature,
@@ -4294,13 +4295,13 @@ impl LlmAgent {
                                 metadata,
                             )?;
                         }
-                        Ok(Verdict::Stop(reason)) => {
+                        Ok(Decision::Stop(reason)) => {
                             return Err(ModelFailure::by_hook(
                                 format!("stopped by a plugin: {reason}"),
                                 false,
                             ));
                         }
-                        Ok(Verdict::Deny(_) | Verdict::Ask(_)) => {
+                        Ok(Decision::Deny(_) | Decision::Ask(_)) => {
                             return Err(ModelFailure::by_hook(
                                 "a hook may only continue or stop at model.request".to_owned(),
                                 false,
@@ -7341,11 +7342,12 @@ fn ask_message(
         Ok(Some(decided)) => {
             let plugin = decided.plugin;
             match decided.verdict {
-                Verdict::Continue => MessageDecision {
+                // An action has nothing to perform yet (slice H1d): the message goes on as allowed.
+                Decision::Continue | Decision::Act(_) => MessageDecision {
                     text: (text != original).then_some(text),
                     hook: None,
                 },
-                Verdict::Deny(reason) => MessageDecision {
+                Decision::Deny(reason) => MessageDecision {
                     text: None,
                     hook: Some(
                         HookDecision::new(
@@ -7356,7 +7358,7 @@ fn ask_message(
                         .by(plugin),
                     ),
                 },
-                Verdict::Stop(reason) => MessageDecision {
+                Decision::Stop(reason) => MessageDecision {
                     text: None,
                     hook: Some(
                         HookDecision::new(
@@ -7369,7 +7371,7 @@ fn ask_message(
                 },
                 // The point allows, rewrites or refuses: an ask is a verdict this point does not
                 // have, so it is a failure of the hook and the message does not go through.
-                Verdict::Ask(reason) => refuse_at_message(
+                Decision::Ask(reason) => refuse_at_message(
                     plugin,
                     &format!(
                         "the hook asked at message.received, which only allows or refuses: {reason}"
@@ -7744,14 +7746,15 @@ fn decide_before(
         }
     };
     match verdict {
-        Ok(Verdict::Continue) => {
+        // An action has nothing to perform yet (slice H1d): the call runs as if it continued.
+        Ok(Decision::Continue | Decision::Act(_)) => {
             if !changes_access(args) {
                 return Ok(None);
             }
             Ok(Some(refuse(HookDecision::FAILED, changed_access(), None)))
         }
-        Ok(Verdict::Deny(reason)) => Ok(Some(refuse(HookDecision::DENY, reason, None))),
-        Ok(Verdict::Ask(question)) => {
+        Ok(Decision::Deny(reason)) => Ok(Some(refuse(HookDecision::DENY, reason, None))),
+        Ok(Decision::Ask(question)) => {
             if changes_access(args) {
                 return Ok(Some(refuse(HookDecision::FAILED, changed_access(), None)));
             }
@@ -7778,7 +7781,7 @@ fn decide_before(
                 approval: Some(question),
             }))
         }
-        Ok(Verdict::Stop(reason)) => Ok(Some(refuse(HookDecision::STOP, reason, None))),
+        Ok(Decision::Stop(reason)) => Ok(Some(refuse(HookDecision::STOP, reason, None))),
         Err(error) if error.is_retryable() => Err(ToolError::Transient(error.to_string())),
         Err(error) => Ok(Some(refuse(
             HookDecision::FAILED,
@@ -7833,18 +7836,19 @@ fn decide_after(
         refused.sanitized()
     };
     match verdict {
-        Ok(Verdict::Continue) => {
+        // An action has nothing to perform yet (slice H1d): the answer goes on as rewritten.
+        Ok(Decision::Continue | Decision::Act(_)) => {
             output.content = text;
             Ok(output.sanitized())
         }
-        Ok(Verdict::Deny(reason)) => Ok(refuse(output, HookDecision::DENY, reason, None)),
-        Ok(Verdict::Ask(question)) => Ok(refuse(
+        Ok(Decision::Deny(reason)) => Ok(refuse(output, HookDecision::DENY, reason, None)),
+        Ok(Decision::Ask(question)) => Ok(refuse(
             output,
             HookDecision::FAILED,
             format!("a hook may not ask after the call ran: {question}"),
             None,
         )),
-        Ok(Verdict::Stop(reason)) => Ok(refuse(output, HookDecision::STOP, reason, None)),
+        Ok(Decision::Stop(reason)) => Ok(refuse(output, HookDecision::STOP, reason, None)),
         Err(error) if error.is_retryable() => Err(ToolError::Transient(error.to_string())),
         Err(error) => Ok(refuse(
             output,

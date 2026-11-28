@@ -826,6 +826,11 @@ impl Inner {
             update.head = head;
             match self.store.commit_run(run, rec.version, update).await {
                 Ok(committed) => {
+                    // ANR-1449: a cancel is a transition to `failed`, and the family counts it.
+                    crate::metrics::record_run_status(
+                        &opentelemetry::global::meter(crate::metrics::SCOPE),
+                        committed.status,
+                    );
                     // First, and on a task of its own: firing the token below lets the step end,
                     // and the worker then drops the cancel watch that may be running this very
                     // call, so anything awaited after it can be cut short.
@@ -892,6 +897,14 @@ impl Inner {
             update.wake_at = wake_at;
             match self.store.commit_run(run, rec.version, update).await {
                 Ok(_) => {
+                    // ANR-1449: only a wake is a transition (`parked` -> `runnable`); a delivery to
+                    // a run that was already runnable writes the same state and is not counted.
+                    if woke {
+                        crate::metrics::record_run_status(
+                            &opentelemetry::global::meter(crate::metrics::SCOPE),
+                            status,
+                        );
+                    }
                     self.announce_runnable(run, &rec.agent).await;
                     if woke {
                         self.emit_status(

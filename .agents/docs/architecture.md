@@ -267,3 +267,20 @@ tests named here.
   `a_parent_restarted_mid_wait_still_gets_the_childs_answer`; `crates/adam-a2a-runtime/tests/child_sessions.rs`:
   `a_one_shot_session_is_listed_and_takes_no_message_from_the_person`; `crates/adam-export/tests/export.rs`:
   `a_subagents_run_is_a_record_of_its_own_linked_to_its_parent`.
+
+## L2 memory beside the run store
+
+* **The table.** `<prefix>memory_lesson` is created by every store migration (schema version 10) and, alone, by
+  `PgMemory::migrate`; the DDL is `memory_lesson_ddl` in `crates/adam-store-postgres/src/lib.rs`, whatever the `memory`
+  feature says, so a binary without the feature that stamps version 10 cannot leave a feature-enabled one on a schema
+  with no table. `root_cause` is `COLLATE "C"`, so the recall's tie-break is byte order as
+  `sort_newest_first` (`crates/adam-memory/src/lesson.rs`) is. Fixture:
+  `crates/adam-store-postgres/tests/fixtures/schema-v10.sql`.
+* **The adapter.** `crates/adam-store-postgres/src/memory.rs`: `record` is one transaction that takes
+  `pg_advisory_xact_lock(hashtextextended(scope || chr(31) || audience, 0))`, counts served lessons and upserts
+  keeping `created`; `retire` takes the same lock in a CTE; the synchronous `Memory` port over the async pool is bridged
+  by `PgMemory::block_on` (outside a runtime, `block_in_place` in a multi-thread one, a scoped thread in a
+  current-thread one). The constructors and `migrate` answer `adam_core::StoreError` with the store's classes.
+* **The suite.** `crates/adam-store-postgres/tests/memory.rs` runs `memory_conformance!` against a real server; under
+  `ADAM_TEST_REQUIRE_DB=1` a missing URL fails. The scope-blind mutation that makes its two-scope case fail is recorded
+  in ADR 0081's agent page.

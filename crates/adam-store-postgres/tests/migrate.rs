@@ -52,7 +52,15 @@ async fn create_v1_schema(pool: &Pool, p: &str) {
 }
 
 async fn drop_tables(pool: &Pool, p: &str) {
-    for table in ["run_blob", "blob", "push", "journal", "runs", "meta"] {
+    for table in [
+        "memory_lesson",
+        "run_blob",
+        "blob",
+        "push",
+        "journal",
+        "runs",
+        "meta",
+    ] {
         support::exec(pool, &format!("DROP TABLE IF EXISTS {p}{table} CASCADE")).await;
     }
 }
@@ -111,8 +119,10 @@ async fn a_version_1_schema_migrates_to_the_current_one_and_keeps_its_runs() {
     store.migrate().await.unwrap();
     assert!(has_owner_column(&pool, &p).await, "the column was added");
     assert_eq!(version(&pool, &p).await, SCHEMA_VERSION.to_string());
-    assert_eq!(SCHEMA_VERSION, 9);
-    // The push table exists now (a missing table would be a backend error).
+    assert_eq!(SCHEMA_VERSION, 10);
+    // The push table exists now (a missing table would be a backend error), and so does the L2
+    // memory table schema version 10 adds to every migration (ADR 0081).
+    assert!(has_table(&pool, &format!("{p}memory_lesson")).await);
     assert!(
         store
             .push_list(adam_core::RunId(id))
@@ -178,14 +188,14 @@ async fn an_older_release_migrating_does_not_lower_the_version() {
         .with_table_prefix(&p)
         .unwrap();
     store.migrate().await.unwrap();
-    // A future release wrote version 10.
+    // A future release wrote version 11.
     support::exec(
         &pool,
-        &format!("UPDATE {p}meta SET value = '10' WHERE key = 'schema_version'"),
+        &format!("UPDATE {p}meta SET value = '11' WHERE key = 'schema_version'"),
     )
     .await;
     store.migrate().await.unwrap();
-    assert_eq!(version(&pool, &p).await, "10");
+    assert_eq!(version(&pool, &p).await, "11");
     drop_tables(&pool, &p).await;
 }
 
