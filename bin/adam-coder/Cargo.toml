@@ -36,6 +36,7 @@ adam-code-tools.workspace = true
 adam-core.workspace = true
 adam-env-kubernetes.workspace = true
 adam-error.workspace = true
+adam-hook-exec.workspace = true
 adam-host.workspace = true
 adam-llm-agent.workspace = true
 adam-model.workspace = true

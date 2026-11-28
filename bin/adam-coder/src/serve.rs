@@ -70,7 +70,20 @@ async fn build_agent(
     files: &AgentFiles,
     sessions: adam_service::SessionSettings,
     inline_upload_threshold: u64,
+    hooks: &adam_service::HooksSettings,
 ) -> anyhow::Result<(CoderAgent, Janitor, CommandsSweep)> {
+    // The deployment's hook programs that apply to the coder (ADR 0050, slice P2b), started now
+    // and before anything connects: a program that cannot start is a mistake in the deployment's
+    // file, exit 78, and the process does not serve. The set is given to the binding below, so the
+    // coder and each subagent of its folder run them first.
+    let hooks = {
+        let redactor = redactor.clone();
+        hooks
+            .hook_set_for(AGENT_NAME, move |text: &str| redactor.scrub(text).into_owned())
+            .context(
+                "starting the hook programs ADAM_HOOKS_FILE names (HOOKS_ALLOW_PROGRAMS must be true)",
+            )?
+    };
     let model: DynModel = worker.model.client().context("building the model client")?;
     if worker.commands_can_read_the_app_key() {
         tracing::warn!(
@@ -275,13 +288,14 @@ async fn build_agent(
         .with_environment(env.environment.clone())
         .with_scratch_idle(worker.scratch_idle);
     let (janitor, sweep) = wire_commands(&env, janitor, worker);
-    let agent = CoderAgent::try_from_def_with_profiles(
+    let agent = CoderAgent::try_from_def_with_hooks(
         def,
         model,
         worker.model.alias.clone(),
         worker.model.profiles.clone(),
         env,
         tools,
+        hooks,
     )
     .map_err(|e| *e)
     .context("assembling the coder agent")?;
@@ -447,6 +461,7 @@ pub async fn serve(
                     folder_inline_upload_limit(&files),
                     config.service.uploads_inline_max_bytes,
                 ),
+                &config.service.hooks,
             )
             .await?;
             // The prompts of the MCP servers the deployment adds (`ADAM_EXTRA_MCP_FILE`) are

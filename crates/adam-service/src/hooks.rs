@@ -32,6 +32,11 @@
 //!
 //! **The switch.** A file that names programs is refused (exit 78 in a binary) unless
 //! `HOOKS_ALLOW_PROGRAMS=true`, as a deployment that allows stdio MCP servers must say so.
+//!
+//! **Wired (slice P2b, ANR-1301).** A binary that runs workers turns the programs that apply to
+//! the agent it serves into the host's hook set at startup
+//! ([`HooksSettings::hook_set_for`](HooksSettings::hook_set_for)), and the assembly gives that set
+//! to the root and every subagent. A program that cannot start is exit 78, naming the program.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -276,6 +281,42 @@ impl HooksSettings {
     pub fn is_empty(&self) -> bool {
         self.programs.is_empty()
     }
+
+    /// The host's hooks for the agent called `agent` (ADR 0050, slice **P2b**): the programs that
+    /// apply to it, started and asked hello, in the file's order. Empty when the deployment
+    /// declared none, which is the same as no file at all: a process without a file behaves as it
+    /// did before this slice.
+    ///
+    /// `scrub` is the deployment's scrubber, applied to every payload a program is given and to
+    /// the reason it answers with (a program sees what a step would, never a secret).
+    ///
+    /// The filter is the root agent's name: a set is given to the whole assembly, the root and its
+    /// subagents (`Assembly::hooks`), so a program is started only when every agent the process
+    /// runs may be held to it. An `agents` list naming just a subagent declares nothing for this
+    /// process.
+    ///
+    /// # Errors
+    ///
+    /// The first program that cannot be started: the error names the program and says why (a
+    /// path that is not there, a hello that is not answered, another protocol). A binary reports
+    /// it as exit 78: a deployment that declared a program and cannot run it does not serve.
+    pub fn hook_set_for(
+        &self,
+        agent: &str,
+        scrub: impl Fn(&str) -> String + Send + Sync + 'static,
+    ) -> Result<adam_plugin::HookSet, adam_hook_exec::Error> {
+        let scrub: std::sync::Arc<dyn Fn(&str) -> String + Send + Sync> =
+            std::sync::Arc::new(scrub);
+        let mut set = adam_plugin::HookSet::new();
+        for program in self.for_agent(agent) {
+            let scrub = std::sync::Arc::clone(&scrub);
+            let started = adam_hook_exec::HookExec::start(
+                program.config().scrub(move |text: &str| scrub(text)),
+            )?;
+            set = set.with(std::sync::Arc::new(started));
+        }
+        Ok(set)
+    }
 }
 
 /// The protected root `path` is under, when it is under one.
@@ -510,5 +551,36 @@ mod tests {
         assert!(settings.is_empty());
         assert_eq!(problems.len(), 1, "{problems:?}");
         assert!(problems[0].contains("is not a file"), "{problems:?}");
+    }
+
+    /// Slice P2b: the host's set is the programs that apply to the agent it serves, started; a
+    /// program that cannot start names itself and is `Invalid` (exit 78 in a binary).
+    #[test]
+    fn the_hosts_set_is_the_programs_that_apply_and_a_broken_one_names_itself() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write(
+            dir.path(),
+            "hooks.json",
+            r#"{"programs":[{"name":"no-push","command":"./missing","agents":["coder"],
+                "points":{"decide":["tool.before"]}}]}"#,
+        );
+        let (settings, problems) =
+            parse(&[(HOOKS_FILE, path.to_str().unwrap()), (HOOKS_ALLOW, "true")]);
+        assert!(problems.is_empty(), "{problems:?}");
+        // A program filtered to another agent is not started, and the set is empty.
+        assert!(
+            settings
+                .hook_set_for("assistant", str::to_owned)
+                .expect("no program applies")
+                .is_empty()
+        );
+        let error = settings
+            .hook_set_for("coder", str::to_owned)
+            .expect_err("the program is not there");
+        assert!(error.to_string().contains("no-push"), "{error}");
+        assert_eq!(
+            adam_error::Classify::class(&error),
+            adam_error::ErrorClass::Invalid
+        );
     }
 }

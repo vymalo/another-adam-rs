@@ -397,7 +397,7 @@ step that part changes. Hooks are tested with concurrent tool calls from H1 on.
 | H9 | `compaction.before`; `model.request` with `kind: compaction` | the summary request carries the added context; a veto shortens instead; a replay asks no hook | H1, H3 |
 | H7 | Child and session events | a scripted run with a one-shot child and a kept-open session gives the events in order, again on a replay | H2; ADR 0045 slices 3 and 4 |
 | P1 | `adam-hook-exec`, the `adam-hooks/1` adapter, and a test program | messages round-trip; a dead program makes deciding points transient, then the run fails; garbage denies; the child sees only the safe variables; a replay sends no request | H1, H2, H5 |
-| P2 | The deployment's file and switch, wiring in `adam-agent` and `adam-coder`, exit codes | no switch is exit 78; a program denies `git push` on the dev stack | P1 |
+| P2 | The deployment's file and switch, wiring in `adam-agent` and `adam-coder`, exit codes | no switch is exit 78; a program denies `git push` on the dev stack | P1 · *Built (2026-11-28, ANR-1301)* |
 | P3 | The coder chart: `hooks.file` and its volume, with goldens (`deploy/coder` is read by another repository: the pull request says so) | renders and goldens | P2 |
 
 `permission.ask`, a deciding point on the `ask` of ADR 0039's rules, comes with those rules (ADR 0039 slice 5) and is
@@ -615,3 +615,20 @@ and reads `Act` as `Continue`, and a program's action reply is still refused `Un
 stays closed (rule 3): a new variant must fail to compile in every host. Proof:
 `an_action_is_a_decision_and_carries_no_reason` in `crates/adam-plugin/src/lib.rs`, seen red with `decides()`
 counting `Act` as `Continue` and green with it as a decision.
+
+*Built 2026-11-28 (slice **P2** wired, ANR-1301):* `HooksSettings::hook_set_for(agent, scrub)` turns the
+deployment's file into the host's `HookSet` — the programs that apply to the agent, started and asked hello, with
+their payloads and reasons scrubbed by the process's own redactor. Both binaries build it where they assemble the
+agents: `adam-agent`'s `serve`, for the roles that run workers, once the folder's name is known, and `adam-coder`'s
+`build_agent`, before anything connects. The set goes to `BoundDef::hooks`, so the root and every subagent of the
+assembly run it before the plugins their files name. A program that cannot start is **exit 78**, naming the
+program (`AgentError::Hooks` in `adam-agent`; `adam_hook_exec::Error` in the coder's chain): a deployment that
+declared a program and cannot run it does not serve. A control plane starts none, and a deployment with no
+`ADAM_HOOKS_FILE` runs exactly as before the slice. Readings to confirm: the filter is the **root** agent's name,
+because a set belongs to the whole assembly — a program whose `agents` names only a subagent declares nothing for
+this process rather than widening to the root — and the file's contents are still parsed by `ServiceConfig`, so a
+file without `HOOKS_ALLOW_PROGRAMS=true` was already exit 78. Proof: `crates/adam-service/src/hooks.rs` — a program
+filtered to another agent starts nothing and an absent one names itself with class `Invalid`; and
+`dev/hooks-e2e.sh` on the dev stack — a program (`dev/hooks/no-git-push.sh`, `adam-hooks/1`) denies
+`commit_and_push` at `tool.before`, the call's step ends `failed` with the reason, git-server's heads do not move and
+the mock code host sees no pull request. The chart's `hooks.file` and its volume (P3) are separate and not built.

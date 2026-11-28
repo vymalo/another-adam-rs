@@ -63,6 +63,7 @@ fn options() -> RuntimeOptions {
 /// What a worker needs: the model, the alias, the policy of the MCP servers.
 fn worker(model: DynModel, mcp: McpPolicy) -> WorkerParts<'static> {
     WorkerParts {
+        hooks: adam_llm_agent::HookSet::new(),
         model,
         alias: "test-model",
         profiles: adam_model::ModelProfiles::default(),

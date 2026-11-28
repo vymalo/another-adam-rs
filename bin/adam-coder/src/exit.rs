@@ -56,6 +56,11 @@ fn class_of(cause: &(dyn Error + 'static)) -> Option<ErrorClass> {
     if let Some(e) = cause.downcast_ref::<crate::tools::ReferencesError>() {
         return Some(e.class());
     }
+    // The deployment's hook programs (`ADAM_HOOKS_FILE`, ADR 0050 slice P2b): a program that cannot
+    // start is a mistake of the deployment's file, 78 (its class is `Invalid`).
+    if let Some(e) = cause.downcast_ref::<adam_hook_exec::Error>() {
+        return Some(e.class());
+    }
     cause.downcast_ref::<AssemblyError>().map(Classify::class)
 }
 
