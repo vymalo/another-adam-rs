@@ -28,7 +28,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use adam::prelude::*;
-use adam_llm_agent::{Listing, SourceCtx, ToolNote, ToolSource, Withheld};
+use adam_llm_agent::{Declared, Listing, SourceCtx, ToolNote, ToolSource, Withheld};
 use adam_model::ToolSpec;
 use adam_workspace::EnvError;
 use adam_workspace::devcontainer;
@@ -244,6 +244,13 @@ impl ToolSource for RepositoryEnvironmentSource {
             Some(_) => Vec::new(),
             None => vec![use_repository_environment_spec()],
         }
+    }
+
+    /// The one tool this source can offer, whether or not this turn withholds it: the set is what a
+    /// session's `tools` and `deny_tools` are checked against, and the withholding of a turn says
+    /// nothing about the names (ADR 0054 decision 4).
+    fn declared(&self) -> Declared {
+        Declared::All(vec![USE_REPOSITORY_ENVIRONMENT.to_owned()])
     }
 
     async fn listing(&self, ctx: &SourceCtx) -> Listing {

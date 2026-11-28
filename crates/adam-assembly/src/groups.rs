@@ -22,7 +22,7 @@
 use std::sync::Arc;
 
 use adam_llm_agent::{
-    DynTool, Loaded, Loader, SourceCtx, StepStyle, Tool, ToolAccess, ToolCtx, ToolError,
+    Declared, DynTool, Loaded, Loader, SourceCtx, StepStyle, Tool, ToolAccess, ToolCtx, ToolError,
     ToolOutput, ToolSource, Withheld,
 };
 use adam_model::ToolSpec;
@@ -338,6 +338,23 @@ impl ToolSource for Groups {
         Vec::new()
     }
 
+    /// The tools the groups can offer, each once: every member (an own tool of the agent, withheld
+    /// until its group is loaded) and every group's loader (an own tool too). It reads nothing of the
+    /// run, so a group the task loads and one it does not answer the same names, and a session's set
+    /// of tools is complete (ADR 0054 decision 4).
+    fn declared(&self) -> Declared {
+        let mut names: Vec<String> = Vec::new();
+        for group in &self.groups {
+            let loader = group.loader();
+            for name in std::iter::once(&loader).chain(group.members.iter()) {
+                if !names.contains(name) {
+                    names.push(name.clone());
+                }
+            }
+        }
+        Declared::All(names)
+    }
+
     /// The notes of the groups the **task** loaded, in name order: the `when` behaviour, whose
     /// instructions reached the prompt of a matching run. A group the run loads during itself is
     /// not here: its note is in the load's result, so the prompt does not grow mid-run.
@@ -630,6 +647,27 @@ mod tests {
             }]
         );
         assert_eq!(groups.loader_tools().len(), 1);
+    }
+
+    /// A group withholds its members until it is loaded and announces a loader: it declares both,
+    /// because a session's set is what the run can be offered, not what one turn offers (ADR 0054
+    /// decision 4).
+    #[test]
+    fn the_groups_declare_their_loaders_and_members() {
+        let groups = Groups::bind(
+            &origin(),
+            vec![group("bash", &["run_command", "read_file"])],
+            &given(&["run_command", "read_file"]),
+        )
+        .unwrap();
+        assert_eq!(
+            groups.declared(),
+            Declared::All(vec![
+                "load__group__bash".to_owned(),
+                "run_command".to_owned(),
+                "read_file".to_owned(),
+            ])
+        );
     }
 
     #[test]
