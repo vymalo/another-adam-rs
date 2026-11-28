@@ -341,6 +341,7 @@ mod tests {
             created_at: at,
             updated_at: at,
             error: None,
+            artifacts: Vec::new(),
         }
     }
 

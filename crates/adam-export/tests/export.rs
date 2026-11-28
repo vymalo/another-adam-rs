@@ -8,14 +8,14 @@ use std::time::{Duration, Instant};
 use adam_core::{DynStore, MemoryStore, RunId, RunStatus};
 use adam_error::{Classify, ErrorClass};
 use adam_export::{
-    ExportError, ExportOptions, Exporter, Filter, JsonLines, Pseudonyms, RuntimeSource, Samples,
-    Summary, export_runs,
+    CHECKS_ARTIFACT, ExportError, ExportOptions, Exporter, Filter, JSON_MEDIA_TYPE, JsonLines,
+    PULL_REQUEST_ARTIFACT, Pseudonyms, RuntimeSource, Samples, Summary, export_runs,
 };
 use adam_llm_agent::{
     LlmAgent, LlmAgentBuilder, Tool, ToolCtx, ToolError, ToolOutput, user_message,
 };
 use adam_model::{DynModel, MockModel, ToolCall, ToolSpec};
-use adam_runtime::{Runtime, RuntimeBuilder};
+use adam_runtime::{Artifact, Runtime, RuntimeBuilder};
 use async_trait::async_trait;
 use serde_json::{Value, json};
 use tokio::sync::oneshot;
@@ -72,6 +72,47 @@ impl Tool for Helper {
 }
 
 const HELPER: &str = "coder/helper";
+
+/// The repository the `deliver` tool's pull request is in: an owner and a private host that must
+/// not reach a record.
+const REPOSITORY: &str = "https://git.corp.example/alice/payroll.git";
+
+/// Delivers the way the coder does (ADR 0085, slice E4): a `checks` verdict, then a `pull_request`
+/// whose head was verified when the call says so, both artifacts of the outcome contract.
+struct Deliver;
+
+#[async_trait]
+impl Tool for Deliver {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "deliver".into(),
+            description: "check the code and open a pull request".into(),
+            parameters: json!({"type": "object", "properties": {"green": {"type": "boolean"}}}),
+        }
+    }
+
+    async fn call(&self, _ctx: &ToolCtx, args: Value) -> Result<ToolOutput, ToolError> {
+        let green = args["green"].as_bool().unwrap_or(false);
+        Ok(ToolOutput::text("Pull request #42 is open")
+            .with_artifact(Artifact::new(
+                CHECKS_ARTIFACT,
+                Some(JSON_MEDIA_TYPE.into()),
+                json!({"passed": green, "commit": "a".repeat(40)}),
+            ))
+            .with_artifact(Artifact::new(
+                PULL_REQUEST_ARTIFACT,
+                Some(JSON_MEDIA_TYPE.into()),
+                json!({
+                    "url": "https://git.corp.example/alice/payroll/pull/42",
+                    "number": "42",
+                    "branch": "agent/fix",
+                    "repository": REPOSITORY,
+                    "commit": "a".repeat(40),
+                    "verified": green,
+                }),
+            )))
+    }
+}
 
 impl Harness {
     fn new() -> Self {
@@ -434,6 +475,79 @@ async fn a_subagents_run_is_a_record_of_its_own_linked_to_its_parent() {
     assert_eq!(roles, ["system", "user", "assistant"]);
     assert_eq!(helper["messages"][1]["content"], "summarise the manifest");
     assert_eq!(helper["messages"][2]["content"], "it uses axum");
+    h.stop().await;
+}
+
+/// The outcome contract end to end (ADR 0085, slice E4): the artifacts a run's tool committed are
+/// read from the store through `RuntimeSource`, the record says which pull request the run
+/// delivered and whether its head was verified, and `verified_only` keeps only such runs. The
+/// repository is a pseudonym: its host and owner, and the pull request's URL, are not written.
+#[tokio::test]
+async fn the_outcome_says_whether_the_pull_request_was_verified() {
+    let h = Harness::on(|coder| coder.tool(Deliver), |runtime, _| runtime);
+    h.mock
+        .push_tool_calls(vec![ToolCall::new("c1", "deliver", json!({"green": true}))])
+        .push_text("opened #42, verified");
+    let green = h.run_to_done("fix the payroll bug", "conv-green").await;
+    h.mock
+        .push_tool_calls(vec![ToolCall::new(
+            "c1",
+            "deliver",
+            json!({"green": false}),
+        )])
+        .push_text("opened #42 with red checks");
+    h.run_to_done("fix it anyway", "conv-red").await;
+    h.mock.push_text("hello");
+    h.run_to_done("hi", "conv-chat").await;
+
+    let (summary, lines) = export(&h.runtime, &Filter::default()).await;
+    assert_eq!((summary.seen, summary.written), (3, 3), "{summary:?}");
+    for record in &lines {
+        let raw = record.to_string();
+        assert!(
+            !raw.contains("git.corp.example") && !raw.contains("alice"),
+            "the repository leaked: {raw}"
+        );
+    }
+    let chat = lines
+        .iter()
+        // The first message is the recorded system prompt, the person's is the second.
+        .find(|record| record["messages"][1]["content"] == "hi")
+        .expect("the chat's record");
+    assert_eq!(
+        chat["outcome"],
+        json!({"status": "done"}),
+        "a run that delivered nothing has the outcome it had before"
+    );
+
+    let (summary, verified) = export(&h.runtime, &Filter::default().verified_only(true)).await;
+    assert_eq!((summary.written, summary.filtered), (1, 2), "{summary:?}");
+    let [record] = verified.as_slice() else {
+        panic!("one verified run: {verified:#?}");
+    };
+    assert_eq!(
+        record["id"],
+        Pseudonyms::new(b"export key").of("run", &green.to_string())
+    );
+    assert_eq!(
+        record["outcome"]["pull_requests"],
+        json!([{
+            "number": 42,
+            "repository": Pseudonyms::new(b"export key").of("repository", REPOSITORY),
+            "verified": true,
+        }])
+    );
+    assert_eq!(
+        record["outcome"]["checks"],
+        json!({"passed": true, "reports": 1, "failed": 0})
+    );
+    assert_eq!(
+        record["outcome"]["artifacts"],
+        json!([
+            {"name": "checks", "mime_type": "application/json"},
+            {"name": "pull_request", "mime_type": "application/json"},
+        ])
+    );
     h.stop().await;
 }
 

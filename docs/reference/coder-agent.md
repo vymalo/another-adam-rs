@@ -98,7 +98,9 @@ sequenceDiagram
 
 Artifacts:
 
-* `pull_request`: a data part (`url`, `number`, `branch`, `repository`) and an A2A `url` part, so a chat
+* `pull_request`: a data part (`url`, `number`, `branch`, `repository`, `commit` the pull request's head, `verified`
+  whether the checks passed on exactly that code; the last two are what an
+  [export](../guides/export-runs-for-training.md) filters on with `--verified-only`) and an A2A `url` part, so a chat
   surface shows a link (`adam_a2a_runtime::artifact_of`). It comes from `open_pull_request`, or from the
   `pull_request` of a `commit_and_push`, which runs the same gate and the same code path in the same call.
 * `checks` (`passed`, `commit`, `tree`, optional `summary`, `findings`, and `preexisting` with `base_commit` when the

@@ -10,7 +10,7 @@ reads one or several sources into one sink.
 
 The decision is
 [ADR 0085](https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0085-runs-are-exported-as-training-records.md),
-slices E1 and E5 (per-turn samples). The binaries' `export` subcommand (slice E2) is described in
+slices E1, E4 (the outcome contract) and E5 (per-turn samples). The binaries' `export` subcommand (slice E2) is described in
 [`adam-agent`](../../bin/adam-agent/README.md) and [`adam-coder`](../../bin/adam-coder/README.md);
 the training pipeline around it is the guide
 [Export runs for training](../../docs/guides/export-runs-for-training.md).
@@ -26,7 +26,10 @@ the training pipeline around it is the guide
 | `Samples` | `Run` (the default: one record per run) or `Turn` (one per assistant turn). |
 | `estimated_tokens(&Record) -> u64` | The characters of a record's messages and tools divided by four, rounded up: an estimate, adam's own rule (`adam-llm-agent`'s history estimate). |
 | `turns_lost_to_compaction(&Conversation) -> u32` | The run's turns before its last compaction, which have no sample. |
-| `RunMeta`, `RunMeta::of(&RunRecord, error)` | A run's bookkeeping without its state: id, agent, conversation id, parent, status, times, error. |
+| `RunMeta`, `RunMeta::of(&RunRecord, error)`, `.with_artifacts(..)` | A run's bookkeeping without its state: id, agent, conversation id, parent, status, times, error, and its JSON artifacts (`artifacts: Vec<RunArtifact>`, what the outcome is read from; `of` leaves it empty). The field is new: **breaking** for a `RunMeta { .. }` literal outside the crate. |
+| `RunArtifact::new(name, mime_type, data)`, `RunArtifact::json(name, data)` | One JSON artifact of a run, as it committed it. `#[non_exhaustive]`. |
+| `pull_requests_of(&[RunArtifact], &Pseudonyms) -> Vec<PullRequestOutcome>`, `checks_of(&[RunArtifact]) -> Option<ChecksOutcome>` | What a run delivered, read from the artifacts of the outcome contract (*The outcome contract*). Pure. |
+| `PULL_REQUEST_ARTIFACT`, `CHECKS_ARTIFACT`, `JSON_MEDIA_TYPE` | The contract's names: `pull_request`, `checks`, `application/json`. |
 | `ExportOptions` | `new(Pseudonyms)`, then `.scrub(..)` (the deployment's secrets), `.include_reasoning(bool)`, `.current(agent, RequestShape)` (the agent's current prompt and tools), `.samples(Samples)` and `.max_tokens(Option<u32>)` (the driver leaves out a record over it, whole). |
 | `RequestShape` | A system prompt and a list of `ToolSpec`, as the export passes them. |
 | `Exporter::new(Filter, ExportOptions)`, `.run(&[&dyn RunSource], &mut dyn RecordSink) -> Result<Summary, ExportError>` | The pipeline: for each source, for each of its agents, reads the runs page by page and puts the records the filter accepts into the sink: one per run, or its samples with `Samples::Turn`, each under `max_tokens`; then finishes the sink. *Ports and adapters*, below. |
@@ -39,7 +42,7 @@ the training pipeline around it is the guide
 | `Summary` | `seen`, `written` (records: runs, or samples), `filtered` (runs), `not_a_conversation`, `unreadable`, `over_budget` (records left out by `max_tokens`), `turns_lost_to_compaction` and `inexact` (samples written with `exact: false`), summed over every source. **Breaking** for a `Summary { .. }` literal outside the crate: it needs the three new fields or `..Summary::default()`. |
 | `ExportError` | `Source` (a page failed; its class), `Sink` (its class: a write is `Transient`, a put after `finish` `Internal`), `Labels` (several sources and one has no label of its own: `Invalid`, nothing read). `#[non_exhaustive]`. Implements `Classify`. **Breaking**: it was `Runtime`, `Write`, `Json`. |
 | `Filter` | Which records are written; `Filter::parse_requirement("lang=rust")`. See *Filters*. |
-| `Record`, `ChatMessage`, `ChatToolCall`, `FunctionCall`, `ToolDef`, `FunctionDef`, `Outcome`, `OutcomeArtifact`, `Facets`, `ToolsSource`, `TrainOn`, `Sample`, `SCHEMA` | The record (below). `Serialize` and `Deserialize`. `Record` gained `train_on`, `sample` and `source`: **breaking** for a `Record { .. }` literal outside the crate. |
+| `Record`, `ChatMessage`, `ChatToolCall`, `FunctionCall`, `ToolDef`, `FunctionDef`, `Outcome`, `OutcomeArtifact`, `PullRequestOutcome`, `ChecksOutcome`, `Facets`, `ToolsSource`, `TrainOn`, `Sample`, `SCHEMA` | The record (below). `Serialize` and `Deserialize`. `Record` gained `train_on`, `sample` and `source`, `Outcome` gained `pull_requests` and `checks` (and `Outcome::verified`): **breaking** for a `Record { .. }` or `Outcome { .. }` literal outside the crate. |
 | `facets` (module) | `facets_of(&[Message]) -> Facets`, the kinds `LANG` and `DEP`. |
 | `Scrub`, `NoSecrets`, `scrub_known_shapes` | What removes secrets. A closure `Fn(&str) -> String` is a `Scrub`. |
 | `Pseudonyms`, `NoRandomness` | HMAC-SHA256 pseudonyms; `Pseudonyms::new(key)` or `Pseudonyms::random()`. |
@@ -71,7 +74,7 @@ One line per run (wrapped here):
 | `models` | the model aliases the assistant turns name, sorted, plus both sides of a fallback switch |
 | `compacted` | a compaction, a shortening, omitted turns or a summary replaced history: `messages` are not what the model saw at every turn |
 | `facets` | `{kind: [values]}`, derived from the transcript (*Facets*) |
-| `outcome` | `status`, the scrubbed `error` of a failed run, and the run's `artifacts` by `name` and `mime_type` |
+| `outcome` | `status`, the scrubbed `error` of a failed run, the run's `artifacts` by `name` and `mime_type`, and what it delivered: `pull_requests` (`[{number, repository?, verified}]`, left out when none) and `checks` (`{passed, reports, failed}`, left out when none), read from the artifacts of the outcome contract (below) |
 | `tools_source` | `none` (no system message, no tools), `current` (the agent's current ones, passed by the export) or `recorded` (the system prompt and tools the run's last model call was sent, `Conversation::request`, read with `RecordedRequest::load`; `RuntimeSource` reads them when their blobs are still in the store). A per-turn sample's are those recorded for its call |
 | `train_on` | which messages carry the loss: `assistant` (a whole run: every assistant message) or `last` (a per-turn sample: its last message). A record written before the field reads as `assistant` |
 | `sample` | a per-turn sample only: `{turn, index, of, exact}`, the model call (from 0), its place among the run's samples (from 0) and their number, and whether the messages and tools are what that call was sent (*Per-turn samples*) |
@@ -144,6 +147,7 @@ seen. Facets are read before the text is scrubbed, and are names, never values.
 | `require` | none | facets every record must have: `("lang", "rust")`, `("dep", "cratestack")` |
 | `include_compacted` | `false` | keep runs whose history was compacted |
 | `min_turns` | `1` | the fewest model calls |
+| `verified_only` | `false` | only runs that delivered verified work, `Outcome::verified`: at least one pull request, and every one `verified` (`--verified-only`) |
 
 A record is also written only when it has at least one assistant message. `Filter::default()` is a
 training export's: finished runs, not compacted, with at least one turn. **With `Samples::Turn` a compacted run is kept
@@ -170,9 +174,31 @@ the filter's other fields decide on the run before its samples are made.
 * **Images** become `[image]`: a user's or assistant's image part, and one line per image of a
   tool result. No image bytes are exported.
 * **Reasoning** is exported only with `include_reasoning(true)`, and only when the run kept it.
+* **A pull request is its number and a verdict.** Of a `pull_request` artifact only `number` and `verified` are
+  written, and the repository as a pseudonym (kind `repository`): the URL, the repository's address and the commit
+  name an owner and a host (a commit is searchable on a public one), and scrubbing removes secrets, not names. A
+  `checks` artifact gives two counts and a boolean. So the contract adds no free text to a record.
 
 The messages a person wrote are exported: which threads a deployment may train on is the
 operator's call.
+
+## The outcome contract
+
+What a run delivered is read from two of its artifacts, by name and media type. The contract is the exporter's, so
+`adam-export` depends on no agent: any agent that emits them gets the same `outcome`, and
+[`adam-coder`](../../bin/adam-coder/README.md) emits both (its tests read its artifacts back through
+`pull_requests_of` and `checks_of`).
+
+| Artifact | Media type | Data read | Becomes |
+|---|---|---|---|
+| `pull_request` (`PULL_REQUEST_ARTIFACT`) | `application/json` | an object: `number` (decimal digits in a string, as A2A needs, or a non-negative integer; required), `repository` (a string), `verified` (a boolean; absent is `false`) | one `pull_requests` entry per repository and number, in the order first reported, each as **last** reported (a pull request updated with red checks is no longer verified) |
+| `checks` (`CHECKS_ARTIFACT`) | `application/json` | an object: `passed` (a boolean; required) | `checks`: `passed` of the last verdict, `reports` (how many), `failed` (how many did not pass) |
+
+Any other member is not read. An artifact of either name with another media type (`application/json; charset=...` is
+fine), or without its required member, is not part of the outcome; it is still listed by name in `artifacts`. A run
+with neither has the record it had before (`a_record_without_a_source_is_the_line_it_was`). `RuntimeSource` gives the
+run's JSON artifacts as `RunMeta::artifacts` (a file artifact is left out: its bytes are never read); another source
+fills them with `RunMeta::with_artifacts`.
 
 ## Ports and adapters
 
@@ -213,8 +239,8 @@ label of their own, or the export is `ExportError::Labels` before anything is re
 ### Write an adapter
 
 1. Implement the port in your own crate: a source over another store or a dump (it fills a
-   `SourceRun::new(RunMeta, Conversation, requests)` per run and counts what it cannot yield in
-   `Skipped`), or a sink to object storage, a Hugging Face dataset or a database table (it buffers
+   `SourceRun::new(RunMeta, Conversation, requests)` per run, the run's JSON artifacts in
+   `RunMeta::with_artifacts`, and counts what it cannot yield in `Skipped`), or a sink to object storage, a Hugging Face dataset or a database table (it buffers
    in `put`, makes the records visible in `finish`, and refuses a `put` after it).
 2. Add `adam-export-testkit` as a dev-dependency and run the suite from an integration test:
    `source_conformance!(make_source)` with an `async fn(Vec<SeedRun>) -> Option<Box<dyn RunSource>>`
@@ -269,7 +295,12 @@ None: the crate reads no variable. The binaries read `EXPORT_PSEUDONYM_KEY` for 
 * scrub: `every_known_shape_is_removed`, `a_url_keeps_everything_but_its_password`,
   `ordinary_text_is_borrowed`, `a_closure_is_a_scrub`;
 * convert: `a_record_without_a_source_is_the_line_it_was` (the bytes of a record with no `source` are the
-  line the exporter wrote before the ports, captured before the change);
+  line the exporter wrote before the ports, captured before the change, and stay so for a run whose artifacts are not
+  the contract's), `the_outcome_contract_adds_the_pull_requests_and_the_checks`,
+  `verified_only_keeps_a_run_whose_every_pull_request_was_verified`;
+* outcome: `a_pull_request_is_its_number_its_repository_s_pseudonym_and_whether_it_was_verified`,
+  `the_last_report_of_a_pull_request_wins_and_each_pull_request_is_listed_once`, `what_is_not_the_contract_is_not_read`,
+  `a_verified_flag_that_is_not_true_is_not_verified`, `the_checks_are_the_last_verdict_and_the_counts`;
 * sink: `each_record_is_one_line_of_json_in_order`, `a_refused_write_is_transient`;
 * the pipeline: `several_sources_need_labels_of_their_own`.
 
@@ -277,6 +308,8 @@ The integration tests in `tests/export.rs` cover the conversion and the pipeline
 `a_stack_filter_keeps_the_run_that_read_the_manifest`, `a_turn_export_writes_one_sample_per_answer` (two calls,
 two samples with the recorded tools, `train_on: "last"`, and a budget that keeps the first),
 `a_subagents_run_is_a_record_of_its_own_linked_to_its_parent`,
+`the_outcome_says_whether_the_pull_request_was_verified` (a tool's `checks` and `pull_request` artifacts read back from
+the store, the repository a pseudonym, `verified_only`),
 `two_stores_export_into_one_sink_with_their_labels_and_linked_ids` (two memory stores, labels, the same id alone and
 together, an unnamed source among several refused) and `export_runs_is_the_exporter_over_one_unnamed_runtime_source`
 (byte for byte). The conformance suites run against `RuntimeSource` (memory store) and `JsonLines` in

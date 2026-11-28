@@ -10,8 +10,8 @@ use adam_runtime::{Runtime, RuntimeError, view_from_record};
 use async_trait::async_trait;
 
 use crate::{
-    Cursor, RequestShape, RunMeta, RunSource, Skipped, SourceError, SourcePage, SourceQuery,
-    SourceRun, TurnRequest,
+    Cursor, RequestShape, RunArtifact, RunMeta, RunSource, Skipped, SourceError, SourcePage,
+    SourceQuery, SourceRun, TurnRequest,
 };
 
 /// The runs of a [`Runtime`]'s store, each joined with [`Runtime::state`].
@@ -20,9 +20,10 @@ use crate::{
 /// statuses and `since` pushed into it; `until` is checked here and counted in
 /// [`Skipped::outside_query`]. **Only runs that have a conversation id are listed**
 /// (`ConversationScope::Prefix("")`). Each agent must be registered on the runtime: its `join`
-/// reads a v5 run's transcript. A state that does not decode as a `Conversation` with messages is
-/// [`Skipped::not_a_conversation`]; one that cannot be read is logged with its id and
-/// [`Skipped::unreadable`].
+/// reads a v5 run's transcript. A run's JSON artifacts, with their data, are its
+/// [`RunMeta::artifacts`] (a file artifact is left out). A state that does not decode as a
+/// `Conversation` with messages is [`Skipped::not_a_conversation`]; one that cannot be read is
+/// logged with its id and [`Skipped::unreadable`].
 #[derive(Clone)]
 pub struct RuntimeSource {
     runtime: Runtime,
@@ -146,15 +147,17 @@ async fn read(
         Ok(conversation) if !conversation.messages.is_empty() => conversation,
         _ => return Ok(None),
     };
-    let error = view_from_record(record.clone(), false)
-        .map_err(|e| (run, e))?
-        .error;
+    let view = view_from_record(record.clone(), false).map_err(|e| (run, e))?;
+    // The JSON artifacts with their data, which the outcome contract is read from; a file's
+    // bytes are never read.
+    let artifacts = view
+        .artifacts
+        .into_iter()
+        .filter(|artifact| artifact.file.is_none())
+        .map(|artifact| RunArtifact::new(artifact.name, artifact.mime_type, artifact.data));
+    let meta = RunMeta::of(&record, view.error).with_artifacts(artifacts);
     let requests = recorded_requests(runtime, run, &conversation).await;
-    Ok(Some(SourceRun::new(
-        RunMeta::of(&record, error),
-        conversation,
-        requests,
-    )))
+    Ok(Some(SourceRun::new(meta, conversation, requests)))
 }
 
 /// The requests `conversation` recorded, read from the store: its distinct requests

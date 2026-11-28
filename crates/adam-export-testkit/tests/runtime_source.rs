@@ -13,13 +13,22 @@ use adam_export_testkit::{SeedRun, SeedState};
 use adam_runtime::Runtime;
 use serde_json::{Value, json};
 
-/// The stored state of `state`: the runtime's whole-state envelope (layout version 1, the agent's
-/// state under `agent`), which `Runtime::state` answers as it is. A version the runtime does not
-/// know is a state it cannot read.
-fn stored(state: &SeedState) -> Value {
-    match state {
-        SeedState::Conversation(conversation) => json!({"v": 1, "agent": conversation}),
-        SeedState::Other(value) => json!({"v": 1, "agent": value}),
+/// The stored state of `seed`: the runtime's whole-state envelope (layout version 1, the agent's
+/// state under `agent`, the run's artifacts under `artifacts`), which `Runtime::state` answers as
+/// it is. A version the runtime does not know is a state it cannot read.
+fn stored(seed: &SeedRun) -> Value {
+    let artifacts: Vec<Value> = seed
+        .artifacts
+        .iter()
+        .map(|artifact| {
+            json!({"name": artifact.name, "mime_type": artifact.mime_type, "data": artifact.data})
+        })
+        .collect();
+    match &seed.state {
+        SeedState::Conversation(conversation) => {
+            json!({"v": 1, "agent": conversation, "artifacts": artifacts})
+        }
+        SeedState::Other(value) => json!({"v": 1, "agent": value, "artifacts": artifacts}),
         SeedState::Unreadable => json!({"v": 0}),
     }
 }
@@ -27,7 +36,7 @@ fn stored(state: &SeedState) -> Value {
 async fn make_source(seeds: Vec<SeedRun>) -> Option<Box<dyn RunSource>> {
     let store: DynStore = Arc::new(MemoryStore::new());
     for seed in &seeds {
-        let mut run = NewRun::new(seed.agent.as_str(), stored(&seed.state))
+        let mut run = NewRun::new(seed.agent.as_str(), stored(seed))
             .with_id(seed.id)
             .conversation(seed.conversation_id.as_str());
         run.status = seed.status;

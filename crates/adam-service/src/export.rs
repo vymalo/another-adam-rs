@@ -9,7 +9,7 @@
 //!
 //! ```text
 //! <binary> export [--agent NAME]... [--status done|failed|all] [--require KIND=VALUE]...
-//!                 [--since RFC3339] [--until RFC3339] [--include-compacted]
+//!                 [--since RFC3339] [--until RFC3339] [--include-compacted] [--verified-only]
 //!                 [--include-reasoning] [--samples run|turn] [--max-tokens N] [--out PATH]
 //! ```
 
@@ -40,8 +40,8 @@ pub const EX_USAGE: u8 = 64;
 pub fn usage(binary: &str) -> String {
     format!(
         "usage: {binary} export [--agent NAME]... [--status done|failed|all] [--require KIND=VALUE]... \
-         [--since RFC3339] [--until RFC3339] [--include-compacted] [--include-reasoning] \
-         [--samples run|turn] [--max-tokens N] [--out PATH]\n\
+         [--since RFC3339] [--until RFC3339] [--include-compacted] [--verified-only] \
+         [--include-reasoning] [--samples run|turn] [--max-tokens N] [--out PATH]\n\
          \n\
          Writes one JSON Lines record per run, or per assistant turn (ADR 0085), to standard output, \
          or to PATH (created or truncated, mode 0600).\n\
@@ -53,6 +53,8 @@ pub fn usage(binary: &str) -> String {
          --until RFC3339       only runs last updated before this instant\n\
          --include-compacted   keep runs whose history a compaction replaced (with --samples turn \
          they are kept anyway)\n\
+         --verified-only       keep only runs that delivered a pull request whose head the run's \
+         checks verified (every one, when it opened several)\n\
          --include-reasoning   keep the reasoning text a run kept\n\
          --samples run|turn    one record per run (default), or one per assistant turn since the \
          run's last compaction: the request of that call, its answer last\n\
@@ -69,7 +71,7 @@ pub fn usage(binary: &str) -> String {
 pub struct ExportArgs {
     /// `--agent`: the agents to export, in order; empty for every agent the binary registers.
     pub agents: Vec<String>,
-    /// `--status`, `--require`, `--since`, `--until`, `--include-compacted`.
+    /// `--status`, `--require`, `--since`, `--until`, `--include-compacted`, `--verified-only`.
     pub filter: Filter,
     /// `--include-reasoning`.
     pub include_reasoning: bool,
@@ -116,6 +118,7 @@ pub fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Command, U
     let mut since = None;
     let mut until = None;
     let mut include_compacted = false;
+    let mut verified_only = false;
     let mut include_reasoning = false;
     let mut samples: Option<Samples> = None;
     let mut max_tokens: Option<u32> = None;
@@ -206,6 +209,10 @@ pub fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Command, U
                 takes_no_value("--include-compacted")?;
                 include_compacted = true;
             }
+            "--verified-only" => {
+                takes_no_value("--verified-only")?;
+                verified_only = true;
+            }
             "--include-reasoning" => {
                 takes_no_value("--include-reasoning")?;
                 include_reasoning = true;
@@ -280,6 +287,7 @@ pub fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Command, U
             require,
             include_compacted,
             min_turns: defaults.min_turns,
+            verified_only,
         },
         include_reasoning,
         samples: samples.unwrap_or_default(),
@@ -408,6 +416,7 @@ pub async fn run(
         agents = ?agents,
         statuses = ?statuses,
         require = ?args.filter.require,
+        verified_only = args.filter.verified_only,
         out = args.out.as_deref().map(|p| p.display().to_string()),
         "exporting runs"
     );
@@ -554,6 +563,7 @@ mod tests {
             "2026-11-01T00:00:00Z",
             "--until=2026-11-27T00:00:00Z",
             "--include-compacted",
+            "--verified-only",
             "--include-reasoning",
             "--out",
             "runs.jsonl",
@@ -576,6 +586,7 @@ mod tests {
             Some("2026-11-27T00:00:00Z".parse().expect("an instant"))
         );
         assert!(args.filter.include_compacted);
+        assert!(args.filter.verified_only);
         assert!(args.include_reasoning);
         assert_eq!(args.out, Some(PathBuf::from("runs.jsonl")));
         assert_eq!(export(&["--status", "all"]).filter.statuses, []);
@@ -616,6 +627,7 @@ mod tests {
                 "2026-11-01T00:00:00Z",
             ],
             &["--include-reasoning=yes"],
+            &["--verified-only=true"],
             &["--out"],
             &["--out", "a", "--out", "b"],
             &["--current-tools"],

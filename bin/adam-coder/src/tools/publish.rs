@@ -17,6 +17,13 @@ use super::{Outcome, ToolEnv, cancelled, non_empty, notes_error, scratch, worksp
 /// conversation (see [`pushed_in`]).
 pub(crate) const COMMIT_AND_PUSH: &str = "commit_and_push";
 
+/// The name of the artifact [`open_pull_request`] (and the `pull_request` of [`commit_and_push`])
+/// emits: `url`, `number` (a string), `branch`, `repository`, `commit` (the pull request's head)
+/// and `verified` (the checks passed on exactly that code). It is also the exporter's outcome
+/// contract (`adam_export::PULL_REQUEST_ARTIFACT`, ADR 0085 slice E4), which reads `number`,
+/// `repository` and `verified`.
+pub const PULL_REQUEST_ARTIFACT: &str = "pull_request";
+
 /// The repository and branch that the text of a `commit_and_push` result ends with: the last two
 /// lines, `repository: <url>` then `branch: <name>`, which name the line of work a later task may
 /// continue (the run's own branch, or the branch it continued).
@@ -622,14 +629,18 @@ async fn open_in(
         ));
     }
     // The number is a string: A2A carries JSON numbers as floats (`7` would arrive as `7.0`).
+    // `commit` and `verified` say what the gate saw: the pull request's head, and whether the
+    // checks passed on exactly its code (the exporter's outcome contract, ADR 0085 slice E4).
     let data = json!({
         "url": pr.url,
         "number": pr.number.to_string(),
         "branch": pr.head,
         "repository": wt.repo().url,
+        "commit": head,
+        "verified": verified,
     });
     Ok(ToolOutput::text(text).with_artifact(Artifact::new(
-        "pull_request",
+        PULL_REQUEST_ARTIFACT,
         Some("application/json".into()),
         data,
     )))

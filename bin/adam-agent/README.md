@@ -309,6 +309,7 @@ EXPORT_PSEUDONYM_KEY=... adam-agent export --require lang=rust --out runs.jsonl
 | `--require KIND=VALUE` | a facet every record must have, `lang=rust`, `dep=axum` (repeatable: all of them) |
 | `--since RFC3339`, `--until RFC3339` | only runs last updated at or after, and before, an instant |
 | `--include-compacted` | keep runs whose history a compaction replaced (with `--samples turn` they are kept anyway) |
+| `--verified-only` | keep only runs that delivered a pull request whose head was verified: a run whose artifacts follow the exporter's outcome contract (`pull_request` with `verified: true`, [`adam-export`](../../crates/adam-export/README.md#the-outcome-contract)); a folder agent's runs have none unless its tools emit them |
 | `--include-reasoning` | keep the reasoning text a run kept |
 | `--samples run\|turn` | one record per run (`run`, the default), or one per assistant turn since the run's last compaction (`turn`): the request of that model call, its answer last, `train_on: "last"` and a `sample` field |
 | `--max-tokens N` | leave out a record over `N` estimated tokens (characters / 4), whole, never cut (counted as `over_budget`) |

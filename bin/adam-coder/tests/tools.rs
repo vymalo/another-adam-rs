@@ -1500,6 +1500,8 @@ async fn a_pull_request_opens_for_a_failure_the_base_has_too() {
         "{}",
         opened.content
     );
+    // Let in because the failure is the base's, not because its code passed: not verified.
+    assert_eq!(opened.artifacts[0].data["verified"], false);
     let pulls = rig.fx.created_pulls().await;
     let body = pulls[0]["body"].as_str().unwrap();
     assert!(
@@ -1962,6 +1964,21 @@ async fn commit_and_push_is_idempotent_and_refuses_an_empty_branch() {
     assert!(is_error(&empty));
 }
 
+/// The pull requests the exporter reads from `out`'s artifacts (ADR 0085, slice E4): the coder's
+/// `pull_request` artifact is the exporter's outcome contract.
+fn exported_pull_requests(out: &ToolOutput) -> Vec<adam_export::PullRequestOutcome> {
+    assert_eq!(
+        adam_coder::tools::publish::PULL_REQUEST_ARTIFACT,
+        adam_export::PULL_REQUEST_ARTIFACT
+    );
+    let artifacts: Vec<adam_export::RunArtifact> = out
+        .artifacts
+        .iter()
+        .map(|a| adam_export::RunArtifact::new(a.name.clone(), a.mime_type.clone(), a.data.clone()))
+        .collect();
+    adam_export::pull_requests_of(&artifacts, &adam_export::Pseudonyms::new(b"test"))
+}
+
 #[tokio::test]
 async fn open_pull_request_needs_a_push_and_green_checks_and_is_idempotent() {
     let rig = Rig::new().await;
@@ -2025,6 +2042,14 @@ async fn open_pull_request_needs_a_push_and_green_checks_and_is_idempotent() {
     );
     assert_eq!(opened.artifacts[0].name, "pull_request");
     assert_eq!(opened.artifacts[0].data["url"], PR_URL);
+    // What the gate saw, for the exporter's outcome contract (ADR 0085, slice E4): the head it
+    // let in, verified by the checks on exactly that code.
+    let head = head_of(&rig.worktree());
+    assert_eq!(opened.artifacts[0].data["commit"], head.as_str());
+    assert_eq!(opened.artifacts[0].data["verified"], true);
+    let delivered = exported_pull_requests(&opened);
+    assert_eq!(delivered.len(), 1, "{delivered:?}");
+    assert!(delivered[0].verified && delivered[0].repository.is_some());
 
     // Again (replay): the same PR, no second POST.
     let again = pr.call(&rig.ctx, args).await.unwrap();
@@ -2063,6 +2088,11 @@ async fn commit_and_push_opens_the_pull_request_in_the_same_call() {
         out.artifacts[1].data["commit"]
     );
     assert_eq!(out.artifacts[2].data["url"], PR_URL);
+    assert_eq!(
+        out.artifacts[2].data["commit"], out.artifacts[1].data["commit"],
+        "the pull request's head is the pushed commit"
+    );
+    assert_eq!(out.artifacts[2].data["verified"], true);
     assert!(out.content.starts_with("Committed "), "{}", out.content);
     assert!(out.content.contains(PR_URL), "{}", out.content);
     let branch = out.artifacts[1].data["branch"].as_str().unwrap().to_owned();
@@ -2245,6 +2275,9 @@ async fn a_commit_and_push_with_pull_request_refuses_red_or_stale_checks() {
         .unwrap();
     assert!(!accepted.is_error, "{}", accepted.content);
     assert_eq!(accepted.artifacts[2].data["url"], PR_URL);
+    // Red checks a person accepted are not verified work: the outcome says so.
+    assert_eq!(accepted.artifacts[2].data["verified"], false);
+    assert!(!exported_pull_requests(&accepted)[0].verified);
     let pulls = rig.fx.created_pulls().await;
     assert_eq!(pulls.len(), 1, "{pulls:?}");
     assert!(

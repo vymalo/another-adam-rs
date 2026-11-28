@@ -24,6 +24,7 @@ EXPORT_PSEUDONYM_KEY=... adam-coder export --require lang=rust --require dep=cra
 | `--require KIND=VALUE` | none | keep a run only if it has this facet; repeat it: `lang=rust` and `dep=cratestack` are both required |
 | `--since`, `--until` | none | keep runs last updated in this window (RFC 3339) |
 | `--include-compacted` | off | keep runs whose history was summarised: their messages are not what the model saw at every turn. With `--samples turn` such runs are kept anyway |
+| `--verified-only` | off | keep only runs that delivered a pull request whose head the run's checks verified (every one, when it opened several) |
 | `--include-reasoning` | off | keep the model's reasoning text, when the run kept it |
 | `--samples run\|turn` | `run` | one record per run, or one per assistant turn (below) |
 | `--max-tokens N` | none | leave out a record over `N` tokens, estimated as characters / 4; a record is never cut |
@@ -36,6 +37,28 @@ goes to the log on standard error.
 each export gets a random key ([environment variables](../reference/environment.md)).
 
 The record, every field and the facets are described in [the crate's README](../../crates/adam-export/README.md).
+
+**Only verified pull requests.** A coder run that opens a pull request says, in its record's `outcome`, which one it
+was and whether the checks passed on exactly the code of its head:
+
+```json
+"outcome":{"status":"done","artifacts":[...],
+  "pull_requests":[{"number":42,"repository":"5f0c...","verified":true}],
+  "checks":{"passed":true,"reports":3,"failed":2}}
+```
+
+`verified` is `false` when a person accepted red checks, when the failure was the base branch's, and for a run from
+before this field. `checks` counts the run's check verdicts and says whether the last one passed. `repository` is a
+pseudonym under the export's key: the records of one repository share it, so you can keep a repository out of your
+training split without its name leaving the store. `--verified-only` keeps only the runs whose every pull request is
+`verified`:
+
+```sh
+EXPORT_PSEUDONYM_KEY=... adam-coder export --verified-only --require lang=rust --out verified.jsonl
+```
+
+Any agent can fill these fields: they are read from two artifacts, `pull_request` and `checks`, whose shape is the
+exporter's (the crate's README, *The outcome contract*).
 
 **Several stores into one dataset.** Where runs come from and where records go are adapters: a source (the store
 behind a runtime, so PostgreSQL, MongoDB, SQLite or memory) and a sink (JSON Lines to a file or standard output). The
@@ -72,7 +95,8 @@ an estimate: count with your tokenizer before training.
 |---|---|
 | the messages: what the person wrote, what the model wrote, its tool calls and the tools' results | the store's run and conversation ids: they become pseudonyms |
 | the agent, status, times, turns, tool calls, tokens, model aliases | the conversation's context, the caller, the prompt statement, the session header |
-| the facets (`lang`, `dep`) and the outcome (error, artifact names) | image bytes: an image becomes `[image]` |
+| the facets (`lang`, `dep`) and the outcome (error, artifact names, each pull request's number and whether it was verified, the checks' verdicts) | image bytes: an image becomes `[image]` |
+| a pseudonym of a pull request's repository | the pull request's URL, its repository's address and its commit: they name an owner and a host |
 | reasoning, only when asked | secrets: every string is scrubbed of the deployment's secrets and of well-known token shapes |
 | the system prompt and tools the run's last model call was sent, when the run recorded them (`tools_source: "recorded"`) | |
 
@@ -107,7 +131,8 @@ flowchart LR
    teacher model, with a store that keeps its runs, on tasks in the target stack. Use real tasks, and tasks another
    model writes for you, sent to the coder over [A2A](../reference/a2a-server.md) a batch at a time. Each run that ends in a pull
    request is a worked example.
-2. **Export** the finished runs of that stack: `--status done --require lang=rust --require dep=cratestack`. Facets are
+2. **Export** the finished runs of that stack: `--status done --require lang=rust --require dep=cratestack`, and
+   `--verified-only` to keep only the runs whose pull request passed the checks on exactly its code. Facets are
    guessed from the files and manifests a run touched, so read a sample before you trust a filter.
 3. **Curate.** Drop duplicates (the same task twice), compacted runs (left out by default) and runs longer than your
    trainer's context, or export per turn with a budget (`--samples turn --max-tokens N`). A judge model may score runs so you keep the best. **Never let a model rewrite a trajectory**:
@@ -126,9 +151,3 @@ flowchart LR
 
 The benchmark harness resets its database before each run, so its runs are not kept for export: collect with a coder
 of your own.
-
-## Not built yet
-
-| What | Until then |
-|---|---|
-| The coder's outcome: the pull request, whether its head was verified, the checks (slice E4) | the outcome is the run's status, its error and its artifact names (the coder's `pull_request` among them) |

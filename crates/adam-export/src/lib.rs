@@ -12,6 +12,8 @@
 //!   [`Runtime`](adam_runtime::Runtime); [`JsonLines`] is the sink over any [`std::io::Write`].
 //!   `adam-export-testkit` holds the conformance suites of both ports.
 //! * [`export_runs`] is the convenience path: one runtime's agents as JSON Lines to a writer.
+//! * [`pull_requests_of`] and [`checks_of`] read what a run delivered from the artifacts of the
+//!   outcome contract ([`PULL_REQUEST_ARTIFACT`], [`CHECKS_ARTIFACT`]), which any agent may emit.
 //! * [`facets`] derives `lang` and `dep` from a transcript; [`Scrub`] and
 //!   [`scrub_known_shapes`] remove secrets; [`Pseudonyms`] hide ids.
 //!
@@ -21,6 +23,7 @@ mod convert;
 mod export;
 pub mod facets;
 mod filter;
+mod outcome;
 mod pseudonym;
 mod record;
 mod runtime_source;
@@ -34,10 +37,14 @@ pub use convert::{
 };
 pub use export::{ExportError, Exporter, Summary, export_runs, write_record};
 pub use filter::Filter;
+pub use outcome::{
+    CHECKS_ARTIFACT, JSON_MEDIA_TYPE, PULL_REQUEST_ARTIFACT, RunArtifact, checks_of,
+    pull_requests_of,
+};
 pub use pseudonym::{NoRandomness, Pseudonyms};
 pub use record::{
-    ChatMessage, ChatToolCall, Facets, FunctionCall, FunctionDef, Outcome, OutcomeArtifact, Record,
-    SCHEMA, Sample, ToolDef, ToolsSource, TrainOn,
+    ChatMessage, ChatToolCall, ChecksOutcome, Facets, FunctionCall, FunctionDef, Outcome,
+    OutcomeArtifact, PullRequestOutcome, Record, SCHEMA, Sample, ToolDef, ToolsSource, TrainOn,
 };
 pub use runtime_source::RuntimeSource;
 pub use sample::{Samples, TurnRequest, estimated_tokens, samples_of, turns_lost_to_compaction};

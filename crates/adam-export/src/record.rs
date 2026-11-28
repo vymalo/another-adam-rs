@@ -188,7 +188,9 @@ pub enum ToolsSource {
     Recorded,
 }
 
-/// How a run ended: what the store says (ADR 0085 decision 6).
+/// How a run ended: what the store says (ADR 0085 decision 6), and what the run delivered, read
+/// from the artifacts of the outcome contract (slice E4, [`pull_requests_of`](crate::pull_requests_of)
+/// and [`checks_of`](crate::checks_of)).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Outcome {
     /// The run's status.
@@ -199,6 +201,48 @@ pub struct Outcome {
     /// The artifacts the run's tools produced, by name and media type.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub artifacts: Vec<OutcomeArtifact>,
+    /// The pull requests the run reported, one each, as last reported; left out when none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pull_requests: Vec<PullRequestOutcome>,
+    /// The verdicts of the run's checks; left out when it reported none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checks: Option<ChecksOutcome>,
+}
+
+impl Outcome {
+    /// Whether the run delivered verified work: at least one pull request, and the head of each
+    /// was verified by the run's checks. What [`Filter::verified_only`](crate::Filter::verified_only)
+    /// keeps.
+    pub fn verified(&self) -> bool {
+        !self.pull_requests.is_empty() && self.pull_requests.iter().all(|pr| pr.verified)
+    }
+}
+
+/// A pull request of an [`Outcome`]. Its URL, its repository's name and its commit are never
+/// written: they name a person or an organisation and a host.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PullRequestOutcome {
+    /// Its number in its repository.
+    pub number: u64,
+    /// The pseudonym of its repository (kind `repository`), when the run named it: the records
+    /// of one repository share it, which keeps a repository out of a training split.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repository: Option<String>,
+    /// The run said the code at the pull request's head passed the run's checks; `false` when it
+    /// said it did not (red checks a person accepted, or a failure the base has too) or did not
+    /// say (a run from before slice E4).
+    pub verified: bool,
+}
+
+/// The verdicts of a run's checks, in an [`Outcome`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChecksOutcome {
+    /// The last verdict passed.
+    pub passed: bool,
+    /// How many verdicts the run reported.
+    pub reports: u32,
+    /// How many of them failed.
+    pub failed: u32,
 }
 
 /// An artifact of an [`Outcome`].

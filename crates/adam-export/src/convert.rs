@@ -13,7 +13,8 @@ use crate::facets::facets_of;
 use crate::scrub::scrub_known_shapes;
 use crate::{
     ChatMessage, ChatToolCall, FunctionCall, FunctionDef, NoSecrets, Outcome, OutcomeArtifact,
-    Pseudonyms, Record, SCHEMA, Samples, Scrub, ToolDef, ToolsSource, TrainOn,
+    Pseudonyms, Record, RunArtifact, SCHEMA, Samples, Scrub, ToolDef, ToolsSource, TrainOn,
+    checks_of, pull_requests_of,
 };
 
 /// What an image part becomes: no image bytes are exported.
@@ -141,10 +142,15 @@ pub struct RunMeta {
     pub updated_at: Timestamp,
     /// Why it failed.
     pub error: Option<String>,
+    /// Its JSON artifacts, in the order its transitions committed them: what the outcome contract
+    /// is read from ([`pull_requests_of`](crate::pull_requests_of), [`checks_of`](crate::checks_of)).
+    /// Empty when the source has none, and then the outcome is the status, the error and the
+    /// artifacts' names only.
+    pub artifacts: Vec<RunArtifact>,
 }
 
 impl RunMeta {
-    /// The bookkeeping of `record`, with the error its view reads.
+    /// The bookkeeping of `record`, with the error its view reads, and no artifact.
     pub fn of(record: &RunRecord, error: Option<String>) -> Self {
         Self {
             id: record.id,
@@ -155,7 +161,15 @@ impl RunMeta {
             created_at: record.created_at,
             updated_at: record.updated_at,
             error,
+            artifacts: Vec::new(),
         }
+    }
+
+    /// With `artifacts` as the run's JSON artifacts (see [`artifacts`](Self::artifacts)).
+    #[must_use]
+    pub fn with_artifacts(mut self, artifacts: impl IntoIterator<Item = RunArtifact>) -> Self {
+        self.artifacts = artifacts.into_iter().collect();
+        self
     }
 }
 
@@ -264,6 +278,8 @@ pub(crate) fn head_of(
                     mime_type: artifact.mime_type.clone(),
                 })
                 .collect(),
+            pull_requests: pull_requests_of(&run.artifacts, pseudonyms),
+            checks: checks_of(&run.artifacts),
         },
         tools_source: ToolsSource::None,
         train_on: TrainOn::Assistant,
@@ -404,6 +420,7 @@ mod tests {
             created_at: at,
             updated_at: at,
             error: None,
+            artifacts: Vec::new(),
         }
     }
 
@@ -595,6 +612,87 @@ mod tests {
         );
     }
 
+    #[test]
+    fn the_outcome_contract_adds_the_pull_requests_and_the_checks() {
+        let repository = "https://git.example.internal/someone/secret-project.git";
+        let run = meta(RunStatus::Done).with_artifacts([
+            RunArtifact::json(crate::CHECKS_ARTIFACT, json!({"passed": false})),
+            RunArtifact::json(crate::CHECKS_ARTIFACT, json!({"passed": true})),
+            RunArtifact::json(
+                crate::PULL_REQUEST_ARTIFACT,
+                json!({
+                    "url": "https://git.example.internal/someone/secret-project/pull/12",
+                    "number": "12",
+                    "repository": repository,
+                    "verified": true,
+                }),
+            ),
+        ]);
+        let record = record_of(&run, &conversation(), &options());
+        assert_eq!(
+            record.outcome.pull_requests,
+            [crate::PullRequestOutcome {
+                number: 12,
+                repository: Some(options().pseudonyms.of("repository", repository)),
+                verified: true,
+            }]
+        );
+        assert_eq!(
+            record.outcome.checks,
+            Some(crate::ChecksOutcome {
+                passed: true,
+                reports: 2,
+                failed: 1,
+            })
+        );
+        assert!(record.outcome.verified());
+        let line = serde_json::to_string(&record.outcome).expect("serializes");
+        assert!(
+            !line.contains("example.internal") && !line.contains("someone"),
+            "neither the host nor the owner is written: {line}"
+        );
+        assert!(
+            line.contains(r#""checks":{"passed":true,"reports":2,"failed":1}"#),
+            "{line}"
+        );
+    }
+
+    #[test]
+    fn verified_only_keeps_a_run_whose_every_pull_request_was_verified() {
+        let pull_request = |number: &str, verified: bool| {
+            RunArtifact::json(
+                crate::PULL_REQUEST_ARTIFACT,
+                json!({"number": number, "repository": number, "verified": verified}),
+            )
+        };
+        let record = |artifacts: Vec<RunArtifact>| {
+            record_of(
+                &meta(RunStatus::Done).with_artifacts(artifacts),
+                &conversation(),
+                &options(),
+            )
+        };
+        let filter = crate::Filter::default().verified_only(true);
+        assert!(filter.accepts(&record(vec![pull_request("1", true)])));
+        assert!(filter.accepts(&record(vec![
+            pull_request("1", false),
+            pull_request("1", true),
+        ])));
+        for refused in [
+            Vec::new(),
+            vec![pull_request("1", false)],
+            vec![pull_request("1", true), pull_request("2", false)],
+            vec![RunArtifact::json(
+                crate::CHECKS_ARTIFACT,
+                json!({"passed": true}),
+            )],
+        ] {
+            let record = record(refused);
+            assert!(!filter.accepts(&record), "{:?}", record.outcome);
+            assert!(crate::Filter::default().accepts(&record));
+        }
+    }
+
     /// The bytes of a record as the exporter wrote them before records could name their source
     /// (`Record::source`): a record with no source is the same line, so one unnamed source's export
     /// is byte-identical to the one before the ports (ADR 0085, *Amended*: ports and adapters).
@@ -607,6 +705,15 @@ mod tests {
             ..meta(RunStatus::Done)
         };
         let line = serde_json::to_string(&record_of(&run, &conversation(), &options()))
+            .expect("a record serializes");
+        assert_eq!(line, GOLDEN_LINE);
+        // Nor does the outcome contract (slice E4) change the line of a run that reported no
+        // pull request and no checks, whatever else its artifacts are.
+        let branch = run.with_artifacts([RunArtifact::json(
+            "branch",
+            json!({"repository": "https://example.com/r.git", "branch": "agent/x"}),
+        )]);
+        let line = serde_json::to_string(&record_of(&branch, &conversation(), &options()))
             .expect("a record serializes");
         assert_eq!(line, GOLDEN_LINE);
     }

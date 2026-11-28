@@ -5,7 +5,8 @@ the invariants to check on a change to the exporter, the commands to run and whe
 decision is [ADR 0085](../../../docs/decisions/0085-runs-are-exported-as-training-records.md); the crate is
 [`adam-export`](../../../crates/adam-export/README.md). Written on 2026-11-27 against the working tree on `f69e6ea` plus
 the slice E1 and E2 change, and updated the same day for slice E5 (per-turn samples) on `3bc7997` and for the ports
-and adapters on `6a859c0`; line numbers move, so the function names are the anchors.
+and adapters on `6a859c0`, and on 2026-11-28 for slice E4 (the outcome contract) on `27afaae`; line numbers move, so
+the function names are the anchors.
 
 ## Invariants to check on a change
 
@@ -20,8 +21,10 @@ and adapters on `6a859c0`; line numbers move, so the function names are the anch
    (`crates/adam-llm-agent/src/conversation.rs:821`; the caller is the `vymalo.caller` key in it, `CALLER_CONTEXT_KEY`
    at `:167`), `prompt_statement` (`:851`) or `session` (`:867`). `RuntimeSource` reads `messages` only to skip an empty
    state (`crates/adam-export/src/runtime_source.rs:146`), and `request` and `requests` to load their blobs
-   (`recorded_requests`, `runtime_source.rs:165`). A change that reads another field must say why in the pull request
-   and update both pages.
+   (`recorded_requests`, `runtime_source.rs:165`). Beside the state it reads the run's view (`view_from_record`,
+   `runtime_source.rs:150`): its `error`, and its JSON artifacts with their data (`RunMeta::artifacts`; a file
+   artifact is dropped at `:156`, its bytes never read). A change that reads another field must say why in the pull
+   request and update both pages.
 2. **Every string is cleaned.** Each `String` a record carries from the run passes `ExportOptions::clean`
    (`convert.rs:104`): the deployment's `Scrub`, then `scrub_known_shapes` (`crates/adam-export/src/scrub.rs:62`;
    the shapes at `:41`, the URL password at `:57`). Today that is the system prompt (a per-turn sample's too), every message's text, a tool
@@ -96,6 +99,17 @@ and adapters on `6a859c0`; line numbers move, so the function names are the anch
     each have a label of their own, or nothing is read (`check_labels`, `export.rs:231`). The pseudonym key is the
     export's, so ids link across sources. A label is the operator's word and is not scrubbed: never put a host or a URL
     in one.
+16. **The outcome contract is the exporter's and adds no free text** (slice E4). `pull_requests_of` and `checks_of`
+    (`crates/adam-export/src/outcome.rs:83`, `:116`) read only artifacts named `pull_request` and `checks` with a JSON
+    media type (`contract_data`, `:64`), and of them only `number`, `repository`, `verified` and `passed`. A record
+    writes a pull request's `number` (a `u64`), `verified` (a `bool`) and its repository **only** as
+    `Pseudonyms::of("repository", ..)`: never its URL, its repository's address or its commit (each names an owner and
+    a host; scrubbing removes secrets, not names). So nothing the contract adds needs `clean`. `adam-export` depends on
+    no agent: the coder matches the contract (`PULL_REQUEST_ARTIFACT` in `bin/adam-coder/src/tools/publish.rs:25`,
+    `"verified": verified` at `:640`, `CHECKS_ARTIFACT` in `checks.rs`), and its tests read its artifacts through the
+    exporter's functions. A run with neither artifact writes the line it wrote before (`Outcome::pull_requests` and
+    `checks` are skipped when empty, `record.rs`). `Filter::verified_only` (`filter.rs:94`) requires `Outcome::verified`
+    (`record.rs:216`): at least one pull request, every one verified.
 
 ## The gates
 
@@ -105,7 +119,9 @@ cargo clippy -p adam-export --all-targets --locked -- -D warnings
 cargo test -p adam-export --locked
 cargo test -p adam-export-testkit --locked                           # the port suites against RuntimeSource and JsonLines
 cargo test -p adam-llm-agent --test recorded_request --locked        # the per-change request list (slice E5)
-cargo test -p adam-service --features export --lib export --locked   # --samples, --max-tokens
+cargo test -p adam-service --features export --lib export --locked   # --samples, --max-tokens, --verified-only
+cargo test -p adam-coder --lib checks::tests --locked                # the checks artifact is the outcome contract
+cargo test -p adam-coder --test tools --locked -- pull_request       # the pull_request artifact's commit and verified
 cargo clippy --workspace --all-targets --locked -- -D warnings      # the binaries' subcommand
 cargo nextest run -p adam-agent -p adam-coder --locked              # the subcommand's tests
 sh tools/release/check-versions.sh                                  # a new path dependency with a version is marked
@@ -141,6 +157,12 @@ blocks are not doc-tested.
 | `export_runs` is the `Exporter` over one unnamed `RuntimeSource` into `JsonLines`, byte for byte | `tests/export.rs` `export_runs_is_the_exporter_over_one_unnamed_runtime_source` |
 | a record without a source is the line the exporter wrote before the ports | `convert.rs` `a_record_without_a_source_is_the_line_it_was` |
 | several sources need labels of their own, not blank | `export.rs` `several_sources_need_labels_of_their_own` |
+| the contract: a pull request is its number, a pseudonym of its repository and `verified`; the last report wins, one per repository and number; what is not the contract is not read; the checks are the last verdict and two counts | `outcome.rs` `a_pull_request_is_its_number_its_repository_s_pseudonym_and_whether_it_was_verified`, `the_last_report_of_a_pull_request_wins_and_each_pull_request_is_listed_once`, `what_is_not_the_contract_is_not_read`, `a_verified_flag_that_is_not_true_is_not_verified`, `the_checks_are_the_last_verdict_and_the_counts` |
+| the record carries the outcome, with neither host nor owner; `verified_only` keeps only all-verified runs; a run with no contract artifact is byte-identical | `convert.rs` `the_outcome_contract_adds_the_pull_requests_and_the_checks`, `verified_only_keeps_a_run_whose_every_pull_request_was_verified`, `a_record_without_a_source_is_the_line_it_was` |
+| end to end: a tool's artifacts read back from the store, the repository a pseudonym, `verified_only` | `tests/export.rs` `the_outcome_says_whether_the_pull_request_was_verified` |
+| a source yields a run's JSON artifacts, data and order kept | `adam-export-testkit` `a_run_keeps_its_json_artifacts_in_order` |
+| `--verified-only` parses and takes no value | `adam-service` `src/export.rs` `every_flag_reads`, `a_wrong_command_line_is_a_usage_error` |
+| the coder emits the contract: `commit` the gate's head, `verified` true on green, false on accepted red and on a base failure | `bin/adam-coder/tests/tools.rs` `open_pull_request_needs_a_push_and_green_checks_and_is_idempotent`, `commit_and_push_opens_the_pull_request_in_the_same_call`, `a_commit_and_push_with_pull_request_refuses_red_or_stale_checks`, `a_pull_request_opens_for_a_failure_the_base_has_too`; `src/tools/checks.rs` `the_artifact_is_the_export_contract` |
 | `JsonLines`: one line per record, in order; `finish` twice is fine; a put after it is `Internal`; a refused write `Transient` | `sink.rs` `each_record_is_one_line_of_json_in_order`, `a_refused_write_is_transient` |
 | `RuntimeSource` passes the source suite (disjoint pages, the cursor, skips counted, the query, the bookkeeping) | `adam-export-testkit` `tests/runtime_source.rs` (`source_conformance!`), and `a_cursor_it_did_not_make_is_invalid` |
 | `JsonLines` over a `BufWriter` passes the sink suite (order, `finish` flushes and is idempotent, a put after it refused, a whole record) | `adam-export-testkit` `tests/json_lines.rs` (`sink_conformance!`) |

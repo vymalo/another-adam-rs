@@ -119,3 +119,18 @@ turns with their `tool_calls`, and tool results. Three things are missing or uns
   repository. The exporter supplies the part only adam has: how to use the harness.
 * No `Store` or `Notifier` method changes, so no adapter breaks. Slice E3 adds blobs to commits a store already keeps.
 * A new field of the record is not a breaking change. A changed meaning is a new `schema`.
+
+*Amended 2026-11-28:* slice E4 is built, and decision 6 grows. The outcome is still what the store says, now read
+whole: `RuntimeSource` gives a run's JSON artifacts **with their data** (from the run's view; files are left out) as
+`RunMeta::artifacts`, and the record's `outcome` gains `pull_requests` and `checks`, read from two artifacts by a
+contract that is **the exporter's**, so `adam-export` still depends on no agent: `pull_request` (`application/json`,
+`number` required, `repository` and `verified` optional) and `checks` (`application/json`, `passed`). A pull request
+is listed once per repository and number, as last reported, as `{number, repository, verified}`; `checks` is
+`{passed, reports, failed}`. Privacy: the URL, the repository's address and the commit are **not** written (they name an
+owner and a host, and a scrub removes secrets, not names); the repository is a pseudonym under the export's key, so a
+trainer can still keep one repository out of a split. The coder already emitted both artifacts; its `pull_request`
+data gains `commit` (the head the gate let in) and `verified` (the checks passed on exactly that code; `false` for red
+checks a person accepted and for a failure the base has too), and its tests read them through the exporter's
+functions. `Filter::verified_only` (`--verified-only`) keeps the runs with at least one pull request, every one
+verified. A run with neither artifact writes the record it wrote before, byte for byte. The port `RunSource` is
+unchanged; `SeedRun` gains `artifacts` and the source suite a case that a source yields them.

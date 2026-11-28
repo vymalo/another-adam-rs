@@ -1142,6 +1142,31 @@ mod tests {
         assert!(none.findings[0].message.contains("an unknown tree"));
     }
 
+    /// The `checks` artifact is the exporter's outcome contract (ADR 0085, slice E4): its name,
+    /// media type and `passed` are what `adam_export::checks_of` reads.
+    #[test]
+    fn the_artifact_is_the_export_contract() {
+        assert_eq!(CHECKS_ARTIFACT, adam_export::CHECKS_ARTIFACT);
+        let verdicts: Vec<adam_export::RunArtifact> = [(Some(1), false), (Some(0), true)]
+            .into_iter()
+            .map(|(code, passed)| {
+                let a = report(&outcome(code, ""), Some(SHA), false)
+                    .into_artifact(&Redactor::default());
+                assert_eq!(a.mime_type.as_deref(), Some(adam_export::JSON_MEDIA_TYPE));
+                assert_eq!(a.data["passed"], passed);
+                adam_export::RunArtifact::new(a.name, a.mime_type, a.data)
+            })
+            .collect();
+        assert_eq!(
+            adam_export::checks_of(&verdicts),
+            Some(adam_export::ChecksOutcome {
+                passed: true,
+                reports: 2,
+                failed: 1,
+            })
+        );
+    }
+
     #[test]
     fn the_artifact_is_json_and_scrubbed_of_secrets() {
         let redactor = Redactor::new(["ghp_secretvalue123"]);

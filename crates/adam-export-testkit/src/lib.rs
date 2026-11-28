@@ -27,7 +27,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use adam_core::RunId;
 use adam_core::store::RunStatus;
-use adam_export::{Record, RecordSink};
+use adam_export::{Record, RecordSink, RunArtifact};
 use adam_llm_agent::Conversation;
 use adam_model::{Message, Usage};
 use async_trait::async_trait;
@@ -49,6 +49,9 @@ pub struct SeedRun {
     pub conversation_id: String,
     /// Its status.
     pub status: RunStatus,
+    /// Its JSON artifacts, in the order the run committed them; the source yields them as
+    /// `meta.artifacts`. Empty unless a case adds some ([`with_artifact`](Self::with_artifact)).
+    pub artifacts: Vec<RunArtifact>,
     /// Its state.
     pub state: SeedState,
 }
@@ -75,8 +78,16 @@ impl SeedRun {
             agent: agent.into(),
             conversation_id: format!("seed/{id}"),
             status,
+            artifacts: Vec::new(),
             state,
         }
+    }
+
+    /// With `artifact` after the run's other artifacts.
+    #[must_use]
+    pub fn with_artifact(mut self, artifact: RunArtifact) -> Self {
+        self.artifacts.push(artifact);
+        self
     }
 
     /// A finished run of `agent` whose conversation is [`conversation`]`(text)`.
@@ -179,6 +190,7 @@ macro_rules! source_conformance {
             skipped_runs_are_counted_not_yielded,
             a_page_holds_only_the_query_s_agent_statuses_and_times,
             a_run_keeps_its_bookkeeping_and_conversation,
+            a_run_keeps_its_json_artifacts_in_order,
         );
     };
     (@cases $make:path; $($case:ident),+ $(,)?) => {
@@ -231,7 +243,7 @@ pub mod cases {
         use adam_core::RunId;
         use adam_core::store::RunStatus;
         use adam_core::time::Timestamp;
-        use adam_export::{RunSource, Skipped, SourceQuery, SourceRun};
+        use adam_export::{RunArtifact, RunSource, Skipped, SourceQuery, SourceRun};
         use serde_json::json;
 
         use crate::{SeedRun, SeedState};
@@ -518,6 +530,35 @@ pub mod cases {
             };
             assert_eq!(run.conversation, **conversation);
             assert!(run.requests.is_empty(), "{:?}", run.requests);
+            assert!(run.meta.artifacts.is_empty(), "{:?}", run.meta.artifacts);
+        }
+
+        /// A yielded run carries its JSON artifacts, data included and in the order it committed
+        /// them: what the outcome contract is read from (ADR 0085, slice E4).
+        pub async fn a_run_keeps_its_json_artifacts_in_order<M, F>(make: M, case: &str)
+        where
+            M: FnOnce(Vec<SeedRun>) -> F,
+            F: Future<Output = Option<Box<dyn RunSource>>>,
+        {
+            let agent = agent(case);
+            let seed = SeedRun::done(agent.as_str(), "deliver")
+                .with_artifact(RunArtifact::json(
+                    adam_export::CHECKS_ARTIFACT,
+                    json!({"passed": true}),
+                ))
+                .with_artifact(RunArtifact::new("note", None, json!("a plain value")))
+                .with_artifact(RunArtifact::json(
+                    adam_export::PULL_REQUEST_ARTIFACT,
+                    json!({"number": "7", "repository": "seed", "verified": true}),
+                ));
+            let Some(source) = source_of(make, vec![seed.clone()], case).await else {
+                return;
+            };
+            let (runs, _) = drain(source.as_ref(), &SourceQuery::new(agent.as_str(), 10)).await;
+            let [run] = runs.as_slice() else {
+                panic!("one run: {runs:?}");
+            };
+            assert_eq!(run.meta.artifacts, seed.artifacts);
         }
     }
 
@@ -543,6 +584,7 @@ pub mod cases {
                 created_at: at,
                 updated_at: at,
                 error: None,
+                artifacts: Vec::new(),
             };
             let options = ExportOptions::new(Pseudonyms::new(b"adam-export-testkit"));
             record_of(&run, &crate::conversation(text), &options)
@@ -587,8 +629,8 @@ pub mod cases {
             assert_eq!(fixture.readback.records().await, [before]);
         }
 
-        /// A record with every optional field set (a source, a parent, a sample, reasoning)
-        /// reads back equal.
+        /// A record with every optional field set (a source, a parent, a sample, reasoning, an
+        /// outcome with a pull request and checks) reads back equal.
         pub async fn a_record_reads_back_whole(mut fixture: SinkFixture) {
             let mut whole = record("whole");
             whole.source = Some("testkit".to_owned());
@@ -599,6 +641,19 @@ pub mod cases {
                 index: 0,
                 of: 1,
                 exact: true,
+            });
+            whole
+                .outcome
+                .pull_requests
+                .push(adam_export::PullRequestOutcome {
+                    number: 7,
+                    repository: Some("1".repeat(32)),
+                    verified: true,
+                });
+            whole.outcome.checks = Some(adam_export::ChecksOutcome {
+                passed: true,
+                reports: 2,
+                failed: 1,
             });
             whole.messages.push(adam_export::ChatMessage::Assistant {
                 content: "line one\nline \"two\"\u{2028}".to_owned(),

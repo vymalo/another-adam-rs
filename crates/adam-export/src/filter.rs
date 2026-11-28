@@ -21,6 +21,10 @@ pub struct Filter {
     pub include_compacted: bool,
     /// The fewest model calls a run must have made. `1` by default.
     pub min_turns: u32,
+    /// Keep only runs that delivered verified work ([`Outcome::verified`](crate::Outcome::verified)):
+    /// at least one pull request, the head of each verified by the run's checks. `false` by
+    /// default.
+    pub verified_only: bool,
 }
 
 impl Default for Filter {
@@ -32,6 +36,7 @@ impl Default for Filter {
             require: Vec::new(),
             include_compacted: false,
             min_turns: 1,
+            verified_only: false,
         }
     }
 }
@@ -41,6 +46,13 @@ impl Filter {
     #[must_use]
     pub fn require(mut self, kind: impl Into<String>, value: impl Into<String>) -> Self {
         self.require.push((kind.into(), value.into()));
+        self
+    }
+
+    /// Keep only runs that delivered verified work (see [`verified_only`](Self::verified_only)).
+    #[must_use]
+    pub fn verified_only(mut self, yes: bool) -> Self {
+        self.verified_only = yes;
         self
     }
 
@@ -79,6 +91,7 @@ impl Filter {
         answered
             && record.turns >= self.min_turns
             && (self.include_compacted || !record.compacted)
+            && (!self.verified_only || record.outcome.verified())
             && self
                 .require
                 .iter()

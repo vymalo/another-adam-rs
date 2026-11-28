@@ -15,14 +15,16 @@ The decision is [ADR 0085](../../docs/decisions/0085-runs-are-exported-as-traini
 
 ## API at a glance
 
-* `source_conformance!(make)` generates one `#[tokio::test]` per source case (6). `make` is a path
+* `source_conformance!(make)` generates one `#[tokio::test]` per source case (7). `make` is a path
   to `async fn(Vec<SeedRun>) -> Option<Box<dyn RunSource>>`: it puts the seeded runs where a fresh
   source reads them and returns the source. `None` skips the suite (and fails under
   `ADAM_TEST_REQUIRE_DB=1`, see `adam_core::testing`).
 * `sink_conformance!(make)` generates one per sink case (5). `make` is a path to
   `async fn() -> Option<SinkFixture>`.
-* `SeedRun { id, agent, conversation_id, status, state }`, `SeedRun::new(agent, status, state)`,
-  `SeedRun::done(agent, text)`: a run a case needs. Every seed has a conversation id of its own and
+* `SeedRun { id, agent, conversation_id, status, artifacts, state }`, `SeedRun::new(agent, status, state)`,
+  `SeedRun::done(agent, text)`, `.with_artifact(RunArtifact)`: a run a case needs. `artifacts` are its JSON
+  artifacts (ADR 0085, slice E4), which the source yields as `meta.artifacts`: **a maker must store them**, or the new
+  case `a_run_keeps_its_json_artifacts_in_order` fails. Every seed has a conversation id of its own and
   is `done` or `failed`. `SeedState` (closed): `Conversation(Box<Conversation>)` (yielded),
   `Other(Value)` (a readable state that is not a conversation: `not_a_conversation`),
   `Unreadable` (a corrupt document: `unreadable`).
@@ -40,7 +42,8 @@ The decision is [ADR 0085](../../docs/decisions/0085-runs-are-exported-as-traini
 | `the_cursor_resumes_after_the_last_item` | the page after a cursor holds nothing before it; the same cursor answers the same page; the rest follows |
 | `skipped_runs_are_counted_not_yielded` | two states that are not conversations and an unreadable one are counted, the two conversations yielded |
 | `a_page_holds_only_the_query_s_agent_statuses_and_times` | the query's agent and statuses only; `since` inclusive, `until` exclusive |
-| `a_run_keeps_its_bookkeeping_and_conversation` | id, agent, conversation id, status and conversation as seeded; no recorded request |
+| `a_run_keeps_its_bookkeeping_and_conversation` | id, agent, conversation id, status and conversation as seeded; no recorded request, no artifact |
+| `a_run_keeps_its_json_artifacts_in_order` | the seed's three JSON artifacts (`checks`, a plain value with no media type, `pull_request`), data and order kept: what the outcome contract is read from |
 
 | Sink case | What it pins down |
 |---|---|
@@ -48,7 +51,7 @@ The decision is [ADR 0085](../../docs/decisions/0085-runs-are-exported-as-traini
 | `records_arrive_in_order_once_finished` | five records, in order, once, after `finish` |
 | `finish_twice_is_harmless` | a second `finish` succeeds and adds nothing |
 | `a_put_after_finish_is_refused` | `Internal`, and nothing is written |
-| `a_record_reads_back_whole` | every optional field (`source`, `parent`, `sample`, reasoning, line breaks in text) reads back equal |
+| `a_record_reads_back_whole` | every optional field (`source`, `parent`, `sample`, reasoning, an outcome's `pull_requests` and `checks`, line breaks in text) reads back equal |
 
 ```rust
 async fn make_source(seeds: Vec<adam_export_testkit::SeedRun>) -> Option<Box<dyn adam_export::RunSource>> {
@@ -74,8 +77,8 @@ No Cargo features. `ADAM_TEST_REQUIRE_DB=1` turns a skipped suite into a failure
 ## Tests
 
 * `tests/runtime_source.rs`: the source suite against `RuntimeSource` over a `MemoryStore` (the
-  seeds are written as the runtime's whole-state envelope; an unreadable one has an unknown
-  version), and `a_cursor_it_did_not_make_is_invalid`.
+  seeds are written as the runtime's whole-state envelope, their artifacts under its `artifacts`; an unreadable
+  one has an unknown version), and `a_cursor_it_did_not_make_is_invalid`.
 * `tests/json_lines.rs`: the sink suite against `JsonLines` over a `BufWriter` on a
   `SharedBuffer`, so the cases also check that `finish` flushes.
 
