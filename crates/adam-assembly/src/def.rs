@@ -14,8 +14,7 @@ use adam_agent_fs::{
 use adam_core::{DynSecretSource, ProcessEnv};
 use adam_llm_agent::{
     DynSkillCatalog, DynTool, DynToolSource, Limits, LlmStarter, SESSION_TOOLS, SessionTools,
-    SiMemoryHandle,
-    ToolSet,
+    SiMemoryHandle, ToolSet,
 };
 use adam_model::ReasoningEffort;
 use adam_runtime::{RuntimeBuilder, SessionLimits, glob};
