@@ -518,6 +518,54 @@ async fn the_assembled_agent_is_what_the_hand_written_one_was() {
     assert!(agent.assembly().remotes().is_empty());
 }
 
+/// ADR 0054 decision 4, amended 2026-11-28 (ANR-1390): the coder adds the thread-tools source,
+/// which declares the contract tools it knows by name and the shape `*__*` of the tools it relays
+/// from a server a person attached. Its helpers' sets are therefore **complete**, so a `tools`
+/// entry that selects nothing is refused with the list (the shape among the names) and one naming a
+/// relayed server's tools is admitted. This is the check ANR-1319 could not turn on for this agent.
+#[tokio::test]
+async fn the_helpers_bounds_are_complete_and_admit_a_relayed_servers_tools() {
+    let (_fx, agent) = coder(3).await;
+    let all = agent.assembly().session_bounds();
+    assert_eq!(all.len(), 2, "the coder's two helpers: {all:?}");
+    let asked = |value| adam_runtime::SessionConfig::from_value(value).expect("a config");
+    for (name, bound) in &all {
+        assert!(
+            bound.tools_complete,
+            "{name}: every source declares its tools: {bound:?}"
+        );
+        assert!(
+            bound
+                .tools
+                .iter()
+                .any(|tool| tool.as_str() == adam_ui::RELAYED_SHAPE),
+            "{name}: the shape of a relayed tool is declared: {bound:?}"
+        );
+        let why = bound
+            .admit(asked(json!({"tools": ["a_typo"]})))
+            .expect_err("an allow entry selecting nothing");
+        assert_eq!(why.option(), Some("tools"), "{name}");
+        assert!(
+            why.message().contains("matches none of its tools:"),
+            "{name}: {why}"
+        );
+        assert!(
+            why.message().contains(adam_ui::RELAYED_SHAPE),
+            "{name}: the shape is listed as itself: {why}"
+        );
+        assert!(
+            bound.admit(asked(json!({"tools": ["github__*"]}))).is_ok(),
+            "{name}: a relayed server's tools are what the shape declares"
+        );
+        assert!(
+            bound
+                .admit(asked(json!({"tools": ["github__search"]})))
+                .is_ok(),
+            "{name}: a relayed tool's name too"
+        );
+    }
+}
+
 #[tokio::test]
 async fn a_model_alias_the_assembly_refuses_is_an_error_not_a_panic_for_try_new() {
     let fx = Fixture::new().await;

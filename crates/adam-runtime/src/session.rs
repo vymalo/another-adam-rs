@@ -923,16 +923,25 @@ pub struct SessionBounds {
     /// Whether [`tools`](Self::tools) is **every** tool the subagent can have: `false` when a source
     /// cannot name its tools before a run calls it (`ToolSource::declared` answers
     /// `Declared::Unknown`: an endpoint whose listing is another system's and may change with the
-    /// conversation), so no list made at startup holds them. `admit` uses the two so that a
-    /// narrowing is never silently ignored (ADR 0054 decision 2):
+    /// conversation), so no list made at startup holds them. A name here may be a **shape**: a
+    /// declared name containing `*` (`*__*` for a relayed `<server>__<tool>`) stands for a family
+    /// the source can offer, and the set stays complete (ADR 0054, amended 2026-11-28). `admit`
+    /// uses the two so that a narrowing is never silently ignored (ADR 0054 decision 2):
     ///
-    /// * a `tools` entry that matches no name is refused, listing the names, **only when the set is
+    /// * an entry is admitted when it **selects** a name the set holds: a concrete declared name
+    ///   that its pattern matches (`glob(entry, name)`), or a declared shape that matches it as a
+    ///   string (`glob(name, entry)`). `*__*` therefore admits `github__*`, `github__search` and
+    ///   `*` (the last through the concrete names beside it);
+    /// * a `tools` entry that selects nothing is refused, listing the names, **only when the set is
     ///   complete**; otherwise the shape alone is checked (an allow entry that matches nothing
     ///   offers nothing, so it fails narrow);
-    /// * a `deny_tools` entry **without a `*`** that matches no name is refused **whenever any name
+    /// * a `deny_tools` entry **without a `*`** that selects nothing is refused **whenever any name
     ///   is known**, even when the set is incomplete: a concrete name nobody knows is far more often
     ///   a typo than a tool a source adds, and the refusal says to use a pattern for the latter;
-    /// * an entry with a `*` is checked only when the set is complete.
+    /// * a `deny_tools` entry with a `*` is checked only when the set is complete, and by the same
+    ///   rule as an allow entry — a shape admits a pattern over the family it declares, and never an
+    ///   entry that selects nothing. A deny that silently denies nothing is worse than a refusal:
+    ///   the person would believe the tool is blocked while it is offered.
     ///
     /// With no name known (a control plane) only the shape is checked, so it admits what a worker
     /// will accept.
@@ -1103,7 +1112,7 @@ impl SessionBounds {
 
     /// The entries of `tools` or `deny_tools`: each non-blank and short, not too many, and, as far
     /// as the bound tool names are known (see [`tools_complete`](Self::tools_complete)), each
-    /// matching at least one of them.
+    /// selecting at least one of them or one of the shapes they declare.
     fn admit_tool_entries(&self, option: &str, entries: &[String]) -> Result<(), Refusal> {
         if entries.len() > MAX_SESSION_TOOL_ENTRIES {
             return Err(Refusal::new(
@@ -1141,7 +1150,7 @@ impl SessionBounds {
             } else {
                 self.tools_complete || !names.is_empty()
             };
-            if !checked || names.iter().any(|name| glob(entry, name)) {
+            if !checked || selects(names, entry) {
                 continue;
             }
             let listed: Vec<&str> = names
@@ -1197,6 +1206,26 @@ pub fn glob(pattern: &str, name: &str) -> bool {
         tail = &tail[at + middle.len()..];
     }
     tail.ends_with(last)
+}
+
+/// Whether `entry`, an entry of a session's `tools` or `deny_tools`, selects a tool the bound set
+/// holds: a declared concrete name its pattern matches, or a declared **shape** — a declared name
+/// containing `*` (ADR 0054, amended 2026-11-28) — that matches it as a string. `*__*`, the shape
+/// of a relayed `<server>__<tool>`, therefore admits `github__*`, `github__search` and `*` (the
+/// last through the concrete names beside it).
+///
+/// Both lists use it, so a `deny_tools` entry is held to the same rule as an allow one and never to
+/// a weaker one: an entry that selects neither a name nor a shape is refused with the list. A deny
+/// that silently denies nothing is worse than a refusal, because the person would believe the tool
+/// is blocked while it is offered.
+fn selects(names: &[String], entry: &str) -> bool {
+    names.iter().any(|name| {
+        if name.contains('*') {
+            glob(name, entry)
+        } else {
+            glob(entry, name)
+        }
+    })
 }
 
 impl SessionBounds {
@@ -3182,8 +3211,8 @@ mod tests {
         }
     }
 
-    /// The same, for an agent a source adds tools to while it runs (both shipped agents): the
-    /// names are known, but not all of them.
+    /// The same, for an agent a source adds tools to while it runs: the names are known, but not
+    /// all of them (a source that answers `Declared::Unknown`, ADR 0054 decision 4).
     fn bound_with_incomplete_tools() -> SessionBounds {
         SessionBounds {
             tools_complete: false,
@@ -3305,6 +3334,54 @@ mod tests {
             .admit(listing(&["github__*"], &[]))
             .expect_err("no github tools");
         assert!(why.message().contains("\"github__*\""), "{why}");
+    }
+
+    /// ADR 0054 decision 4, amended 2026-11-28 (ANR-1390, the owner's answer to ANR-Q155): a
+    /// declaration may name a **shape**. `*__*` stands for the `<server>__<tool>` tools the
+    /// thread-tools source relays from the servers a person attached, so a session may name one by
+    /// pattern, by name, or everything — and an entry that selects nothing is still refused.
+    #[test]
+    fn a_declared_shape_admits_a_relayed_servers_tools() {
+        let bound = SessionBounds {
+            tools: ["turn_output", "*__*"].map(str::to_owned).to_vec(),
+            tools_complete: true,
+            ..bounds()
+        };
+        for entry in ["github__*", "github__search", "*", "turn_output", "*__*"] {
+            assert!(
+                bound.admit(listing(&[entry], &[])).is_ok(),
+                "{entry} selects a declared name or the shape"
+            );
+        }
+        // A concrete name, or a pattern, that selects neither is refused with the list, and the
+        // shape is listed as itself.
+        for entry in ["a_typo", "github_", "*_issues"] {
+            let why = bound
+                .admit(listing(&[entry], &[]))
+                .expect_err("selects nothing");
+            assert_eq!(why.option(), Some("tools"), "{entry}");
+            assert!(
+                why.message()
+                    .contains("matches none of its tools: turn_output, *__*"),
+                "{entry}: {why}"
+            );
+            assert!(!why.message().contains("while it runs"), "{entry}: {why}");
+        }
+        // `deny_tools` is held to the same rule and never a weaker one: a relayed server's pattern
+        // is a real deny, and a typo of a concrete name is still refused.
+        assert!(
+            bound.admit(listing(&[], &["github__*"])).is_ok(),
+            "a deny over the declared family is a deny of something"
+        );
+        let why = bound
+            .admit(listing(&[], &["write_fil"]))
+            .expect_err("a typo of a concrete name");
+        assert_eq!(why.option(), Some("deny_tools"));
+        assert!(
+            why.message()
+                .contains("matches none of its tools: turn_output, *__*"),
+            "{why}"
+        );
     }
 
     #[test]

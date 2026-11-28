@@ -34,12 +34,19 @@ reads the lists from the round's session header first (`crates/adam-llm-agent/sr
 
 * **What differs between roles is the tool names**, never the numbers. A control plane's bounds (`AgentDef::session_bounds`)
   carry `tools: []`, `tools_complete: false`: shape only. A worker's carry the names of the bound node and of every source
-  that declares them (`ToolSource::declared`), and `tools_complete` only when every source of the node does; the coder and the
-  folder agent add the thread-tools source, whose endpoint lists another system's tools per conversation and answers
-  `Declared::Unknown`, so a `tools` entry that matches nothing is admitted there, and a concrete `denyTools` name no tool has
-  is refused (ANR-1319).
+  that declares them (`ToolSource::declared`), and `tools_complete` only when every source of the node does. A declared name
+  may be a **shape** (ADR 0054 amended 2026-11-28, ANR-1390): `*__*` stands for a relayed `<server>__<tool>`, and
+  `SessionBounds::admit` (`crates/adam-runtime/src/session.rs`, `selects`) admits an entry that selects a concrete declared
+  name with its pattern or that a declared shape matches as a string. The coder and the folder agent add the thread-tools
+  source, which declares the contract's tools it knows by name and `*__*`, so **their sets are complete**: a `tools` entry
+  that selects nothing is refused there, `github__*` is admitted, and a concrete `denyTools` name no tool has is still
+  refused (ANR-1319, ANR-1390). A source that answers `Declared::Unknown` still leaves a set incomplete and the check
+  shape-only.
 * **Tests:** `child_sessions.rs` unit tests `a_start_takes_tools_and_deny_tools_as_lists_of_names`,
   `a_remote_helper_refuses_tools_and_deny_tools`, `a_round_carries_the_tools_its_header_narrows_over_what_the_message_said`;
   `adam-runtime` `session.rs` `an_incomplete_set_refuses_a_concrete_deny_entry_it_does_not_know_and_checks_no_pattern`,
-  `a_complete_set_checks_patterns_and_allow_entries_too`; `adam-assembly/tests/session_bounds.rs`
-  `an_agent_with_a_source_has_an_incomplete_set_that_still_catches_a_deny_typo`.
+  `a_complete_set_checks_patterns_and_allow_entries_too`, `a_declared_shape_admits_a_relayed_servers_tools`;
+  `adam-assembly/tests/session_bounds.rs` `an_agent_with_a_source_has_an_incomplete_set_that_still_catches_a_deny_typo`,
+  `a_source_that_declares_a_shape_makes_the_set_complete_and_admits_a_servers_tools`; `bin/adam-agent/tests/agent.rs`
+  `a_helpers_bounds_are_complete_and_admit_a_relayed_servers_tools`; `bin/adam-coder/tests/agent_files.rs`
+  `the_helpers_bounds_are_complete_and_admit_a_relayed_servers_tools`.

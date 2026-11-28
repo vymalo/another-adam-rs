@@ -90,6 +90,23 @@ pub const GET_UI_CATALOG: &str = "get_ui_catalog";
 /// answer and the end of the turn ([`ToolOutput::final_answer`]).
 pub const TURN_OUTPUT: &str = "turn_output";
 
+/// The contract's tool with which an agent asks another agent of the orchestrator, named by a
+/// mention: relayed by the endpoint like a server's tools, and known here by name.
+pub const ASK_AGENT: &str = "ask_agent";
+
+/// The contract's tool with which an agent asks for a slot to upload a file by reference
+/// (`uploads/v1`): relayed by the endpoint, and known here by name.
+pub const REQUEST_UPLOAD: &str = "request_upload";
+
+/// The shape of a tool the orchestration layer relays from a server attached to the conversation
+/// (`<server>__<tool>`, [`is_relayed`]), as a declaration's name: `*` is any run of characters, so
+/// this stands for every relayed tool without naming one.
+pub const RELAYED_SHAPE: &str = "*__*";
+
+/// The contract's tools this source can offer on a turn whatever the endpoint lists, beside the
+/// shape of the ones it relays: what [`ThreadTools::declared`] answers for them.
+const CONTRACT_TOOLS: &[&str] = &[GET_UI_CATALOG, TURN_OUTPUT, ASK_AGENT, REQUEST_UPLOAD];
+
 /// What the step of a `turn_output` call is called.
 pub const TURN_OUTPUT_TITLE: &str = "Send the answer";
 
@@ -554,7 +571,7 @@ fn is_relayed(name: &str) -> bool {
 /// answers a name it does not have with a protocol error, which the model reads as an error
 /// result), so the source belongs **last** among the sources of an agent.
 ///
-/// **`turn_output`.** The one tool of the endpoint this source knows by name: when a call to it
+/// **`turn_output`.** One of the contract's tools this source knows by name: when a call to it
 /// succeeds, its `text` is announced as the run's answer **and ends the turn**
 /// ([`ToolOutput::final_answer`]): once the calls of that model turn are answered, the run finishes
 /// with `text` as its output, so the A2A `completed` status carries the Markdown the person was
@@ -569,6 +586,11 @@ fn is_relayed(name: &str) -> bool {
 /// has the tool of that name, which wins. That is expected at every model turn, so the source says
 /// so ([`ToolSource::expects_repeat`]) and the loop logs the omission at debug level; any other
 /// clash (a plain name the agent has too) is still a warning.
+///
+/// **What it declares.** The whole set it can offer, so a session's set of tools is complete: the
+/// contract's tools it knows by name and does not hide ([`CONTRACT_TOOLS`]) and
+/// [`RELAYED_SHAPE`], the shape of the tools it relays from a server a person attached (ADR 0054
+/// decision 4, amended 2026-11-28).
 ///
 /// [`Ui::source`](crate::Ui::source) makes one that **hides `get_ui_catalog`** from the model (the
 /// agent has `ui_catalog` for that, and two tools for one thing made models call whichever they
@@ -633,14 +655,30 @@ impl ToolSource for ThreadTools {
         self.listing(ctx).await.specs
     }
 
-    /// **`Unknown`**: the endpoint is another system's. It lists per conversation (the grant in the
-    /// run's context, a new grant, a refused call or [`LISTING_TTL`] lists again) and it relays the
-    /// tools of the servers a person attached as `<server>__<tool>`, so no list made at startup is
-    /// every name this source can offer. A session's set of tools stays incomplete and
-    /// `SessionBounds::admit` checks the shape of a `tools` entry alone (ADR 0054 decision 4): an
-    /// entry naming a thread tool is admitted, and offers what it selects.
+    /// **The whole set, as a shape.** The endpoint is another system's and lists per conversation
+    /// (the grant in the run's context, a new grant, a refused call or [`LISTING_TTL`] lists again),
+    /// but what it can list is the contract's: the tools this source knows by name and does not
+    /// hide ([`CONTRACT_TOOLS`]), and the tools of the servers a person attached, relayed as
+    /// `<server>__<tool>`, which [`RELAYED_SHAPE`] names as a shape. So a session's set of tools is
+    /// **complete**: `SessionBounds::admit` refuses an entry that selects nothing, and admits one
+    /// naming a relayed server's tools (`github__*`, `github__search`) or the shape itself
+    /// (ADR 0054 decision 4, amended 2026-11-28). The declaration says what **can** arrive, not what
+    /// this turn offers: [`listing`](ToolSource::listing) still lists per conversation.
+    ///
+    /// A source with no client (a [`Ui::embedded`](crate::Ui::embedded) one) offers nothing ever:
+    /// its declaration is empty, which is complete and honest.
     fn declared(&self) -> Declared {
-        Declared::Unknown
+        if self.client.is_none() {
+            return Declared::All(Vec::new());
+        }
+        let mut names: Vec<String> = CONTRACT_TOOLS
+            .iter()
+            .copied()
+            .filter(|name| !self.hidden.contains(name))
+            .map(str::to_owned)
+            .collect();
+        names.push(RELAYED_SHAPE.to_owned());
+        Declared::All(names)
     }
 
     fn expects_repeat(&self, name: &str, _taken: &[ToolSpec]) -> bool {
@@ -809,14 +847,40 @@ mod tests {
         ThreadToolsClient::new(McpPolicy::default()).with_clock(at("2026-10-01T12:00:00Z"))
     }
 
-    /// The endpoint is another system's: it lists per conversation and relays the tools of the
-    /// servers a person attached, so no list made at startup is every name this source can offer. A
-    /// session's set of tools stays incomplete and `admit` checks the shape of an entry alone (ADR
-    /// 0054 decision 4).
+    /// The endpoint is another system's, but what it can list is the contract's: its tools, named
+    /// here, and the tools of the servers a person attached, relayed as `<server>__<tool>` and
+    /// declared as the shape `*__*`. A session's set of tools is therefore complete, and an entry
+    /// naming a relayed server's tools is admitted (ADR 0054 decision 4, amended 2026-11-28).
     #[test]
-    fn the_thread_tools_declare_unknown() {
+    fn the_thread_tools_declare_their_contract_tools_and_the_shape_of_a_relayed_one() {
         let source = ThreadTools::new(Arc::new(client()));
-        assert_eq!(source.declared(), Declared::Unknown);
+        assert_eq!(
+            source.declared(),
+            Declared::All(vec![
+                GET_UI_CATALOG.to_owned(),
+                TURN_OUTPUT.to_owned(),
+                ASK_AGENT.to_owned(),
+                REQUEST_UPLOAD.to_owned(),
+                RELAYED_SHAPE.to_owned(),
+            ])
+        );
+        // The source of a `Ui` hides `get_ui_catalog` from the model: the declaration leaves it
+        // out, so a session may not ask for a tool the source never offers.
+        let ui = crate::Ui::with_client(client());
+        assert_eq!(
+            ui.source().declared(),
+            Declared::All(vec![
+                TURN_OUTPUT.to_owned(),
+                ASK_AGENT.to_owned(),
+                REQUEST_UPLOAD.to_owned(),
+                RELAYED_SHAPE.to_owned(),
+            ])
+        );
+        // A source with no client offers nothing ever: an empty, complete set.
+        assert_eq!(
+            crate::Ui::embedded().source().declared(),
+            Declared::All(Vec::new())
+        );
     }
 
     #[test]

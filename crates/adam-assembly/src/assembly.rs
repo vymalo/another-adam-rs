@@ -831,7 +831,9 @@ impl BoundDef {
     /// be checked against (ADR 0054 decision 4), and whether they are **every** tool it can have: the
     /// node whose registered name is the target's, its own tools (its `tools:` and the `mcp.json`
     /// servers' as `server__tool`), and what every source of that node declares
-    /// ([`ToolSource::declared`]).
+    /// ([`ToolSource::declared`]). A declared name may be a **shape** (`*__*` for a relayed
+    /// `<server>__<tool>`): it is joined as a name, once, like a concrete one (ADR 0054, amended
+    /// 2026-11-28).
     ///
     /// The set is **incomplete** when a source cannot name its tools before a run calls it
     /// ([`adam_llm_agent::Declared::Unknown`]): an endpoint whose listing is another system's and may change with the
