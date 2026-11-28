@@ -3591,22 +3591,39 @@ impl LlmAgent {
                 // The notes are this turn's (a source's listing, read above): a source's call
                 // reports and is labelled as the turn says, not as the turn before it did.
                 let mut early = Early::new(agent, early_facts, notes.clone(), own_order.clone());
-                let (recorded_request, streamed) = tokio::join!(
+                // ANR-1462: the streamed turn is the default one, so it is measured like the
+                // unstreamed turn — the timer inside the joined future, so the request recording
+                // that runs beside it is not in the latency. A failed or cancelled stream returns
+                // before the recording, since its answer (and its usage) was dropped.
+                let alias = request.model.clone();
+                let (recorded_request, (streamed, elapsed)) = tokio::join!(
                     recording,
-                    text_stream::stream_response(
-                        &model,
-                        request,
-                        &emitter,
-                        &cancel,
-                        Some(&mut early),
-                        move || stream_id(run, turn),
-                        move || reasoning_stream_id(run, turn),
-                    )
+                    async {
+                        let started = std::time::Instant::now();
+                        let streamed = text_stream::stream_response(
+                            &model,
+                            request,
+                            &emitter,
+                            &cancel,
+                            Some(&mut early),
+                            move || stream_id(run, turn),
+                            move || reasoning_stream_id(run, turn),
+                        )
+                        .await;
+                        (streamed, started.elapsed())
+                    }
                 );
                 // The batch goes back to the turn, whatever the stream did with it: the calls that
                 // started are the turn's to settle (their steps are written only after it).
                 *slot.lock().unwrap_or_else(PoisonError::into_inner) = Some(early);
                 let streamed = streamed.map_err(ModelFailure::from)?;
+                crate::metrics::record_model_call(
+                    &opentelemetry::global::meter(crate::metrics::SCOPE),
+                    &alias,
+                    streamed.response.usage.input_tokens,
+                    streamed.response.usage.output_tokens,
+                    elapsed,
+                );
                 Ok(Recorded {
                     response: unthought(&emitter, run, turn, true, streamed.response).await,
                     stream: streamed.stream,

@@ -127,6 +127,11 @@ latency in seconds by `model`. `model` is the **alias the call was made to** —
 `adam.model.alias_class`; nothing in the tree defines a class, so the alias — the most precise member of that set — is
 what is recorded, and the ADR's 2026-11-28 amendment says so.
 
+`model` is checked against [`labels::Name`](../adam-otel/src/labels.rs) (`[a-z0-9._-]`, at most 64 bytes). An alias
+outside that alphabet — an upper-case one, one with a `/` — records **nothing**: neither instrument, and no
+substitute label. The alias the deployment declares is therefore also the alias it can measure; ANR-1512 adds a
+startup warning that names such an alias, rather than refusing the boot.
+
 Off with the rest: the instruments come from `opentelemetry::global::meter`, a no-op meter in a process where
 `adam_otel::init` found no endpoint (ADR 0075). The tests assert each exported data point carries exactly its declared
 labels, and that a name the alphabet refuses produces no point.

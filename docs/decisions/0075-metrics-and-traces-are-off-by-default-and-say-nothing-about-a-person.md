@@ -143,7 +143,8 @@ half:
   tree defines a coarser class, so `adam.llm.tokens` and `adam.llm.duration` label by the **alias the call was made
   to**, which the deployment declares (`MODEL_ALIASES_FILE` or `MODEL`) and the agent therefore cannot invent. A
   coarser class can replace it later without changing the rule: the label stays a value from a set the deployment
-  chose.
+  chose. Decision 2's "a model alias chosen by a user" is bounded by that same set: `model-pick/v1` offers only the
+  aliases the deployment declared, so a pick is a value from a closed set, never a string carried from a run.
 - **A label is a type, not a string.** `adam_otel::labels` holds the closed sets — `RunState`, held to
   `adam_core::store::RunStatus` by a test, and a shape-checked `Name` for the names a deployment declares. The shape
   check is **not** a secret filter (a token can have a name's shape: `ghp_0123…` is lower-case, digits and `_`), so

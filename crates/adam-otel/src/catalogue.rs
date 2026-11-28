@@ -145,6 +145,10 @@ mod tests {
         assert_eq!(runs.prometheus_name(), "adam_runs_total");
         let tool = emitted(TOOL_DURATION).expect("adam.tool.duration is emitted");
         assert_eq!(tool.prometheus_name(), "adam_tool_duration_seconds");
+        let tokens = emitted(LLM_TOKENS).expect("adam.llm.tokens is emitted");
+        assert_eq!(tokens.prometheus_name(), "adam_llm_tokens_total");
+        let duration = emitted(LLM_DURATION).expect("adam.llm.duration is emitted");
+        assert_eq!(duration.prometheus_name(), "adam_llm_duration_seconds");
     }
 
     /// A duplicate name would make [`emitted`] answer one of two instruments, and a name outside
