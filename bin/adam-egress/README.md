@@ -97,7 +97,7 @@ Read once at startup, the allow-list file too (a change to it is a restart); eve
 | `EGRESS_IDLE_SECS` | a tunnel with no byte for this long is closed (1 to 86400) | `300` |
 | `EGRESS_MAX_CONNECTIONS` | connections served at once (1 to 1000000) | `1024` |
 | `RUST_LOG` | log filter | `info` |
-| `OTEL_EXPORTER_OTLP_ENDPOINT` | the OTLP/HTTP collector, an absolute `http` or `https` URL with no user, password, query or fragment: the spans this process writes are exported beside the JSON log ([ADR 0075](../../docs/decisions/0075-metrics-and-traces-are-off-by-default-and-say-nothing-about-a-person.md)); unset or blank means no exporter and no thread; a refused value is one warning at startup and tracing stays off | unset: off | This binary links **no TLS provider**, so the endpoint must be plain `http` (an in-cluster collector); the `aws-lc` feature on `adam-otel` adds `https`.
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | the OTLP/HTTP collector, an absolute `http` or `https` URL with no user, password, query or fragment: the spans this process writes are exported beside the JSON log ([ADR 0075](../../docs/decisions/0075-metrics-and-traces-are-off-by-default-and-say-nothing-about-a-person.md)); unset or blank means no exporter and no thread; a refused value is one warning at startup and tracing stays off. This binary links **no TLS provider**, so the endpoint must be plain `http` (an in-cluster collector); the `aws-lc` feature on `adam-otel` adds `https` | unset: off |
 | `OTEL_SERVICE_NAME` | `service.name` of every exported span's resource | `adam` |
 
 Not variables: the head limit (8 KiB), the head time (10 s), the resolve and each connect time (10 s), at most 4
