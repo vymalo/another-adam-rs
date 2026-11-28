@@ -36,6 +36,7 @@ use serde_json::{Map, Value, json};
 use tracing::Instrument as _;
 
 use crate::access::ToolAccess;
+use crate::catalog::{DynSkillCatalog, SkillCatalog, system_prompt};
 use crate::compaction::{
     self, COMPACTION_TURN, CompactionReason, MAX_COMPACTIONS, OVERFLOW_OUTPUT_CHARS, PromptSize,
     RETRY_AFTER_TURNS,
@@ -497,6 +498,9 @@ struct CallFacts {
     /// The words the run was started with (`Conversation::task`), for a source that decides from
     /// them: the same text at every turn and at every call.
     task: Option<Arc<str>>,
+    /// The skills the run's session lists (`Conversation`'s header), for a skills tool to refuse
+    /// one outside it ([`ToolCtx::skills`]).
+    skills: Option<Arc<[String]>>,
     /// What the run has loaded so far (`Conversation::loaded`): what a loader reads to refuse a
     /// second load, and what the source that withholds a group's tools reads.
     loaded: Arc<[Loaded]>,
@@ -549,6 +553,8 @@ struct EarlyFacts {
     images: ImageGate,
     output_cut: bool,
     task: Option<Arc<str>>,
+    /// The skills the run's session lists, as the turn starts ([`CallFacts::skills`]).
+    skills: Option<Arc<[String]>>,
     /// What the run has loaded as the turn starts, for the calls that read it.
     loaded: Arc<[Loaded]>,
     /// The loaded tools a request did not carry, as the turn starts.
@@ -709,6 +715,7 @@ impl<'a> Early<'a> {
             kept_left: self.facts.kept_left,
             images: self.facts.images.clone(),
             task: self.facts.task.clone(),
+            skills: self.facts.skills.clone(),
             loaded: Arc::clone(&self.facts.loaded),
             removed_tools: Arc::clone(&self.facts.removed_tools),
             narrowing: Arc::clone(&self.facts.narrowing),
@@ -1449,6 +1456,11 @@ pub struct LlmAgentBuilder {
     model: DynModel,
     model_alias: String,
     instructions: Option<String>,
+    /// The skills section, rendered per request for the session's selection ([`SkillCatalog`]).
+    catalog: Option<DynSkillCatalog>,
+    /// What follows the skills section in every request (the session tools' guide), when there is
+    /// one.
+    tail: Option<String>,
     tools: Vec<DynTool>,
     sources: Vec<DynToolSource>,
     limits: Limits,
@@ -1529,6 +1541,32 @@ impl LlmAgentBuilder {
     /// The system prompt.
     pub fn instructions(mut self, instructions: impl Into<String>) -> Self {
         self.instructions = Some(instructions.into());
+        self
+    }
+
+    /// The agent's skills section ([`SkillCatalog`]), rendered for each request with the session's
+    /// `skills` when it has one (ADR 0054, slice 7): the catalog of the skills left to load, and
+    /// the bodies of the preloaded ones.
+    ///
+    /// [ADR 0054]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md
+    pub fn skill_catalog(mut self, catalog: impl SkillCatalog + 'static) -> Self {
+        self.catalog = Some(Arc::new(catalog));
+        self
+    }
+
+    /// An already shared [`SkillCatalog`] ([`LlmAgentBuilder::skill_catalog`]).
+    pub fn dyn_skill_catalog(mut self, catalog: DynSkillCatalog) -> Self {
+        self.catalog = Some(catalog);
+        self
+    }
+
+    /// Text that follows the skills section in every request, after a blank line: the session
+    /// tools' guide, when the agent has them. It never varies, so the prefix ADR 0044's cache
+    /// relies on holds.
+    ///
+    /// [ADR 0044]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0044-paged-tools-a-stable-prompt-prefix-a-plan-skills-commands-and-project-context.md
+    pub fn prompt_tail(mut self, text: impl Into<String>) -> Self {
+        self.tail = Some(text.into());
         self
     }
 
@@ -1906,10 +1944,17 @@ impl LlmAgentBuilder {
         };
         // The toolset never changes after the build, so what a request holds besides the history
         // (the instructions and the specs as the request shows them) is counted once, here, and
-        // never cloned or serialised again to answer `fixed_chars`.
+        // never cloned or serialised again to answer `fixed_chars`. The skills section is counted
+        // for the folder's own selection, the widest one a run can have: a session's narrows it.
         let mut shown = specs.clone();
         order::prepare(&mut shown, self.max_parallel > 1);
-        let fixed_chars = instructions.as_deref().map_or(0, |s| s.chars().count())
+        let fixed_catalog = self.catalog.as_ref().map(|catalog| catalog.section(None));
+        let fixed_system = system_prompt(
+            instructions.as_deref(),
+            fixed_catalog.as_deref(),
+            self.tail.as_deref(),
+        );
+        let fixed_chars = fixed_system.as_deref().map_or(0, |s| s.chars().count())
             + serde_json::to_string(&shown).map_or(0, |s| s.chars().count());
         let model = crate::gate::admitted(self.model, self.admission.as_ref(), &self.name);
         LlmAgent {
@@ -1917,6 +1962,8 @@ impl LlmAgentBuilder {
             model,
             model_alias: self.model_alias,
             instructions,
+            catalog: self.catalog,
+            tail: self.tail,
             tools,
             sources: self.sources,
             index,
@@ -2134,6 +2181,12 @@ pub struct LlmAgent {
     model: DynModel,
     model_alias: String,
     instructions: Option<String>,
+    /// The skills section, rendered per request for the session's selection ([`SkillCatalog`]),
+    /// when the agent has skills.
+    catalog: Option<DynSkillCatalog>,
+    /// What follows the skills section in every request: the session tools' guide, when the agent
+    /// has them.
+    tail: Option<String>,
     tools: Vec<DynTool>,
     sources: Vec<DynToolSource>,
     index: HashMap<String, usize>,
@@ -2287,6 +2340,8 @@ impl LlmAgent {
             model,
             model_alias: model_alias.into(),
             instructions: None,
+            catalog: None,
+            tail: None,
             tools: Vec::new(),
             sources: Vec::new(),
             limits: Limits::default(),
@@ -2318,6 +2373,23 @@ impl LlmAgent {
     /// The limits in force.
     pub fn limits(&self) -> &Limits {
         &self.limits
+    }
+
+    /// The system prompt of a request ([`system_prompt`]): the folder's own text, the skills
+    /// section for the session's `skills` (the folder's own when it names none), the tail, then
+    /// the session's `instructions` under their heading ([`with_session_instructions`]).
+    fn system_for(&self, config: Option<&adam_runtime::SessionConfig>) -> Option<String> {
+        let selected = config.and_then(|c| c.skills.as_deref());
+        let catalog = self
+            .catalog
+            .as_ref()
+            .map(|catalog| catalog.section(selected));
+        let system = system_prompt(
+            self.instructions.as_deref(),
+            catalog.as_deref(),
+            self.tail.as_deref(),
+        );
+        with_session_instructions(system, config)
     }
 
     /// The most tool calls of a turn that run at the same time
@@ -3197,7 +3269,7 @@ impl LlmAgent {
         let live = self.live_model(state);
         let live_alias = live.alias.to_owned();
         let mut request = ModelRequest::new(live_alias.clone());
-        request.system = with_session_instructions(self.instructions.clone(), state.config());
+        request.system = self.system_for(state.config());
         // What is sent about an image is decided here, from the reference and the deployment's
         // settings now, and recorded nowhere: the same settings give the same lines every turn.
         let image_limits = self.model.input_modalities(&live_alias).images;
@@ -3312,6 +3384,7 @@ impl LlmAgent {
             images: self.image_gate(state),
             output_cut: state.output_cut,
             task: state.task().map(Arc::from),
+            skills: skills_of(state),
             loaded: Arc::from(state.loaded.clone()),
             removed_tools: Arc::from(state.removed_tools.clone()),
             narrowing: Arc::new(narrowing_of(
@@ -4043,7 +4116,7 @@ impl LlmAgent {
         let live = self.live_model(state);
         let live_alias = live.alias.to_owned();
         let mut request = ModelRequest::new(live_alias.clone());
-        request.system = with_session_instructions(self.instructions.clone(), state.config());
+        request.system = self.system_for(state.config());
         // The summary request is the request before it and one more message, so a provider's cache
         // serves it: its images are the ones the last request sent. A history that a provider
         // rejected as too long is sent shorter, with each image said in a few words.
@@ -4899,6 +4972,7 @@ impl LlmAgent {
                         kept_left: MAX_RUN_KEPT_BYTES.saturating_sub(state.kept_bytes()),
                         images: self.image_gate(state),
                         task: state.task().map(Arc::from),
+                        skills: skills_of(state),
                         loaded: Arc::from(state.loaded.clone()),
                         removed_tools: Arc::from(state.removed_tools.clone()),
                         narrowing: Arc::new(narrowing_of(
@@ -5257,6 +5331,7 @@ impl LlmAgent {
                 kept_left: MAX_RUN_KEPT_BYTES.saturating_sub(state.kept_bytes()),
                 images: self.image_gate(state),
                 task: state.task().map(Arc::from),
+                skills: skills_of(state),
                 loaded: Arc::from(state.loaded.clone()),
                 removed_tools: Arc::from(state.removed_tools.clone()),
                 narrowing: Arc::new(narrowing_of(
@@ -5797,6 +5872,7 @@ impl LlmAgent {
             kept_left,
             images,
             task,
+            skills,
             loaded,
             removed_tools,
             narrowing,
@@ -5810,6 +5886,7 @@ impl LlmAgent {
             .tool_ctx(ctx, context, root, notes, &call.id, &call.name)
             .with_note(note.cloned())
             .with_task(task.clone())
+            .with_skills(skills)
             .with_loaded(Arc::clone(&loaded))
             .with_removed_tools(Arc::clone(&removed_tools))
             .with_files_left((MAX_RUN_FILE_BYTES as u64).saturating_sub(files_used))
@@ -7098,6 +7175,16 @@ fn model_run_of(state: &Conversation) -> Option<RunId> {
 /// workspace of [`ToolCtx::root_run_id`](crate::ToolCtx::root_run_id), as they always did.
 fn workspace_run_of(state: &Conversation) -> Option<RunId> {
     state.session.as_ref().and_then(|header| header.workspace)
+}
+
+/// The skills the run's session lists ([`adam_runtime::SessionConfig::skills`]), for the skills
+/// tools to refuse one outside it; `None` when the session names none, so the folder's whole
+/// selection stands.
+fn skills_of(state: &Conversation) -> Option<Arc<[String]>> {
+    state
+        .config()
+        .and_then(|config| config.skills.as_deref())
+        .map(|names| Arc::from(names.to_vec()))
 }
 
 /// The first user message of a run, as a fresh [`Conversation`]. Shared by
@@ -9673,6 +9760,56 @@ mod session_instructions_tests {
         assert_eq!(
             with_session_instructions(Some("You are the coder.".into()), Some(&none)),
             Some("You are the coder.".into())
+        );
+    }
+
+    /// A fixed catalog, for the composition: the folder's own selection, or a session's names.
+    struct Fixed;
+
+    impl crate::catalog::SkillCatalog for Fixed {
+        fn section(&self, selected: Option<&[String]>) -> String {
+            match selected {
+                None => "catalog: alpha, beta".to_owned(),
+                Some(names) => format!("catalog: {}", names.join(", ")),
+            }
+        }
+    }
+
+    /// The prompt is `system_prompt`'s: the folder's text, the catalog for the session's `skills`,
+    /// the tail, then the session's `instructions` under their heading (ADR 0054, slice 7). A
+    /// root names no selection, so its prompt is the whole folder's; a narrowed session changes
+    /// only the catalog, and the folder's part stays first (ADR 0044's prefix).
+    ///
+    /// [ADR 0044]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0044-paged-tools-a-stable-prompt-prefix-a-plan-skills-commands-and-project-context.md
+    /// [ADR 0054]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md
+    #[test]
+    fn a_sessions_skills_narrow_the_catalog_and_the_text_follows_it() {
+        let model: DynModel = Arc::new(MockModel::new());
+        let agent = LlmAgent::builder("a", model, "m")
+            .instructions("You are the coder.")
+            .skill_catalog(Fixed)
+            .prompt_tail("Child sessions guide.")
+            .build();
+        let root = agent.system_for(None).expect("a prompt");
+        assert_eq!(
+            root,
+            "You are the coder.\n\ncatalog: alpha, beta\n\nChild sessions guide."
+        );
+        let config = adam_runtime::SessionConfig::from_value(serde_json::json!({
+            "skills": ["alpha"],
+            "instructions": "Answer in one paragraph."
+        }))
+        .expect("a config");
+        let out = agent.system_for(Some(&config)).expect("a prompt");
+        assert!(
+            out.starts_with("You are the coder.\n\ncatalog: alpha\n\nChild sessions guide."),
+            "{out}"
+        );
+        assert!(!out.contains("beta"), "{out}");
+        assert!(out.ends_with("Answer in one paragraph."), "{out}");
+        assert!(
+            out.contains("Instructions from the parent agent or the person"),
+            "{out}"
         );
     }
 }

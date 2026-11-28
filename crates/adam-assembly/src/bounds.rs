@@ -83,6 +83,10 @@ fn is_local(manifest: &AgentManifest, target: &SessionTarget) -> bool {
 ///   have (a worker, which binds the agent; see `SessionBounds::tools_complete`), else an empty,
 ///   incomplete set (the control plane, which binds none). A remote target has the empty, incomplete
 ///   set whatever is passed: its tools are another system's, and the option is refused.
+/// * `skills` is the names the subagent's folder selects ([`crate::def`]'s `session_targets`, from
+///   the file's `skills:` alone): what a session's `skills` may name (ADR 0054, slice 7). A folder
+///   always knows its skills, so the set is complete; a remote target has none and refuses the
+///   option.
 ///
 /// A remote subagent's rounds are runs of an agent of its own, and the ADR refuses every option
 /// but `time_limit`, `max_rounds` and `instructions` on one: the loop's defaults stand for the
@@ -94,6 +98,7 @@ pub(crate) fn bounds_of(
     max_rounds: u32,
     tools: Vec<String>,
     tools_complete: bool,
+    skills: Vec<String>,
 ) -> SessionBounds {
     let (max_turns, max_tool_calls, max_output_tokens, parallel) = if is_local(manifest, target) {
         let file = folder_limits(manifest, target);
@@ -135,5 +140,6 @@ pub(crate) fn bounds_of(
         token_budget: None,
         tools: if target.remote { Vec::new() } else { tools },
         tools_complete: tools_complete && !target.remote,
+        skills: if target.remote { Vec::new() } else { skills },
     }
 }

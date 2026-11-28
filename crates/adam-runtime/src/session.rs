@@ -878,8 +878,20 @@ pub const MAX_SESSION_TOOL_ENTRIES: usize = 32;
 /// [ADR 0054]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md
 pub const MAX_SESSION_TOOL_ENTRY_CHARS: usize = 200;
 
-/// The most tool names a refusal lists before it says `and N more`.
+/// The most skill names a refusal lists before it says `and N more`.
 const REFUSAL_LIST_NAMES: usize = 50;
+
+/// The most entries of a session's `skills` ([ADR 0054], decision 4).
+///
+/// [ADR 0054]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md
+pub const MAX_SESSION_SKILLS: usize = 32;
+
+/// The most characters of one entry of a session's `skills` ([ADR 0054], decision 4): a skill
+/// name's bound. The folder's own names are at most 64 characters
+/// (`adam_agent_fs::is_skill_name`); the bound here leaves room for a name a deployment renders.
+///
+/// [ADR 0054]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md
+pub const MAX_SESSION_SKILL_CHARS: usize = 128;
 
 /// The most bytes of a session's `report_schema` as compact JSON: 16 KiB ([ADR 0054], decision 4).
 ///
@@ -961,6 +973,15 @@ pub struct SessionConfig {
     /// [ADR 0054]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub instructions: Option<String>,
+    /// The skills of the subagent's own selection this session keeps ([ADR 0054], decision 4):
+    /// each one must be a skill the subagent's `skills:` selects, and the catalog the model sees
+    /// offers no other. At most [`MAX_SESSION_SKILLS`] names of at most
+    /// [`MAX_SESSION_SKILL_CHARS`] characters, none blank. Preloaded skills stay in the prompt
+    /// whatever the session lists: they are the folder's own instructions. Local subagents only.
+    ///
+    /// [ADR 0054]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skills: Option<Vec<String>>,
 }
 
 /// The most characters a session's `instructions` may hold ([ADR 0054], decision 4).
@@ -981,6 +1002,7 @@ impl SessionConfig {
             && self.deny_tools.is_none()
             && self.report_schema.is_none()
             && self.instructions.is_none()
+            && self.skills.is_none()
     }
 
     /// What a round's context carries of this config under `vymalo.session.tools`
@@ -1031,13 +1053,15 @@ impl SessionConfig {
         adopted.max_rounds = kept.max_rounds;
         adopted.report_schema = kept.report_schema;
         adopted.instructions = kept.instructions;
+        adopted.skills = kept.skills;
         adopted
     }
 
     /// The options decision 4's table marks *next round*: an edit of a working round leaves them
     /// pending in the header, and the next round applies them. `time_limit` and `max_rounds` are
-    /// read where a round starts, `instructions` is the round's system prompt and `report_schema`
-    /// the gate of its final answer, so none of them moves under a round that is running.
+    /// read where a round starts, `instructions` is the round's system prompt, `skills` the
+    /// catalog it renders and `report_schema` the gate of its final answer, so none of them moves
+    /// under a round that is running.
     ///
     /// A slice that adds an option with *next round* in that column adds it here, and to
     /// [`adopted_mid_round`](Self::adopted_mid_round), or an edit would apply it mid-round.
@@ -1050,6 +1074,7 @@ impl SessionConfig {
             max_rounds: self.max_rounds,
             report_schema: self.report_schema.clone(),
             instructions: self.instructions.clone(),
+            skills: self.skills.clone(),
             ..Self::default()
         }
     }
@@ -1156,6 +1181,13 @@ pub struct SessionPatch {
         skip_serializing_if = "Option::is_none"
     )]
     pub instructions: Option<Option<String>>,
+    /// See [`max_turns`](Self::max_turns).
+    #[serde(
+        default,
+        deserialize_with = "double_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub skills: Option<Option<Vec<String>>>,
 }
 
 /// Read a **present** member of a patch as `Some(..)` whatever it is, so that a member set to
@@ -1211,6 +1243,7 @@ impl SessionPatch {
         name("denyTools", self.deny_tools.is_some());
         name("reportSchema", self.report_schema.is_some());
         name("instructions", self.instructions.is_some());
+        name("skills", self.skills.is_some());
         named
     }
 
@@ -1255,6 +1288,9 @@ impl SessionPatch {
         }
         if let Some(v) = &self.instructions {
             config.instructions = v.clone();
+        }
+        if let Some(v) = &self.skills {
+            config.skills = v.clone();
         }
         config
     }
@@ -1362,12 +1398,17 @@ pub struct SessionBounds {
     /// With no name known (a control plane) only the shape is checked, so it admits what a worker
     /// will accept.
     pub tools_complete: bool,
+    /// The skills the subagent's folder selects (`skills:`, preloaded ones included): what a
+    /// session's `skills` may name ([`admit`](Self::admit)). A folder always knows its skills, so
+    /// the set is complete. Empty for a remote target, whose loop is another system's and which
+    /// refuses the option.
+    pub skills: Vec<String>,
 }
 
 impl Default for SessionBounds {
     /// The loop's own defaults: 50 turns, 200 tool calls, 4,096 output tokens, 10 calls at once,
-    /// 30 minutes, 20 rounds, no token budget, no known window and no known tools (an incomplete,
-    /// empty set).
+    /// 30 minutes, 20 rounds, no token budget, no known window, no known tools (an incomplete,
+    /// empty set) and no known skill.
     fn default() -> Self {
         Self {
             max_turns: 50,
@@ -1380,6 +1421,7 @@ impl Default for SessionBounds {
             token_budget: None,
             tools: Vec::new(),
             tools_complete: false,
+            skills: Vec::new(),
         }
     }
 }
@@ -1508,6 +1550,9 @@ impl SessionBounds {
         if let Some(entries) = &requested.deny_tools {
             self.admit_tool_entries("deny_tools", entries)?;
         }
+        if let Some(names) = &requested.skills {
+            self.admit_skill_names(names)?;
+        }
         if let Some(text) = &requested.instructions {
             let chars = text.chars().count();
             if chars > MAX_SESSION_INSTRUCTIONS_CHARS {
@@ -1595,6 +1640,68 @@ impl SessionBounds {
                 format!(
                     "config.{option} has {entry:?}, which matches none of the names this agent declares: \
                      {list}{hint}"
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    /// The entries of `skills`: each non-blank and short, not too many, and each one a skill the
+    /// subagent's folder selects — the list is complete, a folder always knows its skills.
+    fn admit_skill_names(&self, names: &[String]) -> Result<(), Refusal> {
+        if names.len() > MAX_SESSION_SKILLS {
+            return Err(Refusal::new(
+                Some("skills"),
+                format!(
+                    "config.skills has {} entries; at most {MAX_SESSION_SKILLS}",
+                    names.len()
+                ),
+            ));
+        }
+        for name in names {
+            if name.trim().is_empty() {
+                return Err(Refusal::new(
+                    Some("skills"),
+                    "config.skills has a blank entry; name a skill".to_owned(),
+                ));
+            }
+            let chars = name.chars().count();
+            if chars > MAX_SESSION_SKILL_CHARS {
+                return Err(Refusal::new(
+                    Some("skills"),
+                    format!(
+                        "config.skills has an entry of {chars} characters; at most \
+                         {MAX_SESSION_SKILL_CHARS}"
+                    ),
+                ));
+            }
+        }
+        for name in names {
+            if self.skills.iter().any(|have| have == name) {
+                continue;
+            }
+            let listed: Vec<&str> = self
+                .skills
+                .iter()
+                .take(REFUSAL_LIST_NAMES)
+                .map(String::as_str)
+                .collect();
+            let mut list = if listed.is_empty() {
+                "none".to_owned()
+            } else {
+                listed.join(", ")
+            };
+            if self.skills.len() > REFUSAL_LIST_NAMES {
+                list.push_str(&format!(
+                    " and {} more",
+                    self.skills.len() - REFUSAL_LIST_NAMES
+                ));
+            }
+            return Err(Refusal::new(
+                Some("skills"),
+                format!(
+                    "config.skills has {name:?}, which is not one of the skills this agent selects: \
+                     {list}"
                 ),
             ));
         }
@@ -1716,9 +1823,11 @@ impl SessionBounds {
             tools: config.tools.clone(),
             deny_tools: config.deny_tools.clone(),
             report_schema: config.report_schema.clone(),
-            // Text has no bound to clamp to: `admit` already refused one that is too long, and a
-            // later round keeps what the session was started with.
+            // Text and a skill selection have no bound to clamp to: `admit` already refused one
+            // that is too long or names a skill the folder does not select, and a later round
+            // keeps what the session was started with.
             instructions: config.instructions.clone(),
+            skills: config.skills.clone(),
         }
     }
 }
@@ -3155,6 +3264,7 @@ mod tests {
             token_budget: None,
             tools: Vec::new(),
             tools_complete: false,
+            skills: Vec::new(),
         }
     }
 
@@ -3580,6 +3690,7 @@ mod tests {
             token_budget: Some(4_000),
             tools: Vec::new(),
             tools_complete: false,
+            skills: Vec::new(),
         };
         let clamped = lowered.clamp(&ask);
         assert_eq!(clamped.max_turns, Some(40));
@@ -4038,6 +4149,105 @@ mod tests {
         assert_eq!(
             serde_json::to_value(&both).expect("serialises"),
             serde_json::json!({"tools": ["a*"], "denyTools": ["ab"]})
+        );
+    }
+
+    /// A bounds whose folder selects `skills`, for the session `skills` tests ([ADR 0054],
+    /// decision 4).
+    fn bound_with_skills(skills: &[&str]) -> SessionBounds {
+        SessionBounds {
+            skills: skills.iter().map(|s| (*s).to_owned()).collect(),
+            ..bounds()
+        }
+    }
+
+    fn skills(names: &[&str]) -> SessionConfig {
+        SessionConfig {
+            skills: Some(names.iter().map(|n| (*n).to_owned()).collect()),
+            ..SessionConfig::default()
+        }
+    }
+
+    /// A session keeps only the skills the subagent's folder selects ([ADR 0054], decision 4): a
+    /// name outside it is refused with the selection in the sentence.
+    ///
+    /// [ADR 0054]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md
+    #[test]
+    fn a_skill_outside_the_folders_selection_is_refused_with_the_list() {
+        let bound = bound_with_skills(&["alpha", "beta"]);
+        assert_eq!(
+            bound.admit(skills(&["alpha"])).expect("a selected skill"),
+            skills(&["alpha"])
+        );
+        // Every skill, in the folder's own order, is the folder's own selection.
+        assert!(bound.admit(skills(&["beta", "alpha"])).is_ok());
+        let why = bound.admit(skills(&["gamma"])).expect_err("not selected");
+        assert_eq!(why.option(), Some("skills"));
+        assert!(
+            why.message().contains("\"gamma\"")
+                && why.message().contains("alpha, beta")
+                && why.message().contains("skills this agent selects"),
+            "{why}"
+        );
+        // A folder that selects no skill admits none: the catalog is empty either way.
+        let none = bound_with_skills(&[]);
+        let why = none
+            .admit(skills(&["alpha"]))
+            .expect_err("nothing selectable");
+        assert!(why.message().ends_with("selects: none"), "{why}");
+    }
+
+    /// The shape of a `skills` entry is held before its name: none blank, not too long, not too
+    /// many ([ADR 0054], decision 4).
+    ///
+    /// [ADR 0054]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md
+    #[test]
+    fn a_skills_entry_is_held_to_its_shape() {
+        let bound = bound_with_skills(&["alpha"]);
+        let blank = bound.admit(skills(&[" "])).expect_err("blank");
+        assert_eq!(blank.option(), Some("skills"));
+        assert!(blank.message().contains("blank entry"), "{blank}");
+        let long = "a".repeat(MAX_SESSION_SKILL_CHARS + 1);
+        let why = bound.admit(skills(&[long.as_str()])).expect_err("too long");
+        assert!(
+            why.message()
+                .contains(&format!("at most {MAX_SESSION_SKILL_CHARS}")),
+            "{why}"
+        );
+        let many: Vec<String> = (0..=MAX_SESSION_SKILLS).map(|n| format!("s{n}")).collect();
+        let why = bound
+            .admit(SessionConfig {
+                skills: Some(many),
+                ..SessionConfig::default()
+            })
+            .expect_err("too many");
+        assert!(
+            why.message()
+                .contains(&format!("at most {MAX_SESSION_SKILLS}")),
+            "{why}"
+        );
+    }
+
+    /// A session's `skills` is a set option that survives a clamp, crosses the wire camelCase, and
+    /// is one of the options a working round takes only from its next one ([ADR 0054], decisions 4
+    /// and 11).
+    ///
+    /// [ADR 0054]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md
+    #[test]
+    fn skills_count_as_set_and_survive_a_clamp_and_an_edit() {
+        let asked = skills(&["alpha"]);
+        assert!(!asked.is_empty());
+        assert_eq!(bound_with_skills(&["alpha"]).clamp(&asked), asked);
+        assert_eq!(
+            serde_json::to_value(&asked).expect("serialises"),
+            serde_json::json!({"skills": ["alpha"]})
+        );
+        assert_eq!(asked.next_round_only().skills, asked.skills);
+        let edit = skills(&["alpha", "beta"]);
+        assert_eq!(
+            asked.adopted_mid_round(&edit).skills,
+            asked.skills,
+            "a running round keeps its catalog"
         );
     }
 }

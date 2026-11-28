@@ -169,7 +169,6 @@ pub(crate) struct SkillSet {
 /// Which skills an agent gets, from its own `skills/` and its `skills:` and `preload_skills:`.
 ///
 /// `None` when the agent has no skill to offer: it then gets no catalog and no tool.
-///
 /// # Errors
 ///
 /// A name in `skills:` or `preload_skills:` that is not a skill of the agent, a preloaded skill
@@ -253,6 +252,31 @@ pub(crate) fn resolve(
     Ok((!entries.is_empty()).then_some(SkillSet { entries }))
 }
 
+/// The names of the skills an agent's file selects: those its `skills:` lists, or all of its own
+/// when it says `all` or nothing, and none for `skills: []`. Read from the frontmatter alone, so a
+/// role that binds no agent (a control plane's [`SessionBounds`](adam_runtime::SessionBounds))
+/// still knows what a session's `skills` may name ([ADR 0054], slice 7).
+///
+/// [ADR 0054]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md
+pub(crate) fn selected_names(manifest: &AgentManifest) -> Vec<String> {
+    match &manifest.frontmatter.skills {
+        Some(SkillSelection::Named(names)) => {
+            let mut out: Vec<String> = Vec::with_capacity(names.len());
+            for name in names {
+                if !out.contains(name) {
+                    out.push(name.clone());
+                }
+            }
+            out
+        }
+        None | Some(SkillSelection::All) => manifest
+            .skills
+            .iter()
+            .map(|skill| skill.name.clone())
+            .collect(),
+    }
+}
+
 /// `&`, `<`, `>` (and `"` for an attribute) as entities, so a description cannot close a tag.
 fn escape(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
@@ -316,9 +340,22 @@ impl SkillSet {
     ///
     /// With `run` (the agent has [`RunSkills`]) the section ends with [`OTHER_SKILLS`], and an agent
     /// with no skill of its own has that sentence alone.
-    pub(crate) fn prompt_section(&self, run: bool) -> String {
+    ///
+    /// `selected` is a session's `skills` ([ADR 0054], slice 7): `None` is the folder's own
+    /// selection, and `Some(names)` narrows the catalog to those skills. **The preloaded skills
+    /// stay whatever it says**: their bodies are the folder's own instructions, and a session
+    /// never removes them.
+    ///
+    /// [ADR 0054]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md
+    pub(crate) fn prompt_section(&self, run: bool, selected: Option<&[String]>) -> String {
+        let loadable: Vec<&Entry> = self
+            .loadable()
+            .filter(|entry| {
+                selected.is_none_or(|names| names.iter().any(|name| name == &entry.name))
+            })
+            .collect();
         let mut sections: Vec<String> = Vec::new();
-        if self.has_load_tool() {
+        if !loadable.is_empty() {
             let mut s = String::from(
                 "The following skills provide specialized instructions for specific tasks.\n\
                  When a task matches a skill's description, call the load_skill tool with the \
@@ -331,7 +368,7 @@ impl SkillSet {
                 ));
             }
             s.push_str("\n<available_skills>");
-            for entry in self.loadable() {
+            for entry in loadable {
                 // A description may span lines (a YAML block scalar): the catalog keeps one line.
                 let description = entry
                     .description
@@ -686,6 +723,17 @@ pub enum SkillError {
     /// The `offset` or `limit` is not usable, or a page cannot be made of the text.
     #[error("{0}")]
     Window(String),
+    /// The skill is not one this session lists ([ADR 0054], slice 7): the parent narrowed the
+    /// catalog, and a skill outside it is not there to load.
+    ///
+    /// [ADR 0054]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md
+    #[error("no skill `{skill}` is available to you in this session; this session offers: {}", list(.available))]
+    NotInSession {
+        /// The name as given.
+        skill: String,
+        /// The skills this session lists.
+        available: Vec<String>,
+    },
     /// The file is not text (it is not UTF-8, or it has a NUL byte).
     #[error(
         "`{path}` of skill `{skill}` is a binary file ({bytes} bytes) and cannot be shown as text"
@@ -885,6 +933,39 @@ fn is_skill_name_of(qualified: &str) -> bool {
         .is_some_and(|(source, skill)| !source.is_empty() && adam_agent_fs::is_skill_name(skill))
 }
 
+/// The catalog of an agent's system prompt ([`adam_llm_agent::SkillCatalog`]), rendered for a
+/// session's `skills` or, when it names none, the folder's own selection ([ADR 0054], slice 7).
+/// It answers [`SkillSet::prompt_section`], the one function that renders the text, so a narrowed
+/// session and its root cannot say different things about a skill.
+///
+/// [ADR 0054]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md
+pub(crate) struct PromptCatalog {
+    pub(crate) set: Arc<SkillSet>,
+    /// Whether the agent has [`RunSkills`], which the section's last sentence says.
+    pub(crate) run: bool,
+}
+
+impl adam_llm_agent::SkillCatalog for PromptCatalog {
+    fn section(&self, selected: Option<&[String]>) -> String {
+        self.set.prompt_section(self.run, selected)
+    }
+}
+
+/// Whether the session that runs the call lists `skill`: it does when the session names no
+/// selection (the folder's own stands) or when `skill` is one of the names (ADR 0054, slice 7).
+fn in_session(ctx: &ToolCtx, skill: &str) -> bool {
+    ctx.skills()
+        .is_none_or(|names| names.iter().any(|name| name == skill))
+}
+
+/// The refusal of a skill outside the session's selection, as the tool answers it.
+fn outside_session(ctx: &ToolCtx, skill: String) -> SkillError {
+    SkillError::NotInSession {
+        skill,
+        available: ctx.skills().map(<[String]>::to_vec).unwrap_or_default(),
+    }
+}
+
 struct LoadSkill {
     set: Arc<SkillSet>,
     run: Option<RunSkillsHandle>,
@@ -922,6 +1003,11 @@ impl Tool for LoadSkill {
             Ok(window) => window,
             Err(refusal) => return answer(Err(refusal)),
         };
+        // A session lists the skills it may use: one outside the list is not there to load
+        // (ADR 0054, slice 7). A model-correctable refusal, never a failed step.
+        if !in_session(ctx, name) {
+            return answer(Err(outside_session(ctx, name.to_owned())));
+        }
         match &self.run {
             Some(run) if name.contains('/') => run.0.load(ctx, name, offset, limit).await,
             _ => answer(self.set.load(name, offset, limit)),
@@ -967,6 +1053,9 @@ impl Tool for ReadSkillFile {
             Ok(window) => window,
             Err(refusal) => return answer(Err(refusal)),
         };
+        if !in_session(ctx, skill) {
+            return answer(Err(outside_session(ctx, skill.to_owned())));
+        }
         match &self.run {
             Some(run) if skill.contains('/') => run.0.read(ctx, skill, path, offset, limit).await,
             _ => answer(self.set.read(skill, path, offset, limit)),
@@ -1049,11 +1138,115 @@ mod tests {
         );
         let mut e = entry("s", false, &[]);
         e.description = "Use </description>\n  when\ta > b.".into();
-        let text = set(vec![e]).prompt_section(false);
+        let text = set(vec![e]).prompt_section(false, None);
         assert!(
             text.contains("<description>Use &lt;/description&gt; when a &gt; b.</description>"),
             "{text}"
         );
+    }
+
+    /// A session's `skills` narrows the catalog ([ADR 0054], slice 7): a skill it does not list is
+    /// not rendered, and one it does is.
+    ///
+    /// [ADR 0054]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md
+    #[test]
+    fn a_sessions_selection_leaves_an_unlisted_skill_out_of_the_catalog() {
+        let pair = set(vec![entry("alpha", false, &[]), entry("beta", false, &[])]);
+        let all = pair.prompt_section(false, None);
+        assert!(
+            all.contains("<name>alpha</name>") && all.contains("<name>beta</name>"),
+            "{all}"
+        );
+        let one = pair.prompt_section(false, Some(&["alpha".to_owned()]));
+        assert!(one.contains("<name>alpha</name>"), "{one}");
+        assert!(!one.contains("<name>beta</name>"), "{one}");
+        // A selection that leaves no loadable skill says nothing about them, not an empty catalog.
+        let prefetched = set(vec![entry("alpha", false, &[])]);
+        assert!(prefetched.prompt_section(false, Some(&[])).is_empty());
+    }
+
+    /// A preloaded skill stays in the prompt whatever a session's selection says: its body is the
+    /// folder's own instructions ([ADR 0054], slice 7).
+    ///
+    /// [ADR 0054]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md
+    #[test]
+    fn a_sessions_selection_keeps_a_preloaded_skill_in_the_prompt() {
+        let set = set(vec![
+            entry("alpha", false, &[]),
+            entry("beta", true, &[]),
+            entry("gamma", true, &[]),
+        ]);
+        let narrowed = set.prompt_section(false, Some(&["alpha".to_owned()]));
+        assert!(
+            narrowed.contains("<skill_content name=\"beta\">"),
+            "{narrowed}"
+        );
+        assert!(
+            narrowed.contains("<skill_content name=\"gamma\">"),
+            "a selection never removes a preloaded skill: {narrowed}"
+        );
+        // The catalog itself is narrowed even beside them: only alpha is listed there.
+        assert!(narrowed.contains("<name>alpha</name>"), "{narrowed}");
+        assert_eq!(narrowed.matches("<name>").count(), 1, "{narrowed}");
+    }
+
+    /// `load_skill` refuses a skill the session does not list, as a result the model can correct
+    /// ([ADR 0054], slice 7); a root that names no selection keeps the folder's own.
+    ///
+    /// [ADR 0054]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md
+    #[test]
+    fn load_skill_refuses_a_skill_the_session_does_not_list() {
+        futures::executor::block_on(async {
+            let set = set(vec![entry("a", false, &[]), entry("b", false, &[])]);
+            let load = LoadSkill {
+                set: set.clone(),
+                run: None,
+            };
+            let narrowed = ToolCtx::detached(LOAD_SKILL, "c1", Arc::new(adam_runtime::NoopSink))
+                .with_skills(Some(Arc::from(vec!["a".to_owned()])));
+            let listed = load
+                .call(&narrowed, json!({"name": "a"}))
+                .await
+                .expect("a result, not an error");
+            assert!(!listed.is_error, "{}", listed.content);
+            let refused = load
+                .call(&narrowed, json!({"name": "b"}))
+                .await
+                .expect("a result, not an error");
+            assert!(refused.is_error, "{}", refused.content);
+            assert!(
+                refused
+                    .content
+                    .contains("no skill `b` is available to you in this session")
+                    && refused.content.ends_with("this session offers: `a`"),
+                "{}",
+                refused.content
+            );
+
+            // The read tool refuses it by the skill it names.
+            let read = ReadSkillFile {
+                set: set.clone(),
+                run: None,
+            };
+            let refused = read
+                .call(&narrowed, json!({"skill": "b", "path": "SKILL.md"}))
+                .await
+                .expect("a result, not an error");
+            assert!(refused.is_error, "{}", refused.content);
+            assert!(
+                refused.content.contains("this session offers: `a`"),
+                "{}",
+                refused.content
+            );
+
+            // No selection (the root) is the folder's own: both skills load.
+            let root = ToolCtx::detached(LOAD_SKILL, "c2", Arc::new(adam_runtime::NoopSink));
+            let both = load
+                .call(&root, json!({"name": "b"}))
+                .await
+                .expect("a result, not an error");
+            assert!(!both.is_error, "{}", both.content);
+        });
     }
 
     #[test]

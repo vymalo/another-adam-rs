@@ -396,7 +396,15 @@ impl BoundDef {
                 model_fallback,
                 model_choices,
                 reasoning_effort: effort,
-                prompt: node.prompt.clone(),
+                prompt: adam_llm_agent::system_prompt(
+                    Some(&node.prompt),
+                    node.catalog
+                        .as_ref()
+                        .map(|catalog| catalog.section(None))
+                        .as_deref(),
+                    node.tail.as_deref(),
+                )
+                .unwrap_or_default(),
                 tools: {
                     let mut tools: Vec<String> =
                         node.tools.iter().map(|(name, _)| name.clone()).collect();
@@ -824,6 +832,7 @@ impl BoundDef {
             self.session_limits.max_rounds(),
             names,
             complete,
+            target.skills.clone(),
         )
     }
 
@@ -924,6 +933,15 @@ impl BoundDef {
             .max_parallel(self.parallel_of(node))
             .reasoning_effort(effort)
             .model_choices(choices);
+        // The skills catalog and the session tools' guide are rendered per run, after the folder's
+        // text (ADR 0054 slice 7): the loop composes them, with a session's selection when it has
+        // one.
+        if let Some(catalog) = &node.catalog {
+            builder = builder.dyn_skill_catalog(Arc::clone(catalog));
+        }
+        if let Some(tail) = &node.tail {
+            builder = builder.prompt_tail(tail.clone());
+        }
         if let Some(fallback) = fallback {
             builder = builder.model_fallback(fallback);
         }

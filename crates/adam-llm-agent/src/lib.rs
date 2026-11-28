@@ -139,6 +139,7 @@
 pub mod __private;
 mod access;
 mod agent;
+mod catalog;
 mod compaction;
 mod conversation;
 mod early;
@@ -195,6 +196,11 @@ pub use agent::{
     approval_step, approves, interface_language, interface_language_turn, is_unattended,
     tool_retry_key,
 };
+/// The skills section of an agent's system prompt ([ADR 0054], slice 7): what a
+/// [`SkillCatalog`] answers and the one function that composes the prompt.
+///
+/// [ADR 0054]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md
+pub use catalog::{DynSkillCatalog, SkillCatalog, system_prompt};
 pub use compaction::{
     COMPACTION_TURN, Compaction, CompactionReason, MAX_COMPACTIONS, PromptSize,
     WINDOW_MARGIN_TOKENS, summary_output_tokens,

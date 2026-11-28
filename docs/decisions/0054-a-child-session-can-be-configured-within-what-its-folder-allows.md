@@ -173,9 +173,11 @@ amendment is the owner's to make there.
    * When an agent has the session tools, its instructions end with a short fixed section, *Child sessions*: what each tool
      does (start with `config`, send, read, list, edit, close and delete), when to keep a session open, and that options only
      narrow what each helper allows and a refusal says the allowed set.
-   * **Where:** appended at bind in `adam-assembly`, after the skills catalog, so it is part of `LlmAgent::instructions` and of
-     the request's `system` before anything a tool source adds (`agent.rs`, `instructed`). It is in the stable prefix of
-     ADR 0044 decision 1 and counted in `fixed_chars`.
+   * **Where:** built at bind in `adam-assembly`, after the skills catalog, so it is part of the request's `system` before
+     anything a tool source adds (`agent.rs`, `instructed`). It is in the stable prefix of ADR 0044 decision 1 and counted in
+     `fixed_chars`. *(Amended 2026-11-28, ANR-214: it is `Node::tail`, passed to `LlmAgentBuilder::prompt_tail` and composed per
+     request after the skills catalog — no longer part of `LlmAgent::instructions`, which is the folder's own text alone; the
+     bytes, `AgentInfo::prompt` and `fixed_chars` are unchanged.)*
    * **Fixed per agent:** it names the tools and the helpers (sorted, as the roster is) and nothing per session, no limit and
      no count, so a deployment that changes a limit does not change the prompt (as `with_limits` keeps the specs).
    * **One source:** a table in `sessions.rs` (each tool's name, purpose and arguments) generates both the specs and the
@@ -364,8 +366,8 @@ where a store is involved (`crates/adam-llm-agent/tests/sessions.rs` holds the s
   *delete* are slices 4 and 5 and join the table with their tools. `def.rs` appends it at bind, after the skills catalog, to the
   root that has subagents (`guide_for` takes the helper names: the section needs no bounds, but `SessionTools` is not built at bind
   because a `SessionAgent` needs them), so it is in
-  `AgentInfo::prompt`, in `LlmAgent::instructions` and in `fixed_chars`. It has no limit and no count, so it is the same bytes
-  under any `SessionLimits`. **The table generates the argument lists; the descriptions are written twice and no test compares
+  `AgentInfo::prompt` and in `fixed_chars` (and, since the ANR-214 amendment above, in the prompt's tail rather than in
+  `LlmAgent::instructions`). It has no limit and no count, so it is the same bytes under any `SessionLimits`. **The table generates the argument lists; the descriptions are written twice and no test compares
   them:** each spec's `required` is built
   from it (`required_of`), a unit test holds each spec's `properties` keys (and `required`) to the table's arguments, and the specs stay
   pinned byte for byte by `tests/fixtures/session-tools.json`. The drift test (`tests/sessions.rs`,
@@ -448,6 +450,22 @@ where a store is involved (`crates/adam-llm-agent/tests/sessions.rs` holds the s
 * Files: `def.rs` (the catalog kept apart from the body), `agent.rs` (the run's `system`), `crates/adam-assembly/src/skills.rs` (`load_skill`).
 * Accepted when: the session's text follows the folder's under the fixed heading in round 2 and later; an unlisted skill is not in
   the catalog and `load_skill` refuses it; a preloaded skill stays.
+* *Built (2026-11-27, ANR-1214), the `instructions` half:* `SessionConfig::instructions` (camelCase `instructions`), at most
+  `MAX_SESSION_INSTRUCTIONS_CHARS` (4,000), is rendered by `with_session_instructions` at both places a request's `system` is
+  set (`agent.rs`), after the folder's text and under a fixed heading that says the text above wins; a session that asks for
+  nothing adds nothing.
+* *Built (2026-11-28, ANR-214), the `skills` half:* `SessionConfig::skills` (camelCase `skills`), at most `MAX_SESSION_SKILLS`
+  (32) names of at most `MAX_SESSION_SKILL_CHARS` (128) characters, none blank. `SessionBounds::skills` is the names the
+  subagent's folder selects (read from its `skills:` alone, so a control plane knows them; a folder always knows its skills, so
+  the set is complete), and `admit` refuses a name outside it with the list, and a remote subagent refuses the option by name.
+  The three parts of the prompt are kept apart at bind (`Node::prompt` the folder's text, `Node::catalog` a `PromptCatalog`,
+  `Node::tail` the session tools' guide) and composed per request by `adam_llm_agent::system_prompt` — the same function
+  `AgentInfo::prompt` reads — so the root's prompt is byte for byte what it was (ADR 0044's prefix test unchanged) and a
+  session's catalog offers only its names, with the preloaded skills' `<skill_content>` still there. `ToolCtx::skills` carries
+  the list to `load_skill` and `read_skill_file`, which refuse a skill it does not name as a result the model can correct
+  (`SkillError::NotInSession`), never as a failed step. `skills` is a *next round* option: an edit of a working round leaves it
+  in the header. **The model's `subagent_start`/`subagent_edit` take it; the A2A `start.config` does not yet**, as with
+  `instructions`.
 
 **8. `access_tier`** (the coder). Depends on 1.
 * Files: `bin/adam-coder/src/tier.rs` (`TierSource`, `Gated`), `crates/adam-llm-agent/src/source.rs` and `tool.rs` (the header's

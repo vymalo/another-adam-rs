@@ -51,6 +51,33 @@ reads the lists from the round's session header first (`crates/adam-llm-agent/sr
   `a_helpers_bounds_are_complete_and_admit_a_relayed_servers_tools`; `bin/adam-coder/tests/agent_files.rs`
   `the_helpers_bounds_are_complete_and_admit_a_relayed_servers_tools`.
 
+## A session's `skills` (ADR 0054 decision 4, slice 7, `skills` half)
+
+For people: the same [`start.config` paragraph](../../../docs/reference/a2a-server.md#child-sessions-child-sessionsv1) — it
+says `skills` is an option of the model's tools and not of `start.config` yet, as `instructions` is.
+
+* `SessionConfig::skills` (`skills` on the wire, camelCase in the header too) is held by `SessionBounds::admit`
+  (`crates/adam-runtime/src/session.rs`, `admit_skill_names`): at most `MAX_SESSION_SKILLS` (32) names of at most
+  `MAX_SESSION_SKILL_CHARS` (128) characters, none blank, and each one a name of `SessionBounds::skills`. That set is
+  `skills::selected_names` (`crates/adam-assembly/src/skills.rs`) from the subagent's `skills:` **alone**, so a control plane
+  that binds no agent knows it as a worker does; it is complete by construction. A remote subagent refuses the option by name
+  (`REMOTE_REFUSED` in `crates/adam-llm-agent/src/sessions.rs`). `clamp` keeps the selection, and it is a *next round* option
+  (`SessionConfig::next_round_only`, `adopted_mid_round`).
+* The prompt is composed per request: `Node::prompt` (the folder's text), `Node::catalog` (`skills::PromptCatalog`, whose
+  `section(Some(names))` filters the loadable entries and **keeps every preloaded body**) and `Node::tail` (the session tools'
+  guide), joined by `adam_llm_agent::system_prompt` at `LlmAgent::system_for` and at `AgentInfo::prompt`, so a root and a
+  narrowed session share one renderer. `ToolCtx::skills` carries the list into `load_skill` and `read_skill_file`, which answer
+  `SkillError::NotInSession` (a result with `is_error`, never `Err`).
+* **Evidence:** `adam-runtime` `session.rs` `a_skill_outside_the_folders_selection_is_refused_with_the_list`,
+  `a_skills_entry_is_held_to_its_shape`, `skills_count_as_set_and_survive_a_clamp_and_an_edit`;
+  `adam-assembly/src/skills.rs` `a_sessions_selection_leaves_an_unlisted_skill_out_of_the_catalog`,
+  `a_sessions_selection_keeps_a_preloaded_skill_in_the_prompt`, `load_skill_refuses_a_skill_the_session_does_not_list`;
+  `adam-llm-agent/src/catalog.rs` `the_three_parts_are_joined_with_a_blank_line_and_an_empty_one_is_left_out`, and
+  `src/agent.rs` `a_sessions_instructions_follow_the_folders_under_a_heading` and
+  `a_sessions_skills_narrow_the_catalog_and_the_text_follows_it`. The refusal was seen red: with the
+  `in_session` check deleted from `LoadSkill::call`, `load_skill_refuses_a_skill_the_session_does_not_list` failed on
+  `assert!(refused.is_error)` (the call returned the body of `b`). The golden and ADR 0044 prefix tests are unchanged.
+
 ## `edit` of `child-sessions/v1` (ADR 0054 decision 11, slice 4)
 
 For people: [the `edit` paragraph](../../../docs/reference/a2a-server.md#child-sessions-child-sessionsv1) of the page

@@ -368,7 +368,7 @@ fn required_of(tool: &str) -> Vec<&'static str> {
 
 /// The options of `config` as the model writes them (snake_case, like the other arguments), and
 /// the camelCase the wire and the header use for the same names.
-const CONFIG_OPTIONS: [(&str, &str); 11] = [
+const CONFIG_OPTIONS: [(&str, &str); 12] = [
     ("max_turns", "maxTurns"),
     ("max_tool_calls", "maxToolCalls"),
     ("max_output_tokens", "maxOutputTokens"),
@@ -380,10 +380,11 @@ const CONFIG_OPTIONS: [(&str, &str); 11] = [
     ("tools", "tools"),
     ("deny_tools", "denyTools"),
     ("report_schema", "reportSchema"),
+    ("skills", "skills"),
 ];
 
-/// The options of `config` that are lists of tool names rather than numbers.
-const CONFIG_LISTS: [&str; 2] = ["tools", "deny_tools"];
+/// The options of `config` that are lists of names rather than numbers.
+const CONFIG_LISTS: [&str; 3] = ["tools", "deny_tools", "skills"];
 
 /// A session's config as a list and a read say it: `max_turns 20, time_limit 10`, the options that
 /// are set, in the model's own names. `None` when none is, so nothing is shown (ADR 0054
@@ -417,7 +418,7 @@ fn config_words(config: &SessionConfig) -> Option<String> {
 
 /// The options a remote subagent refuses: every one but `time_limit` and `max_rounds` (ADR 0054
 /// decision 4).
-const REMOTE_REFUSED: [&str; 9] = [
+const REMOTE_REFUSED: [&str; 10] = [
     "max_turns",
     "max_tool_calls",
     "max_output_tokens",
@@ -427,6 +428,7 @@ const REMOTE_REFUSED: [&str; 9] = [
     "tools",
     "deny_tools",
     "report_schema",
+    "skills",
 ];
 
 /// The [`SessionPatch`] a `config` object of `subagent_start` or `subagent_edit` asked for, or the
@@ -458,9 +460,12 @@ fn config_of(value: &Value) -> Result<SessionPatch, String> {
                     .all(|entry| entry.as_str().is_some_and(|name| !name.trim().is_empty()))
             });
             if !named {
-                return Err(format!(
-                    "config.{key} must be a list of tool names or patterns, none blank"
-                ));
+                let what = if key == "skills" {
+                    "a list of skill names, none blank"
+                } else {
+                    "a list of tool names or patterns, none blank"
+                };
+                return Err(format!("config.{key} must be {what}"));
             }
             wire.insert((*name).to_owned(), value.clone());
             continue;

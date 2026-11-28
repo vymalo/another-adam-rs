@@ -13,7 +13,8 @@ use adam_agent_fs::{
 };
 use adam_core::{DynSecretSource, ProcessEnv};
 use adam_llm_agent::{
-    DynTool, DynToolSource, Limits, LlmStarter, SESSION_TOOLS, SessionTools, ToolSet,
+    DynSkillCatalog, DynTool, DynToolSource, Limits, LlmStarter, SESSION_TOOLS, SessionTools,
+    ToolSet,
 };
 use adam_model::ReasoningEffort;
 use adam_runtime::{RuntimeBuilder, SessionLimits, glob};
@@ -559,6 +560,7 @@ impl AgentDef {
                     max_rounds,
                     Vec::new(),
                     false,
+                    target.skills.clone(),
                 );
                 (target.name, bounds)
             })
@@ -909,6 +911,12 @@ pub(crate) struct Node {
     /// continues on, once, when its model is locked.
     pub(crate) model_fallback: Option<String>,
     pub(crate) prompt: String,
+    /// The skills catalog the run's system prompt carries, rendered per request for a session's
+    /// `skills` ([`DynSkillCatalog`], ADR 0054 slice 7); `None` when the agent has no skills.
+    pub(crate) catalog: Option<DynSkillCatalog>,
+    /// What follows the catalog in every request: the session tools' guide when the agent has
+    /// them.
+    pub(crate) tail: Option<String>,
     pub(crate) tools: Vec<(String, DynTool)>,
     pub(crate) limits: Limits,
     /// `limits.max_output_tokens` of the agent's file, as written (ADR 0064): the cap the agent
@@ -973,6 +981,10 @@ pub(crate) struct SessionTarget {
     /// The time limit of each of its rounds (`None`: none).
     pub(crate) within: Option<Duration>,
     pub(crate) remote: bool,
+    /// The names of the skills its folder selects ([`skills::selected_names`]): what a session's
+    /// `skills` may name (ADR 0054, slice 7). Empty for a remote subagent, which refuses the
+    /// option.
+    pub(crate) skills: Vec<String>,
 }
 
 /// A remote (A2A) subagent, found on the way: what [`Assembly::remotes`](crate::Assembly::remotes) lists.
@@ -1089,8 +1101,7 @@ impl Walk<'_> {
             parent.is_none(),
             &catalog,
         )?;
-        let mut prompt = render_prompt(&origin, manifest, self.values.get(&name))?;
-        // The servers whose `when` makes them groups: their tools are withheld by the source below
+        let mut prompt = render_prompt(&origin, manifest, self.values.get(&name))?; // The servers whose `when` makes them groups: their tools are withheld by the source below
         // until the task holds a keyword or the run loads the group, and their instructions are the
         // group's note.
         //
@@ -1194,13 +1205,16 @@ impl Walk<'_> {
                 Arc::new(adam_llm_agent::ReadOutput),
             ));
         }
+        // The folder's own text ends here: the skills catalog and the session tools' guide are
+        // rendered per run, after it, so a session narrows the catalog and the root's prefix stays
+        // the same bytes (ADR 0054 slice 7, ADR 0044).
+        let base = std::mem::take(&mut prompt);
         let registered = tools.len();
-        let (skills, preloaded) = add_skills(
+        let (skills, preloaded, catalog) = add_skills(
             &origin,
             manifest,
             self.files,
             self.run_skills.filter(|_| parent.is_none()),
-            &mut prompt,
             &mut tools,
         )?;
         // The tools `add_skills` appended, so a clash can say whose tool it hit.
@@ -1221,12 +1235,10 @@ impl Walk<'_> {
         )?;
         // An agent that has the session tools reads what they are, after the skills catalog: the
         // same bytes for the same helpers, whatever the deployment's limits (ADR 0054 decision 9).
-        if !session_targets.is_empty() {
-            prompt.push_str("\n\n");
-            prompt.push_str(&SessionTools::guide_for(
-                session_targets.iter().map(|target| target.name.as_str()),
-            ));
-        }
+        // It follows the catalog in every request, so it is the prompt's tail.
+        let tail = (!session_targets.is_empty()).then(|| {
+            SessionTools::guide_for(session_targets.iter().map(|target| target.name.as_str()))
+        });
         let retry = retry_policies(&origin, manifest, &tools)?;
         let plugins = self.plugins_of(&origin, manifest, parent)?;
         // The root's modes: a name in a mode's `tools:` is one of the agent's tools (fail closed),
@@ -1252,7 +1264,9 @@ impl Walk<'_> {
                 .or_else(|| parent.is_none().then(|| self.root_effort.clone()).flatten()),
             model_preset: manifest.frontmatter.model_preset.clone(),
             model_fallback: manifest.frontmatter.model_fallback.clone(),
-            prompt,
+            prompt: base,
+            catalog,
+            tail,
             tools,
             limits: limits(manifest.frontmatter.limits.as_ref()),
             max_output_tokens: manifest
@@ -1357,17 +1371,20 @@ impl Walk<'_> {
     }
 }
 
-/// Give the agent its skills: the catalog and the preloaded skills after the prompt, then the
-/// tools `load_skill` and `read_skill_file` after the agent's own. Returns the names of the
-/// selected and of the preloaded skills. Nothing is added for an agent without skills.
+/// Give the agent its skills: the tools `load_skill` and `read_skill_file` after the agent's own,
+/// and the catalog its system prompt carries ([`PromptCatalog`]). Returns the names of the
+/// selected and of the preloaded skills, and the catalog (`None` for an agent without skills).
+/// The catalog is **not** appended to the prompt here: the run renders it, with the session's
+/// selection when it has one (ADR 0054, slice 7).
+///
+/// [ADR 0054]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md
 fn add_skills(
     origin: &Origin,
     manifest: &AgentManifest,
     files: &SkillFiles,
     run: Option<&RunSkillsHandle>,
-    prompt: &mut String,
     tools: &mut Vec<(String, DynTool)>,
-) -> Result<(Vec<String>, Vec<String>), Error> {
+) -> Result<(Vec<String>, Vec<String>, Option<DynSkillCatalog>), Error> {
     // `skills: []` is off for everything: what the run finds too.
     let off = matches!(
         &manifest.frontmatter.skills,
@@ -1377,7 +1394,7 @@ fn add_skills(
     let set = match skills::resolve(origin, manifest, files)? {
         Some(set) => set,
         None if run.is_some() => SkillSet::empty(),
-        None => return Ok((Vec::new(), Vec::new())),
+        None => return Ok((Vec::new(), Vec::new(), None)),
     };
     let set = Arc::new(set);
     let added = set.tools(run);
@@ -1391,12 +1408,11 @@ fn add_skills(
         }
     }
     tools.extend(added.into_iter().map(|tool| (tool.spec().name, tool)));
-    let section = set.prompt_section(run.is_some());
-    // A prompt is never empty (the loader refuses an agent without instructions), and a set
-    // with skills, or an agent given `RunSkills`, always has a section.
-    prompt.push_str("\n\n");
-    prompt.push_str(&section);
-    Ok((set.names(), set.preloaded()))
+    let catalog: DynSkillCatalog = Arc::new(skills::PromptCatalog {
+        set: Arc::clone(&set),
+        run: run.is_some(),
+    });
+    Ok((set.names(), set.preloaded(), Some(catalog)))
 }
 
 /// Where some of an agent's tools came from, so that a name clash can say whose tool it hit.
@@ -1548,6 +1564,7 @@ fn session_targets(
                 description: child.frontmatter.description.clone().unwrap_or_default(),
                 within: run_limit(child.frontmatter.limits.as_ref()),
                 remote: false,
+                skills: skills::selected_names(child),
             },
             Subagent::Remote(agent) => SessionTarget {
                 name: agent.name.clone(),
@@ -1555,6 +1572,7 @@ fn session_targets(
                 description: agent.description.clone(),
                 within: Some(remote.max_wait),
                 remote: true,
+                skills: Vec::new(),
             },
         })
         .collect()

@@ -1152,6 +1152,9 @@ pub struct ToolCtx {
     removed_tools: Arc<[String]>,
     /// The words the run was started with ([`task`](Self::task)).
     task: Option<Arc<str>>,
+    /// The skills the run's session lists ([`skills`](Self::skills)), when it narrowed the
+    /// catalog: a skills tool refuses one outside it (ADR 0054, slice 7).
+    skills: Option<Arc<[String]>>,
     /// What scrubs secrets out of a text ([`scrub`](Self::scrub)); `None` scrubs nothing.
     scrub: Option<Scrubber>,
     /// What the call needs to admit images ([`keep_image`](crate::keep_image)); `None` for a
@@ -1216,6 +1219,7 @@ impl ToolCtx {
             loaded: Arc::default(),
             removed_tools: Arc::default(),
             task: None,
+            skills: None,
             scrub: None,
             kept_left: Arc::default(),
             kept: Arc::default(),
@@ -1456,6 +1460,23 @@ impl ToolCtx {
     /// the first part of its first message, the same text at every call of the run.
     pub fn task(&self) -> Option<&str> {
         self.task.as_deref()
+    }
+
+    /// Say which skills the run's session lists ([`skills`](Self::skills)); the agent loop does it
+    /// for every call, from the round's header.
+    #[must_use]
+    pub fn with_skills(mut self, skills: Option<Arc<[String]>>) -> Self {
+        self.skills = skills;
+        self
+    }
+
+    /// The skills the run's session lists (ADR 0054, slice 7), or `None` when it names none and
+    /// the folder's whole selection stands: a skills tool refuses a skill outside this list, so a
+    /// session sees the catalog it asked for and nothing more.
+    ///
+    /// [ADR 0054]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md
+    pub fn skills(&self) -> Option<&[String]> {
+        self.skills.as_deref()
     }
 
     /// Say how many bytes the run may still keep in its own state and what it keeps there:
