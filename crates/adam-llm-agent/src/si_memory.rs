@@ -13,7 +13,10 @@
 
 use std::sync::Arc;
 
-use adam_memory::{AttemptDraft, AttemptId, MemoryError, Problem, Provenance, Scope, SiMemory};
+use adam_memory::{
+    AttemptDraft, AttemptId, Audience, Lesson, Memory, MemoryError, Problem, Provenance, Scope,
+    SiMemory,
+};
 use adam_model::ToolSpec;
 use async_trait::async_trait;
 use serde_json::{Value, json};
@@ -43,6 +46,10 @@ pub struct SiMemoryHandle {
     memory: Arc<dyn SiMemory>,
     scope: Scope,
     caller: CallerResolver,
+    /// The deployment's L2, when it configured one (`MEMORY_URL`), and the audience this agent's
+    /// runs read. `None` is L1 alone, which is a working deployment (ADR 0081 decision 11).
+    l2: Option<Arc<dyn Memory>>,
+    audience: Option<Audience>,
 }
 
 /// How a handle names the caller of one call.
@@ -69,7 +76,18 @@ impl SiMemoryHandle {
             memory,
             scope,
             caller: Arc::new(caller),
+            l2: None,
+            audience: None,
         }
+    }
+
+    /// The same handle reading the deployment's L2 as well: the lessons of `audience` come back
+    /// from `si_recall` after the L1 problems (ADR 0081 decision 6).
+    #[must_use]
+    pub fn with_l2(mut self, memory: Arc<dyn Memory>, audience: Audience) -> Self {
+        self.l2 = Some(memory);
+        self.audience = Some(audience);
+        self
     }
 
     /// A handle whose every call is the same caller: a process that serves one, or a test.
@@ -122,10 +140,26 @@ impl Tool for SiRecall {
     }
 
     async fn call(&self, ctx: &ToolCtx, _args: Value) -> Result<ToolOutput, ToolError> {
-        match self.handle.memory.recall(&self.handle.scope_for(ctx)) {
-            Ok(problems) => Ok(ToolOutput::text(render(&problems))),
-            Err(error) => Err(refuse(error)),
+        let problems = match self.handle.memory.recall(&self.handle.scope_for(ctx)) {
+            Ok(problems) => problems,
+            Err(error) => return Err(refuse(error)),
+        };
+        let mut text = render(&problems);
+        if let (Some(l2), Some(audience)) = (&self.handle.l2, &self.handle.audience) {
+            match l2.recall(audience) {
+                Ok(lessons) => {
+                    text.push_str("\n\n");
+                    text.push_str(&render_lessons(&lessons));
+                }
+                // An unreachable L2 never fails the run (decision 12): the L1 half still answers,
+                // and the model is told the lessons could not be read.
+                Err(error) => {
+                    text.push_str("\n\nthe shared lessons could not be read: ");
+                    text.push_str(&error.to_string());
+                }
+            }
         }
+        Ok(ToolOutput::text(text))
     }
 }
 
@@ -259,6 +293,26 @@ fn render(problems: &[Problem]) -> String {
     out
 }
 
+/// The L2 lessons as text, after the L1 problems: what another run already learnt and a reviewer
+/// approved (ADR 0081 decisions 9 and 10).
+fn render_lessons(lessons: &[Lesson]) -> String {
+    if lessons.is_empty() {
+        return "no approved lesson for this audience yet".to_owned();
+    }
+    let mut out = format!("{} approved lesson(s), freshest first:", lessons.len());
+    for lesson in lessons {
+        out.push_str("\n\n- ");
+        out.push_str(&lesson.root_cause);
+        out.push_str("\n  remedy: ");
+        out.push_str(&lesson.remedy);
+        if !lesson.rationale.is_empty() {
+            out.push_str("\n  why: ");
+            out.push_str(&lesson.rationale);
+        }
+    }
+    out
+}
+
 /// A required non-empty text argument.
 fn text_arg(args: &Value, name: &str) -> Result<String, String> {
     match args.get(name) {
@@ -281,7 +335,10 @@ fn optional_text(args: &Value, name: &str) -> Result<Option<String>, String> {
 
 #[cfg(test)]
 mod tests {
-    use adam_memory::{InProcessSiMemory, REDACTION_MARKER, Scrubber, Settings};
+    use adam_memory::{
+        Audience, InProcessMemory, InProcessSiMemory, LessonDraft, LessonProvenance,
+        LessonSettings, MemoryScope, REDACTION_MARKER, Scrubber, Settings,
+    };
     use serde_json::json;
 
     use super::*;
@@ -407,6 +464,40 @@ mod tests {
             read.content.matches("regenerate it").count(),
             1,
             "a retried call writes one attempt: {}",
+            read.content
+        );
+    }
+
+    /// `si_recall` appends the audience's approved lessons from the L2 store the handle carries,
+    /// after the L1 problems (ADR 0081 decisions 4 and 11): one tool answers for both tiers.
+    #[tokio::test]
+    async fn recall_appends_the_audiences_lessons_from_l2() {
+        let l2 = Arc::new(InProcessMemory::new(
+            LessonSettings::new(Scrubber::new(|text: &str| text.to_owned())),
+            MemoryScope::new("release-1"),
+        ));
+        l2.record(
+            LessonDraft::new(
+                Audience::new("adam-coder"),
+                "the lockfile was stale",
+                LessonProvenance::new(["scope-a"], "the reviewer"),
+            )
+            .remedy("regenerate the lockfile"),
+        )
+        .expect("a valid lesson");
+        let handle = handle(memory()).with_l2(l2, Audience::new("adam-coder"));
+        let read = SiRecall { handle }
+            .call(&ctx("call-1"), json!({}))
+            .await
+            .expect("a readable memory");
+        assert!(
+            read.content.contains("1 approved lesson(s)"),
+            "{}",
+            read.content
+        );
+        assert!(
+            read.content.contains("regenerate the lockfile"),
+            "{}",
             read.content
         );
     }

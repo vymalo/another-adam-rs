@@ -131,10 +131,11 @@ fn for_workers(def: AgentDef, config: &Config) -> AgentDef {
         return def;
     }
     let secrets = crate::redact::secret_values(config, crate::redact::process_vars());
-    let settings = adam_memory::Settings::new(adam_memory::Scrubber::new(move |text: &str| {
-        crate::redact::scrub(&secrets, text)
-    }));
-    let memory = match adam_memory::FolderSiMemory::open(dir, settings) {
+    let scrub = {
+        let secrets = secrets.clone();
+        adam_memory::Scrubber::new(move |text: &str| crate::redact::scrub(&secrets, text))
+    };
+    let memory = match adam_memory::FolderSiMemory::open(dir, adam_memory::Settings::new(scrub)) {
         Ok(memory) => std::sync::Arc::new(memory),
         Err(error) => {
             // A folder that cannot be opened is not a reason to refuse to serve: the run goes on
@@ -147,9 +148,9 @@ fn for_workers(def: AgentDef, config: &Config) -> AgentDef {
     // process are kept apart by the agent key as well. The caller is the message's: the A2A
     // conversation id is `<subject>:<context id>`.
     let name = def.name().to_owned();
-    def.si_memory_handle(adam_llm_agent::SiMemoryHandle::new(
+    let handle = adam_llm_agent::SiMemoryHandle::new(
         memory,
-        adam_memory::Scope::agent(name.clone(), "-", name),
+        adam_memory::Scope::agent(name.clone(), "-", name.clone()),
         |ctx: &adam_llm_agent::ToolCtx| {
             ctx.conversation_id()
                 .and_then(|id| id.split_once(':'))
@@ -157,8 +158,67 @@ fn for_workers(def: AgentDef, config: &Config) -> AgentDef {
                 .filter(|subject| !subject.is_empty())
                 .unwrap_or_else(|| "-".to_owned())
         },
-    ))
+    );
+    // The deployment's L2, when `MEMORY_URL` names one: the audience's lessons come back from
+    // `si_recall` after the L1 problems. A store that cannot be reached is a warning, not a
+    // refusal to serve (ADR 0081 decision 12).
+    let handle = match &worker.memory {
+        None => handle,
+        Some(crate::config::MemoryStore::Postgres(url)) => {
+            let settings =
+                adam_memory::LessonSettings::new(adam_memory::Scrubber::new(move |text: &str| {
+                    crate::redact::scrub(&secrets, text)
+                }));
+            match adam_store_postgres::PgMemory::connect(
+                url,
+                settings,
+                adam_memory::MemoryScope::new(name.clone()),
+            ) {
+                // The table is schema version 10 of the run store's database; a deployment that
+                // shares that database has it already. `migrate` is idempotent and takes the same
+                // advisory lock, so a process that serves memory alone can create it here.
+                Ok(l2) => match l2.migrate() {
+                    Ok(()) => {
+                        handle.with_l2(std::sync::Arc::new(l2), adam_memory::Audience::new(name))
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "the L2 memory table cannot be created; runs read L1 alone");
+                        handle
+                    }
+                },
+                Err(error) => {
+                    tracing::warn!(%error, "the L2 memory cannot be reached; runs read L1 alone");
+                    handle
+                }
+            }
+        }
+        Some(crate::config::MemoryStore::Mongo(url)) => {
+            let settings =
+                adam_memory::LessonSettings::new(adam_memory::Scrubber::new(move |text: &str| {
+                    crate::redact::scrub(&secrets, text)
+                }));
+            match adam_store_mongodb::memory::MongoMemory::connect(
+                url,
+                MEMORY_DATABASE,
+                settings,
+                adam_memory::MemoryScope::new(name.clone()),
+            ) {
+                Ok(l2) => handle.with_l2(
+                    std::sync::Arc::new(l2),
+                    adam_memory::Audience::new(name.clone()),
+                ),
+                Err(error) => {
+                    tracing::warn!(%error, "the L2 memory cannot be reached; runs read L1 alone");
+                    handle
+                }
+            }
+        }
+    };
+    def.si_memory_handle(handle)
 }
+
+/// The database `MEMORY_URL` selects when its path names none.
+const MEMORY_DATABASE: &str = "adam_memory";
 
 #[cfg(test)]
 mod tests {
