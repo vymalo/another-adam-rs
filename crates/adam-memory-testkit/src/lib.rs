@@ -26,7 +26,8 @@
 //! * a lesson refuses a repository, a path, a URL, a host and an e-mail address whatever its
 //!   audience;
 //! * a retired lesson is kept and not served, and `retire` takes the stored, scrubbed root cause;
-//! * an empty audience is refused by `recall` and `retire` before anything is read;
+//! * an empty audience is refused by `recall` and `retire` before anything is read, and an adapter
+//!   configured with an empty scope refuses `record`, `recall` and `retire`;
 //! * sixteen writers on one audience leave sixteen lessons.
 //!
 //! Each case is a function here, so each suite is compiled once and the macro only names it.
@@ -1128,6 +1129,45 @@ pub mod lesson_cases {
         );
     }
 
+    /// An adapter configured with an empty scope refuses `record`, `recall` and `retire`: every key
+    /// and every query carries the scope, and the port refuses an empty one (ADR 0081 decision 4).
+    ///
+    /// A suite whose adapter is built with a fixed non-empty scope cannot see this half, so the
+    /// macro builds this case's adapter with `memory_scope("")`.
+    ///
+    /// # Panics
+    ///
+    /// When an empty configured scope is served instead of refused.
+    pub fn an_empty_configured_scope_is_refused(memory: DynMemory, _plan: LessonPlan) {
+        let audience = audience("empty-scope");
+        let refused = |error: MemoryError| {
+            assert!(
+                matches!(
+                    error,
+                    MemoryError::EmptyField {
+                        field: "memory scope"
+                    }
+                ),
+                "{error}"
+            );
+        };
+        refused(
+            memory
+                .record(lesson_draft(&audience, "the lockfile is stale"))
+                .expect_err("record refuses an empty scope"),
+        );
+        refused(
+            memory
+                .recall(&audience)
+                .expect_err("recall refuses an empty scope"),
+        );
+        refused(
+            memory
+                .retire(&audience, "the lockfile is stale")
+                .expect_err("retire refuses an empty scope"),
+        );
+    }
+
     /// Sixteen writers on one audience leave sixteen lessons: the port is `Send + Sync`.
     ///
     /// # Panics
@@ -1488,6 +1528,16 @@ macro_rules! memory_conformance {
                 let plan = LessonPlan::default();
                 $crate::lesson_cases::an_empty_key_is_refused(
                     make(&plan, &$crate::memory_scope("empty-key")),
+                    plan,
+                );
+            }
+
+            #[test]
+            fn an_empty_configured_scope_is_refused() {
+                $(if !$available() { return; })?
+                let plan = LessonPlan::default();
+                $crate::lesson_cases::an_empty_configured_scope_is_refused(
+                    make(&plan, &$crate::memory_scope("")),
                     plan,
                 );
             }

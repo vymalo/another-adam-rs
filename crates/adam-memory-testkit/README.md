@@ -131,6 +131,7 @@ with a remedy, a rationale and two sources.
 | `a_full_audience_refuses_a_revived_lesson` | the bound counts what is served: reviving needs a free slot, and a full audience refuses it |
 | `retire_takes_the_stored_root_cause` | `retire` finds a lesson only by the stored, scrubbed root cause; the raw text is `NotFound` |
 | `an_empty_key_is_refused` | an empty audience is refused by `recall` and `retire` before anything is read |
+| `an_empty_configured_scope_is_refused` | an adapter built with an empty scope refuses `record`, `recall` and `retire` (the macro builds this case's adapter with `memory_scope("")`, which a fixed-scope suite cannot see) |
 | `sixteen_writers_share_one_audience` | the port is `Send + Sync` and one audience keeps every writer's lesson |
 
 ## The doubles
