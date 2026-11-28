@@ -7,7 +7,7 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: {{ include "coder.turnKeyJobName" . }}
+  name: {{ include "coder.turnKeyJobResourceName" . }}
   labels:
     {{- include "coder.labels" . | nindent 4 }}
 spec:
@@ -19,6 +19,10 @@ spec:
         {{- include "coder.selectorLabels" . | nindent 8 }}
     spec:
       restartPolicy: OnFailure
+      # The Job's own account, and the only pod in this chart that mounts a token on purpose: it writes one Secret
+      # through the API server (turn-key-rbac.yaml).
+      serviceAccountName: {{ include "coder.turnKeyServiceAccountName" . }}
+      automountServiceAccountToken: true
       securityContext:
         runAsNonRoot: true
         runAsUser: 10001
@@ -31,16 +35,7 @@ spec:
           command: ["/bin/sh", "-ec"]
           args:
             - |
-              set -eu
-              name={{ include "coder.turnKeySecretName" . }}
-              if kubectl -n "$NAMESPACE" get secret "$name" -o jsonpath='{.data.private-key\.pem}' 2>/dev/null | grep -q .; then
-                echo "the turn key already exists in $name; nothing to do"
-                exit 0
-              fi
-              openssl genpkey -algorithm ed25519 -out /tmp/private-key.pem
-              kubectl -n "$NAMESPACE" create secret generic "$name" --from-file=private-key.pem=/tmp/private-key.pem --dry-run=client -o yaml \
-                | kubectl -n "$NAMESPACE" apply -f -
-              rm -f /tmp/private-key.pem
+{{ include "coder.turnKeyScript" . | indent 14 }}
           env:
             - name: NAMESPACE
               valueFrom:

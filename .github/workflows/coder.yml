@@ -88,7 +88,7 @@ jobs:
     name: helm lint and template
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: azure/setup-helm@v5
         with:
           version: ${{ env.HELM_VERSION }}
@@ -241,7 +241,7 @@ jobs:
     name: lint Dockerfile
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: hadolint/hadolint-action@v3.1.0
         with:
           dockerfile: docker/coder/Dockerfile
@@ -250,7 +250,7 @@ jobs:
     name: shell scripts and stub model
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: shellcheck
         run: shellcheck deploy/coder/bump-tag.sh deploy/coder/tests/*.sh docker/coder/test/*.sh dev/*.sh tools/check-dev-stack.sh
       - name: bump-tag.sh is idempotent and edits only image.tag
@@ -263,7 +263,7 @@ jobs:
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: What the bump would change on main
         env:
           SHA: ${{ github.event.pull_request.head.sha }}
@@ -304,7 +304,7 @@ jobs:
         options: >-
           --health-cmd "pg_isready -U postgres" --health-interval 2s --health-retries 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # docker/coder/Dockerfile pins the workspace base image by tag. If it is
       # ever set back to a placeholder (…-PENDING) that does not exist, say so
       # instead of failing every build. `push` is true only on main.
@@ -323,12 +323,12 @@ jobs:
               echo "push=false" >> "$GITHUB_OUTPUT"
             fi
           fi
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@v4
         if: steps.guard.outputs.ready == 'true'
       # Build only (no push) and load into the local daemon for the smoke test.
       # The Dockerfile's own last RUN is a smoke test of the tools. Fork pull
       # requests cannot write the cache: ignore-error keeps them green.
-      - uses: docker/build-push-action@v6
+      - uses: docker/build-push-action@v7
         if: steps.guard.outputs.ready == 'true'
         with:
           context: .
@@ -504,7 +504,7 @@ jobs:
       - name: Compose e2e teardown
         if: always() && steps.guard.outputs.ready == 'true'
         run: docker compose -f compose.yaml -f dev/compose.github-app.yaml --profile app down -v
-      - uses: docker/login-action@v3
+      - uses: docker/login-action@v4
         if: steps.guard.outputs.push == 'true'
         with:
           registry: ghcr.io
@@ -528,7 +528,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: main
       - name: Set image.tag and push

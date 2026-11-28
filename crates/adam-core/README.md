@@ -3,7 +3,9 @@
 The seam every durable-state backend implements: the `Store` trait, the run
 and journal types, and an in-memory reference store. Also the turn key port
 `TurnKeys` and the turn signature of [ADR 0068](../../docs/decisions/0068-adam-signs-its-own-history.md)
-(slice T1), and RFC 8785 canonical JSON (`jcs`).
+(slice T1), the run-certificate ports of
+[ADR 0086](../../docs/decisions/0086-a-run-signs-its-model-requests-with-a-certificate.md),
+and RFC 8785 canonical JSON (`jcs`).
 
 ## Where it sits
 
@@ -48,6 +50,11 @@ database driver.
 | `head_payload`, `sign_head`, `verify_head` | a run's head signature (`adam-head/v1`, ADR 0068 decision 4, slice T3a-2): the payload `{typ, run, cnv, len, chain, head}`; the runtime decides which members of its state document are `head` |
 | `TurnKeyError`, `TurnKeyConfigError`, `KeySetError`, `TurnSignatureError` | see *Errors* |
 | `turn::testkit`, `turn_keys_conformance!` | the cases every `TurnKeys` passes, and `testkit::Certified`: a key named by a certificate chain, whose signatures carry `x5c` |
+| `RunCertIssuer` (trait), `DynRunCertIssuer`, `CertificateRequest`, `RunCertError` | the run-certificate issuer port ([ADR 0086](../../docs/decisions/0086-a-run-signs-its-model-requests-with-a-certificate.md)): `issue(&CertificateRequest)` answers the `CertificateChain` that vouches for a run key, `kind()` for `Debug`; the request is a bounded PKCS#10 CSR as DER (1 to 8 KiB, `Debug` shows the length), the error carries a class. No driver type is in the trait |
+| `RunKeys` (trait), `DynRunKeys` | a `TurnKeys` that belongs to **one run** ([ADR 0086](../../docs/decisions/0086-a-run-signs-its-model-requests-with-a-certificate.md)): no method of its own, and no blanket implementation, so a process key is never passed as a run key. It signs the run's model requests only; the history keeps the process `TurnKeys` |
+| `RunKeyring`, `RunSubject`, `RunClock`, `SystemClock`, `RunKeyError` | the `RunKeys` over any `RunCertIssuer` ([ADR 0086](../../docs/decisions/0086-a-run-signs-its-model-requests-with-a-certificate.md) decisions 3 and 5): a key per run made in memory, a CSR whose critical URI SAN is `urn:another:person:<sub>:agent:<run>`, the chain cached, renewal at two thirds of the leaf's life with a new key each time, and an expired leaf that refuses to sign (`Expired`, `Transient`). `RunClock` is the clock it reads (`SystemClock` in a server) |
+| `RenewFraction`, `BadRenewFraction` | when the keyring renews: `TWO_THIRDS` (the default), or `new(n, d)` for any fraction strictly between 0 and 1 (`RUN_CERT_RENEW_FRACTION`); `at(notBefore, notAfter)` is the exact instant, and a bad fraction is `Invalid`. `RunKeyring::with_renew_fraction` moves it without changing that the key is replaced as a whole |
+| `turn::run_cert::testkit`, `run_cert_issuer_conformance!` | the cases every `RunCertIssuer` passes (a carryable chain, a `kid` that is the leaf's `x5t#S256`, two requests getting two leaves), and `testkit::FakeRunCertIssuer`, a fake CA that mints a real leaf per request and passes them, with `testkit::TestClock` |
 | `testing` (`#[doc(hidden)]`) | `test_env`, `skipped`, `require_db`: gate for database-backed tests, not part of the supported API |
 
 ```rust
@@ -228,10 +235,33 @@ T2's; `Ed25519TurnKeys::from_files` reads the files they will name).
   key the set revokes is refused at start.
 * **Ed25519 here is pure Rust** (`ed25519-dalek`, strict verification, weak keys refused), because
   the engine's tree may hold neither `aws-lc-rs` nor `ring` (`tools/embedded-deps/check.sh`). It
-  gives the same bytes as `aws-lc-rs` (a test in `adam-a2a`).
+  gives the same bytes as `aws-lc-rs` (a test in `adam-a2a`). A run key's CSR and its leaf's window
+  are read with `x509-cert`, which signs through `signature`'s traits — the same `ed25519-dalek`, so
+  no second provider arrives.
 * **Cost** (`cargo run -p adam-core --release --example turn_signature_timing`, one core of a
   2.1 GHz Xeon, 2026-11-25): a signature 20 µs, a verification 49 µs; a 2 KB turn signed with its
   RFC 8785 form 45 µs, verified 67 µs; the chain over 1,000 such turns 7.3 ms.
+
+### Run certificates
+
+[ADR 0086](../../docs/decisions/0086-a-run-signs-its-model-requests-with-a-certificate.md) adds a second key for
+the request path: a run's **model requests** may be signed by a key a certificate authority certified for that
+run, while the history keeps the process `TurnKeys`.
+
+* **The port.** `RunCertIssuer::issue` takes a `CertificateRequest` (a bounded PKCS#10 CSR as DER) and answers
+  the `CertificateChain` that becomes the request's `x5c`, or a `RunCertError` with a class. No driver type
+  crosses it. `run_cert_issuer_conformance!` proves an adapter; `testkit::FakeRunCertIssuer` is a fake CA it
+  passes on.
+* **The keyring.** `RunKeyring` is the `RunKeys` over any issuer: one Ed25519 key per run, made in memory and
+  never written; a CSR whose critical URI SAN is `urn:another:person:<sub>:agent:<run>` (`RunSubject`, the PKI
+  decision of 2026-11-26); the chain cached for the run. At **two thirds** of the leaf's life it makes a new key,
+  a new CSR and a new leaf, and the old key signs until the new one is in hand: a renewal the issuer refuses
+  leaves the old leaf signing, and `RENEW_RETRY_SECS` bounds how often it is retried. A leaf whose `notAfter`
+  has passed with no renewal **refuses to sign** (`RunKeyError::Expired`, a `Transient` refusal): the call is
+  not sent, and nothing is ever signed with an expired leaf. `RunClock` is the clock it reads, so a test reaches
+  both instants without waiting (`testkit::TestClock`).
+* **What it does not do.** It does not issue anything itself, does not write a key anywhere, and reads no
+  variable: the CA adapter and the `RUN_CERT_*` wiring are a later slice.
 
 ## Push configurations
 
@@ -303,6 +333,8 @@ The turn errors carry no key, no signed content and no signature; they name a ke
 | `TurnKeyConfigError` (a key file that cannot be read, is not an Ed25519 PKCS#8 private key, a public key, a revoked signing key, a bad verify set) | `Invalid`; `NoRandomness` is `Internal` |
 | `KeySetError`, `BadKeyId`, `BadCertificateChain` | `Invalid` |
 | `TurnSignatureError` (unsigned, too long, malformed, another type, an unknown or revoked key, does not verify; for a request signature, a member that is not the request's, an `iat` outside the window) | `Corrupt` |
+| `RunCertError` (the CA refuses the request as written, cannot be reached, refuses to issue, or answers a chain that is not one) | `Invalid`, `Transient`, `Unauthenticated`, `Internal` |
+| `BadCertificateRequest` (a CSR that is empty or over 8 KiB) | `Invalid` |
 
 `InvalidInput` is data the store cannot hold (an integer above `i64::MAX`, a
 bad table prefix); `Corrupt` is data read back that

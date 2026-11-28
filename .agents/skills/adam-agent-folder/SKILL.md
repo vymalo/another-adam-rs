@@ -40,6 +40,9 @@ before you rely on a detail here.
      its model's profile in `MODEL_ALIASES_FILE`: the alias the run continues on, once, when the endpoint refuses
      `model` as locked; not the agent's own alias, else exit 78; a subagent resolves its own, so an `inherit` subagent
      takes its model's profile fallback and needs no key; ADR 0064 amended 2026-11-23),
+     `si_memory:` (`off`, `on`, or a map of `recall`, `record`, `preload_kib`, `scopes`: the agent's
+     self-improvement memory, ADR 0081; the deployment's `SI_MEMORY=off` beats it, an unknown or secret-looking
+     option is a load error, and `memory:` is a different, ignored key),
      `reasoning_effort:` (one of `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`) and
      `model_preset:` (a name in `MODEL_ALIASES_FILE`'s `presets`): the level this agent asks for and
      the preset it starts from. The effort resolves folder, its preset, the model's profile, then the

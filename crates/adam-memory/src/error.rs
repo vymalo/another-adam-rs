@@ -3,7 +3,7 @@
 use adam_error::{BoxError, Classify, ErrorClass};
 use thiserror::Error;
 
-/// An L1 memory refusal. Callers decide from [`Classify::class`], never from the variant.
+/// A memory refusal. Callers decide from [`Classify::class`], never from the variant.
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum MemoryError {
@@ -14,12 +14,13 @@ pub enum MemoryError {
         /// The field that carried it.
         field: &'static str,
     },
-    /// A text was longer than its byte bound after scrubbing. Nothing was stored.
+    /// A text was longer than its byte bound. Nothing was stored. The length is after scrubbing, or
+    /// as given for a key, which is never scrubbed.
     #[error("{field} is {bytes} bytes, over the bound of {limit}")]
     TooManyBytes {
         /// The field that was too long.
         field: &'static str,
-        /// Its length after scrubbing.
+        /// Its length after scrubbing, or as given for a key.
         bytes: usize,
         /// The bound.
         limit: usize,
@@ -67,11 +68,28 @@ pub enum MemoryError {
         /// The bound.
         limit: usize,
     },
-    /// An attempt carried more anchors than it may.
-    #[error("an attempt carries {anchors} anchors, over the bound of {limit}")]
+    /// The audience already held as many lessons as it may.
+    #[error("the audience holds {limit} lessons already")]
+    AudienceFull {
+        /// The bound.
+        limit: usize,
+    },
+    /// No lesson with this root cause is in the audience.
+    #[error("no lesson {0:?} for this audience")]
+    LessonNotFound(String),
+    /// An attempt or a lesson carried more anchors than it may.
+    #[error("an entry carries {anchors} anchors, over the bound of {limit}")]
     TooManyAnchors {
         /// How many it carried.
         anchors: usize,
+        /// The bound.
+        limit: usize,
+    },
+    /// A lesson carried more L1 sources than it may.
+    #[error("a lesson carries {sources} sources, over the bound of {limit}")]
+    TooManySources {
+        /// How many it carried.
+        sources: usize,
         /// The bound.
         limit: usize,
     },
@@ -101,7 +119,9 @@ pub enum MemoryError {
 
 impl MemoryError {
     /// A storage failure.
-    pub(crate) fn backend(error: impl std::error::Error + Send + Sync + 'static) -> Self {
+    /// A storage failure, for an adapter: the class is the backend's own, and a run treats it as
+    /// transient (ADR 0081 decision 12).
+    pub fn backend(error: impl std::error::Error + Send + Sync + 'static) -> Self {
         Self::Backend {
             source: Box::new(error),
         }
@@ -117,16 +137,21 @@ impl Classify for MemoryError {
             | Self::NamesAddress { .. }
             | Self::EmptyScope { .. }
             | Self::EmptyField { .. }
-            | Self::TooManyAnchors { .. } => ErrorClass::Invalid,
-            Self::ScopeFull { .. } | Self::ProblemFull { .. } => ErrorClass::Rejected,
-            Self::ProblemNotFound(_) | Self::AttemptNotFound(..) => ErrorClass::NotFound,
+            | Self::TooManyAnchors { .. }
+            | Self::TooManySources { .. } => ErrorClass::Invalid,
+            Self::ScopeFull { .. } | Self::ProblemFull { .. } | Self::AudienceFull { .. } => {
+                ErrorClass::Rejected
+            }
+            Self::ProblemNotFound(_) | Self::AttemptNotFound(..) | Self::LessonNotFound(_) => {
+                ErrorClass::NotFound
+            }
             Self::Corrupt { .. } => ErrorClass::Corrupt,
             Self::Backend { .. } => ErrorClass::Transient,
         }
     }
 }
 
-/// A result from an L1 memory adapter.
+/// A result from a memory adapter.
 pub type MemoryResult<T> = Result<T, MemoryError>;
 
 #[cfg(test)]
@@ -176,9 +201,17 @@ mod tests {
             ),
             (MemoryError::ScopeFull { limit: 1 }, ErrorClass::Rejected),
             (MemoryError::ProblemFull { limit: 1 }, ErrorClass::Rejected),
+            (MemoryError::AudienceFull { limit: 1 }, ErrorClass::Rejected),
             (
                 MemoryError::TooManyAnchors {
                     anchors: 2,
+                    limit: 1,
+                },
+                ErrorClass::Invalid,
+            ),
+            (
+                MemoryError::TooManySources {
+                    sources: 2,
                     limit: 1,
                 },
                 ErrorClass::Invalid,
@@ -189,6 +222,10 @@ mod tests {
             ),
             (
                 MemoryError::AttemptNotFound("a".to_owned(), "p".to_owned()),
+                ErrorClass::NotFound,
+            ),
+            (
+                MemoryError::LessonNotFound("l".to_owned()),
                 ErrorClass::NotFound,
             ),
             (

@@ -295,33 +295,45 @@ this conversation's is "no session"). At most 16 sessions that are not closed an
 `max_open` and `max_rounds` as constants for now).
 
 **A session's own limits** ([ADR 0054](../decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md),
-slice 1). `subagent_start` takes an optional `config` of ten options: seven numbers, `max_turns`, `max_tool_calls`, `max_output_tokens`,
-`context_window`, `max_parallel_tool_calls`, `time_limit` (minutes) and `max_rounds`, and two lists of tool names, `tools` and
-`deny_tools` (below). An option chooses within what the
+slice 1). `subagent_start` takes an optional `config` of eleven options: eight numbers, `max_turns`, `max_tool_calls`,
+`max_output_tokens`, `context_window`, `max_parallel_tool_calls`, `time_limit` (minutes), `max_rounds` and `token_budget`
+(below), two lists of tool names, `tools` and `deny_tools` (below), and `report_schema` (below). An option chooses within what the
 subagent's folder allows and **never widens it**: a value above its bound is refused, in words that name the option
-(`config.max_turns is 51; at most 50`), and nothing starts; an option that is not one of the nine is refused too. What was
-admitted is kept in the session's header, and the round reads its limits from it. Five of the numbers apply at the next model call
-slice 1). `subagent_start` takes an optional `config` of eight options: `max_turns`, `max_tool_calls`, `max_output_tokens`,
-`context_window`, `max_parallel_tool_calls`, `time_limit` (minutes), `max_rounds` and `report_schema`. An option chooses within what the
-subagent's folder allows and **never widens it**: a value above its bound is refused, in words that name the option
-(`config.max_turns is 51; at most 50`), and nothing starts; an option that is not one of the eight is refused too. What was
+(`config.max_turns is 51; at most 50`), and nothing starts; an option that is not one of the eleven is refused too. What was
 admitted is kept in the session's header, and the round reads its limits from it. Five of them apply at the next model call
-(`max_turns`, `max_tool_calls`, `max_output_tokens`, `context_window`, `max_parallel_tool_calls`); `time_limit` and
+(`max_turns`, `max_tool_calls`, `max_output_tokens`, `context_window`, `max_parallel_tool_calls`, and `token_budget`, below); `time_limit` and
 `max_rounds` apply to the next round. A later round copies the config and **clamps it to the bounds of that moment**, so a
 deployment that lowered a limit is obeyed and nothing is raised back. `max_output_tokens` is never `0` (that would leave the cap
 to the model) and a `context_window` is never so small that no history fits: it is held to the least that leaves room.
+
+**The token budget** (slice 6). `token_budget` caps the whole session's tokens, input and output as `usage/v1` counts them:
+1,000 to 2^53 − 1, and no folder bounds it today, so any value narrows. Before each model call, the tokens the session has
+spent (`spent`: the earlier rounds' carried by the header, plus this round's own calls) reaching the budget makes that call
+the **closing turn**, and the round ends with `limit: "token_budget"` — or, when the closing turn says nothing, with the words
+`token budget reached`. `spent` is written into the header at every commit, so `subagent_list`, `subagent_read` and the A2A
+session object's listing read it from the round's record, and a **send to a spent session is refused** (`subagent_send` in
+words, the A2A front as `UnsupportedOperation`) from the header the send already reads: no round starts and no model is
+called. A session with no budget spends and is never refused.
 
 `config` also takes `tools` and `deny_tools` (ADR 0054, slice 3): lists of tool names, in the folder's own syntax (an exact name or
 a `*` pattern; `github__*` selects an MCP server). The session is offered only the tools `tools` matches, less the ones `deny_tools`
 matches (the deny-list is applied after the allow-list); `read_output` always stays. A hidden tool is not in the model's request,
 and a call to it anyway is refused without running; this holds even when an oversized message context was dropped, because the session's header, not the
-context, is the truth. At most 32 entries, each at most 200 characters, none blank. **Which names are
+context, is the truth. A lazy MCP server's tools are loaded by a tool of its own, `load__group__<server>` (ADR 0066), so a
+session that names any tool of that server keeps that loader — `tools: ["github__*"]` can load the `github` group — and a
+session that names none of its tools keeps no loader, because a loader that can load nothing is not handed out. The rule is exact for a `when` MCP server's group, whose members are `<server>__<tool>`; a group whose members do not share its name is not covered (none ships today). The loader is a
+means to the tools the list names, never an extra tool the session may use: once the group is loaded its tools are held to the
+same lists, so nothing widens. At most 32 entries, each at most 200 characters, none blank. **Which names are
 checked at the start depends on what the starter knows.** The tool names of a subagent are known where the agent is bound (a
-worker), not on a control plane that only answers A2A; and a worker knows the whole set only when no source adds tools to the
-agent while it runs. **Neither shipped agent has the whole set** (both add tools through sources), so in practice: a concrete
-`deny_tools` name that is none of the subagent's tools is refused with the list (it is almost always a typo; to deny a tool a
-source adds, use a pattern, `name*`), and a `tools` entry or a pattern that selects nothing is admitted and just offers less.
-A remote subagent takes neither. They apply from the next model call; a later round carries them on.
+worker), not on a control plane that only answers A2A; and a worker knows the whole set only when every source declares what
+it can offer. A declaration may name a **shape** (`*__*` for a relayed `<server>__<tool>`): an entry is admitted when it
+selects a concrete declared name with its pattern or a declared shape matches it as a string, so `github__*` and
+`github__search` are admitted on a complete set. **Both shipped agents have the whole set** (they add the thread-tools
+source, which declares the contract's tools and that shape), so there: a `tools` entry or a pattern that selects nothing is
+refused with the list, and a concrete `deny_tools` name that is none of the subagent's tools too. A source that cannot name
+its tools leaves the set incomplete, and there a `tools` entry or a pattern that selects nothing is admitted and just offers
+less. A remote subagent takes neither. They apply from the next model call; a later round carries them on. A pattern weaker than the declared shape (`*_issues`, `github_*`) is refused even though it would select relayed tools: name the family as `github__*`. An entry whose shape half is empty (`github__`, `__`) is refused too, because `*` matches the empty run and it selects nothing at run time.
+
 `report_schema` is a JSON Schema (draft 2020-12, at most 16 KiB, no reference outside itself) that the subagent's final answer
 must match, for a helper that runs here (a remote one refuses it). The subagent is not shown the schema unless its first answer
 fails it, so describe the shape in `prompt` too. An answer that is not one JSON value, or does not match, is sent back to the

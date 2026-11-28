@@ -116,6 +116,7 @@ pub async fn serve(
 /// cluster: `A2A_ALLOW_INSECURE_REMOTES`).
 fn for_workers(def: AgentDef, worker: &WorkerConfig) -> AgentDef {
     def.allow_insecure_remotes(worker.allow_insecure_remotes)
+        .si_memory_ceiling(worker.si_memory)
 }
 
 #[cfg(test)]

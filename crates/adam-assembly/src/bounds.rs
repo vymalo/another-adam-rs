@@ -75,11 +75,14 @@ fn is_local(manifest: &AgentManifest, target: &SessionTarget) -> bool {
 ///   option (decision 2); a *folder* above the deployment's is clamped (decision 3).
 /// * `time_limit` is the round's own limit (`limits.max_minutes`, or the remote's wait), and
 ///   `max_rounds` the root's effective `max_session_rounds`.
-/// * `tools` and `tools_complete` are what the caller passes: the names the subagent is bound with
-///   and whether they are every tool it can have (a worker, which binds the agent; see
-///   `SessionBounds::tools_complete`), else an empty, incomplete set (the control plane, which binds
-///   none). A remote target has the empty, incomplete set whatever is passed: its tools are another
-///   system's, and the option is refused.
+/// * `token_budget` is `None`: no folder caps a session's tokens today (ADR 0054 decision 4), so
+///   `SessionBounds::admit` holds the request to the ADR's own 1,000 to 2^53 − 1.
+/// * `tools` and `tools_complete` are what the caller passes: the names the subagent can be offered
+///   (its own, and what every source of its node declares: `ToolSource::declared`; a declared name
+///   may be a shape, `*__*` for a relayed `<server>__<tool>`) and whether they are every tool it can
+///   have (a worker, which binds the agent; see `SessionBounds::tools_complete`), else an empty,
+///   incomplete set (the control plane, which binds none). A remote target has the empty, incomplete
+///   set whatever is passed: its tools are another system's, and the option is refused.
 ///
 /// A remote subagent's rounds are runs of an agent of its own, and the ADR refuses every option
 /// but `time_limit`, `max_rounds` and `instructions` on one: the loop's defaults stand for the
@@ -127,6 +130,9 @@ pub(crate) fn bounds_of(
             u32::try_from(within.as_secs() / 60).unwrap_or(u32::MAX)
         }),
         max_rounds,
+        // No folder caps a session's tokens today (ADR 0054, decision 4): any value narrows, and
+        // `admit` holds a request to the ADR's own ceiling.
+        token_budget: None,
         tools: if target.remote { Vec::new() } else { tools },
         tools_complete: tools_complete && !target.remote,
     }

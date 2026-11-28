@@ -1,0 +1,7 @@
+{
+  "type": "about:blank",
+  "title": "The run's lease has expired",
+  "status": 403,
+  "code": "lease_expired",
+  "detail": "the binding exists but its lease is over"
+}

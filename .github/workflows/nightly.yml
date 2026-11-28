@@ -43,7 +43,7 @@ jobs:
             echo "ADAM_TEST_OPENAI_BASE_URL / ADAM_TEST_OPENAI_API_KEY are not set: skipping" | tee -a "$GITHUB_STEP_SUMMARY"
             echo "run=false" >> "$GITHUB_OUTPUT"
           fi
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         if: steps.have.outputs.run == 'true'
       - uses: dtolnay/rust-toolchain@stable
         if: steps.have.outputs.run == 'true'
@@ -74,7 +74,7 @@ jobs:
             echo "ADAM_TEST_OPENCODE_CONFIG is not set: skipping" | tee -a "$GITHUB_STEP_SUMMARY"
             echo "run=false" >> "$GITHUB_OUTPUT"
           fi
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         if: steps.have.outputs.run == 'true'
       - uses: dtolnay/rust-toolchain@stable
         if: steps.have.outputs.run == 'true'

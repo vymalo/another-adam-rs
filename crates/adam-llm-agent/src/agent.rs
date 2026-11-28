@@ -33,6 +33,7 @@ use futures::future::BoxFuture;
 use futures::stream::FuturesUnordered;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
+use tracing::Instrument as _;
 
 use crate::access::ToolAccess;
 use crate::compaction::{
@@ -2328,6 +2329,12 @@ impl LlmAgent {
         self.index.get(name).map(|&i| &self.tools[i])
     }
 
+    /// The names of the agent's own tools, loaders included: what a session's `tools` selects
+    /// among, and the group loaders a session keeps ([`SessionNarrowing`], ANR-1304).
+    fn own_names(&self) -> Vec<&str> {
+        self.specs.iter().map(|spec| spec.name.as_str()).collect()
+    }
+
     /// The retry policy of the tool `name`, first found: the one set by name
     /// ([`LlmAgentBuilder::tool_retry`]), the tool's own ([`Tool::retry_policy`]); `None`: the
     /// runtime's (ADR 0061, decision 3).
@@ -2760,6 +2767,32 @@ impl LlmAgent {
         state.session.as_ref().and_then(|h| h.config.as_ref())
     }
 
+    /// The cap on the tokens of this run's session ([ADR 0054], decision 6), `None` for a run that
+    /// is no round of a session or a session that set none. Read at every model call, so a budget
+    /// an edit raises applies from the next call.
+    ///
+    /// [ADR 0054]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md
+    fn token_budget_of(&self, state: &Conversation) -> Option<u64> {
+        self.session_config(state)
+            .and_then(|config| config.token_budget)
+    }
+
+    /// Count the tokens of a model call of this round: `usage` adds to the round's own
+    /// ([`Conversation::usage`]) and, for a round of a session, to the session's so far
+    /// ([`Conversation::spent`]), which the header carries so that a listing and a send read it
+    /// from the committed record ([ADR 0054], decision 6).
+    ///
+    /// [ADR 0054]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md
+    fn count_tokens(state: &mut Conversation, usage: adam_model::Usage) {
+        state.usage = state.usage.saturating_add(usage);
+        // A run that is nobody's round has no session to spend for: it keeps `0`, so its state is
+        // the bytes it always was.
+        if let Some(header) = &mut state.session {
+            state.spent = state.spent.saturating_add(usage.total_tokens());
+            header.spent = state.spent;
+        }
+    }
+
     /// The check of a final answer against the `report_schema` of its session ([ADR 0054], slice 9):
     /// `None` when the session has none or the answer matches it, so the answer ends the round as
     /// it would. A mismatch with a correction left (`retry`) puts the problems to the model as a
@@ -3101,6 +3134,21 @@ impl LlmAgent {
                 answer: None,
             });
         }
+        // The session's tokens, the earlier rounds' and this one's, reached its budget ([ADR 0054],
+        // decision 6): this model call is the closing turn and the round ends with it.
+        //
+        // [ADR 0054]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md
+        if state.limit.is_none()
+            && self
+                .token_budget_of(state)
+                .is_some_and(|budget| state.spent >= budget)
+        {
+            state.limit = Some(LimitHit {
+                limit: LimitKind::TokenBudget,
+                answered: false,
+                answer: None,
+            });
+        }
         let closing = state.limit.is_some();
         let live = self.live_model(state);
         let live_alias = live.alias.to_owned();
@@ -3140,7 +3188,11 @@ impl LlmAgent {
 
         let model = self.model.clone();
         let sources = self.sources.clone();
-        let narrowing = Arc::new(narrowing_of(state, context.map(|c| &**c)));
+        let narrowing = Arc::new(narrowing_of(
+            state,
+            context.map(|c| &**c),
+            &self.own_names(),
+        ));
         let turn = state.turns;
         // The step start seeded a journal written before `loaded` existed; a fresh run (or a
         // continuation) has no seed, and its task-loaded groups are journaled here.
@@ -3221,7 +3273,11 @@ impl LlmAgent {
             task: state.task().map(Arc::from),
             loaded: Arc::from(state.loaded.clone()),
             removed_tools: Arc::from(state.removed_tools.clone()),
-            narrowing: Arc::new(narrowing_of(state, context.map(|c| &**c))),
+            narrowing: Arc::new(narrowing_of(
+                state,
+                context.map(|c| &**c),
+                &self.own_names(),
+            )),
             event_budget: Arc::clone(&state.event_budget.0),
             approvable: approvable(ctx, state),
             turn: crate::early::Turn {
@@ -3357,11 +3413,14 @@ impl LlmAgent {
                 if !stream_text {
                     // The request races the run's cancellation: a cancel drops it, and with it the
                     // connection, instead of letting the provider finish an answer nobody will read.
+                    let span = model_span(&request.model, false);
                     let answer = tokio::select! {
                         biased;
                         () = cancel.cancelled() => return Err(ModelFailure::cancelled()),
-                        answer = model.complete(request) => answer.map_err(ModelFailure::from)?,
+                        answer = model.complete(request).instrument(span.clone()) => answer.map_err(ModelFailure::from)?,
                     };
+                    span.record("input_tokens", answer.usage.input_tokens);
+                    span.record("output_tokens", answer.usage.output_tokens);
                     return Ok(Recorded {
                         response: unthought(&emitter, run, turn, false, answer).await,
                         stream: None,
@@ -3571,7 +3630,7 @@ impl LlmAgent {
             reasoning: _,
         } = response;
         // The call's tokens count whatever its answer was: the provider took them.
-        state.usage = state.usage.saturating_add(usage);
+        Self::count_tokens(state, usage);
         state
             .usage_totals
             .add(self.model.provider(), &live_alias, usage);
@@ -3970,7 +4029,7 @@ impl LlmAgent {
         let model = self.model.clone();
         let ordered = self.max_parallel > 1;
         let sources = self.sources.clone();
-        let narrowing = Arc::new(narrowing_of(state, Some(&state.context)));
+        let narrowing = Arc::new(narrowing_of(state, Some(&state.context), &self.own_names()));
         let source_ctx = (!sources.is_empty()).then(|| {
             SourceCtx::new(
                 ctx.run_id(),
@@ -4113,11 +4172,14 @@ impl LlmAgent {
                         }
                     }
                 }
+                let span = model_span(&request.model, true);
                 let answer = tokio::select! {
                     biased;
                     () = cancel.cancelled() => return Err(ModelFailure::cancelled()),
-                    answer = model.complete(request) => answer.map_err(ModelFailure::from)?,
+                    answer = model.complete(request).instrument(span.clone()) => answer.map_err(ModelFailure::from)?,
                 };
+                span.record("input_tokens", answer.usage.input_tokens);
+                span.record("output_tokens", answer.usage.output_tokens);
                 let text = answer.message.text();
                 Ok(Summarised {
                     summary: (!text.trim().is_empty()).then_some(text),
@@ -4183,10 +4245,11 @@ impl LlmAgent {
                 return Ok(Compacted::No);
             }
             Ok(done) => {
-                // The call was made and counts, whatever its summary is worth.
+                // The call was made and counts, whatever its summary is worth. A summary is a
+                // model call of the round: its tokens count toward the session's spend too.
                 self.report_usage(ctx, state, done.call.clone(), &live_alias, done.usage, None)
                     .await;
-                state.usage = state.usage.saturating_add(done.usage);
+                Self::count_tokens(state, done.usage);
                 state
                     .usage_totals
                     .add(self.model.provider(), &live_alias, done.usage);
@@ -4800,7 +4863,11 @@ impl LlmAgent {
                         task: state.task().map(Arc::from),
                         loaded: Arc::from(state.loaded.clone()),
                         removed_tools: Arc::from(state.removed_tools.clone()),
-                        narrowing: Arc::new(narrowing_of(state, context.map(|c| &**c))),
+                        narrowing: Arc::new(narrowing_of(
+                            state,
+                            context.map(|c| &**c),
+                            &self.own_names(),
+                        )),
                         event_budget: Arc::clone(&state.event_budget.0),
                         approvable: approvable(ctx, state),
                     },
@@ -5154,7 +5221,11 @@ impl LlmAgent {
                 task: state.task().map(Arc::from),
                 loaded: Arc::from(state.loaded.clone()),
                 removed_tools: Arc::from(state.removed_tools.clone()),
-                narrowing: Arc::new(narrowing_of(state, context.map(|c| &**c))),
+                narrowing: Arc::new(narrowing_of(
+                    state,
+                    context.map(|c| &**c),
+                    &self.own_names(),
+                )),
                 event_budget: Arc::clone(&state.event_budget.0),
                 approvable: approvable(ctx, state),
             };
@@ -5820,12 +5891,18 @@ impl LlmAgent {
             // The arguments the tool ran with, for the two `within` closures: each would otherwise
             // take `args` from this scope, and the after hook reads them again below.
             let ran = args.clone();
+            // A tool call's span (ANR-1346): the tool's name, from the set the agent offers, and
+            // nothing of what the call read or wrote.
+            let span = tool_span(&name);
             let called = match own {
                 Some(tool) => {
-                    let limit = tool.time_limit().unwrap_or(DEFAULT_TOOL_TIME_LIMIT);
+                    let limit = tool
+                        .time_limit_for(&args)
+                        .unwrap_or(DEFAULT_TOOL_TIME_LIMIT);
                     within(&tool_ctx, &name, limit, |ctx| async move {
                         tool.call(&ctx, ran).await
                     })
+                    .instrument(span.clone())
                     .await
                 }
                 None => {
@@ -5838,6 +5915,7 @@ impl LlmAgent {
                         }
                         Ok(ToolOutput::error(unknown))
                     })
+                    .instrument(span.clone())
                     .await
                 }
             };
@@ -6631,6 +6709,16 @@ impl LlmAgent {
             LimitKind::RepeatedCall => "the same tool call was repeated with the same result \
                  and the run was stopped (doom_loop)"
                 .to_owned(),
+            LimitKind::TokenBudget => match self.token_budget_of(state) {
+                Some(budget) => format!(
+                    "token budget reached: the session has spent {} of its {budget} tokens",
+                    state.spent
+                ),
+                None => format!(
+                    "token budget reached: the session has spent {} tokens",
+                    state.spent
+                ),
+            },
         }
     }
 
@@ -6984,6 +7072,9 @@ fn start_conversation(input: Inbound) -> Result<Conversation, AgentError> {
     conversation.model_run = parse_model_run(&input.payload);
     conversation.root_step = parse_root_step(&input.payload);
     conversation.session = parse_session(&input.payload);
+    // A round of a session starts from the tokens its earlier rounds spent, which the header it was
+    // started with carries (ADR 0054, decision 6).
+    conversation.spent = conversation.session.as_ref().map_or(0, |h| h.spent);
     conversation.prompt_statement = parse_prompt_statement(&input.payload);
     if let Some(context) = parse_context(&input.payload) {
         conversation.merge_context(context);
@@ -7251,12 +7342,15 @@ fn continue_conversation(
             .rev()
             .find(|m| matches!(m, Message::Assistant { .. }))
             .cloned();
+        let session = parse_session(&input.payload).or_else(|| prior.session.clone());
         let mut conversation = Conversation {
             messages: last.into_iter().collect(),
             continued_from: Some(prior_run),
             context: prior.context.clone(),
             plan: prior.plan.clone(),
-            session: parse_session(&input.payload).or_else(|| prior.session.clone()),
+            // The closing round keeps the session's spend: it calls no model, so it only carries it.
+            spent: session.as_ref().map_or(0, |h| h.spent),
+            session,
             ..Conversation::default()
         };
         // The carried answer was signed under the run it came from; this run signs it again.
@@ -7278,6 +7372,9 @@ fn continue_conversation(
     // A later task brings its own; a round of a session, the run that sent it.
     conversation.prompt_statement = parse_prompt_statement(&input.payload);
     if let Some(header) = parse_session(&input.payload) {
+        // The session's spend comes from the header the round was started with: the earlier
+        // rounds' tokens, carried by it (ADR 0054, decision 6).
+        conversation.spent = header.spent;
         conversation.session = Some(header);
     }
     // The context of the run before comes along; what this message says about its sender is
@@ -7691,6 +7788,31 @@ fn timed_out(tool: &str, limit: Duration) -> String {
 /// result before that, at the instant of the limit or while it was told to stop. It runs inside the
 /// journaled step, so a replay reads the recorded answer and never waits, and no clock is read in a
 /// transition.
+/// The span of one model call ([ANR-1346]): the alias the request names, whether it is a
+/// compaction's summary, and its token counts once it answers.
+///
+/// **No prompt, no message, no tool spec, no answer** — a model call's content is not telemetry
+/// (pantry `otel-conventions`). A provider is not a field: the loop is not told one.
+///
+/// [ANR-1346]: https://github.com/vymalo/another-adam-rs/issues
+fn model_span(alias: &str, compaction: bool) -> tracing::Span {
+    tracing::info_span!(
+        "adam.model",
+        alias = %alias,
+        compaction,
+        input_tokens = tracing::field::Empty,
+        output_tokens = tracing::field::Empty,
+    )
+}
+
+/// The span of one tool call ([ANR-1346]): the tool's name, from the set the agent offers, and
+/// nothing the call read or wrote.
+///
+/// [ANR-1346]: https://github.com/vymalo/another-adam-rs/issues
+fn tool_span(tool: &str) -> tracing::Span {
+    tracing::info_span!("adam.tool", tool = %tool)
+}
+
 async fn within<F, Fut>(
     tool_ctx: &ToolCtx,
     name: &str,
@@ -9459,5 +9581,83 @@ mod session_instructions_tests {
             with_session_instructions(Some("You are the coder.".into()), Some(&none)),
             Some("You are the coder.".into())
         );
+    }
+}
+
+/// The spans of a model call and a tool call ([ANR-1346]): their fields, and what is never one.
+///
+/// [ANR-1346]: https://github.com/vymalo/another-adam-rs/issues
+#[cfg(test)]
+mod call_span_tests {
+    use super::{model_span, tool_span};
+    use std::sync::{Arc, Mutex};
+    use tracing_subscriber::fmt::MakeWriter;
+
+    /// A writer the test reads back: what the subscriber rendered.
+    #[derive(Clone, Default)]
+    struct Captured(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Captured {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> MakeWriter<'a> for Captured {
+        type Writer = Self;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// What `span` renders, as text.
+    fn rendered(span: tracing::Span) -> String {
+        let sink = Captured::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(sink.clone())
+            .with_span_events(tracing_subscriber::fmt::format::FmtSpan::FULL)
+            .with_max_level(tracing::Level::INFO)
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            span.in_scope(|| {});
+        });
+        let bytes = sink
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        String::from_utf8(bytes).expect("utf-8")
+    }
+
+    #[test]
+    fn a_model_span_names_the_alias_and_holds_no_content() {
+        let text = rendered(model_span("some-alias", false));
+        assert!(text.contains("adam.model"), "{text}");
+        assert!(text.contains("some-alias"), "{text}");
+        // A prompt, a message, a tool spec or an answer is never a field.
+        for forbidden in [
+            "prompt", "system", "messages", "tools=", "answer", "content",
+        ] {
+            assert!(!text.contains(forbidden), "{forbidden} in {text}");
+        }
+    }
+
+    #[test]
+    fn a_tool_span_names_the_tool_and_holds_no_arguments() {
+        let text = rendered(tool_span("read_file"));
+        assert!(text.contains("adam.tool"), "{text}");
+        assert!(text.contains("read_file"), "{text}");
+        for forbidden in ["args", "arguments", "output", "content"] {
+            assert!(!text.contains(forbidden), "{forbidden} in {text}");
+        }
     }
 }

@@ -171,9 +171,9 @@ flowchart LR
     ToolError -->|Permanent| Invalid
     ToolError -->|NeedsInput| Rejected
 
-    MemoryError -->|"Redacted, TooManyBytes, TooManyChars, NamesAddress, EmptyScope, EmptyField, TooManyAnchors"| Invalid
-    MemoryError -->|"ScopeFull, ProblemFull"| Rejected
-    MemoryError -->|"ProblemNotFound, AttemptNotFound"| NotFound
+    MemoryError -->|"Redacted, TooManyBytes, TooManyChars, NamesAddress, EmptyScope, EmptyField, TooManyAnchors, TooManySources"| Invalid
+    MemoryError -->|"ScopeFull, ProblemFull, AudienceFull"| Rejected
+    MemoryError -->|"ProblemNotFound, AttemptNotFound, LessonNotFound"| NotFound
     MemoryError -->|Corrupt| Corrupt
     MemoryError -->|Backend| Transient
 

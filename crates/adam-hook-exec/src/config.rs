@@ -39,6 +39,7 @@ pub const SAFE_VARS: &[&str] = &[
 
 /// The variables a program may never be given, whatever the configuration says (ADR 0050,
 /// decision 13): the safe ones are the adapter's, and the rest change how a program starts.
+/// `adam_workspace::DENIED_ENV` holds the same list for an exec hook; keep the two equal.
 const DENIED_ENV: &[&str] = &["PATH", "HOME", "LANG", "TMPDIR", "BASH_ENV", "ENV", "IFS"];
 
 /// Whether `name` is a variable a configuration may add (ADR 0050, decision 13: "a plain

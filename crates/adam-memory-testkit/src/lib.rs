@@ -1,6 +1,7 @@
-//! The conformance suite of [`adam_memory::SiMemory`], and the [`Plan`] a test writes with.
+//! The conformance suites of [`adam_memory::SiMemory`] and [`adam_memory::Memory`], and the
+//! [`Plan`] and [`LessonPlan`] a test writes with.
 //!
-//! [`si_memory_conformance!`] writes the cases of ADR 0081 decisions 3 to 5 into a module of the
+//! [`si_memory_conformance!`] writes the L1 cases of ADR 0081 decisions 3 to 5 into a module of the
 //! implementing crate:
 //!
 //! * a problem and its attempt round-trip, and attempts with one root cause share a problem;
@@ -14,7 +15,20 @@
 //! * an observation is stamped once and a failed attempt is kept;
 //! * sixteen writers on one scope leave sixteen problems.
 //!
-//! Each case is a function here, so the suite is compiled once and the macro only names it.
+//! [`memory_conformance!`] writes the L2 cases of decisions 4, 5 and 10:
+//!
+//! * a lesson round-trips, and one audience and root cause is one lesson, updated in place;
+//! * an audience answers only its own lessons;
+//! * the audience is a key and is never scrubbed, while a provenance label is;
+//! * two configured scopes on one store never read, overwrite or retire each other's lessons;
+//! * a lesson text is scrubbed or the write is refused, and every bound refuses the write it would
+//!   break;
+//! * a lesson refuses a repository, a path, a URL, a host and an e-mail address whatever its
+//!   audience;
+//! * a retired lesson is kept and not served, and `retire` takes the stored, scrubbed root cause;
+//! * sixteen writers on one audience leave sixteen lessons.
+//!
+//! Each case is a function here, so each suite is compiled once and the macro only names it.
 //!
 //! ```ignore
 //! use std::sync::Arc;
@@ -29,8 +43,34 @@
 //! adam_memory_testkit::si_memory_conformance!(crate::make);
 //! ```
 //!
-//! `$make` is a path to a `fn(&Plan) -> DynSiMemory`. The suite also ships two doubles the cases
-//! must reject: [`doubles::ScopeBlindSiMemory`] and [`doubles::DoubleWritingSiMemory`].
+//! ```ignore
+//! use std::sync::{Arc, OnceLock};
+//!
+//! use adam_memory::{DynMemory, InProcessLessonStore, InProcessMemory, MemoryScope};
+//! use adam_memory_testkit::LessonPlan;
+//!
+//! fn store() -> &'static InProcessLessonStore {
+//!     static STORE: OnceLock<InProcessLessonStore> = OnceLock::new();
+//!     STORE.get_or_init(InProcessLessonStore::new)
+//! }
+//!
+//! fn make(plan: &LessonPlan, scope: &MemoryScope) -> DynMemory {
+//!     // A database adapter here would open one database whatever the scope; this reference shares
+//!     // a store so two scopes really are two scopes on one store.
+//!     Arc::new(InProcessMemory::shared(
+//!         plan.settings.clone(),
+//!         scope.clone(),
+//!         InProcessLessonStore::clone(store()),
+//!     ))
+//! }
+//!
+//! adam_memory_testkit::memory_conformance!(crate::make);
+//! ```
+//!
+//! `$make` is a path to a `fn(&Plan) -> DynSiMemory` or a
+//! `fn(&LessonPlan, &MemoryScope) -> DynMemory`. Each suite also ships two doubles the cases must
+//! reject: [`doubles::ScopeBlindSiMemory`] and [`doubles::DoubleWritingSiMemory`] for L1, and
+//! [`doubles::ScopeBlindMemory`] and [`doubles::DoubleWritingMemory`] for L2.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -43,11 +83,12 @@ use std::time::Duration;
 use adam_core::RunId;
 use adam_core::time::span_of;
 use adam_memory::{
-    AttemptDraft, AttemptId, Limits, MemoryError, Observation, Outcome, Problem, Provenance,
+    AttemptDraft, AttemptId, Lesson, LessonDraft, LessonLimits, LessonProvenance, LessonSettings,
+    LessonState, Limits, Memory, MemoryError, Observation, Outcome, Problem, Provenance,
     REDACTION_MARKER, Repository, Scope, Scrubber, Settings, SiMemory,
 };
 
-pub use adam_memory::DynSiMemory;
+pub use adam_memory::{Audience, DynMemory, DynSiMemory, MemoryScope};
 
 /// A secret the suite's default scrubber replaces with [`REDACTION_MARKER`], so a text that holds
 /// it is refused.
@@ -122,6 +163,67 @@ pub fn draft(root_cause: &str, id: &str) -> AttemptDraft {
     .remedy("restart the worker")
     .rationale("the lease had expired")
     .predicted("the run resumes")
+}
+
+/// What one L2 conformance run writes with: the injected scrub and the bounds.
+///
+/// `LessonPlan::default()` injects the same scrubber `Plan::default()` does, with the bounds of
+/// `LessonLimits::default()` (the ADR's, with this slice's anchor and source counts).
+#[derive(Clone, Debug)]
+#[non_exhaustive]
+pub struct LessonPlan {
+    /// The scrub and bounds the `$make` adapter is built with.
+    pub settings: LessonSettings,
+}
+
+impl LessonPlan {
+    /// A plan with `scrubber` and the ADR's bounds.
+    #[must_use]
+    pub fn new(scrubber: Scrubber) -> Self {
+        Self {
+            settings: LessonSettings::new(scrubber),
+        }
+    }
+
+    /// A plan with `scrubber` and other bounds.
+    #[must_use]
+    pub fn with_limits(scrubber: Scrubber, limits: LessonLimits) -> Self {
+        Self {
+            settings: LessonSettings::new(scrubber).with_limits(limits),
+        }
+    }
+}
+
+impl Default for LessonPlan {
+    fn default() -> Self {
+        Self::new(Scrubber::new(|text| {
+            text.replace(SECRET, REDACTION_MARKER).replace(TOKEN, "")
+        }))
+    }
+}
+
+/// An audience of the suite's deployment.
+#[must_use]
+pub fn audience(name: &str) -> Audience {
+    Audience::new(name)
+}
+
+/// A configured L2 scope of the suite.
+#[must_use]
+pub fn memory_scope(name: &str) -> MemoryScope {
+    MemoryScope::new(name)
+}
+
+/// A lesson draft for `root_cause`, served to `audience`, approved by two sources and a reviewer.
+#[must_use]
+pub fn lesson_draft(audience: &Audience, root_cause: &str) -> LessonDraft {
+    LessonDraft::new(
+        audience.clone(),
+        root_cause,
+        LessonProvenance::new(["scope-a", "scope-b"], "the conformance reviewer"),
+    )
+    .remedy("restart the worker")
+    .rationale("the lease had expired")
 }
 
 /// The cases, as plain functions for harnesses that do not use the macro.
@@ -552,6 +654,480 @@ pub mod cases {
     }
 }
 
+/// The L2 cases, as plain functions for harnesses that do not use the macro.
+pub mod lesson_cases {
+    use super::*;
+
+    fn record(memory: &DynMemory, draft: LessonDraft) -> Lesson {
+        memory.record(draft).expect("a valid lesson is stored")
+    }
+
+    /// A lesson comes back as it was written, served, with its provenance.
+    ///
+    /// # Panics
+    ///
+    /// When a field of the stored lesson differs from the draft's.
+    pub fn record_then_recall_round_trips(memory: DynMemory, _plan: LessonPlan) {
+        let audience = audience("round-trip");
+        let written = memory
+            .record(
+                lesson_draft(&audience, "the lockfile is stale")
+                    .remedy("regenerate the lockfile")
+                    .rationale("the manifest changed")
+                    .anchors(["the dependency block of the manifest"]),
+            )
+            .unwrap();
+        assert_eq!(written.audience, audience);
+        assert_eq!(written.root_cause, "the lockfile is stale");
+        assert_eq!(written.remedy, "regenerate the lockfile");
+        assert_eq!(written.rationale, "the manifest changed");
+        assert_eq!(written.anchors, ["the dependency block of the manifest"]);
+        assert_eq!(
+            written.provenance.sources,
+            ["scope-a".to_owned(), "scope-b".to_owned()]
+        );
+        assert_eq!(written.provenance.review, "the conformance reviewer");
+        assert_eq!(written.state, LessonState::Active);
+        assert!(written.retired_at.is_none());
+        let recalled = memory.recall(&audience).unwrap();
+        assert_eq!(recalled, vec![written]);
+    }
+
+    /// A second record for one audience and root cause is one lesson: the update replaces its
+    /// text and keeps its creation time, and the recall serves the freshest write first.
+    ///
+    /// # Panics
+    ///
+    /// When a retried record writes a second lesson, or an update opens another, or the recall
+    /// does not serve the freshest update first.
+    pub fn a_record_lands_once_for_one_key(memory: DynMemory, _plan: LessonPlan) {
+        let audience = audience("one-key");
+        let draft = lesson_draft(&audience, "the worker dies on a large input");
+        let first = record(&memory, draft.clone());
+        let second = record(&memory, draft);
+        assert_eq!(
+            first.created, second.created,
+            "an upsert keeps the creation time"
+        );
+        let recalled = memory.recall(&audience).unwrap();
+        assert_eq!(recalled.len(), 1, "one key is one lesson");
+
+        let updated = record(
+            &memory,
+            lesson_draft(&audience, "the worker dies on a large input")
+                .remedy("stream the input instead"),
+        );
+        assert_eq!(updated.remedy, "stream the input instead");
+        let recalled = memory.recall(&audience).unwrap();
+        assert_eq!(recalled.len(), 1, "an update does not open another lesson");
+        assert_eq!(recalled[0].remedy, "stream the input instead");
+
+        // The recall serves the freshest write first, not the most recently opened lesson.
+        record(&memory, lesson_draft(&audience, "a second lesson"));
+        std::thread::sleep(Duration::from_millis(5));
+        record(
+            &memory,
+            lesson_draft(&audience, "the worker dies on a large input")
+                .remedy("cap the input size"),
+        );
+        let recalled = memory.recall(&audience).unwrap();
+        assert_eq!(recalled.len(), 2);
+        assert!(
+            recalled[0].updated > recalled[1].updated,
+            "the store cannot separate two writes 5 ms apart"
+        );
+        assert_eq!(
+            recalled[0].root_cause, "the worker dies on a large input",
+            "the freshest update is served first"
+        );
+        assert_eq!(recalled[0].remedy, "cap the input size");
+    }
+
+    /// An audience answers only its own lessons.
+    ///
+    /// # Panics
+    ///
+    /// When a recall serves another audience's lesson.
+    pub fn recall_answers_only_its_audience(memory: DynMemory, _plan: LessonPlan) {
+        let a = audience("audience-a");
+        let b = audience("audience-b");
+        record(&memory, lesson_draft(&a, "the first lesson"));
+        record(&memory, lesson_draft(&b, "the second lesson"));
+
+        let only = |audience: &Audience, root_cause: &str| {
+            let recalled = memory.recall(audience).unwrap();
+            assert_eq!(
+                recalled.len(),
+                1,
+                "{} must answer one lesson, not {recalled:?}",
+                audience.as_str()
+            );
+            assert_eq!(recalled[0].root_cause, root_cause);
+        };
+        only(&a, "the first lesson");
+        only(&b, "the second lesson");
+    }
+
+    /// The audience is a key and is never scrubbed, while a provenance label is scrubbed.
+    ///
+    /// An adapter that scrubs its audience stores under text the caller's `recall` never asks for,
+    /// so this case fails on the miss.
+    ///
+    /// # Panics
+    ///
+    /// When an adapter scrubs the audience, or stores a label unscrubbed.
+    pub fn an_audience_is_not_scrubbed(memory: DynMemory, _plan: LessonPlan) {
+        let audience = audience(&format!("a{TOKEN}b"));
+        let written = record(&memory, lesson_draft(&audience, "the key is the audience"));
+        assert_eq!(written.audience, audience);
+        let recalled = memory.recall(&audience).unwrap();
+        assert_eq!(
+            recalled.len(),
+            1,
+            "the audience was scrubbed, so the recall missed the lesson"
+        );
+        assert_eq!(recalled[0].root_cause, "the key is the audience");
+
+        let draft = LessonDraft::new(
+            audience.clone(),
+            "the label is scrubbed",
+            LessonProvenance::new([format!("source-{TOKEN}")], format!("reviewer-{TOKEN}")),
+        );
+        let written = record(&memory, draft);
+        assert_eq!(
+            written.provenance.sources,
+            ["source-"],
+            "a provenance label is stored scrubbed"
+        );
+        assert_eq!(written.provenance.review, "reviewer-");
+    }
+
+    /// Two configured scopes on one store never see each other's lessons, whether they are
+    /// recorded, recalled or retired.
+    ///
+    /// This is M2's decisive case: an adapter that ignores its configured scope stores both under
+    /// one key, so `second` sees `first`'s lesson and fails here.
+    ///
+    /// # Panics
+    ///
+    /// When the second scope reads, overwrites or retires the first's lesson.
+    pub fn two_scopes_never_see_each_other(first: DynMemory, second: DynMemory, _plan: LessonPlan) {
+        let audience = audience("shared-audience");
+        first
+            .record(
+                lesson_draft(&audience, "the lockfile is stale").remedy("regenerate the lockfile"),
+            )
+            .unwrap();
+        assert!(
+            second.recall(&audience).unwrap().is_empty(),
+            "the second scope saw the first scope's lesson"
+        );
+
+        let own = second
+            .record(lesson_draft(&audience, "the lockfile is stale").remedy("delete the lockfile"))
+            .unwrap();
+        assert_eq!(own.remedy, "delete the lockfile");
+        assert_eq!(
+            first.recall(&audience).unwrap()[0].remedy,
+            "regenerate the lockfile",
+            "the second scope's record overwrote the first scope's lesson"
+        );
+        assert_eq!(
+            second.recall(&audience).unwrap()[0].remedy,
+            "delete the lockfile"
+        );
+
+        second
+            .retire(&audience, "the lockfile is stale")
+            .expect("the second scope retires its own lesson");
+        assert_eq!(
+            first.recall(&audience).unwrap().len(),
+            1,
+            "retiring in one scope retired the other scope's lesson"
+        );
+        assert!(
+            second.recall(&audience).unwrap().is_empty(),
+            "the retired lesson is no longer served"
+        );
+    }
+
+    /// A text is scrubbed before it is stored.
+    ///
+    /// # Panics
+    ///
+    /// When the stored text still holds the token the plan scrubs.
+    pub fn a_text_is_scrubbed_before_the_write(memory: DynMemory, _plan: LessonPlan) {
+        let audience = audience("scrubbed");
+        let written = memory
+            .record(
+                lesson_draft(&audience, "the command failed")
+                    .remedy(format!("retry with {TOKEN} and report")),
+            )
+            .unwrap();
+        assert_eq!(written.remedy, "retry with  and report");
+        assert!(!written.remedy.contains(TOKEN));
+    }
+
+    /// A text that still holds the redaction marker after the scrub is refused, and nothing is
+    /// stored.
+    ///
+    /// # Panics
+    ///
+    /// When the write succeeds, or the refusal stores a lesson.
+    pub fn a_text_carrying_the_marker_is_refused(memory: DynMemory, _plan: LessonPlan) {
+        let audience = audience("marker");
+        let error = memory
+            .record(
+                lesson_draft(&audience, "the command failed")
+                    .remedy(format!("retry with {SECRET}")),
+            )
+            .expect_err("a text the scrub marked is refused");
+        assert!(matches!(error, MemoryError::Redacted { .. }), "{error}");
+        let error = memory
+            .record(
+                lesson_draft(&audience, "the command failed")
+                    .rationale(REDACTION_MARKER.to_owned()),
+            )
+            .expect_err("a text that already holds the marker is refused");
+        assert!(matches!(error, MemoryError::Redacted { .. }), "{error}");
+        assert!(
+            memory.recall(&audience).unwrap().is_empty(),
+            "a refused write stores nothing"
+        );
+    }
+
+    /// A field over its byte bound, and too many anchors, are refused.
+    ///
+    /// # Panics
+    ///
+    /// When the write succeeds.
+    pub fn a_field_over_the_bound_is_refused(memory: DynMemory, plan: LessonPlan) {
+        let audience = audience("field-bound");
+        let long = "a".repeat(plan.settings.limits.field_bytes + 1);
+        let error = memory
+            .record(lesson_draft(&audience, "the output is huge").remedy(long))
+            .expect_err("a field over the bound is refused");
+        assert!(matches!(error, MemoryError::TooManyBytes { .. }), "{error}");
+        let anchors = vec!["an anchor".to_owned(); plan.settings.limits.anchors_per_lesson + 1];
+        let error = memory
+            .record(lesson_draft(&audience, "the output is huge").anchors(anchors))
+            .expect_err("too many anchors are refused");
+        assert!(
+            matches!(error, MemoryError::TooManyAnchors { .. }),
+            "{error}"
+        );
+        let sources = vec!["a source".to_owned(); plan.settings.limits.sources_per_lesson + 1];
+        let draft = LessonDraft::new(
+            audience.clone(),
+            "the output is huge",
+            LessonProvenance::new(sources, "the conformance reviewer"),
+        );
+        let error = memory
+            .record(draft)
+            .expect_err("too many sources are refused");
+        assert!(
+            matches!(error, MemoryError::TooManySources { .. }),
+            "{error}"
+        );
+    }
+
+    /// A root cause over its character bound is refused, and one under it is accepted even when
+    /// its bytes would exceed the byte bound.
+    ///
+    /// # Panics
+    ///
+    /// When the write succeeds over the bound, or a root cause the ADR allows is refused.
+    pub fn a_root_cause_over_the_bound_is_refused(memory: DynMemory, plan: LessonPlan) {
+        let audience = audience("root-cause-bound");
+        let long = "é".repeat(plan.settings.limits.root_cause_chars + 1);
+        let error = memory
+            .record(lesson_draft(&audience, &long))
+            .expect_err("a root cause over the bound is refused");
+        assert!(matches!(error, MemoryError::TooManyChars { .. }), "{error}");
+        // 199 characters, 398 bytes: under the character bound, over the byte one.
+        let accepted = "é".repeat(plan.settings.limits.root_cause_chars - 1);
+        assert!(accepted.len() > plan.settings.limits.root_cause_chars);
+        memory
+            .record(lesson_draft(&audience, &accepted))
+            .expect("the bound counts characters, not bytes");
+    }
+
+    /// A full audience refuses a new lesson, and a retired one frees a slot.
+    ///
+    /// # Panics
+    ///
+    /// When the bound is not enforced, or retiring does not free its slot.
+    pub fn a_full_audience_refuses_another_lesson(memory: DynMemory, plan: LessonPlan) {
+        let audience = audience("audience-bound");
+        for i in 0..plan.settings.limits.lessons_per_audience {
+            record(&memory, lesson_draft(&audience, &format!("lesson {i}")));
+        }
+        let error = memory
+            .record(lesson_draft(&audience, "one lesson too many"))
+            .expect_err("a full audience refuses a new lesson");
+        assert!(matches!(error, MemoryError::AudienceFull { .. }), "{error}");
+        memory
+            .retire(&audience, "lesson 0")
+            .expect("the oldest lesson is there to retire");
+        record(&memory, lesson_draft(&audience, "one lesson too many"));
+    }
+
+    /// An L2 lesson refuses a repository, a path, a URL, a host and an e-mail address whatever its
+    /// audience (ADR 0081 decision 5), and a refusal stores nothing.
+    ///
+    /// # Panics
+    ///
+    /// When a lesson naming an address is stored.
+    pub fn a_lesson_refuses_an_address(memory: DynMemory, _plan: LessonPlan) {
+        let cases = [
+            ("repository", "github.com/vymalo/another-adam-rs"),
+            ("path", "/etc/passwd"),
+            ("URL", "https://example.com/x"),
+            ("host", "db.internal:5432"),
+            ("e-mail address", "someone@example.com"),
+        ];
+        let audience = audience("addresses");
+        for (index, (what, text)) in cases.iter().enumerate() {
+            let error = memory
+                .record(lesson_draft(&audience, &format!("lesson {index}")).remedy(*text))
+                .expect_err("a lesson refuses an address");
+            assert!(
+                matches!(error, MemoryError::NamesAddress { what: found, .. } if found == *what),
+                "{text:?}: {error}"
+            );
+        }
+        assert!(
+            memory.recall(&audience).unwrap().is_empty(),
+            "the refusals stored nothing"
+        );
+    }
+
+    /// A retired lesson is kept but no longer served; retiring twice is one retirement, and a
+    /// fresh record serves it again.
+    ///
+    /// # Panics
+    ///
+    /// When a retired lesson is served, its record is lost, or an unknown lesson is retired.
+    pub fn a_retired_lesson_is_kept_and_not_served(memory: DynMemory, _plan: LessonPlan) {
+        let audience = audience("retired");
+        let written = record(&memory, lesson_draft(&audience, "the tests flake"));
+        let retired = memory
+            .retire(&audience, &written.root_cause)
+            .expect("the lesson is there");
+        assert_eq!(retired.state, LessonState::Retired);
+        assert!(retired.retired_at.is_some());
+        assert_eq!(retired.remedy, written.remedy, "the lesson is kept");
+        assert!(memory.recall(&audience).unwrap().is_empty());
+
+        let again = memory
+            .retire(&audience, &written.root_cause)
+            .expect("retiring twice is a no-op");
+        assert_eq!(again.retired_at, retired.retired_at, "one retirement");
+        assert_eq!(again.created, written.created);
+
+        let error = memory
+            .retire(&audience, "no such lesson")
+            .expect_err("an unknown lesson is refused");
+        assert!(matches!(error, MemoryError::LessonNotFound(_)), "{error}");
+
+        let revived = record(&memory, lesson_draft(&audience, "the tests flake"));
+        assert_eq!(revived.state, LessonState::Active);
+        assert!(revived.retired_at.is_none());
+        assert_eq!(revived.created, written.created, "the lesson is the same");
+        assert_eq!(memory.recall(&audience).unwrap().len(), 1);
+    }
+
+    /// A full audience refuses to revive a retired lesson: the bound counts what is served.
+    ///
+    /// # Panics
+    ///
+    /// When a retired lesson is revived without a free slot, or a free slot is refused.
+    pub fn a_full_audience_refuses_a_revived_lesson(memory: DynMemory, plan: LessonPlan) {
+        let audience = audience("revive-bound");
+        let limit = plan.settings.limits.lessons_per_audience;
+        for i in 0..limit {
+            record(&memory, lesson_draft(&audience, &format!("lesson {i}")));
+        }
+        memory
+            .retire(&audience, "lesson 0")
+            .expect("the oldest lesson is there to retire");
+        record(&memory, lesson_draft(&audience, "lesson 0"));
+        assert_eq!(
+            memory.recall(&audience).unwrap().len(),
+            limit,
+            "a revived lesson fills the freed slot"
+        );
+
+        memory
+            .retire(&audience, "lesson 1")
+            .expect("lesson 1 is there to retire");
+        record(&memory, lesson_draft(&audience, "one lesson too many"));
+        assert_eq!(
+            memory.recall(&audience).unwrap().len(),
+            limit,
+            "the audience serves the limit again"
+        );
+        let error = memory
+            .record(lesson_draft(&audience, "lesson 1"))
+            .expect_err("reviving at the limit would serve one too many");
+        assert!(matches!(error, MemoryError::AudienceFull { .. }), "{error}");
+        let recalled = memory.recall(&audience).unwrap();
+        assert_eq!(recalled.len(), limit);
+        assert!(
+            recalled
+                .iter()
+                .all(|lesson| lesson.root_cause.as_str() != "lesson 1"),
+            "the refused revival left the lesson retired"
+        );
+    }
+
+    /// `retire` takes the stored, scrubbed root cause; the draft's unscrubbed text is `NotFound`.
+    ///
+    /// # Panics
+    ///
+    /// When an unscrubbed root cause retires a lesson, or the stored one is not found.
+    pub fn retire_takes_the_stored_root_cause(memory: DynMemory, _plan: LessonPlan) {
+        let audience = audience("stored-root-cause");
+        let raw = format!("the lockfile {TOKEN} is stale");
+        let written = record(&memory, lesson_draft(&audience, &raw));
+        assert_eq!(written.root_cause, "the lockfile  is stale");
+        let error = memory
+            .retire(&audience, &raw)
+            .expect_err("an unscrubbed root cause does not find the lesson");
+        assert!(matches!(error, MemoryError::LessonNotFound(_)), "{error}");
+        memory
+            .retire(&audience, &written.root_cause)
+            .expect("the stored root cause finds the lesson");
+    }
+
+    /// Sixteen writers on one audience leave sixteen lessons: the port is `Send + Sync`.
+    ///
+    /// # Panics
+    ///
+    /// When a writer fails or a lesson is lost.
+    pub fn sixteen_writers_share_one_audience(memory: DynMemory, _plan: LessonPlan) {
+        let audience = std::sync::Arc::new(audience("writers"));
+        let mut writers = Vec::new();
+        for i in 0..16 {
+            let memory = std::sync::Arc::clone(&memory);
+            let audience = std::sync::Arc::clone(&audience);
+            writers.push(std::thread::spawn(move || {
+                memory
+                    .record(lesson_draft(&audience, &format!("lesson {i}")))
+                    .expect("a writer's record is stored");
+            }));
+        }
+        for writer in writers {
+            writer.join().expect("a writer thread does not panic");
+        }
+        assert_eq!(
+            memory.recall(&audience).unwrap().len(),
+            16,
+            "every writer's lesson is there"
+        );
+    }
+}
+
 /// Write the conformance cases of ADR 0081 decisions 3 to 5 into a `mod si_memory_conformance` of
 /// the crate that calls it, for the memory `$make` builds from a [`Plan`].
 ///
@@ -676,12 +1252,172 @@ macro_rules! si_memory_conformance {
     };
 }
 
+/// Write the L2 conformance cases of ADR 0081 decisions 4, 5 and 10 into a `mod
+/// memory_conformance` of the crate that calls it, for the memory `$make` builds from a
+/// [`LessonPlan`] and a [`MemoryScope`].
+///
+/// `$make` is a path to a `fn(&LessonPlan, &MemoryScope) -> DynMemory`; in a test file of a crate,
+/// that is `crate::make`. The macro calls it with two scopes for
+/// [`lesson_cases::two_scopes_never_see_each_other`], so an adapter whose instances share one
+/// database must build both against it. The cases are synchronous, so the calling crate needs no
+/// runtime.
+#[macro_export]
+macro_rules! memory_conformance {
+    ($make:path) => {
+        #[allow(missing_docs)]
+        mod memory_conformance {
+            use super::*;
+            use $crate::{LessonPlan, MemoryScope};
+
+            fn make(plan: &LessonPlan, scope: &MemoryScope) -> $crate::DynMemory {
+                $make(plan, scope)
+            }
+
+            #[test]
+            fn record_then_recall_round_trips() {
+                let plan = LessonPlan::default();
+                $crate::lesson_cases::record_then_recall_round_trips(
+                    make(&plan, &$crate::memory_scope("round-trip")),
+                    plan,
+                );
+            }
+
+            #[test]
+            fn a_record_lands_once_for_one_key() {
+                let plan = LessonPlan::default();
+                $crate::lesson_cases::a_record_lands_once_for_one_key(
+                    make(&plan, &$crate::memory_scope("one-key")),
+                    plan,
+                );
+            }
+
+            #[test]
+            fn recall_answers_only_its_audience() {
+                let plan = LessonPlan::default();
+                $crate::lesson_cases::recall_answers_only_its_audience(
+                    make(&plan, &$crate::memory_scope("audiences")),
+                    plan,
+                );
+            }
+
+            #[test]
+            fn an_audience_is_not_scrubbed() {
+                let plan = LessonPlan::default();
+                $crate::lesson_cases::an_audience_is_not_scrubbed(
+                    make(&plan, &$crate::memory_scope("audience-key")),
+                    plan,
+                );
+            }
+
+            #[test]
+            fn two_scopes_never_see_each_other() {
+                let plan = LessonPlan::default();
+                $crate::lesson_cases::two_scopes_never_see_each_other(
+                    make(&plan, &$crate::memory_scope("scope-a")),
+                    make(&plan, &$crate::memory_scope("scope-b")),
+                    plan,
+                );
+            }
+
+            #[test]
+            fn a_text_is_scrubbed_before_the_write() {
+                let plan = LessonPlan::default();
+                $crate::lesson_cases::a_text_is_scrubbed_before_the_write(
+                    make(&plan, &$crate::memory_scope("scrubbed")),
+                    plan,
+                );
+            }
+
+            #[test]
+            fn a_text_carrying_the_marker_is_refused() {
+                let plan = LessonPlan::default();
+                $crate::lesson_cases::a_text_carrying_the_marker_is_refused(
+                    make(&plan, &$crate::memory_scope("marker")),
+                    plan,
+                );
+            }
+
+            #[test]
+            fn a_field_over_the_bound_is_refused() {
+                let plan = LessonPlan::default();
+                $crate::lesson_cases::a_field_over_the_bound_is_refused(
+                    make(&plan, &$crate::memory_scope("field-bound")),
+                    plan,
+                );
+            }
+
+            #[test]
+            fn a_root_cause_over_the_bound_is_refused() {
+                let plan = LessonPlan::default();
+                $crate::lesson_cases::a_root_cause_over_the_bound_is_refused(
+                    make(&plan, &$crate::memory_scope("root-cause-bound")),
+                    plan,
+                );
+            }
+
+            #[test]
+            fn a_full_audience_refuses_another_lesson() {
+                let plan = LessonPlan::default();
+                $crate::lesson_cases::a_full_audience_refuses_another_lesson(
+                    make(&plan, &$crate::memory_scope("audience-bound")),
+                    plan,
+                );
+            }
+
+            #[test]
+            fn a_lesson_refuses_an_address() {
+                let plan = LessonPlan::default();
+                $crate::lesson_cases::a_lesson_refuses_an_address(
+                    make(&plan, &$crate::memory_scope("addresses")),
+                    plan,
+                );
+            }
+
+            #[test]
+            fn a_retired_lesson_is_kept_and_not_served() {
+                let plan = LessonPlan::default();
+                $crate::lesson_cases::a_retired_lesson_is_kept_and_not_served(
+                    make(&plan, &$crate::memory_scope("retired")),
+                    plan,
+                );
+            }
+
+            #[test]
+            fn a_full_audience_refuses_a_revived_lesson() {
+                let plan = LessonPlan::default();
+                $crate::lesson_cases::a_full_audience_refuses_a_revived_lesson(
+                    make(&plan, &$crate::memory_scope("revive-bound")),
+                    plan,
+                );
+            }
+
+            #[test]
+            fn retire_takes_the_stored_root_cause() {
+                let plan = LessonPlan::default();
+                $crate::lesson_cases::retire_takes_the_stored_root_cause(
+                    make(&plan, &$crate::memory_scope("stored-root-cause")),
+                    plan,
+                );
+            }
+
+            #[test]
+            fn sixteen_writers_share_one_audience() {
+                let plan = LessonPlan::default();
+                $crate::lesson_cases::sixteen_writers_share_one_audience(
+                    make(&plan, &$crate::memory_scope("writers")),
+                    plan,
+                );
+            }
+        }
+    };
+}
+
 #[cfg(test)]
 mod tests {
     use std::panic::{AssertUnwindSafe, catch_unwind};
     use std::sync::Arc;
 
-    use adam_memory::InProcessSiMemory;
+    use adam_memory::{InProcessLessonStore, InProcessMemory, InProcessSiMemory};
 
     use super::*;
 
@@ -716,6 +1452,57 @@ mod tests {
             Arc::new(doubles::DoubleWritingSiMemory::new(plan.settings.clone()));
         let failed = catch_unwind(AssertUnwindSafe(|| {
             cases::a_record_lands_once_for_one_key(double, plan);
+        }))
+        .is_err();
+        assert!(
+            failed,
+            "the suite accepted a double that writes twice for one key"
+        );
+    }
+
+    #[test]
+    fn the_l2_reference_passes_the_two_scope_case() {
+        let plan = LessonPlan::default();
+        let store = InProcessLessonStore::new();
+        let first: DynMemory = Arc::new(InProcessMemory::shared(
+            plan.settings.clone(),
+            memory_scope("scope-a"),
+            store.clone(),
+        ));
+        let second: DynMemory = Arc::new(InProcessMemory::shared(
+            plan.settings.clone(),
+            memory_scope("scope-b"),
+            store,
+        ));
+        lesson_cases::two_scopes_never_see_each_other(first, second, plan);
+    }
+
+    #[test]
+    fn a_scope_blind_l2_double_fails_the_two_scope_case() {
+        let plan = LessonPlan::default();
+        let store = InProcessLessonStore::new();
+        let first: DynMemory = Arc::new(doubles::ScopeBlindMemory::new(
+            plan.settings.clone(),
+            store.clone(),
+        ));
+        let second: DynMemory =
+            Arc::new(doubles::ScopeBlindMemory::new(plan.settings.clone(), store));
+        let failed = catch_unwind(AssertUnwindSafe(|| {
+            lesson_cases::two_scopes_never_see_each_other(first, second, plan);
+        }))
+        .is_err();
+        assert!(
+            failed,
+            "the suite accepted a double that ignores its configured scope"
+        );
+    }
+
+    #[test]
+    fn a_double_writing_l2_double_fails_the_key_case() {
+        let plan = LessonPlan::default();
+        let double: DynMemory = Arc::new(doubles::DoubleWritingMemory::new(plan.settings.clone()));
+        let failed = catch_unwind(AssertUnwindSafe(|| {
+            lesson_cases::a_record_lands_once_for_one_key(double, plan);
         }))
         .is_err();
         assert!(

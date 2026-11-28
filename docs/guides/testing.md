@@ -28,7 +28,7 @@ cargo test --workspace --doc --locked
 cargo nextest run --workspace --locked --features adam-llm-agent/schema,adam-assembly/dev,adam/dev,adam-assembly/mcp,adam/mcp   # CI adds --profile ci
 cargo test -p adam --test ui                                  # #[tool] compile tests (trybuild)
 npm --prefix tools/docs-check ci && node tools/docs-check/check-docs.mjs   # diagrams, links, anchors, crate READMEs, skills
-```
+sh tools/check-workflow-pins.sh   # every action a workflow uses is at or above the floor recorded in tools/workflow-pins.txt```
 
 CI also runs the MSRV build (`rust-version` in `Cargo.toml`), `cargo deny`, line coverage
 (`cargo llvm-cov nextest --workspace`, on main: the two conformance arms run the suite on every pull request),
