@@ -788,10 +788,12 @@ impl Inner {
             let mut stored = Stored::decode(run, &rec.state)?;
             let error = format!("cancelled: {reason}");
             *stored.error_mut() = Some(error.clone());
-            // A request to close the session survives: a cancel must not reopen it.
-            stored
-                .inbox_mut()
-                .retain(|i| i.kind == crate::SESSION_CLOSE_KIND);
+            // A request to close the session survives: a cancel must not reopen it. An edit does
+            // too: it belongs to the session, not to the round that was cancelled, and the next
+            // round carries it (ADR 0054, decision 11).
+            stored.inbox_mut().retain(|i| {
+                i.kind == crate::SESSION_CLOSE_KIND || i.kind == crate::SESSION_EDIT_KIND
+            });
             // The head this cancel writes is the run's only copy: it must not keep naming an
             // inherited file whose bytes are gone (an S2a expand-release head can).
             if let Stored::Head(head) = &mut stored {

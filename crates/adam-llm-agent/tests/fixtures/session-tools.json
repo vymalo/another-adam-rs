@@ -152,6 +152,118 @@
     }
   },
   {
+    "name": "subagent_edit",
+    "description": "Change a session's options, while its round works or between its rounds. The session keeps what it was started with for every option you leave out, and a member set to null returns that option to the helper's own. The same bounds a start has apply: a value above one is refused, naming the option, and the session is left as it was. An option that a model call uses applies from the next call, the others from the next round; this starts no work, so send a message with subagent_send to make the session go on with the new options.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "session": {
+          "type": "string",
+          "description": "The session id."
+        },
+        "config": {
+          "type": "object",
+          "description": "The options to change: a member set to null returns it to the helper's own, and one you leave out is not touched.",
+          "properties": {
+            "max_turns": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 1
+            },
+            "max_tool_calls": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 1
+            },
+            "max_output_tokens": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 1
+            },
+            "context_window": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 1
+            },
+            "max_parallel_tool_calls": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 1
+            },
+            "time_limit": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 1,
+              "description": "Minutes one round may take."
+            },
+            "max_rounds": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 1
+            },
+            "token_budget": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 1000,
+              "description": "The most tokens the whole session may spend, input and output: raise it to let a session that spent its budget go on."
+            },
+            "tools": {
+              "type": [
+                "array",
+                "null"
+              ],
+              "items": {
+                "type": "string"
+              },
+              "maxItems": 32,
+              "description": "Only these tools: names or * patterns (github__* is one MCP server)."
+            },
+            "deny_tools": {
+              "type": [
+                "array",
+                "null"
+              ],
+              "items": {
+                "type": "string"
+              },
+              "maxItems": 32,
+              "description": "Hide these tools, same syntax; applied after tools."
+            },
+            "report_schema": {
+              "type": [
+                "object",
+                "null"
+              ],
+              "description": "A JSON Schema (draft 2020-12, at most 16 KiB, with no reference outside itself) that the subagent's final answer must match."
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "required": [
+        "session",
+        "config"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
     "name": "subagent_close",
     "description": "Close a session: it takes no more messages, and is never reopened. A round that is working is left to finish (read its report with subagent_read), unless you pass cancel: true, which stops it. Closing a closed session does nothing.",
     "parameters": {

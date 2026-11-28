@@ -50,8 +50,9 @@ use adam_a2a::{BackendError, CHILD_SESSIONS_EXTENSION, Caller, ChildSessionInfo,
 use adam_core::{ConversationScope, RunId, RunQuery, RunRecord, Timestamp};
 use adam_runtime::{
     Inbound, MAX_SESSION_PAGE, RoundOutcome, RunView, RuntimeError, SESSION_CLOSE_KIND,
-    SESSION_STATE_KEY, SessionBounds, SessionConfig, SessionHeader, SessionLimits, SessionState,
-    SessionSummary, SessionView, closing_round_payload, parse_session_conversation_id,
+    SESSION_EDIT_KIND, SESSION_STATE_KEY, SessionBounds, SessionConfig, SessionEditRequest,
+    SessionEditor, SessionHeader, SessionLimits, SessionPatch, SessionState, SessionSummary,
+    SessionView, closing_round_payload, editing_round_payload, parse_session_conversation_id,
     session_conversation_id,
 };
 use async_trait::async_trait;
@@ -394,7 +395,17 @@ pub(crate) struct Start {
 pub(crate) enum Asked {
     Nothing,
     Start(Box<Start>),
-    Close { cancel: bool },
+    Close {
+        cancel: bool,
+    },
+    /// An edit of the session's config ([ADR 0054], decision 11): the patch the message carries,
+    /// held to the helper's bounds where the session is known. Boxed, as `Start` is: a patch is
+    /// wide and every other variant is not.
+    ///
+    /// [ADR 0054]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md
+    Edit {
+        patch: Box<SessionPatch>,
+    },
 }
 
 fn members(message: &Message) -> Result<Option<&Value>, String> {
@@ -413,20 +424,26 @@ fn members(message: &Message) -> Result<Option<&Value>, String> {
     Ok(Some(entry))
 }
 
-/// What `message` asks. Unknown members are ignored; `start` and `close` are objects of the
-/// contract's members, and a message cannot ask both.
+/// What `message` asks. Unknown members are ignored; `start`, `close` and `edit` are objects of the
+/// contract's members, and a message asks one of them at most.
 pub(crate) fn asked(message: &Message, sessions: &ChildSessions) -> Result<Asked, String> {
     let Some(entry) = members(message)? else {
         return Ok(Asked::Nothing);
     };
-    let (start, close) = (entry.get("start"), entry.get("close"));
-    match (start, close) {
-        (None, None) => Ok(Asked::Nothing),
-        (Some(_), Some(_)) => Err("a message starts a session or closes one, not both".into()),
-        (Some(start), None) => {
+    let (start, close, edit) = (entry.get("start"), entry.get("close"), entry.get("edit"));
+    let asked = [start.is_some(), close.is_some(), edit.is_some()];
+    if asked.iter().filter(|asked| **asked).count() > 1 {
+        return Err("a message starts, closes or edits a session, not two of them".into());
+    }
+    match (start, close, edit) {
+        (Some(start), _, _) => {
             parse_start(start, sessions).map(|start| Asked::Start(Box::new(start)))
         }
-        (None, Some(close)) => parse_close(close).map(|cancel| Asked::Close { cancel }),
+        (_, Some(close), _) => parse_close(close).map(|cancel| Asked::Close { cancel }),
+        (_, _, Some(edit)) => parse_edit(edit).map(|patch| Asked::Edit {
+            patch: Box::new(patch),
+        }),
+        _ => Ok(Asked::Nothing),
     }
 }
 
@@ -618,6 +635,48 @@ pub(crate) fn config_value(config: &SessionConfig) -> Option<Value> {
         return None;
     }
     serde_json::to_value(config).ok()
+}
+
+/// `edit`, read ([ADR 0054], decision 11): an object of one member, `config`, a **patch** whose
+/// members are `null` (return that option to the helper's own) or a value. An unknown member is
+/// refused, as in `start.config`; the bounds are checked where the session is known.
+///
+/// [ADR 0054]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md
+fn parse_edit(edit: &Value) -> Result<SessionPatch, String> {
+    let object = edit
+        .as_object()
+        .ok_or("`edit` is not an object: {config}")?;
+    if let Some(other) = object.keys().find(|key| key.as_str() != "config") {
+        return Err(format!(
+            "`edit.{}` is not a member; `edit` takes only `config`",
+            other.chars().take(80).collect::<String>().escape_debug()
+        ));
+    }
+    let config = object
+        .get("config")
+        .ok_or("`edit.config` is missing: it is an object of the options to change")?;
+    let members = config
+        .as_object()
+        .ok_or("`edit.config` is not an object of options")?;
+    for key in members.keys() {
+        if !CONFIG_OPTIONS.iter().any(|(camel, _)| camel == key) {
+            let options: Vec<&str> = CONFIG_OPTIONS.iter().map(|(camel, _)| *camel).collect();
+            return Err(format!(
+                "`edit.config.{}` is not an option; the options are: {}",
+                key.chars().take(80).collect::<String>().escape_debug(),
+                options.join(", ")
+            ));
+        }
+    }
+    let patch = SessionPatch::from_value(config.clone()).map_err(|why| why.message().to_owned())?;
+    if patch.is_empty() {
+        return Err(
+            "`edit.config` names no option: name the ones to change, or set a member to null to \
+             return it to the helper's own"
+                .into(),
+        );
+    }
+    Ok(patch)
 }
 
 fn parse_close(close: &Value) -> Result<bool, String> {
@@ -916,6 +975,13 @@ impl RuntimeTaskBackend {
         {
             object["config"] = config;
         }
+        // The edits the header keeps ([ADR 0054], decision 11): a round that applied one says so,
+        // and the config above is the one it applied.
+        //
+        // [ADR 0054]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md
+        if let Some(edits) = latest.map(|h| &h.edits).filter(|edits| !edits.is_empty()) {
+            object["edits"] = json!(edits);
+        }
         object
     }
 
@@ -1121,7 +1187,7 @@ impl RuntimeTaskBackend {
             (Some(task), Some(round), _) => {
                 if asked != Asked::Nothing {
                     return Err(BackendError::InvalidParams(
-                        "a start or a close names no taskId".into(),
+                        "a start, a close or an edit names no taskId".into(),
                     ));
                 }
                 let located = (round.run, round.view, round.context);
@@ -1153,7 +1219,7 @@ impl RuntimeTaskBackend {
                             "a start goes to the parent context".into(),
                         ));
                     }
-                    Asked::Close { .. } => None,
+                    Asked::Close { .. } | Asked::Edit { .. } => None,
                     Asked::Nothing => {
                         let mut inbound =
                             (self.inbound)(message).map_err(BackendError::InvalidParams)?;
@@ -1164,11 +1230,7 @@ impl RuntimeTaskBackend {
                         Some(inbound)
                     }
                 };
-                let close = match asked {
-                    Asked::Close { cancel } => Some(cancel),
-                    _ => None,
-                };
-                self.message_to_session(caller, message, inbound, &parent, session, close)
+                self.message_to_session(caller, message, inbound, &parent, session, &asked)
                     .await?
             }
             (None, _, _) => return Ok(None),
@@ -1192,6 +1254,9 @@ impl RuntimeTaskBackend {
             Asked::Nothing => Ok(None),
             Asked::Close { .. } => Err(BackendError::InvalidParams(
                 "a close goes to the child context of a session".into(),
+            )),
+            Asked::Edit { .. } => Err(BackendError::InvalidParams(
+                "an edit goes to the child context of a session".into(),
             )),
             Asked::Start(start) => {
                 if task_id.is_some() {
@@ -1345,6 +1410,8 @@ impl RuntimeTaskBackend {
             // a replay reads it from here and never recomputes it (ADR 0054 decision 3).
             config: start.config,
             spent: 0,
+            editing: false,
+            edits: Vec::new(),
         };
         put_header(&mut inbound, &header).map_err(BackendError::InvalidParams)?;
         self.runtime
@@ -1370,10 +1437,20 @@ impl RuntimeTaskBackend {
         inbound: Option<Inbound>,
         context: &str,
         session: RunId,
-        close: Option<bool>,
+        asked: &Asked,
     ) -> Result<Task, BackendError> {
         let sessions = self.sessions()?;
         let child = session_conversation_id(context, session);
+        // A message asks one of the three at most (`asked`), and this is the child-context path:
+        // a `start` was refused before it got here.
+        let close = match asked {
+            Asked::Close { cancel } => Some(*cancel),
+            _ => None,
+        };
+        let edit = match asked {
+            Asked::Edit { patch } => Some(patch),
+            _ => None,
+        };
         let mut cancel = close.unwrap_or(false);
         for _ in 0..ATTEMPTS {
             let Some(view) = self.session_of(caller, context, session).await? else {
@@ -1386,7 +1463,11 @@ impl RuntimeTaskBackend {
             if view.latest_run == next && view.round > 1 {
                 return self.answer_round(caller, &view.latest_run).await;
             }
-            let working = view.state == SessionState::Working;
+            // A round that only edits the session reads no message and no close: the next round
+            // (or the closing one) is started instead, and while the editing round is still open
+            // that start is busy and the loop looks again (ADR 0054, decision 11).
+            let editing = view.header.as_ref().is_some_and(|h| h.editing);
+            let working = view.state == SessionState::Working && !editing;
             let helper = sessions.by_registered(&view.agent);
             let within = helper.and_then(|h| h.within);
             if close.is_some() {
@@ -1432,6 +1513,82 @@ impl RuntimeTaskBackend {
                 return Err(BackendError::UnsupportedOperation(format!(
                     "session {session} is closed and takes no more messages{why}"
                 )));
+            }
+            // An edit of the session ([ADR 0054], decision 11): the same merge and the same
+            // admission as the model's `subagent_edit`, against the bounds of the helper now and
+            // the person's own grant (which is the message's tier, already the ceiling of the
+            // round). A working round reads it at its next step; an idle session gets a round that
+            // calls no model. It is handled **before** the spent check below: raising the budget of
+            // a session that spent it is one of the things an edit is for, as the model's tool says,
+            // and a close is exempt there for the same reason.
+            //
+            // [ADR 0054]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md
+            if let Some(patch) = edit {
+                let helper = helper.ok_or_else(|| {
+                    BackendError::UnsupportedOperation(format!(
+                        "session {session} runs on a helper this agent no longer has, so its \
+                         bounds are unknown: close it first"
+                    ))
+                })?;
+                if helper.remote
+                    && let Some(option) = patch
+                        .members()
+                        .into_iter()
+                        .find(|member| REMOTE_REFUSED.contains(&member.as_str()))
+                {
+                    return Err(BackendError::InvalidParams(format!(
+                        "`edit.config.{option}` is not an option of a remote helper; it takes \
+                         only timeLimit and maxRounds"
+                    )));
+                }
+                // The bounds this process knows: a role that binds no agent knows none, and such a
+                // helper takes no config at all (a start's refusal, in an edit's words).
+                let Some(bounds) = &helper.bounds else {
+                    return Err(BackendError::InvalidParams(
+                        "`edit.config` is not available for this helper: its bounds are not known \
+                         here"
+                            .into(),
+                    ));
+                };
+                let base = view
+                    .header
+                    .as_ref()
+                    .and_then(|h| h.config.as_ref())
+                    .map(|asked| bounds.clamp(asked));
+                let admitted = bounds.admit(patch.apply(base.as_ref())).map_err(|why| {
+                    let mut words = why.message().to_owned();
+                    for (camel, snake) in CONFIG_OPTIONS {
+                        words = words
+                            .replace(&format!("config.{snake}"), &format!("edit.config.{camel}"));
+                    }
+                    BackendError::InvalidParams(words)
+                })?;
+                let request = SessionEditRequest {
+                    config: (!admitted.is_empty()).then_some(admitted),
+                    by: SessionEditor::Person,
+                    members: patch.members(),
+                };
+                if working {
+                    let payload = serde_json::to_value(&request).map_err(|e| {
+                        BackendError::internal(format!("the edit does not serialise: {e}"))
+                    })?;
+                    let inbound = Inbound::new(SESSION_EDIT_KIND, payload)
+                        .with_id(message.message_id.clone());
+                    match self.runtime.deliver(view.latest_run, inbound).await {
+                        Ok(()) => return self.answer_round(caller, &view.latest_run).await,
+                        Err(RuntimeError::Finished { .. } | RuntimeError::NotFound(_)) => continue,
+                        Err(e) => return Err(map_err(e)),
+                    }
+                }
+                let mut header = next_header(&view, session);
+                header.editing = true;
+                header.apply_edit(&request);
+                let input = Inbound::new("message", editing_round_payload(&header))
+                    .with_id(message.message_id.clone());
+                match self.next_round(&view, next, input, within).await? {
+                    Next::Started => return self.answer_round(caller, &next).await,
+                    Next::Busy => continue,
+                }
             }
             // A session that spent its token budget takes no more messages (ADR 0054, decision 6),
             // and the header the view already carries says so: no second store read.
@@ -1677,10 +1834,14 @@ fn next_header(view: &SessionView, session: RunId) -> SessionHeader {
         visible: false,
         config: None,
         spent: 0,
+        editing: false,
+        edits: Vec::new(),
     });
     header.round = view.round + 1;
-    // The round before may have been one that only cleaned up after a cancel.
+    // The round before may have been one that only cleaned up after a cancel, or one that only
+    // edited the session: neither says anything about this one.
     header.closing = false;
+    header.editing = false;
     header
 }
 
@@ -2153,6 +2314,8 @@ mod tests {
             visible: true,
             config,
             spent: 0,
+            editing: false,
+            edits: Vec::new(),
         };
         let narrowed = SessionConfig::from_value(json!({"tools": ["a"], "denyTools": ["b"]}))
             .expect("a config");
@@ -2277,6 +2440,8 @@ mod tests {
             visible: false,
             config: None,
             spent: 0,
+            editing: false,
+            edits: Vec::new(),
         };
         let mut text = Inbound::new("message", json!("hi"));
         put_header(&mut text, &header).unwrap();
