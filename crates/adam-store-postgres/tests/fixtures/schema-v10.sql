@@ -1,5 +1,5 @@
--- The schema version 9 that adam-store-postgres emits.
--- Regenerate with ADAM_WRITE_FIXTURE=1 cargo test -p adam-store-postgres --lib the_statements_equal_the_version_9_fixture
+-- The schema version 10 that adam-store-postgres emits.
+-- Regenerate with ADAM_WRITE_FIXTURE=1 cargo test -p adam-store-postgres --lib the_statements_equal_the_version_10_fixture
 CREATE TABLE IF NOT EXISTS adam_meta (
                     key   TEXT PRIMARY KEY,
                     value TEXT NOT NULL
@@ -146,6 +146,26 @@ CREATE OR REPLACE FUNCTION adam_claim_due(
               ORDER BY c.sched_at, c.id;
          END;
 
-INSERT INTO adam_meta (key, value) VALUES ('schema_version', '9')
+CREATE TABLE IF NOT EXISTS adam_memory_lesson (
+                scope      TEXT        NOT NULL,
+                audience   TEXT        NOT NULL,
+                root_cause TEXT        NOT NULL,
+                remedy     TEXT        NOT NULL,
+                rationale  TEXT        NOT NULL,
+                anchors    JSONB       NOT NULL,
+                sources    JSONB       NOT NULL,
+                review     TEXT        NOT NULL,
+                state      TEXT        NOT NULL,
+                created    TIMESTAMPTZ NOT NULL,
+                updated    TIMESTAMPTZ NOT NULL,
+                retired_at TIMESTAMPTZ,
+                CONSTRAINT adam_memory_lesson_pkey PRIMARY KEY (scope, audience, root_cause),
+                CONSTRAINT adam_memory_lesson_state CHECK (state IN ('proposed', 'active', 'retired'))
+            );
+
+CREATE INDEX IF NOT EXISTS adam_memory_lesson_active ON adam_memory_lesson (scope, audience, updated DESC, root_cause)
+             WHERE state = 'active';
+
+INSERT INTO adam_meta (key, value) VALUES ('schema_version', '10')
              ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
               WHERE adam_meta.value::INT < EXCLUDED.value::INT;
