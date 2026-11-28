@@ -19,13 +19,14 @@ path = "src/main.rs"
 
 [dependencies]
 adam-error.workspace = true
+adam-otel.workspace = true
 async-trait.workspace = true
 httparse.workspace = true
 mimalloc.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["net", "io-util", "signal"] }
 tracing.workspace = true
-tracing-subscriber.workspace = true
+tracing-subscriber = { workspace = true, features = ["registry"] }
 
 [dev-dependencies]
 serde_json.workspace = true

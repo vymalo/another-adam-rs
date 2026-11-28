@@ -5,8 +5,9 @@ The **OpenTelemetry layer** of adam-rs: OTLP/HTTP spans, **off unless an endpoin
 
 This is the foundation of ADR 0075's trace slices, and the decision's exporter clause is
 [amended](../../docs/decisions/0075-metrics-and-traces-are-off-by-default-and-say-nothing-about-a-person.md):
-the exporter is built on the `opentelemetry` crates, not by hand. The binaries compose the layer and
-the configuration reaches them in later cards (ANR-1385, ANR-1386); nothing reads this crate yet.
+the exporter is built on the `opentelemetry` crates, not by hand. `adam-coder`, `adam-agent`, `adam-egress` and
+`adam-git-sandbox` compose the layer beside their JSON log layer (ANR-1412); the configuration that reaches them
+through `adam-service` and the chart is ANR-1386 and ADR 0075's D1.
 
 ## What it does
 

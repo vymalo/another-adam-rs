@@ -12,6 +12,8 @@ use std::process::ExitCode;
 use adam_coder::{Config, Redactor, RedactorFromConfig, exit_code};
 use anyhow::Context as _;
 
+mod telemetry;
+
 /// The process-wide allocator: mimalloc in place of musl's own, which is slow under many threads
 /// (ADR 0053 decision 11).
 #[global_allocator]
@@ -24,13 +26,22 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 #[tokio::main]
 async fn main() -> ExitCode {
     // `RUST_LOG` when set, else `info` with the MCP client library quiet (`adam_service::logging`).
-    tracing_subscriber::fmt()
-        .json()
-        .with_env_filter(adam_service::logging::env_filter())
-        .init();
+    // The OTel layer joins it when `OTEL_EXPORTER_OTLP_ENDPOINT` is set, and nothing is built when
+    // it is not.
+    let telemetry = telemetry::init(adam_service::logging::env_filter());
 
     adam_service::harden::make_non_dumpable();
 
+    let code = run().await;
+    // Flush the batch queue before the process exits, so the spans of the last runs are not lost.
+    if let Some(otel) = telemetry {
+        otel.shutdown();
+    }
+    code
+}
+
+/// The process's work, once the logger and the hardening are in place.
+async fn run() -> ExitCode {
     // Nothing is known to be secret until the configuration is read; its errors name variables,
     // never their values.
     let config = match Config::from_env().context("reading the configuration") {

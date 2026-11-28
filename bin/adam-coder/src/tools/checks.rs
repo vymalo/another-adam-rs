@@ -1197,7 +1197,7 @@ mod tests {
         let runs: Vec<Run<'_>> = runs
             .iter()
             .map(|(command, outcome)| Run {
-                command: *command,
+                command,
                 outcome,
                 timeout: Duration::from_secs(900),
                 preexisting: None,
@@ -1598,7 +1598,7 @@ mod tests {
                 .iter()
                 .zip(preexisting)
                 .map(|(command, preexisting)| Run {
-                    command: *command,
+                    command,
                     outcome: &o,
                     timeout: Duration::from_secs(1),
                     preexisting,

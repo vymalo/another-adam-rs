@@ -19,13 +19,21 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 /// one structured log line, with the whole cause chain.
 #[tokio::main]
 async fn main() -> ExitCode {
-    // `RUST_LOG` when set, else `info`.
+    // `RUST_LOG` when set, else `info`. The OTel layer joins it when
+    // `OTEL_EXPORTER_OTLP_ENDPOINT` is set, and nothing is built when it is not.
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    tracing_subscriber::fmt()
-        .json()
-        .with_env_filter(filter)
-        .init();
+    let telemetry = adam_git_sandbox::telemetry::init(filter);
 
+    let code = run().await;
+    // Flush the batch queue before the process exits, so the spans of the last runs are not lost.
+    if let Some(otel) = telemetry {
+        otel.shutdown();
+    }
+    code
+}
+
+/// The process's work, once the logger is in place.
+async fn run() -> ExitCode {
     let config = match Config::from_env().map_err(SandboxError::Config) {
         Ok(config) => config,
         Err(e) => return fail(&e),

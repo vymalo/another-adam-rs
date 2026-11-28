@@ -230,6 +230,8 @@ same way; every problem is reported at once at startup):
 | `MCP_MAX_CALL_SECS` | the longest one MCP server is waited for, a call and a connection each: what `timeoutSecs` and `connectTimeoutSecs` ask for and the defaults (60 s and 30 s) are lowered to it, and a value the file asks for is at least 1 s in `mcp.json` or the extra file (1 to 86400); a larger value is lowered to it, with a warning at startup | `900` |
 | `THREAD_TOOLS_MAX_CALL_SECS` | the longest a call to a tool of the thread's tools endpoint is waited for, whatever time the tool says it may take (1 to 86400); a tool that says nothing is waited for 60 s | `3600` |
 | `RUST_LOG` | log filter (JSON logs on stdout); when set it replaces the default whole, so `RUST_LOG=info` shows `rmcp` again | `info,rmcp=warn` (the MCP client library's per-connection lines are quiet; `adam_service::logging`) |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | the OTLP/HTTP collector, an absolute `http` or `https` URL with no user, password, query or fragment: the runtime's `adam.run` and `adam.child` spans are exported beside the JSON log ([ADR 0075](../../docs/decisions/0075-metrics-and-traces-are-off-by-default-and-say-nothing-about-a-person.md)); unset or blank means no exporter and no thread; a refused value is one warning at startup and tracing stays off | unset: off |
+| `OTEL_SERVICE_NAME` | `service.name` of every exported span's resource | `adam` |
 
 **`optional` and `tools:`**: a server marked `optional: true` that is skipped (down, no key, a missing allow-listed tool) has no tools, so a `tools:` entry of the agent that names one of them (`search__web_search`, `search__*`) makes the folder exit 78 at startup. Leave an optional server's tools out of `tools:`, or make the server required.
 
@@ -345,6 +347,8 @@ model, `tini` as PID 1, SIGTERM exits 0), then the compose scenarios.
 
 ## Tests
 
+* `src/telemetry.rs`: with no `OTEL_EXPORTER_OTLP_ENDPOINT` nothing is built and no OTel layer is composed; with
+  one, a run span reaches a loopback collector over OTLP/HTTP.
 * `src/config.rs`: `ADAM_AGENT_DIR` required by every role and an existing directory, every problem at once,
   a control plane that needs no model, `MODEL_CONTEXT_WINDOW` read by the workers (a bad value is exit 78),
   `A2A_ALLOW_INSECURE_REMOTES` off by default, read by the workers and a boolean, secrets hidden from `Debug`;

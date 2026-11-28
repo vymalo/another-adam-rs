@@ -10,6 +10,7 @@ mod error;
 pub mod protocol;
 mod server;
 pub mod subcommand;
+pub mod telemetry;
 
 pub use client::{Client, Output};
 pub use config::{Config, ConfigError, DEFAULT_MAX_COMMANDS, SOCKET_ENV, socket_from_env};

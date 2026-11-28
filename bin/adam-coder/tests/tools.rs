@@ -753,7 +753,7 @@ async fn a_failing_check_fails_the_gate_and_the_findings_keep_the_callers_order(
         )
         .await
         .unwrap();
-    assert!(is_error(&out), "{}", out.content);
+    assert!(out.is_error, "{}", out.content);
     let checks = checks_of(&out);
     assert_eq!(checks["passed"], false);
     assert_eq!(checks["summary"], "2 of 3 checks failed");

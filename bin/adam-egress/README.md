@@ -97,6 +97,8 @@ Read once at startup, the allow-list file too (a change to it is a restart); eve
 | `EGRESS_IDLE_SECS` | a tunnel with no byte for this long is closed (1 to 86400) | `300` |
 | `EGRESS_MAX_CONNECTIONS` | connections served at once (1 to 1000000) | `1024` |
 | `RUST_LOG` | log filter | `info` |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | the OTLP/HTTP collector, an absolute `http` or `https` URL with no user, password, query or fragment: the spans this process writes are exported beside the JSON log ([ADR 0075](../../docs/decisions/0075-metrics-and-traces-are-off-by-default-and-say-nothing-about-a-person.md)); unset or blank means no exporter and no thread; a refused value is one warning at startup and tracing stays off | unset: off |
+| `OTEL_SERVICE_NAME` | `service.name` of every exported span's resource | `adam` |
 
 Not variables: the head limit (8 KiB), the head time (10 s), the resolve and each connect time (10 s), at most 4
 addresses tried, and 25 s for the tunnels to finish after SIGTERM (`Limits`, `src/config.rs`).
@@ -127,6 +129,9 @@ that is a valid name (or a short IP literal) and a port, and **never a path, a q
 `Proxy-Authorization`), user information or a byte of the tunnel**; a test sends all of them in a refused request and
 reads the log. A `GET /healthz` is not logged.
 
+With `OTEL_EXPORTER_OTLP_ENDPOINT` set, the spans the process writes are exported beside these lines; the lines are
+events and stay in the JSON log. A failed export is the SDK's own log line, never a connection's failure.
+
 ## What it does not do
 
 * **No TLS interception.** It sees the name and the port of a `CONNECT`, not the traffic. A client can name an allowed
@@ -144,6 +149,8 @@ reads the log. A `GET /healthz` is not logged.
 
 Offline: `cargo nextest run -p adam-egress`.
 
+* The subscriber (`src/telemetry.rs`): with no `OTEL_EXPORTER_OTLP_ENDPOINT` nothing is built and no OTel layer is
+  composed; with one, a run span reaches a loopback collector over OTLP/HTTP.
 * In the modules: the address table and its edges and IPv4-mapped IPv6 (`ip.rs`), allow-list parsing and matching
   (`allow.rs`), head parsing, IP literals, oversized and slow heads (`head.rs`), every variable and each bad value
   (`config.rs`), the status and class of every refusal (`refusal.rs`).
