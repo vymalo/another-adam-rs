@@ -143,8 +143,9 @@ impl MemSql {
 /// schema version 10**, whatever the `memory` feature says.
 ///
 /// The synchronous [`Memory`] port over the async driver is bridged by one owned multi-thread
-/// Tokio runtime: read [the blocking bridge](self#the-blocking-bridge) before calling this type
-/// from async code.
+/// Tokio runtime. It may be called outside a runtime and from a multi-thread or a current-thread
+/// one, but never from a future running on its own runtime: read the blocking bridge's notes at
+/// the top of `src/memory.rs` before calling this type from async code.
 #[derive(Debug)]
 pub struct PgMemory {
     pool: Pool,
