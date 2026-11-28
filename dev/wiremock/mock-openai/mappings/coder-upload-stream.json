@@ -1,0 +1,157 @@
+{
+ "mappings": [
+  {
+   "name": "coder upload 0: start_scratch (stream)",
+   "priority": 0,
+   "request": {
+    "method": "POST",
+    "urlPathPattern": "(/v1)?/chat/completions",
+    "bodyPatterns": [
+     {
+      "matchesJsonPath": {
+       "expression": "$.model",
+       "equalTo": "mock-coder"
+      }
+     },
+     {
+      "contains": "[mock:upload]"
+     },
+     {
+      "doesNotContain": "up-call-1"
+     },
+     {
+      "matchesJsonPath": {
+       "expression": "$.stream",
+       "equalTo": "true"
+      }
+     }
+    ]
+   },
+   "response": {
+    "status": 200,
+    "headers": {
+     "Content-Type": "text/event-stream; charset=utf-8",
+     "Cache-Control": "no-cache"
+    },
+    "body": "data: {\"id\":\"chatcmpl-upload\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"mock-coder\",\"system_fingerprint\":\"fp_mock\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":null,\"tool_calls\":[{\"index\":0,\"id\":\"up-call-1\",\"type\":\"function\",\"function\":{\"name\":\"start_scratch\",\"arguments\":\"\"}}]},\"finish_reason\":null}]}\n\ndata: {\"id\":\"chatcmpl-upload\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"mock-coder\",\"system_fingerprint\":\"fp_mock\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\\\"name\"}}]},\"finish_reason\":null}]}\n\ndata: {\"id\":\"chatcmpl-upload\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"mock-coder\",\"system_fingerprint\":\"fp_mock\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"\\\":\\\"upl\"}}]},\"finish_reason\":null}]}\n\ndata: {\"id\":\"chatcmpl-upload\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"mock-coder\",\"system_fingerprint\":\"fp_mock\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"oad\\\"}\"}}]},\"finish_reason\":null}]}\n\ndata: {\"id\":\"chatcmpl-upload\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"mock-coder\",\"system_fingerprint\":\"fp_mock\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\ndata: {\"id\":\"chatcmpl-upload\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"mock-coder\",\"system_fingerprint\":\"fp_mock\",\"choices\":[],\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":20,\"total_tokens\":120}}\n\ndata: [DONE]\n\n",
+    "transformers": [
+     "response-template"
+    ]
+   }
+  },
+  {
+   "name": "coder upload 1: write_file (stream)",
+   "priority": 0,
+   "request": {
+    "method": "POST",
+    "urlPathPattern": "(/v1)?/chat/completions",
+    "bodyPatterns": [
+     {
+      "matchesJsonPath": {
+       "expression": "$.model",
+       "equalTo": "mock-coder"
+      }
+     },
+     {
+      "contains": "up-call-1"
+     },
+     {
+      "doesNotContain": "up-call-2"
+     },
+     {
+      "matchesJsonPath": {
+       "expression": "$.stream",
+       "equalTo": "true"
+      }
+     }
+    ]
+   },
+   "response": {
+    "status": 200,
+    "headers": {
+     "Content-Type": "text/event-stream; charset=utf-8",
+     "Cache-Control": "no-cache"
+    },
+    "body": "data: {\"id\":\"chatcmpl-upload\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"mock-coder\",\"system_fingerprint\":\"fp_mock\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":null,\"tool_calls\":[{\"index\":0,\"id\":\"up-call-2\",\"type\":\"function\",\"function\":{\"name\":\"write_file\",\"arguments\":\"\"}}]},\"finish_reason\":null}]}\n\ndata: {\"id\":\"chatcmpl-upload\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"mock-coder\",\"system_fingerprint\":\"fp_mock\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\\\"path\\\":\\\"report.md\\\",\\\"content\\\":\\\"1: the coder shares this file by reference, and the bucket holds exactly these bytes.\\\\n2: the coder shares this file by reference, and the bucket holds exactly these bytes.\\\\n3: the coder shares this file by reference, and the bucket holds exactly these bytes.\\\\n4: the coder shares this file by reference, and the bucket holds exactly these bytes.\\\\n5: the coder shares this file by reference, and the bucket holds exactly these bytes.\\\\n6: the coder shares this file by reference, and the bucket holds exactly these bytes.\\\\n7: the coder shares this file by refer\"}}]},\"finish_reason\":null}]}\n\ndata: {\"id\":\"chatcmpl-upload\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"mock-coder\",\"system_fingerprint\":\"fp_mock\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"ence, and the bucket holds exactly these bytes.\\\\n8: the coder shares this file by reference, and the bucket holds exactly these bytes.\\\\n9: the coder shares this file by reference, and the bucket holds exactly these bytes.\\\\n10: the coder shares this file by reference, and the bucket holds exactly these bytes.\\\\n11: the coder shares this file by reference, and the bucket holds exactly these bytes.\\\\n12: the coder shares this file by reference, and the bucket holds exactly these bytes.\\\\n13: the coder shares this file by reference, and the bucket holds exactly these bytes.\\\\n14: the coder sh\"}}]},\"finish_reason\":null}]}\n\ndata: {\"id\":\"chatcmpl-upload\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"mock-coder\",\"system_fingerprint\":\"fp_mock\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"ares this file by reference, and the bucket holds exactly these bytes.\\\\n15: the coder shares this file by reference, and the bucket holds exactly these bytes.\\\\n16: the coder shares this file by reference, and the bucket holds exactly these bytes.\\\\n17: the coder shares this file by reference, and the bucket holds exactly these bytes.\\\\n18: the coder shares this file by reference, and the bucket holds exactly these bytes.\\\\n19: the coder shares this file by reference, and the bucket holds exactly these bytes.\\\\n20: the coder shares this file by reference, and the bucket holds exactly these\"}}]},\"finish_reason\":null}]}\n\ndata: {\"id\":\"chatcmpl-upload\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"mock-coder\",\"system_fingerprint\":\"fp_mock\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\" bytes.\\\\n21: the coder shares this file by reference, and the bucket holds exactly these bytes.\\\\n22: the coder shares this file by reference, and the bucket holds exactly these bytes.\\\\n23: the coder shares this file by reference, and the bucket holds exactly these bytes.\\\\n24: the coder shares this file by reference, and the bucket holds exactly these bytes.\\\\n25: the coder shares this file by reference, and the bucket holds exactly these bytes.\\\\n26: the coder shares this file by reference, and the bucket holds exactly these bytes.\\\\n27: the coder shares this file by reference, and the b\"}}]},\"finish_reason\":null}]}\n\ndata: {\"id\":\"chatcmpl-upload\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"mock-coder\",\"system_fingerprint\":\"fp_mock\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"ucket holds exactly these bytes.\\\\n28: the coder shares this file by reference, and the bucket holds exactly these bytes.\\\\n29: the coder shares this file by reference, and the bucket holds exactly these bytes.\\\\n30: the coder shares this file by reference, and the bucket holds exactly these bytes.\\\\n31: the coder shares this file by reference, and the bucket holds exactly these bytes.\\\\n32: the coder shares this file by reference, and the bucket holds exactly these bytes.\\\\n33: the coder shares this file by reference, and the bucket holds exactly these bytes.\\\\n34: the coder shares this fil\"}}]},\"finish_reason\":null}]}\n\ndata: {\"id\":\"chatcmpl-upload\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"mock-coder\",\"system_fingerprint\":\"fp_mock\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"e by reference, and the bucket holds exactly these bytes.\\\\n35: the coder shares this file by reference, and the bucket holds exactly these bytes.\\\\n36: the coder shares this file by reference, and the bucket holds exactly these bytes.\\\\n37: the coder shares this file by reference, and the bucket holds exactly these bytes.\\\\n38: the coder shares this file by reference, and the bucket holds exactly these bytes.\\\\n39: the coder shares this file by reference, and the bucket holds exactly these bytes.\\\\n40: the coder shares this file by reference, and the bucket holds exactly these bytes.\\\\n\\\"}\"}}]},\"finish_reason\":null}]}\n\ndata: {\"id\":\"chatcmpl-upload\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"mock-coder\",\"system_fingerprint\":\"fp_mock\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\ndata: {\"id\":\"chatcmpl-upload\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"mock-coder\",\"system_fingerprint\":\"fp_mock\",\"choices\":[],\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":20,\"total_tokens\":120}}\n\ndata: [DONE]\n\n",
+    "transformers": [
+     "response-template"
+    ]
+   }
+  },
+  {
+   "name": "coder upload 2: share_file (stream)",
+   "priority": 0,
+   "request": {
+    "method": "POST",
+    "urlPathPattern": "(/v1)?/chat/completions",
+    "bodyPatterns": [
+     {
+      "matchesJsonPath": {
+       "expression": "$.model",
+       "equalTo": "mock-coder"
+      }
+     },
+     {
+      "contains": "up-call-2"
+     },
+     {
+      "doesNotContain": "up-call-3"
+     },
+     {
+      "matchesJsonPath": {
+       "expression": "$.stream",
+       "equalTo": "true"
+      }
+     }
+    ]
+   },
+   "response": {
+    "status": 200,
+    "headers": {
+     "Content-Type": "text/event-stream; charset=utf-8",
+     "Cache-Control": "no-cache"
+    },
+    "body": "data: {\"id\":\"chatcmpl-upload\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"mock-coder\",\"system_fingerprint\":\"fp_mock\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":null,\"tool_calls\":[{\"index\":0,\"id\":\"up-call-3\",\"type\":\"function\",\"function\":{\"name\":\"share_file\",\"arguments\":\"\"}}]},\"finish_reason\":null}]}\n\ndata: {\"id\":\"chatcmpl-upload\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"mock-coder\",\"system_fingerprint\":\"fp_mock\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\\\"path\\\":\\\"repor\"}}]},\"finish_reason\":null}]}\n\ndata: {\"id\":\"chatcmpl-upload\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"mock-coder\",\"system_fingerprint\":\"fp_mock\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"t.md\\\",\\\"name\\\":\\\"\"}}]},\"finish_reason\":null}]}\n\ndata: {\"id\":\"chatcmpl-upload\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"mock-coder\",\"system_fingerprint\":\"fp_mock\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"Upload proof\\\"}\"}}]},\"finish_reason\":null}]}\n\ndata: {\"id\":\"chatcmpl-upload\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"mock-coder\",\"system_fingerprint\":\"fp_mock\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\ndata: {\"id\":\"chatcmpl-upload\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"mock-coder\",\"system_fingerprint\":\"fp_mock\",\"choices\":[],\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":20,\"total_tokens\":120}}\n\ndata: [DONE]\n\n",
+    "transformers": [
+     "response-template"
+    ]
+   }
+  },
+  {
+   "name": "coder upload 3: final answer (stream)",
+   "priority": 0,
+   "request": {
+    "method": "POST",
+    "urlPathPattern": "(/v1)?/chat/completions",
+    "bodyPatterns": [
+     {
+      "matchesJsonPath": {
+       "expression": "$.model",
+       "equalTo": "mock-coder"
+      }
+     },
+     {
+      "contains": "up-call-3"
+     },
+     {
+      "matchesJsonPath": {
+       "expression": "$.stream",
+       "equalTo": "true"
+      }
+     }
+    ]
+   },
+   "response": {
+    "status": 200,
+    "headers": {
+     "Content-Type": "text/event-stream; charset=utf-8",
+     "Cache-Control": "no-cache"
+    },
+    "body": "data: {\"id\":\"chatcmpl-upload\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"mock-coder\",\"system_fingerprint\":\"fp_mock\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"\"},\"finish_reason\":null}]}\n\ndata: {\"id\":\"chatcmpl-upload\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"mock-coder\",\"system_fingerprint\":\"fp_mock\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"The report is shared: report.md went to the bucket by reference, and its artifact names the upload.\"},\"finish_reason\":null}]}\n\ndata: {\"id\":\"chatcmpl-upload\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"mock-coder\",\"system_fingerprint\":\"fp_mock\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: {\"id\":\"chatcmpl-upload\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"mock-coder\",\"system_fingerprint\":\"fp_mock\",\"choices\":[],\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":20,\"total_tokens\":120}}\n\ndata: [DONE]\n\n",
+    "transformers": [
+     "response-template"
+    ]
+   }
+  }
+ ]
+}

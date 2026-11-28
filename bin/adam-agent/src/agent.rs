@@ -4,7 +4,7 @@
 use adam::mcp::McpPolicy;
 use adam::{AgentDef, AgentFolder, Assembly};
 use adam_a2a::AgentCardConfig;
-use adam_llm_agent::{DEFAULT_MAX_PARALLEL, LlmStarter, ModelParking, StepIo};
+use adam_llm_agent::{DEFAULT_MAX_PARALLEL, HookSet, LlmStarter, ModelParking, StepIo};
 use adam_model::{DynModel, ModelProfiles};
 use adam_service::{Agents, RuntimeOptions};
 use adam_ui::Ui;
@@ -86,6 +86,10 @@ fn card_for_build(
 
 /// What a role that runs workers needs besides the files.
 pub struct WorkerParts<'a> {
+    /// The deployment's hook programs that apply to this agent ([`HookSet`]), which every agent of
+    /// the assembly runs first, the root and each subagent (ADR 0050, slice P2b). Empty when
+    /// `ADAM_HOOKS_FILE` is unset.
+    pub hooks: HookSet,
     /// The model client.
     pub model: DynModel,
     /// The model alias the agent asks for (`MODEL`).
@@ -200,12 +204,15 @@ pub async fn assemble_limited_with_profiles(
         max_parallel,
         profiles,
         ModelParking::default(),
+        // A host that passes no hooks: the binaries pass the deployment's (`WorkerParts::hooks`).
+        HookSet::new(),
     )
     .await
 }
 
 /// [`assemble_limited_with_profiles`], with how every agent waits on a model that refused it
-/// (`MODEL_PARK_LIMIT` and `MODEL_AUTH=injector`, ADR 0067).
+/// (`MODEL_PARK_LIMIT` and `MODEL_AUTH=injector`, ADR 0067), and the host's hooks (`hooks`): the
+/// deployment's hook programs (ADR 0050, slice P2b), which every agent runs first.
 #[allow(clippy::too_many_arguments)] // the parts of one assembly, each a setting of the process
 async fn assemble_parked(
     def: AgentDef,
@@ -216,6 +223,7 @@ async fn assemble_parked(
     max_parallel: usize,
     profiles: ModelProfiles,
     parking: ModelParking,
+    hooks: HookSet,
 ) -> Result<Assembly, AgentError> {
     // The servers are connected now, at startup, before the agent is bound: a server that is down,
     // a local process the policy does not allow, a `${VAR}` that is unset are startup errors with
@@ -235,6 +243,14 @@ async fn assemble_parked(
         .max_parallel(max_parallel)
         .model_parking(parking)
         .step_io(step_io);
+    // The deployment's hook programs run first, before the plugins a file names, for the root and
+    // every subagent (ADR 0050, slice P2b). An empty set adds nothing: a deployment without
+    // `ADAM_HOOKS_FILE` runs exactly as before.
+    let bound = if hooks.is_empty() {
+        bound
+    } else {
+        bound.hooks(hooks)
+    };
     bound
         .model_profiles(profiles)
         // A served agent takes the model a message picks (`model-pick/v1`): the card lists the
@@ -295,6 +311,7 @@ pub async fn agents(
                 parts.max_parallel,
                 profiles.clone(),
                 parts.parking,
+                parts.hooks,
             )
             .await?;
             // The reasoning levels of each agent's model (`reasoning/v1`): what the backend checks

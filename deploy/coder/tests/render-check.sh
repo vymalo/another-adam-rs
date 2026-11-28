@@ -1438,7 +1438,7 @@ check "git sandbox: none of the secrets' names appears in it" \
   gslacks 'MODEL_API_KEY|GITHUB_TOKEN|GITHUB_APP|DATABASE_URL|A2A_BEARER|SEARCH_MCP_TOKEN|CONTEXT7|PRIVATE KEY|private-key|github-app|card-signing'
 check "git sandbox: it mounts the work volume, its socket directory and its own /tmp, and nothing else" \
   gs_names volumeMounts 'work git-sandbox git-sandbox-tmp '
-check "git sandbox: no token mount, no service-account directory" gslacks 'kube-api-access|serviceaccount|run-pod|extra-mcp|cache'
+check "git sandbox: no token mount, no service-account directory" gslacks 'kube-api-access|serviceaccount|run-pod|extra-mcp'
 check "git sandbox: the work volume is at the same path as in the coder (the commands carry paths)" same_work_path
 check "git sandbox: the socket is in a directory both containers mount, and the coder is told where" same_socket
 check "git sandbox: the work volume is mounted read-write, whole (no subPath, no readOnly)" \
@@ -1510,11 +1510,11 @@ check "values: ... its concurrency" [ "$(init_of git-sandbox | env_value GIT_SAN
 helm_rp --set runPods.gitSandbox.maxCommands=4096 > "$out"
 check "values: maxCommands 4096 is the top" [ "$(init_of git-sandbox | env_value GIT_SANDBOX_MAX_COMMANDS)" = 4096 ]
 # The other places the pod gets volumes and secrets: the sandbox gets none of them.
-helm_rp --set cache.create=true --set mcp.context7.enabled=true --set a2a.cardSigning.secretName=sign \
+helm_rp --set mcp.context7.enabled=true --set a2a.cardSigning.secretName=sign \
   --set github.auth=app --set github.app.id=1 --set github.app.owners='{acme}' --set github.app.privateKeySecret=k > "$out"
-check "with the cache, an extra MCP server, a card-signing key and an App key mounted in the coder: the sandbox holds none of them" \
+check "with an extra MCP server, a card-signing key and an App key mounted in the coder: the sandbox holds none of them" \
   gs_names volumeMounts 'work git-sandbox git-sandbox-tmp '
-check "... they are the coder's" coder_names volumeMounts 'work cache github-app extra-mcp run-pod kube-api-access git-sandbox card-signing '
+check "... they are the coder's" coder_names volumeMounts 'work github-app extra-mcp run-pod kube-api-access git-sandbox card-signing '
 check "... and the sandbox has no variable from a Secret" gslacks 'secretKeyRef|secretName|envFrom'
 # The roles and topologies.
 helm_rp --set config.role=control-plane > "$out"
@@ -1984,68 +1984,44 @@ done
 check "refused: the limit in extraEnv beside the value" \
   fails helm template coder "$chart" --namespace coder-ns --set uploads.inlineMaxBytes=2048 --set-string config.extraEnv.UPLOADS_INLINE_MAX_BYTES=1
 
-# The package cache (ADR 0040): one volume at /cache. Off by default and then invisible (the default render
-# equals the golden above); on, mounted by the pods that run toolchains and by nothing else.
+# The package cache (ADR 0040, amended 2026-11-26): the chart mounts none. /cache is a directory of each container's
+# own file system, lost with the pod, and a deployment that wants a cache gives each run its own claim through the
+# platform. The chart only says which claims a run pod may mount: the work claim and cache.allowedClaims, and no other.
 helm_cache() { helm template coder "$chart" --namespace coder-ns --set image.tag=sha-abc1234 "$@"; }
 helm_cache > "$out"
-check "cache off: no cache volume, mount or claim" lacks 'name: cache$|mountPath: /cache|coder-cache'
-helm_cache --set cache.existingClaim=shared-cache > "$out"
-check "cache.existingClaim: the coder container mounts /cache" dhas StatefulSet 'mountPath: /cache$'
-check "cache.existingClaim: ... from that claim" dhas StatefulSet 'claimName: shared-cache$'
-check "cache.existingClaim: /cache is mounted once, by the coder container alone (not the GitHub MCP sidecar)" \
-  dcount StatefulSet 'mountPath: /cache$' 1
-check "cache.existingClaim: the chart creates no claim" lacks '^kind: PersistentVolumeClaim$'
-check "cache.existingClaim: /work is still the per-pod claim" dhas StatefulSet 'name: work$'
+check "cache: no cache volume, mount or claim" lacks 'name: cache$|mountPath: /cache|coder-cache'
+check "cache: the default render is still the golden" cmp -s "$out" "$golden"
+helm_cache --set 'cache.allowedClaims={shared-cache}' > "$out"
+check "cache.allowedClaims: the coder pods still mount no /cache" lacks 'mountPath: /cache'
+check "cache.allowedClaims: the chart creates no claim" lacks '^kind: PersistentVolumeClaim$'
+check "cache.allowedClaims: /work is still the per-pod claim" dhas StatefulSet 'name: work$'
 check "cache: the image's own variables are left alone (no CARGO_HOME, no npm cache variable)" \
   lacks 'CARGO_HOME|npm_config_cache|NPM_CONFIG_CACHE'
-check "cache: no registry credential is rendered for a pod that writes the cache" \
+check "cache: no registry credential is rendered" \
   lacks 'NPM_TOKEN|NODE_AUTH_TOKEN|CARGO_REGISTRY_TOKEN|CARGO_REGISTRIES_|_authToken'
-helm_cache --set cache.create=true --set cache.storageClass=rwx --set cache.size=50Gi > "$out"
-check "cache.create: one claim, coder-cache" count '^kind: PersistentVolumeClaim$' 1
-check "cache.create: ... named after the release" dhas PersistentVolumeClaim '^  name: coder-cache$'
-check "cache.create: ... ReadWriteMany" dhas PersistentVolumeClaim '^    - ReadWriteMany$'
-check "cache.create: ... of the class and size asked" dhas PersistentVolumeClaim 'storageClassName: "rwx"'
-check "cache.create: ... 50Gi" dhas PersistentVolumeClaim 'storage: "50Gi"'
-check "cache.create: ... not kept when the release goes (a cache is not state)" dlacks PersistentVolumeClaim 'resource-policy'
-check "cache.create: the pod mounts that claim" dhas StatefulSet 'claimName: coder-cache$'
-helm_cache --set cache.create=true > "$out"
-check "cache.create with no class: the cluster's default (no storageClassName)" dlacks PersistentVolumeClaim 'storageClassName'
-helm_cache --set cache.create=true --set cache.storageClass=rwx --set runPods.enabled=true > "$out"
+helm_cache --set runPods.enabled=true --set 'cache.allowedClaims={shared-cache}' > "$out"
 check "cache with run pods on: the render equals tests/golden/cache.yaml" cmp -s "$out" "$chart/tests/golden/cache.yaml"
-check "cache with run pods: the pod template mounts /cache from the claim" tpl 'mountPath: /cache$'
-check "cache with run pods: ... as a persistentVolumeClaim" tpl 'claimName: coder-cache$'
-check "cache with run pods: the admission policy lets a run pod mount the work claim and the cache claim, no other" \
-  policy_has "$pn" "claimName in ['work-coder-0', 'coder-cache']"
-check "cache with run pods: ... and still no Secret volume" fails policy_has "$pn" 'has(v.secret)'
-helm_cache --set runPods.enabled=true --set cache.existingClaim=shared-cache > "$out"
-check "cache.existingClaim with run pods: the policy names that claim" \
+check "cache with run pods: the pod template mounts no /cache" notpl 'mountPath: /cache$'
+check "cache with run pods: the admission policy lets a run pod mount the work claim and the admitted claim, no other" \
   policy_has "$pn" "claimName in ['work-coder-0', 'shared-cache']"
-helm_cache --set topology=split --set front.replicas=2 --set cache.existingClaim=shared-cache > "$out"
-check "split: the worker mounts the cache" dhas StatefulSet 'mountPath: /cache$'
-check "split: the front, which runs no toolchain, does not" dlacks Deployment 'cache'
-helm_cache --set config.role=control-plane --set cache.create=true > "$out"
+check "cache with run pods: ... and still no Secret volume" fails policy_has "$pn" 'has(v.secret)'
+helm_cache --set runPods.enabled=true > "$out"
+check "no allowed claim with run pods: the policy names the work claim alone" \
+  policy_has "$pn" "claimName == 'work-coder-0'"
+helm_cache --set runPods.enabled=true --set 'cache.allowedClaims={team-a.cache,team-b-cache}' > "$out"
+check "several allowed claims: the work claim and each of them" \
+  policy_has "$pn" "claimName in ['work-coder-0', 'team-a.cache', 'team-b-cache']"
+helm_cache --set topology=split --set front.replicas=2 --set 'cache.allowedClaims={shared-cache}' > "$out"
+check "split: neither the worker nor the front mounts /cache" lacks 'mountPath: /cache'
+helm_cache --set config.role=control-plane --set 'cache.allowedClaims={shared-cache}' > "$out"
 check "control plane: no cache mount and no claim" lacks 'mountPath: /cache|^kind: PersistentVolumeClaim$'
-helm_cache --set cache.create=true --set 'cache.accessModes={ReadWriteOnce}' > "$out"
-check "cache.create ReadWriteOnce is allowed for one coder pod and no run pod" dhas PersistentVolumeClaim '^    - ReadWriteOnce$'
 
-check "refused: cache.existingClaim and cache.create together" fails helm_cache --set cache.existingClaim=x --set cache.create=true
-check "refused: cache.existingClaim with an empty label" fails helm_cache --set cache.existingClaim=a..b
-check "refused: cache.existingClaim with a label longer than 63 characters" fails helm_cache --set cache.existingClaim=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
-check "refused: cache.existingClaim with an upper-case letter" fails helm_cache --set cache.existingClaim=Cache
-helm_cache --set cache.existingClaim=cache.team-a > "$out"
-check "cache.existingClaim: a dotted name is a claim name" dhas StatefulSet 'claimName: cache.team-a$'
-check "refused: cache.create that is not a boolean" fails helm_cache --set-string cache.create=maybe
-check "refused: a claim name that is not one" fails helm_cache --set cache.existingClaim=Not_A_Claim
-check "refused: a size that is not a quantity" fails helm_cache --set cache.create=true --set cache.size=big
-check "refused: an unknown access mode" fails helm_cache --set cache.create=true --set 'cache.accessModes={Everywhere}'
-check "refused: a claim without ReadWriteMany beside run pods" \
-  fails helm_cache --set cache.create=true --set 'cache.accessModes={ReadWriteOnce}' --set runPods.enabled=true
-check "refused: a claim without ReadWriteMany beside several workers" \
-  fails helm_cache --set cache.create=true --set 'cache.accessModes={ReadWriteOnce}' --set workspace.placement=isolated --set replicaCount=2
-check "refused: CARGO_HOME in extraEnv beside the cache" \
-  fails helm_cache --set cache.existingClaim=shared-cache --set-string config.extraEnv.CARGO_HOME=/elsewhere
-message=$(helm_cache --set cache.existingClaim=x --set cache.create=true 2>&1 || true)
-check "... the error says what to choose" says "$message" 'not both'
+check "refused: cache.allowedClaims that is not a list" fails helm_cache --set cache.allowedClaims=shared-cache
+check "refused: an allowed claim with an empty label" fails helm_cache --set 'cache.allowedClaims={a..b}'
+check "refused: an allowed claim with a label longer than 63 characters" fails helm_cache --set 'cache.allowedClaims={aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}'
+check "refused: an allowed claim with an upper-case letter" fails helm_cache --set 'cache.allowedClaims={Cache}'
+check "refused: an allowed claim that is not a name" fails helm_cache --set 'cache.allowedClaims={Not_A_Claim}'
+check "refused: an empty allowed claim" fails helm_cache --set-json 'cache.allowedClaims=[""]'
 
 # ---------------------------------------------------------------------------------------------------------------
 # App mode and where the commands run (ADR 0036, decision 6; vymalo/another-adam-rs#120). The commands of a run

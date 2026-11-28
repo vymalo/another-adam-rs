@@ -21,7 +21,6 @@ decision 11), so they start in any x86-64 Linux image whatever its C library. Th
 | `NetworkPolicy` | (both workloads with `topology: split`) ingress only from the namespace `another-agentic-system`; egress open (git, the gateway, registries) |
 | `Cluster` (CNPG) | `database.enabled` (the default) only: the coder's database; `DATABASE_URL` is the `uri` key of the `<release>-db-app` Secret CNPG creates. With `database.enabled: false` no Cluster is rendered and `DATABASE_URL` is read from `database.existingSecret`, see [Database](#database) |
 | `ExternalSecret` | `ssegning-aws` / `prod/meta/test-app`; the property of each value is in `externalSecrets.properties` |
-| `PersistentVolumeClaim` | `cache.create` only: `<release>-coder-cache`, ReadWriteMany, deleted with the release, see [The package cache](#the-package-cache) |
 | `ConfigMap`, `ServiceAccount`, `Role`, `RoleBinding`, `PriorityClass`, `ResourceQuota`, `ValidatingAdmissionPolicy` and its binding, a second `NetworkPolicy`, the egress proxy (a `Deployment`, a `Service`, a `PodDisruptionBudget`, a `ServiceAccount`, a `ConfigMap` and a third `NetworkPolicy`), and, in the coder pod, the `git-sandbox` container | `runPods.enabled` only, on the roles that run workers: a pod of its own for each active run, see [Run pods](#run-pods) |
 | `ConfigMap` | `mcp.websearch.url` set or `mcp.context7.enabled` only: `<release>-coder-mcp`, one file of extra MCP servers in the shape of `mcp.json`, mounted in the pods that run workers and named by `ADAM_EXTRA_MCP_FILE`, see [Extra MCP servers](#extra-mcp-servers-web-search-and-context7) |
 | `ConfigMap` | `config.modelProfiles` non-empty only: `<release>-coder-model-profiles`, the per-model profiles file (`model-profiles.json`, JSON only for now) mounted in the pods that run workers at `/etc/adam/model-profiles.json` and named by `MODEL_ALIASES_FILE`, see [Model profiles](#model-profiles) |
@@ -908,7 +907,7 @@ What it renders, and why each is there:
 | `ConfigMap` `<release>-coder-run-pod` | the pod every run pod is made from (`pod.yaml`), mounted in the coder pod at `/etc/adam/run-pod` and named by `RUN_POD_TEMPLATE_FILE`: the workspace image by tag **and digest**, `requests: {cpu: 250m, memory: 512Mi}`, `limits: {memory: 2Gi}`, `CARGO_BUILD_JOBS=2`, uid 10001 non-root with no escalation and every capability dropped, no service account token, no model key and no Secret reference (ADR 0038), the coder's workspace claim at `/work` **whole, which the coder replaces by the run's own mounts** ([below](#what-a-run-pod-sees)), and an init container that copies `adam-exec`, alone, out of the coder's image into a read-only `emptyDir` at `/opt/adam/bin`. The coder adds the name, labels and annotations and narrows the `/work` mount; it refuses to start when the run container does not mount a volume at its `WORKSPACE_ROOT` once and whole; a changed template is a deploy (a checksum annotation) |
 | `PriorityClass` `<release>-run`, `ResourceQuota` | the class is value 0 with `preemptionPolicy: Never` and exists to be **scoped by**: a quota cannot select pods by label, only by priority class. The quota (`limits.memory: 8Gi`, `pods: 4`) counts the run pods and nothing else; a pod beyond it is refused (403 `exceeded quota`) and the coder waits for a slot (`runPods.waitSecs`, refused below `runPods.idleSecs + 62`). `runPods.priorityClassName` names a class you manage instead (then none is rendered) |
 | `ServiceAccount`, `Role`, `RoleBinding` | the coder pod's own ServiceAccount (its token is a projected volume mounted in the coder container alone: the pod automounts none, so neither the git sandbox nor the GitHub MCP sidecar has it; the front of `topology: split` and every run pod mount none) may `create`, `delete`, `get`, `list` and `watch` pods and `create` and `get` `pods/exec` (kube's exec is a WebSocket, which the API server authorizes as a GET: *unverified*, from memory), and nothing else: no Secret, no ConfigMap. `runPods.serviceAccount.name` names one you manage |
-| `ValidatingAdmissionPolicy` and its binding | **the guard that lets the coder make pods without being able to read the namespace's other Secrets.** Matched to pods created by that ServiceAccount, in this namespace, it denies a pod that lacks the run labels or the priority class, uses an image other than `runPods.image`, the tools image and `admissionPolicy.extraAllowedImages` (**or, for the `run` container alone, an image that starts with a prefix of `runPods.repositoryImages.allowedPrefixes`**: the init containers keep the exact list), has a volume other than an `emptyDir`, the work claim and the [cache](#the-package-cache) claim when it is on (so no `hostPath`, and **no Secret volume**), references **any Secret a container can read** (a `secretKeyRef`, or a Secret by `envFrom`: since ADR 0038 a run pod reads none, so the policy no longer names the ExternalSecret's Secret or a key), names a pull secret the chart did not render (`imagePullSecrets` of the values, none by default; a ServiceAccount you name with `runPods.serviceAccount.name` must carry no pull secret that is not in that value, because the cluster adds a ServiceAccount's pull secrets to the pod before the policy looks), is privileged or may escalate, may run as root (a `runAsUser` other than 0 and `runAsNonRoot` are required explicitly), uses the host's network, PID or IPC namespace, or does not set `automountServiceAccountToken: false`. `failurePolicy: Fail`. Without it the RBAC alone would let the coder make any pod in its namespace, so **the chart refuses to turn it off** unless `admissionPolicy.disableAcknowledged: true`, and the chart's `kubeVersion` refuses a cluster older than 1.37 (ADR 0080) |
+| `ValidatingAdmissionPolicy` and its binding | **the guard that lets the coder make pods without being able to read the namespace's other Secrets.** Matched to pods created by that ServiceAccount, in this namespace, it denies a pod that lacks the run labels or the priority class, uses an image other than `runPods.image`, the tools image and `admissionPolicy.extraAllowedImages` (**or, for the `run` container alone, an image that starts with a prefix of `runPods.repositoryImages.allowedPrefixes`**: the init containers keep the exact list), has a volume other than an `emptyDir`, the work claim and the claims `cache.allowedClaims` names (so no `hostPath`, and **no Secret volume**), references **any Secret a container can read** (a `secretKeyRef`, or a Secret by `envFrom`: since ADR 0038 a run pod reads none, so the policy no longer names the ExternalSecret's Secret or a key), names a pull secret the chart did not render (`imagePullSecrets` of the values, none by default; a ServiceAccount you name with `runPods.serviceAccount.name` must carry no pull secret that is not in that value, because the cluster adds a ServiceAccount's pull secrets to the pod before the policy looks), is privileged or may escalate, may run as root (a `runAsUser` other than 0 and `runAsNonRoot` are required explicitly), uses the host's network, PID or IPC namespace, or does not set `automountServiceAccountToken: false`. `failurePolicy: Fail`. Without it the RBAC alone would let the coder make any pod in its namespace, so **the chart refuses to turn it off** unless `admissionPolicy.disableAcknowledged: true`, and the chart's `kubeVersion` refuses a cluster older than 1.37 (ADR 0080) |
 | `NetworkPolicy` `<release>-coder-run-pods` | **deny by default** ([ADR 0042](../../docs/decisions/0042-run-pods-reach-the-internet-through-an-egress-proxy.md)): no ingress; egress to DNS, to the egress proxy's pods on TCP 3128 and to `networkPolicy.extraEgress` (an in-cluster target such as a model gateway), and nothing else. There is no rule for the internet and no value that adds one: `networkPolicy.enabled: false` is refused. No rule names an IPv6 range, so IPv6 egress is denied |
 | a `git-sandbox` container in the coder pod, and a projected token volume | **the git sandbox**, where the coder's local git runs because a repository's configuration can name a program: [below](#the-git-sandbox) |
 | `Deployment`, `Service`, `ServiceAccount`, `ConfigMap`, `PodDisruptionBudget`, `NetworkPolicy` `<release>-coder-egress` | **the egress proxy**, the one way out of a run pod: [below](#the-egress-proxy) |
@@ -957,14 +956,14 @@ configuration (`git add`, `commit`, `stash`, `reset`, `tag`, `branch`, `config -
 (`git switch --detach`: it appends to the read-only reflog), and the coder commits. A slot
 the run adds later (a repository, a scratch project) needs a pod made again: when no command runs in it the coder does it at once, right after it adds the slot, and when one does the tool says so and the next command waits for it to end
 (`RUN_POD_WAIT_SECS`) like it waits for a quota slot. A pod made by an earlier release is made again the same way, and so is the pod of a run whose slot was lost and added again (the mounts follow a directory, and the slot's directory in the mirror is a new one under the same name). Limits (ADR 0041): the mirror of a
-repository is shared by everyone who works on it, so their unpushed `agent/*` branches and worktree directories in it can be read; the [package
-cache](#the-package-cache) is writable by every run; a run pod holds no model key and no Secret a container can read (ADR 0038); the pull secrets are the chart's own. `runPods.enabled` no longer needs `externalSecrets.enabled`.
+repository is shared by everyone who works on it, so their unpushed `agent/*` branches and worktree directories in it can be read; a cache claim
+the deployment admits ([The package cache](#the-package-cache)) is writable by every run that mounts it; a run pod holds no model key and no Secret a container can read (ADR 0038); the pull secrets are the chart's own. `runPods.enabled` no longer needs `externalSecrets.enabled`.
 
 **Checked by:** `tests/render-check.sh` (each object, the pod template, every rule of the policy, the quota's scope, the values and the refusals; the render is
 `tests/golden/run-pods.yaml`), kubeconform on the renders (`.github/workflows/coder.yml`), and the `run-pods` job of `.github/workflows/ci.yml`, which applies the
 objects to a `kind` cluster and runs the environment against it as the coder's ServiceAccount (`tests/kind-run-pods.sh`): a pod from the template, commands
 in it, a kill, the idle sweep, the policy refusing nineteen changes to the pod, the quota refusing the fifth, and a run pod that sees only its own run on a volume the script
-seeds with two runs of one mirror, and whose slot it cannot rename, remove or replace (*verified 2026-10-27*: run 40456829784, job 122032008830), and, new with the egress proxy, the network policies: [below](#the-egress-proxy). `tests/git-in-run-pod.sh` runs real git in the pod's mounts (including the read-only `HEAD`, `commondir`, `gitdir` and `logs`: it writes, renames, replaces and removes them as the pod's uid, and the slots as mounts of their own: it renames, removes and exchanges them and gets `EBUSY`) as bind mounts in a private mount
+seeds with two runs of one mirror, and whose slot it cannot rename, remove or replace (*verified 2026-10-27*: run 40456829784, job 122032008830), and, new with the egress proxy, the network policies: [below](#the-egress-proxy), and `tests/kind-cache-isolation.sh` (no shared cache: a file one run writes under `/cache` is invisible to another, the control that two pods on one claim do share it, and the policy admitting only `cache.allowedClaims`). `tests/git-in-run-pod.sh` runs real git in the pod's mounts (including the read-only `HEAD`, `commondir`, `gitdir` and `logs`: it writes, renames, replaces and removes them as the pod's uid, and the slots as mounts of their own: it renames, removes and exchanges them and gets `EBUSY`) as bind mounts in a private mount
 namespace (needs root; CI runs it before the kind job). It does not run the coder over a model. **Unverified on the cluster:** its Kubernetes version (1.37 or later, ADR 0080), Longhorn
 sharing a `ReadWriteOnce` volume on one node, the pod and service CIDRs, that its CNI enforces NetworkPolicy (kind's, kindnet, does, and the job fails when it does not), and the HTTP status of an admission refusal (the
 coder treats 403, 422 and 400 as the deployment's mistake).
@@ -1004,7 +1003,7 @@ flowchart LR
 | Work volume | `/work` | `/work`, the same path (the commands carry paths) |
 | Secrets | the App's key file, `MODEL_API_KEY`, `A2A_BEARER_TOKENS`, `DATABASE_URL` | **none**: no Secret volume, no `envFrom`, no variable from a Secret |
 | Service-account token | a projected volume (`kube-api-access`: token, the cluster's CA, the namespace) at `/var/run/secrets/kubernetes.io/serviceaccount` | **none**: the pod sets `automountServiceAccountToken: false` |
-| Other volumes | the pod template, the cache when it is on, the extra MCP file, the card-signing key | **none**; its `/tmp` is its own `emptyDir` in memory (`runPods.gitSandbox.tmpSize`) |
+| Other volumes | the pod template, the extra MCP file, the card-signing key | **none**; its `/tmp` is its own `emptyDir` in memory (`runPods.gitSandbox.tmpSize`) |
 | Socket | `GIT_SANDBOX_SOCKET=/run/git-sandbox/git.sock` | `GIT_SANDBOX_LISTEN`, the same `emptyDir`, mode `0600` |
 | Root file system | writable | read-only; no escalation, no capability, the default seccomp profile |
 | Memory | `runPods.coderResources` | `runPods.gitSandbox.resources` (1Gi limit, required) |
@@ -1084,37 +1083,38 @@ the refusal and nothing of a `Proxy-Authorization` header or a query sent to it;
 
 ## The package cache
 
-`cache.*` mounts **one volume at `/cache`**, where the image keeps the caches of npm (`/cache/npm`), pnpm
-(`/cache/pnpm-store`) and cargo (`/cache/cargo`: registry and git sources), so that a pod, a run pod or a release does not
-download again what another fetched ([ADR 0040](../../docs/decisions/0040-a-shared-package-cache-at-cache.md)). **Off by
-default, and then invisible**: `/cache` is a directory of the container's file system, lost with the pod.
+The chart mounts **no cache** ([ADR 0040](../../docs/decisions/0040-a-shared-package-cache-at-cache.md), amended
+2026-11-26). The image keeps the caches of npm (`/cache/npm`), pnpm (`/cache/pnpm-store`) and cargo (`/cache/cargo`:
+registry and git sources) under `/cache`, and `/cache` is a directory of each container's own file system, lost with the
+pod. A deployment that wants its runs to keep them across pods gives each run its own claim through the platform
+(`AgentConfig.environment.cache.existingClaim` of the operator); there is no shared writable cache.
 
 | Value | |
 |---|---|
-| `cache.existingClaim` | the name of a ReadWriteMany claim in this namespace that you manage and may share with other releases and the platform operator's agents. The chart creates nothing |
-| `cache.create` | `true`: the chart makes the claim `<release>-coder-cache` for this release (`cache.storageClass`, `cache.size`, `cache.accessModes`, ReadWriteMany by default). It goes with the release: a cache is not state |
+| `cache.allowedClaims` | the names of `PersistentVolumeClaim`s in this namespace that a **run pod** may mount, besides the work claim. Empty by default: a run pod may mount no cache at all |
 
-Neither: off. Both: refused. The volume is mounted in the **pods that run toolchains**: the `combined` pod, the `split`
-worker and the run pods (their template, and the admission policy lets a run pod mount the work claim and this claim, no
-other). The `split` front and a control plane run none and get none.
+The chart creates no claim and mounts none in the coder pod, the `split` worker or the run pod template. The list is the
+admission policy's, and nothing else: a run pod that mounts a claim the list does not name is refused, so a deployment
+admits exactly the cache it configured through the platform.
 
-* **Prepare the volume.** Its root must be writable by uid and gid 10001. The pods set `fsGroup: 10001`
+* **A claim is one trust domain.** Every run that mounts it reads whatever any run on it wrote: list only the claims of
+  one deployment's own runs, never one shared between people.
+* **Prepare the claim.** Its root must be writable by uid and gid 10001. The pods set `fsGroup: 10001`
   (`OnRootMismatch`), which does it where the storage driver supports it; otherwise `chown` it once.
 * **The storage class matters.** cargo takes **no lock at all on an NFS mount** (*verified* in its source, ADR 0040) and
   pnpm's store is documented for one machine: Longhorn's ReadWriteMany is NFS (*unverified* here). Prefer a class with
-  real locks. If pnpm or cargo misbehave on the shared volume, turn the cache off and let the proxy of the ADR serve it.
-* **One trust domain.** Every run reads whatever any run wrote. Do not share the volume with a deployment you do not
-  trust, and give runs no registry credential: the chart gives them none, and npm may write a token into its cache when a
-  registry answers `Vary: Authorization`. The chart refuses `CARGO_HOME` and the npm cache variable in `config.extraEnv`
-  while the cache is on.
-* Installed binaries (`cargo install`) stay private in the home. Nothing prunes the volume: size it, and clean it
+  real locks.
+* **Give runs no registry credential.** npm may write a token into its cache when a registry answers `Vary:
+  Authorization`; a claim shared with a run that has a token is not a cache you can trust.
+* Installed binaries (`cargo install`) stay private in the home. Nothing prunes the claim: size it, and clean it
   (`pnpm store prune`, `npm cache verify`) if it fills.
 * The image must have the caches under `/cache`: `image.tag` and `runPods.image` are on `1.98.1-8c297d3` or later of the
-  workspace image. An older image mounts a volume no tool uses.
+  workspace image.
 
-Checked by `tests/render-check.sh` (the claim and the mounts, the policy, the refusals; the render with run pods is
-`tests/golden/cache.yaml`) and kubeconform on the renders. **Unverified on the cluster:** the volume's file system,
-that the pods can write to it, and a hit across two pods.
+Checked by `tests/render-check.sh` (no cache volume, mount or claim; the policy's list; the refusals; the render with run
+pods is `tests/golden/cache.yaml`), kubeconform on the renders, and `tests/kind-cache-isolation.sh`: a file one run writes
+under `/cache` is invisible to another run, with the control that two pods on one claim do share it, and the policy admits
+a claim the list names and refuses one it does not.
 
 ## Known risks
 

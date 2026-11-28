@@ -159,13 +159,14 @@ https://github.com/vymalo/another-adam-rs/blob/main/deploy/coder/README.md.
      with a warning, not exit 69); a plain `http` URL needs `mcp.websearch.allowInsecure` (or
      `config.extraEnv.MCP_ALLOW_INSECURE`). Put the AWS properties in place before turning one on (chart
      README, "Extra MCP servers").
-   * `cache.existingClaim` or `cache.create` (off by default and then invisible): one volume at `/cache`, where the
-     image keeps the caches of npm, pnpm and cargo, mounted by the combined pod, the split worker and the run pods
-     (their pod template; the admission policy lets a run pod mount the work claim and this one, no other). The
-     deployer owns the ReadWriteMany claim, its root must be writable by uid and gid 10001, and cargo takes no lock
-     on NFS. One trust domain: runs get no registry credential and the claim is shared only with deployments you
-     trust (ADR 0040, `docs/decisions/0040-a-shared-package-cache-at-cache.md`; chart README, "The package cache").
-     The image must be on the workspace base `1.98.1-8c297d3` or later, which has the caches under `/cache`.
+   * `cache.allowedClaims` (empty by default): the chart mounts **no cache**. The image keeps the caches of npm,
+     pnpm and cargo under `/cache`, a directory of each container's own file system; a deployment that wants them
+     across pods gives each run its own claim through the platform
+     (`AgentConfig.environment.cache.existingClaim`), and this value names the claims a **run pod** may mount besides
+     the work claim — the admission policy refuses any other. A claim is one trust domain, its root must be writable
+     by uid and gid 10001, and cargo takes no lock on NFS (ADR 0040, amended 2026-11-26,
+     `docs/decisions/0040-a-shared-package-cache-at-cache.md`; chart README, "The package cache"). The image must be
+     on the workspace base `1.98.1-8c297d3` or later, which has the caches under `/cache`.
    * No Ingress: the service is cluster-internal and reached over A2A with a bearer token.
    * A repository's own environment is a run pod of its image, never a container engine in the coder
      (ADR 0052). The chart's answer is `runPods.enabled` (off by default and then invisible): each active run's processes run in a pod of its own
@@ -181,6 +182,11 @@ https://github.com/vymalo/another-adam-rs/blob/main/deploy/coder/README.md.
      A repository may bring its own `devcontainer.json`: with `runPods.repositoryImages.allowedPrefixes` (empty by
      default) the coder offers `use_repository_environment` and the policy admits an image under a prefix for the `run`
      container alone (ADR 0052, `docs/decisions/0052-no-podman-a-repositorys-own-environment-is-a-run-pod-of-its-image.md`).
+   * The deployment's hook programs are **not** a chart value yet (ADR 0050, slice P3): the binaries
+     already read `ADAM_HOOKS_FILE` (a mounted JSON file of `programs`) and `HOOKS_ALLOW_PROGRAMS=true`,
+     start the programs that apply to the agent they serve, and exit 78 when one cannot start. Until
+     the chart renders a `hooks.file`, mount the file and its program outside the agent's folder and
+     workspace and set both variables by hand (`docs/reference/environment.md`).
 6. **Change the chart with its guards.** Render-time validation is in
    `deploy/coder/templates/_validate.tpl`; the default render is pinned by
    `deploy/coder/tests/golden/combined.yaml`; `deploy/coder/tests/render-check.sh` asserts the

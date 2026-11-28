@@ -29,6 +29,15 @@ pub const RUNS: &str = "adam.runs";
 /// tool or source resolves is not measured, so a model cannot invent a series.
 pub const TOOL_DURATION: &str = "adam.tool.duration";
 
+/// The counter of a model call's tokens, by direction and model (ANR-1462).
+///
+/// Recorded by `adam-llm-agent` where a model call's answer is read: `direction` is `input` or
+/// `output`, and `model` is the alias the call was made to — one the deployment configured.
+pub const LLM_TOKENS: &str = "adam.llm.tokens";
+
+/// The histogram of one model call's latency in seconds, labelled by the model alias (ANR-1462).
+pub const LLM_DURATION: &str = "adam.llm.duration";
+
 /// The gauge of the runs a worker is stepping right now (ANR-1506).
 ///
 /// Recorded by `adam-service` where it reads the store's activity: `StoreActivity::busy` is open
@@ -106,6 +115,20 @@ pub const EMITTED: &[Instrument] = &[
         labels: &["tool"],
         emitted_by: "adam-llm-agent",
     },
+    Instrument {
+        name: LLM_TOKENS,
+        kind: Kind::Counter,
+        unit: "",
+        labels: &["direction", "model"],
+        emitted_by: "adam-llm-agent",
+    },
+    Instrument {
+        name: LLM_DURATION,
+        kind: Kind::Histogram,
+        unit: "s",
+        labels: &["model"],
+        emitted_by: "adam-llm-agent",
+    },
 ];
 
 /// The suffix a Prometheus-compatible backend appends for an OTel unit.
@@ -136,6 +159,10 @@ mod tests {
         assert_eq!(runs.prometheus_name(), "adam_runs_total");
         let tool = emitted(TOOL_DURATION).expect("adam.tool.duration is emitted");
         assert_eq!(tool.prometheus_name(), "adam_tool_duration_seconds");
+        let tokens = emitted(LLM_TOKENS).expect("adam.llm.tokens is emitted");
+        assert_eq!(tokens.prometheus_name(), "adam_llm_tokens_total");
+        let duration = emitted(LLM_DURATION).expect("adam.llm.duration is emitted");
+        assert_eq!(duration.prometheus_name(), "adam_llm_duration_seconds");
     }
 
     /// A duplicate name would make [`emitted`] answer one of two instruments, and a name outside
