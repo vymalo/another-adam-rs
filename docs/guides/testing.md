@@ -158,8 +158,9 @@ superuser, for its reconnect test). See [Store adapters](../reference/store-adap
 
 Scripts in `dev/` drive the compose stack through A2A and assert the whole chain on the mocks. Each script's
 header lists its steps and variables. CI runs them in `.github/workflows/coder.yml` ("Compose e2e") on the image
-it has just built: a pull request runs the seven default coder scenarios and two App-mode ones (all 19 when it
-carries the `e2e-full` label or changes `dev/`, `docker/coder/` or `compose.yaml`), main and a manual `workflow_dispatch` run all of
+it has just built: a pull request runs the seven default coder scenarios, the hook-program scenario
+(`dev/hooks-e2e.sh`) and two App-mode ones (all 20 when it carries the `e2e-full` label or changes `dev/`,
+`docker/coder/` or `compose.yaml`), main and a manual `workflow_dispatch` run all of
 them. Start the stack first:
 
 ```sh

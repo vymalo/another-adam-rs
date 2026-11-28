@@ -148,8 +148,9 @@ for line in sys.stdin:
 
 It is started with `Config` in an embedding host. `adam-agent` and `adam-coder` do that for a
 deployment: they read the file `ADAM_HOOKS_FILE` names (with `HOOKS_ALLOW_PROGRAMS=true`) and start
-the programs that apply to the agent they serve when they start, so the agent and its subagents run
-them before the plugins their files name (ADR 0050, slice P2). Nothing is read from an agent's folder
+the programs whose `agents` names the root they serve — the set is then installed on every agent of
+that assembly, the root and each subagent — when they start, so the agent and its subagents run them
+before the plugins their files name (ADR 0050, slice P2). Nothing is read from an agent's folder
 or a repository.
 
 The invariants to check, the test behind each claim and what is not built yet:
