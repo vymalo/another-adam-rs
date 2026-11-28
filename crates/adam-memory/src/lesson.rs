@@ -292,72 +292,96 @@ impl LessonSettings {
         self.limits = limits;
         self
     }
+
+    /// Scrub every lesson text of `draft` and check it, then stamp a served lesson at `now`.
+    ///
+    /// This is the adapter's half of [`Memory::record`](crate::Memory::record): the scope
+    /// validation, the scrub, the marker check, the address check and the bounds, in one place,
+    /// so a database adapter and [`InProcessMemory`](crate::InProcessMemory) enforce the same
+    /// rules. The scope is the adapter's configured one: an adapter stamps a lesson for its own
+    /// scope or refuses it.
+    ///
+    /// Every lesson text is scrubbed first; a text that still holds [`crate::REDACTION_MARKER`] is
+    /// refused. A lesson may not name a repository, a path, a URL, a host or an e-mail address whatever
+    /// its audience (ADR 0081 decision 5), so every lesson text goes through the address check too. The
+    /// audience is a key, validated and bounded, never scrubbed; the provenance labels are scrubbed and
+    /// bounded.
+    ///
+    /// # Errors
+    ///
+    /// [`MemoryError`]: a refusal, whose class says which. Never a storage failure: storing the
+    /// stamped lesson is the adapter's half.
+    pub fn prepare(
+        &self,
+        scope: &MemoryScope,
+        draft: LessonDraft,
+        now: Timestamp,
+    ) -> MemoryResult<Lesson> {
+        scope.validate()?;
+        let audience = Audience::new(key("audience", draft.audience.as_str(), self)?);
+        if draft.provenance.sources.is_empty() {
+            return Err(MemoryError::EmptyField {
+                field: "lesson sources",
+            });
+        }
+        if draft.provenance.sources.len() > self.limits.sources_per_lesson {
+            return Err(MemoryError::TooManySources {
+                sources: draft.provenance.sources.len(),
+                limit: self.limits.sources_per_lesson,
+            });
+        }
+        if draft.provenance.review.trim().is_empty() {
+            return Err(MemoryError::EmptyField {
+                field: "lesson review",
+            });
+        }
+        if draft.anchors.len() > self.limits.anchors_per_lesson {
+            return Err(MemoryError::TooManyAnchors {
+                anchors: draft.anchors.len(),
+                limit: self.limits.anchors_per_lesson,
+            });
+        }
+        let root_cause = root_cause(&draft.root_cause, self)?;
+        let remedy = text("remedy", &draft.remedy, self)?;
+        let rationale = text("rationale", &draft.rationale, self)?;
+        let anchors = draft
+            .anchors
+            .iter()
+            .map(|anchor| text("anchor", anchor, self))
+            .collect::<MemoryResult<Vec<_>>>()?;
+        let sources = draft
+            .provenance
+            .sources
+            .iter()
+            .map(|source| label("lesson source", source, self))
+            .collect::<MemoryResult<Vec<_>>>()?;
+        let review = label("lesson review", &draft.provenance.review, self)?;
+        Ok(Lesson {
+            audience,
+            root_cause,
+            remedy,
+            rationale,
+            anchors,
+            provenance: LessonProvenance::new(sources, review),
+            state: LessonState::Active,
+            created: now,
+            updated: now,
+            retired_at: None,
+        })
+    }
 }
 
-/// Scrub every lesson text of `draft` and check it, then stamp a served lesson at `now`.
+/// The order a recall serves: the freshest lesson first, then by root cause so the answer is
+/// stable.
 ///
-/// Every lesson text is scrubbed first; a text that still holds [`crate::REDACTION_MARKER`] is
-/// refused. A lesson may not name a repository, a path, a URL, a host or an e-mail address whatever
-/// its audience (ADR 0081 decision 5), so every lesson text goes through the address check too. The
-/// audience is a key, validated and bounded, never scrubbed; the provenance labels are scrubbed and
-/// bounded.
-pub(crate) fn prepare(
-    scope: &MemoryScope,
-    draft: LessonDraft,
-    settings: &LessonSettings,
-    now: Timestamp,
-) -> MemoryResult<Lesson> {
-    scope.validate()?;
-    let audience = Audience::new(key("audience", draft.audience.as_str(), settings)?);
-    if draft.provenance.sources.is_empty() {
-        return Err(MemoryError::EmptyField {
-            field: "lesson sources",
-        });
-    }
-    if draft.provenance.sources.len() > settings.limits.sources_per_lesson {
-        return Err(MemoryError::TooManySources {
-            sources: draft.provenance.sources.len(),
-            limit: settings.limits.sources_per_lesson,
-        });
-    }
-    if draft.provenance.review.trim().is_empty() {
-        return Err(MemoryError::EmptyField {
-            field: "lesson review",
-        });
-    }
-    if draft.anchors.len() > settings.limits.anchors_per_lesson {
-        return Err(MemoryError::TooManyAnchors {
-            anchors: draft.anchors.len(),
-            limit: settings.limits.anchors_per_lesson,
-        });
-    }
-    let root_cause = root_cause(&draft.root_cause, settings)?;
-    let remedy = text("remedy", &draft.remedy, settings)?;
-    let rationale = text("rationale", &draft.rationale, settings)?;
-    let anchors = draft
-        .anchors
-        .iter()
-        .map(|anchor| text("anchor", anchor, settings))
-        .collect::<MemoryResult<Vec<_>>>()?;
-    let sources = draft
-        .provenance
-        .sources
-        .iter()
-        .map(|source| label("lesson source", source, settings))
-        .collect::<MemoryResult<Vec<_>>>()?;
-    let review = label("lesson review", &draft.provenance.review, settings)?;
-    Ok(Lesson {
-        audience,
-        root_cause,
-        remedy,
-        rationale,
-        anchors,
-        provenance: LessonProvenance::new(sources, review),
-        state: LessonState::Active,
-        created: now,
-        updated: now,
-        retired_at: None,
-    })
+/// A database adapter calls this on what it read, so every adapter serves lessons in the same
+/// order as [`InProcessMemory`](crate::InProcessMemory).
+pub fn sort_lessons_newest_first(lessons: &mut [Lesson]) {
+    lessons.sort_by(|a, b| {
+        b.updated
+            .cmp(&a.updated)
+            .then_with(|| a.root_cause.cmp(&b.root_cause))
+    });
 }
 
 fn root_cause(raw: &str, settings: &LessonSettings) -> MemoryResult<String> {
@@ -409,14 +433,4 @@ fn bytes(field: &'static str, clean: String, limit: usize) -> MemoryResult<Strin
         });
     }
     Ok(clean)
-}
-
-/// The order a recall serves: the freshest lesson first, then by root cause so the answer is
-/// stable.
-pub(crate) fn sort_newest_first(lessons: &mut [Lesson]) {
-    lessons.sort_by(|a, b| {
-        b.updated
-            .cmp(&a.updated)
-            .then_with(|| a.root_cause.cmp(&b.root_cause))
-    });
 }

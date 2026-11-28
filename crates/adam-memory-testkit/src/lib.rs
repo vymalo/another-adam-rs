@@ -68,7 +68,10 @@
 //! ```
 //!
 //! `$make` is a path to a `fn(&Plan) -> DynSiMemory` or a
-//! `fn(&LessonPlan, &MemoryScope) -> DynMemory`. Each suite also ships two doubles the cases must
+//! `fn(&LessonPlan, &MemoryScope) -> DynMemory`. Either macro also takes a second path, to a
+//! `fn() -> bool` whose `false` skips every test of the suite: the hook a database adapter builds
+//! on `adam_core::testing::test_env`, so an unset variable skips the suite and
+//! `ADAM_TEST_REQUIRE_DB=1` fails it instead. Each suite also ships two doubles the cases must
 //! reject: [`doubles::ScopeBlindSiMemory`] and [`doubles::DoubleWritingSiMemory`] for L1, and
 //! [`doubles::ScopeBlindMemory`] and [`doubles::DoubleWritingMemory`] for L2.
 
@@ -1133,9 +1136,22 @@ pub mod lesson_cases {
 ///
 /// `$make` is a path to a `fn(&Plan) -> DynSiMemory`; in a test file of a crate, that is
 /// `crate::make`. The cases are synchronous, so the calling crate needs no runtime.
+///
+/// The second argument, `$available`, is optional: a path to a `fn() -> bool` whose `false` skips
+/// every test of the suite. It exists for a database adapter, whose store is not always reachable:
+/// build it on `adam_core::testing::test_env`, so an unset variable skips the suite and
+/// `ADAM_TEST_REQUIRE_DB=1` fails it instead (the CI switch).
+///
+/// ```ignore
+/// fn available() -> bool {
+///     adam_core::testing::test_env("ADAM_TEST_MY_DB_URL").is_some()
+/// }
+///
+/// adam_memory_testkit::si_memory_conformance!(crate::make, crate::available);
+/// ```
 #[macro_export]
 macro_rules! si_memory_conformance {
-    ($make:path) => {
+    ($make:path $(, $available:path)?) => {
         #[allow(missing_docs)]
         mod si_memory_conformance {
             use super::*;
@@ -1147,6 +1163,7 @@ macro_rules! si_memory_conformance {
 
             #[test]
             fn record_then_recall_round_trips() {
+                $(if !$available() { return; })?
                 $crate::cases::record_then_recall_round_trips(
                     make(&Plan::default()),
                     Plan::default(),
@@ -1155,6 +1172,7 @@ macro_rules! si_memory_conformance {
 
             #[test]
             fn attempts_with_one_root_cause_share_a_problem() {
+                $(if !$available() { return; })?
                 $crate::cases::attempts_with_one_root_cause_share_a_problem(
                     make(&Plan::default()),
                     Plan::default(),
@@ -1163,6 +1181,7 @@ macro_rules! si_memory_conformance {
 
             #[test]
             fn a_record_lands_once_for_one_key() {
+                $(if !$available() { return; })?
                 $crate::cases::a_record_lands_once_for_one_key(
                     make(&Plan::default()),
                     Plan::default(),
@@ -1171,6 +1190,7 @@ macro_rules! si_memory_conformance {
 
             #[test]
             fn recall_answers_only_its_scope() {
+                $(if !$available() { return; })?
                 $crate::cases::recall_answers_only_its_scope(
                     make(&Plan::default()),
                     Plan::default(),
@@ -1179,6 +1199,7 @@ macro_rules! si_memory_conformance {
 
             #[test]
             fn a_text_is_scrubbed_before_the_write() {
+                $(if !$available() { return; })?
                 $crate::cases::a_text_is_scrubbed_before_the_write(
                     make(&Plan::default()),
                     Plan::default(),
@@ -1187,6 +1208,7 @@ macro_rules! si_memory_conformance {
 
             #[test]
             fn a_text_carrying_the_marker_is_refused() {
+                $(if !$available() { return; })?
                 $crate::cases::a_text_carrying_the_marker_is_refused(
                     make(&Plan::default()),
                     Plan::default(),
@@ -1195,30 +1217,35 @@ macro_rules! si_memory_conformance {
 
             #[test]
             fn a_field_over_the_bound_is_refused() {
+                $(if !$available() { return; })?
                 let plan = Plan::default();
                 $crate::cases::a_field_over_the_bound_is_refused(make(&plan), plan);
             }
 
             #[test]
             fn a_root_cause_over_the_bound_is_refused() {
+                $(if !$available() { return; })?
                 let plan = Plan::default();
                 $crate::cases::a_root_cause_over_the_bound_is_refused(make(&plan), plan);
             }
 
             #[test]
             fn a_full_scope_refuses_another_problem() {
+                $(if !$available() { return; })?
                 let plan = Plan::default();
                 $crate::cases::a_full_scope_refuses_another_problem(make(&plan), plan);
             }
 
             #[test]
             fn a_full_problem_refuses_another_attempt() {
+                $(if !$available() { return; })?
                 let plan = Plan::default();
                 $crate::cases::a_full_problem_refuses_another_attempt(make(&plan), plan);
             }
 
             #[test]
             fn an_agent_scope_refuses_an_address() {
+                $(if !$available() { return; })?
                 $crate::cases::an_agent_scope_refuses_an_address(
                     make(&Plan::default()),
                     Plan::default(),
@@ -1227,6 +1254,7 @@ macro_rules! si_memory_conformance {
 
             #[test]
             fn an_observation_is_stamped_once() {
+                $(if !$available() { return; })?
                 $crate::cases::an_observation_is_stamped_once(
                     make(&Plan::default()),
                     Plan::default(),
@@ -1235,6 +1263,7 @@ macro_rules! si_memory_conformance {
 
             #[test]
             fn a_sweep_removes_only_what_is_old() {
+                $(if !$available() { return; })?
                 $crate::cases::a_sweep_removes_only_what_is_old(
                     make(&Plan::default()),
                     Plan::default(),
@@ -1243,6 +1272,7 @@ macro_rules! si_memory_conformance {
 
             #[test]
             fn sixteen_writers_share_one_scope() {
+                $(if !$available() { return; })?
                 $crate::cases::sixteen_writers_share_one_scope(
                     make(&Plan::default()),
                     Plan::default(),
@@ -1261,9 +1291,22 @@ macro_rules! si_memory_conformance {
 /// [`lesson_cases::two_scopes_never_see_each_other`], so an adapter whose instances share one
 /// database must build both against it. The cases are synchronous, so the calling crate needs no
 /// runtime.
+///
+/// The second argument, `$available`, is optional: a path to a `fn() -> bool` whose `false` skips
+/// every test of the suite. It exists for a database adapter, whose store is not always reachable:
+/// build it on `adam_core::testing::test_env`, so an unset variable skips the suite and
+/// `ADAM_TEST_REQUIRE_DB=1` fails it instead (the CI switch).
+///
+/// ```ignore
+/// fn available() -> bool {
+///     adam_core::testing::test_env("ADAM_TEST_MY_DB_URL").is_some()
+/// }
+///
+/// adam_memory_testkit::memory_conformance!(crate::make, crate::available);
+/// ```
 #[macro_export]
 macro_rules! memory_conformance {
-    ($make:path) => {
+    ($make:path $(, $available:path)?) => {
         #[allow(missing_docs)]
         mod memory_conformance {
             use super::*;
@@ -1275,6 +1318,7 @@ macro_rules! memory_conformance {
 
             #[test]
             fn record_then_recall_round_trips() {
+                $(if !$available() { return; })?
                 let plan = LessonPlan::default();
                 $crate::lesson_cases::record_then_recall_round_trips(
                     make(&plan, &$crate::memory_scope("round-trip")),
@@ -1284,6 +1328,7 @@ macro_rules! memory_conformance {
 
             #[test]
             fn a_record_lands_once_for_one_key() {
+                $(if !$available() { return; })?
                 let plan = LessonPlan::default();
                 $crate::lesson_cases::a_record_lands_once_for_one_key(
                     make(&plan, &$crate::memory_scope("one-key")),
@@ -1293,6 +1338,7 @@ macro_rules! memory_conformance {
 
             #[test]
             fn recall_answers_only_its_audience() {
+                $(if !$available() { return; })?
                 let plan = LessonPlan::default();
                 $crate::lesson_cases::recall_answers_only_its_audience(
                     make(&plan, &$crate::memory_scope("audiences")),
@@ -1302,6 +1348,7 @@ macro_rules! memory_conformance {
 
             #[test]
             fn an_audience_is_not_scrubbed() {
+                $(if !$available() { return; })?
                 let plan = LessonPlan::default();
                 $crate::lesson_cases::an_audience_is_not_scrubbed(
                     make(&plan, &$crate::memory_scope("audience-key")),
@@ -1311,6 +1358,7 @@ macro_rules! memory_conformance {
 
             #[test]
             fn two_scopes_never_see_each_other() {
+                $(if !$available() { return; })?
                 let plan = LessonPlan::default();
                 $crate::lesson_cases::two_scopes_never_see_each_other(
                     make(&plan, &$crate::memory_scope("scope-a")),
@@ -1321,6 +1369,7 @@ macro_rules! memory_conformance {
 
             #[test]
             fn a_text_is_scrubbed_before_the_write() {
+                $(if !$available() { return; })?
                 let plan = LessonPlan::default();
                 $crate::lesson_cases::a_text_is_scrubbed_before_the_write(
                     make(&plan, &$crate::memory_scope("scrubbed")),
@@ -1330,6 +1379,7 @@ macro_rules! memory_conformance {
 
             #[test]
             fn a_text_carrying_the_marker_is_refused() {
+                $(if !$available() { return; })?
                 let plan = LessonPlan::default();
                 $crate::lesson_cases::a_text_carrying_the_marker_is_refused(
                     make(&plan, &$crate::memory_scope("marker")),
@@ -1339,6 +1389,7 @@ macro_rules! memory_conformance {
 
             #[test]
             fn a_field_over_the_bound_is_refused() {
+                $(if !$available() { return; })?
                 let plan = LessonPlan::default();
                 $crate::lesson_cases::a_field_over_the_bound_is_refused(
                     make(&plan, &$crate::memory_scope("field-bound")),
@@ -1348,6 +1399,7 @@ macro_rules! memory_conformance {
 
             #[test]
             fn a_root_cause_over_the_bound_is_refused() {
+                $(if !$available() { return; })?
                 let plan = LessonPlan::default();
                 $crate::lesson_cases::a_root_cause_over_the_bound_is_refused(
                     make(&plan, &$crate::memory_scope("root-cause-bound")),
@@ -1357,6 +1409,7 @@ macro_rules! memory_conformance {
 
             #[test]
             fn a_full_audience_refuses_another_lesson() {
+                $(if !$available() { return; })?
                 let plan = LessonPlan::default();
                 $crate::lesson_cases::a_full_audience_refuses_another_lesson(
                     make(&plan, &$crate::memory_scope("audience-bound")),
@@ -1366,6 +1419,7 @@ macro_rules! memory_conformance {
 
             #[test]
             fn a_lesson_refuses_an_address() {
+                $(if !$available() { return; })?
                 let plan = LessonPlan::default();
                 $crate::lesson_cases::a_lesson_refuses_an_address(
                     make(&plan, &$crate::memory_scope("addresses")),
@@ -1375,6 +1429,7 @@ macro_rules! memory_conformance {
 
             #[test]
             fn a_retired_lesson_is_kept_and_not_served() {
+                $(if !$available() { return; })?
                 let plan = LessonPlan::default();
                 $crate::lesson_cases::a_retired_lesson_is_kept_and_not_served(
                     make(&plan, &$crate::memory_scope("retired")),
@@ -1384,6 +1439,7 @@ macro_rules! memory_conformance {
 
             #[test]
             fn a_full_audience_refuses_a_revived_lesson() {
+                $(if !$available() { return; })?
                 let plan = LessonPlan::default();
                 $crate::lesson_cases::a_full_audience_refuses_a_revived_lesson(
                     make(&plan, &$crate::memory_scope("revive-bound")),
@@ -1393,6 +1449,7 @@ macro_rules! memory_conformance {
 
             #[test]
             fn retire_takes_the_stored_root_cause() {
+                $(if !$available() { return; })?
                 let plan = LessonPlan::default();
                 $crate::lesson_cases::retire_takes_the_stored_root_cause(
                     make(&plan, &$crate::memory_scope("stored-root-cause")),
@@ -1402,6 +1459,7 @@ macro_rules! memory_conformance {
 
             #[test]
             fn sixteen_writers_share_one_audience() {
+                $(if !$available() { return; })?
                 let plan = LessonPlan::default();
                 $crate::lesson_cases::sixteen_writers_share_one_audience(
                     make(&plan, &$crate::memory_scope("writers")),

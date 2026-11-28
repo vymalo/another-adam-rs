@@ -60,6 +60,19 @@ adam_memory_testkit::memory_conformance!(crate::make);
 case with the case's scope, and twice with two scopes for `two_scopes_never_see_each_other`; an
 adapter whose instances share one database must build both against it.
 
+Both suites also take an optional second path, to a `fn() -> bool` whose `false` skips every test
+of the suite. This is the hook for a database adapter, whose store is not always reachable: build
+it on `adam_core::testing::test_env`, so an unset variable skips the suite and
+`ADAM_TEST_REQUIRE_DB=1` fails it instead (the CI switch).
+
+```rust
+fn available() -> bool {
+    adam_core::testing::test_env("ADAM_TEST_MY_DB_URL").is_some()
+}
+
+adam_memory_testkit::memory_conformance!(crate::make, crate::available);
+```
+
 Both suites assume the store holds nothing under their fixed scopes and audiences. A persistent
 adapter must clear those keys before the run, or prefix every scope the macro hands it with a
 per-run value.
