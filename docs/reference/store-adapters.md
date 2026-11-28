@@ -31,8 +31,9 @@ let run = store.commit_run(run.id, run.version, RunUpdate::new(RunStatus::Parked
 A `create_run` or a `commit_run` returns the record **without its state** (`RunRecord::state` is `null`):
 the caller has the state it wrote, and echoing it back would transfer the largest member of the record
 on every transition. Read the run for its document (a store may have replaced a NUL in it);
-`journal_put` is the exception and returns the payload it stored, because the loop decodes the step's
-outcome from it.
+`journal_put` is the exception and returns the entry it stored — its payload, because the loop decodes
+the step's outcome from it, and its `signature`, because the runtime checks the entry it reads back
+(ADR 0068).
 
 **Every read that returns a record answers the same document** (ADR 0055, the contract release):
 `load_run`, `load_head`, `claim_due`, `open_run_for_conversation` and `list_runs` serve the v5 **head**
@@ -113,6 +114,7 @@ cron tick across all replicas. A second message on a conversation that has an op
 |---|---|---|---|
 | Commit CAS | `UPDATE .. WHERE version = $n RETURNING` | `findOneAndUpdate({_id, version: n}, {$inc: {version: 1}})` | `UPDATE .. WHERE id = ? AND version = ? RETURNING`, inside one `BEGIN IMMEDIATE` |
 | Journal first-writer-wins | `INSERT .. ON CONFLICT DO NOTHING`, read winner | `insertOne` on `_id = "<run>:<seq>"`; a duplicate key means an earlier writer won, and their entry is read back | `INSERT` on the primary key `(run_id, seq)`; a unique violation reads the winner, a foreign-key violation is `NotFound` |
+| A journal entry's signature (PostgreSQL schema version 11, SQLite 2, MongoDB a field) | `TEXT`, nullable, kept byte for byte and never checked by the store | a `signature` member (a string, or `null` for an entry written before the feature), kept the same | `TEXT`, nullable, the same |
 | Exclusive claiming | `FOR UPDATE SKIP LOCKED` in one statement | read candidates, `updateMany` re-checking due/lease in the filter with a claim token, read back by token | one `BEGIN IMMEDIATE`: select due ids, update them, select the rows; one writer process needs no `SKIP LOCKED` |
 | Busy runs never claimed | `AND id <> ALL($busy)` | `_id: { $nin: busy }` | `AND id NOT IN (?, …)` |
 | Pinned claiming (`owner`, schema version 2) | `AND (owner IS NULL OR owner = $w)` and `owner = COALESCE(owner, $w)` | the same condition in the candidate and `updateMany` filters (a missing field is `null`) | `AND (owner IS NULL OR owner = ?)` and `owner = COALESCE(owner, ?)` |
@@ -145,7 +147,11 @@ document a read serves is written once, beside the data, and every read selects 
 makes the claim a database function (`claim_due`): the due runs that are not busy and whose lease is free (or
 the pinned owner's), locked with `SKIP LOCKED`, leased and returned in claim order, in one call. Schema
 version 10 adds the L2 memory's `<prefix>memory_lesson` table ([ADR 0081](../decisions/0081-an-agent-keeps-a-self-improvement-memory-near-it-and-what-holds-becomes-the-deployments-memory.md)),
-created by every migration and read by `PgMemory` behind the `memory` feature.
+created by every migration and read by `PgMemory` behind the `memory` feature. Schema version 11 adds the
+journal's `signature` column ([ADR 0068](../decisions/0068-adam-signs-its-own-history.md), slice T3a-4):
+nullable, additive (`ADD COLUMN IF NOT EXISTS`, metadata-only), and named **last** in a fresh database's
+`CREATE TABLE` because that is where the upgrade puts it, so a fresh and an upgraded table end with the
+same columns in the same order.
 
 ## SQLite
 
@@ -167,7 +173,7 @@ let store: DynStore = Arc::new(store);
 its target share it) and refuses a second process with `StoreError::InvalidInput`. The operating
 system releases the lock when the process exits, including a `SIGKILL`; `migrate` then clears every
 lease it finds, because the lock proves no other process is alive. A killed process's runs are
-claimable at once, not after a lease expires. `SCHEMA_VERSION` is 1 and a file stamped newer is
+claimable at once, not after a lease expires. `SCHEMA_VERSION` is 2 and a file stamped newer is
 refused, never read.
 
 The file is WAL; `foreign_keys=ON`; every change is one `BEGIN IMMEDIATE` transaction; every call

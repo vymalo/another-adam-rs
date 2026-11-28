@@ -933,9 +933,11 @@ The journal is signed the same way ([slice T3a-4](decisions/0068-adam-signs-its-
 outcome carries a signature over the run, the step's number, its name, whether it succeeded and its payload. The runtime
 signs an entry when it records it and checks it when a replay reads it back; a signed entry changed in the store (its
 payload, name, number or outcome, or moved to another run) fails the run before the step's effect runs again. Entries are
-checked one by one, not chained, and the check is one signature per replayed step. A journal written before this has no
-signature and is accepted as it is for one release. Every store keeps the signature as it was given, in a column or a field
-of its own.
+checked one by one, not chained, and the key set is read once per transition rather than once per entry. A journal written
+before this has no signature and is accepted as it is for one release — but only while **no** entry of the run carries one:
+strip the signature of a single entry in a signed run and the replay refuses it as corrupt instead of taking it for an old
+one. Every store keeps the signature as it was given, in a column or a field of its own, and a store that drops it
+fails the run at its next step.
 
 ### The access tier: which tools a step may use
 

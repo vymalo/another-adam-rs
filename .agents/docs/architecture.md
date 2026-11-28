@@ -179,23 +179,34 @@ Built 2026-11-28.
 * **Write.** `Ctx::step` and `ReservedStep::run` go through `settle` (`crates/adam-runtime/src/ctx.rs`), which, when the
   runtime has a `sealer`, normalizes the payload with `storable_owned`, sets `entry.signature` from
   `Sealer::sign_entry` (`crates/adam-runtime/src/seal.rs`), and checks the entry the store returned (another writer may
-  have won the race).
-* **Re-entry.** `Ctx::recorded_at` is the one read a replay uses (`Ctx::step`, `reserve_steps`): it calls
-  `Sealer::check_entry`, one `key_set()` read and one `verify_step`. A signed entry that does not verify is
-  `RuntimeError::Corrupt`, mapped by `seal`'s `sealed` helper to `AgentError::Store(StoreError::Corrupt(..))` (class
-  `Corrupt`), so the run fails before the step's effect runs. An entry with **no** signature is adopted (decision 11,
-  release N) and is refused in N+1 with the unsigned turns.
+  have won the race). An entry that comes back **unsigned** from a write the runtime signed lost its signature in the
+  store (a dropped column, a writer that nulled it) and is refused `Corrupt`, never kept for a replay to adopt: a run
+  signed once stays signed (decision 5).
+* **Re-entry.** `Ctx::recorded_at` is the one read a replay uses (`Ctx::step`, `reserve_steps`): it calls `Ctx::check_entry`,
+  which verifies a signed entry with `Sealer::check_entry_with` against a key set read **once per transition**
+  (`SignatureCache`; a key set can be remote, and `check_read` reads it once for a head and its turns the same way). An
+  entry with **no** signature is adopted only when no entry of the run carries one: the transition lists the journal once
+  (`SignatureCache` again, so one list per transition, and only a transition that replays an unsigned entry pays for it),
+  and an unsigned entry over a signed run is refused. That is decision 5's rule for turns applied to the journal; a journal
+  written before the feature (every entry unsigned) still replays, and stripping **every** signature is release N's
+  exposure (decision 11), not a mixed journal's. A refused entry is `RuntimeError::Corrupt`, mapped by `sealed` to
+  `AgentError::Store(StoreError::Corrupt(..))` (class `Corrupt`), so the run fails before the step's effect runs.
 * **No keys, no change.** A runtime without turn keys writes `None` and checks nothing; a store never signs or checks.
-* **Schema.** PostgreSQL `SCHEMA_VERSION = 11` (`journal.signature TEXT`, `ALTER TABLE .. ADD COLUMN IF NOT EXISTS` for an
-  existing database), SQLite `SCHEMA_VERSION = 2` (the same column, added by an `ALTER TABLE` gated on `PRAGMA
-  table_info` because SQLite has no `ADD COLUMN IF NOT EXISTS`), MongoDB a `signature` member (string or `null`). The
-  fixtures and goldens follow (`tests/fixtures/schema-v11.sql`).
+* **Schema.** PostgreSQL `SCHEMA_VERSION = 11` (`journal.signature TEXT`, named last in a fresh `CREATE TABLE` and
+  `ALTER TABLE .. ADD COLUMN IF NOT EXISTS` for an existing database, so both end with the same column order), SQLite
+  `SCHEMA_VERSION = 2` (the same column, last for the same reason, added by an `ALTER TABLE` gated on `PRAGMA table_info`
+  because SQLite has no `ADD COLUMN IF NOT EXISTS`), MongoDB a `signature` member (string or `null`). The fixtures and
+  goldens follow (`tests/fixtures/schema-v11.sql`; `crates/adam-store-sqlite/tests/schema.rs` compares a fresh journal's
+  columns with an upgraded one's, and `crates/adam-store-postgres/tests/migrate.rs` pins an upgraded one's order).
 * **Tests.** `adam-store-testkit` `journal_signature_roundtrip` (every adapter: round trip byte for byte, `None`, an
   altered entry refused by `verify_step`); `crates/adam-core/src/turn/step.rs` (the payload's members, an altered entry,
   a NUL); `crates/adam-runtime/tests/head_signature.rs` `a_journaled_step_is_signed_and_verifies`,
-  `an_altered_journal_entry_fails_the_run_on_replay`, `an_unsigned_journal_entry_is_adopted_and_replayed`. **Not run
-  here** (no compiler on this host): the SQL and MongoDB suites need their databases too, so the red-first observation
-  is CI's.
+  `an_altered_journal_entry_fails_the_run_on_replay`, `an_unsigned_journal_entry_is_adopted_and_replayed`,
+  `an_entry_stripped_of_its_signature_is_not_adopted_over_a_signed_one`,
+  `a_journal_whose_every_entry_is_unsigned_is_adopted`, `a_store_that_drops_the_signature_of_a_write_fails_the_run`. The
+  stripped cases wrap a store (`tests/common/stripping.rs`) that answers entries with `signature = None`, which is what a
+  replay actually reads; the testkit's altered cases mutate a local clone and so exercise `verify_step`, not a store. The
+  SQL and MongoDB suites need their databases, which `ci.yml` and `nightly.yml` provide.
 
 ## Signed heads (ADR 0068, slice T3a-2)
 
