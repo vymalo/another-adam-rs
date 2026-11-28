@@ -10,7 +10,7 @@
 use std::future::Future;
 
 use adam::AgentDef;
-use adam_llm_agent::ModelParking;
+use adam_llm_agent::{HookSet, ModelParking};
 
 use crate::agent::{WorkerParts, agents, card_of_folder};
 use crate::config::Config;
@@ -89,6 +89,12 @@ pub async fn serve(
     // Only a role that runs workers builds the model client and connects the MCP servers.
     let parts = match (&config.worker, &config.service.worker) {
         (Some(worker), Some(settings)) => Some(WorkerParts {
+            // The deployment's hook programs that apply to the agent this process serves (ADR
+            // 0050, slice P2b), started with the workers' parts: one that cannot start stops the
+            // process (exit 78), as an unreadable key file does, and it happens before the model
+            // client is built or any MCP server connects (the memory's folder is opened earlier,
+            // by `for_workers`). The assembly gives the set to the root and its subagents.
+            hooks: hooks_of(&config, folder.def.name())?,
             model: worker.model.client().map_err(AgentError::Model)?,
             alias: &worker.model.alias,
             profiles: worker.model.profiles.clone(),
@@ -109,6 +115,23 @@ pub async fn serve(
     let agents = agents(folder.def, card, parts).await?;
     adam_service::serve(&config.service, agents, shutdown).await?;
     Ok(())
+}
+
+/// The deployment's hook programs that apply to the agent `agent` (ADR 0050, slice P2b): a
+/// [`HookSet`] of the programs started, scrubbed with this process's own secrets. Empty when
+/// `ADAM_HOOKS_FILE` is unset, so a deployment without one behaves as it did before.
+///
+/// # Errors
+///
+/// [`AgentError::Hooks`] for the first program that cannot start (exit 78): a deployment that
+/// declared a program and cannot run it does not serve.
+fn hooks_of(config: &Config, agent: &str) -> Result<HookSet, AgentError> {
+    let secrets = redact::secret_values(config, redact::process_vars());
+    config
+        .service
+        .hooks
+        .hook_set_for(agent, move |text: &str| redact::scrub(&secrets, text))
+        .map_err(AgentError::Hooks)
 }
 
 /// The definition the workers bind: what the deployment decides of the folder's remote subagents

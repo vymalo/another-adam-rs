@@ -1,0 +1,11 @@
+{
+  "programs": [
+    {
+      "name": "no-git-push",
+      "command": "./no-git-push.sh",
+      "agents": ["coder"],
+      "points": { "decide": ["tool.before"] },
+      "deadlineMs": 2000
+    }
+  ]
+}

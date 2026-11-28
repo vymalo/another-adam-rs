@@ -28,6 +28,7 @@ adam-a2a.workspace = true
 adam-a2a-runtime.workspace = true
 adam-error.workspace = true
 adam-export.workspace = true
+adam-hook-exec.workspace = true
 adam-llm-agent.workspace = true
 adam-model.workspace = true
 adam-otel = { workspace = true, features = ["aws-lc"] }
