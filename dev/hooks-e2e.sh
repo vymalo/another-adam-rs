@@ -54,7 +54,7 @@ repo_url=$repo_base/$repo.git
 # The extension that reports every tool call as a step with the call's id and result (`steps/v1`).
 steps_ext=https://agents.vymalo.com/a2a/extensions/steps/v1
 # The scripted call of `commit_and_push` (dev/wiremock/mock-openai/mappings/coder-script.json).
-push_call=coder-call-4
+push_call='coder-call-4'
 # The words `dev/hooks/no-git-push.sh` answers with: the denial is this, not a git or check failure.
 reason="the deployment's hook program denies commit_and_push"
 
@@ -63,6 +63,7 @@ ok() { echo "ok   $1"; }
 bad() { echo "FAIL $1"; fail=1; }
 
 tmp=$(mktemp -d)
+# shellcheck disable=SC2329 # invoked by the trap below, which shellcheck does not follow
 cleanup() {
   rm -rf "$tmp"
 }
