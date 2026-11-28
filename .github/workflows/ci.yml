@@ -385,7 +385,7 @@ jobs:
       - name: Database suites again, on the migrated schema
         run: >-
           cargo nextest run --locked --profile ci
-          --features adam-store-postgres/memory
+          --features adam-store-postgres/memory,adam-store-mongodb/memory
           -p adam-store-postgres -p adam-store-mongodb -p adam-runtime -p adam-a2a-runtime
           -p adam-notify-postgres
 
