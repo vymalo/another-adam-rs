@@ -1749,6 +1749,12 @@ async fn commit(
         update.blobs = blobs;
         match inner.store.commit_run(run, cur_rec.version, update).await {
             Ok(rec) => {
+                // ANR-1449: one committed transition, under the state it committed. The meter is the
+                // process's, which is a no-op when `adam_otel::init` found no endpoint (ADR 0075).
+                crate::metrics::record_run_status(
+                    &opentelemetry::global::meter(crate::metrics::SCOPE),
+                    rec.status,
+                );
                 if reopens(next, cur_env, base.inbox.len()) {
                     tracing::info!(%run, "a message arrived while the run finished: the run goes on instead");
                 }
