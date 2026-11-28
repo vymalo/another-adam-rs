@@ -837,7 +837,6 @@ async fn a_failure_after_the_reasoning_began_ends_its_stream_abandoned() {
 /// also count the runs the other tests of this binary make.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_streamed_turn_records_its_tokens_and_latency_under_its_alias() {
-    use opentelemetry::metrics::MeterProvider as _;
     use opentelemetry_sdk::metrics::periodic_reader_with_async_runtime::PeriodicReader;
     use opentelemetry_sdk::metrics::{InMemoryMetricExporter, SdkMeterProvider, data};
 
