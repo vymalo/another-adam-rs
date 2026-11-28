@@ -709,9 +709,10 @@ impl RunNotes {
     /// when it failed, and a run starting on the code it left is another input
     /// ([`CheckRecord::start_tree`]).
     ///
-    /// A passing run is never reused (the model may be confirming it, and the environment may have
-    /// changed under it), and neither is a pre-existing failure: it spends no cycle already, and the
-    /// model is told the failure is the repository's, so it is run again and answered as such. The
+    /// A passing run is not answered here: [`RunNotes::passed_check_on`] reuses it on its tree,
+    /// whatever the epoch is now. A pre-existing failure is not reused either: it spends no cycle
+    /// already, and the model is told the failure is the repository's, so it is run again and
+    /// answered as such. The
     /// most recent run of the check on the tree decides: a pass after a failure means the command
     /// runs again, not that the older failure is the answer. Records written before `cwd`, `epoch`,
     /// `timeout_secs` or `command_sha` existed have none of them, and are not reused.
