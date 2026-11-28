@@ -282,6 +282,9 @@ pub fn http_client(ca_pem: Option<&[u8]>) -> Result<HttpClient, BrokerError> {
         .user_agent(concat!("adam-run-cert-broker/", env!("CARGO_PKG_VERSION")))
         .connect_timeout(CONNECT_TIMEOUT)
         .timeout(REQUEST_TIMEOUT)
+        // The request carries the projected token and a CSR naming the run: a proxy inherited from
+        // the environment would hand both to another host.
+        .no_proxy()
         .redirect(reqwest::redirect::Policy::none());
     if let Some(pem) = ca_pem {
         if pem.len() > MAX_CA_PEM_BYTES {

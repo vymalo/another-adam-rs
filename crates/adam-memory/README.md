@@ -40,10 +40,12 @@ decisions 2 to 5 and 10; slices M1 and M2a (the L2 port and its kit; the L2 adap
 | `MemoryError::backend` | What an adapter wraps its storage failures in: class `Transient` (ADR 0081 decision 12). |
 
 The crate is the two ports, the values, L1's in-folder adapter and the two in-process references.
-The PostgreSQL adapter is a feature of a crate of its own (M2b, ANR-1292); the MongoDB one is
-`adam-store-mongodb`'s `memory` feature (ANR-1293) and the Redis one is
-[`adam-memory-redis`](../adam-memory-redis/README.md). A store reached over the network is L2
-(ADR 0081 decision 2).
+The PostgreSQL adapter is `adam-store-postgres`'s `memory` feature (M2b, ANR-1292), the MongoDB
+one is `adam-store-mongodb`'s `memory` feature (ANR-1293) and the Redis one is
+[`adam-memory-redis`](../adam-memory-redis/README.md) (ANR-1294); all three are built. A store
+reached over the network is L2 (ADR 0081 decision 2). Adapters in other crates use this crate's
+public write-path pieces: `prepare`, `sort_lessons_newest_first`, `MemoryScope::validate`,
+`Audience::validate` and `MemoryError::backend`.
 
 ```rust
 use adam_core::RunId;
@@ -164,7 +166,8 @@ so the two cannot drift.
 variant. A refused text, a bound, an empty field or an address is `Invalid`; a full scope, problem or
 audience is `Rejected`; an unknown problem, attempt or lesson is `NotFound`; a file that does not
 parse is `Corrupt`; a storage failure is `Transient` (ADR 0081 decision 12: an unreachable memory is
-a transient tool error).
+a transient tool error). `MemoryError::backend` is public **for adapters**: a driver failure maps to
+`Backend`, whose class is `Transient`.
 
 ## Environment
 
@@ -184,7 +187,9 @@ variable.
 
 `cargo test -p adam-memory --test lesson` runs
 [`memory_conformance!`](../adam-memory-testkit/README.md) against `InProcessMemory`, over one shared
-store so two configured scopes are two scopes on one store.
+store so two configured scopes are two scopes on one store. The same suite runs against the
+PostgreSQL adapter in [`adam-store-postgres`](../adam-store-postgres/README.md) (`tests/memory.rs`,
+feature `memory`).
 
 The unit tests cover the class table, the marker, the address detector, the slug and the digest.
 

@@ -491,6 +491,19 @@ and it is not durable (no whole text follows, nothing records it: a client that 
 ([ADR 0020](../../docs/decisions/0020-reasoning-is-streamed-beside-the-answer-and-never-stored.md)). A new variant of `RunEvent`: an
 exhaustive `match` needs an arm, and a process that predates it ignores the event.
 
+## Metrics (ANR-1449)
+
+One family, emitted at the commit: **`adam.runs`**, a counter of committed transitions, whose only label is
+`state` — one of `runnable`, `parked`, `done`, `failed`, from [`adam_otel::labels::RunState`](../adam-otel/README.md).
+The state is mapped by an exhaustive `match`, so a state added to the store does not compile here until it has a
+label, and the instrument cannot carry a run id, a conversation or an amount: the label is an enum value, not a
+string a caller chose.
+
+Off with the rest: the instruments come from `opentelemetry::global::meter`, which answers a no-op meter in a
+process where `adam_otel::init` found no endpoint (ADR 0075), so a deployment without one pays nothing. The test
+asserts the emitted attribute set is exactly `state` — it fails the moment a second label is added, which is how the
+"no id, token or amount" rule is kept.
+
 ## Usage
 
 `RunEvent::Usage(UsageEvent)` says that one model call completed and what it cost: a `call` id unique within the task

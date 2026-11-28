@@ -72,13 +72,15 @@ flowchart LR
 ## The image
 
 `docker/coder/Dockerfile`, built from the **repository root**, has three stages: it compiles `adam-coder`,
-`adam-agent`, `adam-kube-exec`, `adam-egress` and the two binaries of `adam-git-sandbox` for
+`adam-agent`, `adam-kube-exec`, `adam-egress`, `run-signer` and the two binaries of `adam-git-sandbox` for
 `x86_64-unknown-linux-musl` on a pinned `rust:1.98-trixie` (tag and digest, plus `musl-tools` for the C
 sources), so each is statically linked with `mimalloc` as its allocator and starts in any x86-64 Linux image
 whatever its C library ([ADR 0053](../decisions/0053-sqlite-a-store-service-a-database-per-agent-and-a-static-coder.md)
 decision 11; the image's smoke test runs each in `debian:bookworm-slim` and Alpine, as uid 10001, and expects
 its configuration error, never a loader error). `adam-egress` is the HTTPS-only proxy for run pods, [`bin/adam-egress`](../../bin/adam-egress/README.md),
-smoke-tested in the image and run by the chart with run pods; `adam-git-sandbox` is the server that runs the coder's git
+smoke-tested in the image and run by the chart with run pods; `run-signer` is the loopback sidecar that signs a run's
+model requests with the run's own certificate, [`bin/run-signer`](../../bin/run-signer/README.md), smoke-tested in the
+image (the deployment that runs it beside an agent is a later change); `adam-git-sandbox` is the server that runs the coder's git
 where no secret is readable and `adam-git` the relay that stands in for git, [`crates/adam-git-sandbox`](../../crates/adam-git-sandbox/README.md),
 smoke-tested in the image and run by the chart, with run pods, as a container of the coder's pod that mounts the same work volume and holds no secret;
 a deployment without run pods that sets `GIT_SANDBOX_SOCKET` runs the server itself); it takes the official `github-mcp-server` binary (pinned by tag and digest); and the runtime is the

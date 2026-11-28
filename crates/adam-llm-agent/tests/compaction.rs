@@ -9,9 +9,9 @@ use std::time::{Duration, Instant};
 
 use adam_core::{DynStore, MemoryStore, RunId, RunStatus, Store};
 use adam_llm_agent::{
-    COMPACTION_TURN, CompactionReason, Conversation, HookResult, HookedCompaction, Limits,
-    LlmAgent, LlmAgentBuilder, Plan, PlanItem, PlanStatus, Plugin, ReadOutput, SessionAgent,
-    SessionTools, Tool, ToolCtx, ToolError, ToolOutput, Verdict, user_message,
+    COMPACTION_TURN, CompactionReason, Conversation, Decision, HookResult, HookedCompaction,
+    Limits, LlmAgent, LlmAgentBuilder, Plan, PlanItem, PlanStatus, Plugin, ReadOutput,
+    SessionAgent, SessionTools, Tool, ToolCtx, ToolError, ToolOutput, user_message,
 };
 use adam_model::{
     DynModel, Message, MockModel, ModelClient, ModelDelta, ModelError, ModelRequest, ModelResponse,
@@ -2499,7 +2499,7 @@ impl Plugin for CompactionContext {
     fn compaction_before(&self, compaction: &mut HookedCompaction<'_>) -> HookResult {
         self.asked.fetch_add(1, SeqCst);
         compaction.context.push_str("THE HOOK ADDED THIS");
-        Ok(Verdict::Continue)
+        Ok(Decision::Continue)
     }
 }
 
@@ -2550,7 +2550,7 @@ impl Plugin for VetoesCompaction {
     }
 
     fn compaction_before(&self, _compaction: &mut HookedCompaction<'_>) -> HookResult {
-        Ok(Verdict::Deny("not this history".into()))
+        Ok(Decision::Deny("not this history".into()))
     }
 }
 

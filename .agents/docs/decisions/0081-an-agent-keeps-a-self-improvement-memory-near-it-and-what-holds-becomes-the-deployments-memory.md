@@ -8,6 +8,25 @@ check a slice.
 The tiers follow the owner's second answer of 2026-11-27 (quoted on the page for people): L1 is every memory local to
 the agent (SIMemory and a code index), L2 every remote one, and L2's scope is its adapter's configuration.
 
+**Amended 2026-11-28 (ANR-1292), the PostgreSQL adapter.** `PgMemory` (`crates/adam-store-postgres/src/memory.rs`,
+feature `memory`): `connect`, `from_pool`, `with_table_prefix`, `pool`, `scope`, `migrate`, and the port's `record`,
+`recall` and `retire` with the in-process reference's semantics (`crates/adam-memory/src/lesson_memory.rs`). The
+adapter uses the port's own write path, exported for it: `prepare`, `MemoryError::backend`,
+`MemoryScope::validate`, `Audience::validate` (`crates/adam-memory/src/lesson.rs`, `error.rs`). The table
+`<prefix>memory_lesson` and its recall index are in `Sql::migrate` **unconditionally** — schema version 10
+(`memory_lesson_ddl`, `crates/adam-store-postgres/src/lib.rs`; `tests/fixtures/schema-v10.sql`) — so a binary built
+without the feature cannot leave one with it on a schema with no table. `record` is one transaction:
+`pg_advisory_xact_lock(hashtextextended(scope || chr(31) || audience, 0))` (64-bit keys), the served count
+and the key's state, the bound refused
+as `AudienceFull`, an upsert keeping `created`. The synchronous port over the async pool is bridged by an owned
+multi-thread runtime (`PgMemory::block_on`: `block_in_place` in a multi-thread caller, a scoped thread in a
+current-thread one). The suite is `crates/adam-store-postgres/tests/memory.rs`
+(`memory_conformance!(crate::make)`, a per-process table prefix and scope suffix; `ADAM_TEST_REQUIRE_DB=1` turns a
+missing URL into a failure) plus one explicit two-scope test on one pool. Broken on purpose (*verified 2026-11-28*):
+a constant scope in the adapter's SQL makes `memory_conformance::two_scopes_never_see_each_other` fail on "the second
+scope saw the first scope's lesson" (and the explicit test with it); restored, the suite is 140/140 green. The MongoDB adapter
+(ANR-1293) and Redis (ANR-1294) adapters are built too, recorded in the M2b row.
+
 ## The paper
 
 *Self-Improvement Memory*, arXiv:2611.18856v1, 13 November 2026 (*verified 2026-11-27* by reading it).
@@ -70,7 +89,7 @@ answers recorded on the page for people.
 |---|---|---|
 | M1 | the L1 port and the in-folder adapter, L1's only one: a double that answers another scope or writes twice for one key fails `si_memory_conformance!`; 16 concurrent writers on one folder; a restart on the same folder reads what was written, on a fresh folder reads nothing | M0 |
 | M2a | the L2 port, its testkit and the in-process reference: `memory_conformance!`; two configured scopes on one store never read each other's lessons; built | M1 |
-| M2b | the PostgreSQL adapter (ANR-1292, unbuilt); the MongoDB adapter is built (ANR-1293): `crates/adam-store-mongodb/src/memory.rs` (`MongoMemory`) behind the crate's `memory` feature, its cases written out by hand in `crates/adam-store-mongodb/tests/memory.rs` because a `#[test]` cannot skip (the `memory_conformance!` suite is the same 16 cases); `memory_conformance!` on each; two configured scopes on one database never read each other's lessons; it fails under `ADAM_TEST_REQUIRE_DB=1` with a URL unset (Rule 7). The Redis adapter is built (ANR-1294, *2026-11-28*): `crates/adam-memory-redis/src/lib.rs` (`RedisMemory`: one hash per `(scope, audience)`, key `<prefix>:<scope_len>:<scope>:<audience>`, WATCH/MULTI/EXEC through `redis::transaction`, one connection per call), `crates/adam-memory-redis/tests/conformance.rs` (`memory_conformance!(crate::make, crate::available)` — all sixteen `lesson_cases`, the two-scope case on one server — behind a per-process key prefix), `crates/adam-memory-redis/tests/redis.rs` (`a_value_that_is_not_a_lesson_is_corrupt`, `a_dead_port_is_a_transient_backend_failure`, `an_empty_scope_is_refused_before_any_connection`), gated on `ADAM_TEST_REDIS_URL` through `adam_core::testing::test_env` (fails under `ADAM_TEST_REQUIRE_DB=1`); the compose service `redis` (`compose.yaml`) runs `appendonly yes` and `maxmemory-policy noeviction`, the durability the ADR's amendment names; CI's `conformance` and `coverage` jobs provide the server | M2a |
+| M2b | the PostgreSQL adapter (ANR-1292, built — the amending note above records its evidence); the MongoDB adapter is built (ANR-1293): `crates/adam-store-mongodb/src/memory.rs` (`MongoMemory`) behind the crate's `memory` feature, its cases written out by hand in `crates/adam-store-mongodb/tests/memory.rs` because a `#[test]` cannot skip (the `memory_conformance!` suite is the same 16 cases); `memory_conformance!` on each; two configured scopes on one database never read each other's lessons; it fails under `ADAM_TEST_REQUIRE_DB=1` with a URL unset (Rule 7). The Redis adapter is built (ANR-1294, *2026-11-28*): `crates/adam-memory-redis/src/lib.rs` (`RedisMemory`: one hash per `(scope, audience)`, key `<prefix>:<scope_len>:<scope>:<audience>`, WATCH/MULTI/EXEC through `redis::transaction`, one connection per call), `crates/adam-memory-redis/tests/conformance.rs` (`memory_conformance!(crate::make, crate::available)` — all sixteen `lesson_cases`, the two-scope case on one server — behind a per-process key prefix), `crates/adam-memory-redis/tests/redis.rs` (`a_value_that_is_not_a_lesson_is_corrupt`, `a_dead_port_is_a_transient_backend_failure`, `an_empty_scope_is_refused_before_any_connection`), gated on `ADAM_TEST_REDIS_URL` through `adam_core::testing::test_env` (fails under `ADAM_TEST_REQUIRE_DB=1`); the compose service `redis` (`compose.yaml`) runs `appendonly yes` and `maxmemory-policy noeviction`, the durability the ADR's amendment names; CI's `conformance` and `coverage` jobs provide the server | M2a |
 | M3 + M4 | a folder `off` is off; `SI_MEMORY=off` beats a folder `on`; an unknown option exits 78; `memory:` stays ignored; a replay past `journal_put` asks the store nothing; a secret in a field is refused; a repository entry is not served without its slot | M1 |
 | M2c | `adam-store-mongodb`'s `memory` feature: `MongoMemory`, one document per lesson keyed by scope, audience and root cause; the rules are `adam_memory::prepare`'s; the L2 conformance suite's fifteen cases pass against a real MongoDB, including two scopes never seeing each other. The audience limit is a read-then-write check, not an index | M2a |
 | M4 tools (part) | `crates/adam-llm-agent/src/si_memory.rs`: `SiMemoryHandle` + `SiRecall`/`SiRecord` as ordinary `Tool`s, the attempt id being the call's (a retry writes one attempt) and a secret refused with a permanent error; unit tests over `InProcessSiMemory`. **Not wired**: nothing registers the pair or declares the `memory` group until the L1 directory is decided (ANR-Q150) | M1, M3 |

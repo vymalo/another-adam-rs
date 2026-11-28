@@ -143,7 +143,9 @@ that refuses raises one of adam's own SQLSTATEs, `AD001` to `AD004`, each with i
 makes the served document a virtual column of the runs table, `served`, so the rule of which
 document a read serves is written once, beside the data, and every read selects it. Schema version 9
 makes the claim a database function (`claim_due`): the due runs that are not busy and whose lease is free (or
-the pinned owner's), locked with `SKIP LOCKED`, leased and returned in claim order, in one call.
+the pinned owner's), locked with `SKIP LOCKED`, leased and returned in claim order, in one call. Schema
+version 10 adds the L2 memory's `<prefix>memory_lesson` table ([ADR 0081](../decisions/0081-an-agent-keeps-a-self-improvement-memory-near-it-and-what-holds-becomes-the-deployments-memory.md)),
+created by every migration and read by `PgMemory` behind the `memory` feature.
 
 ## SQLite
 

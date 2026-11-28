@@ -2192,8 +2192,8 @@ mod tests {
             vec!["maxTurns", "maxOutputTokens"],
             "a member returned to the folder's is named too"
         );
-        // `SessionConfig` is `#[non_exhaustive]` (its options grow slice by slice), so another
-        // crate cannot build a literal: the defaults, then the two fields this test sets.
+        // `SessionConfig` is `#[non_exhaustive]`: another crate sets its fields one by one.
+        #[allow(clippy::field_reassign_with_default)]
         let mut base = SessionConfig::default();
         base.max_turns = Some(20);
         base.max_output_tokens = Some(2048);
@@ -2208,7 +2208,6 @@ mod tests {
             Some(512),
             "a member with a value is the session's"
         );
-        assert_eq!(merged.max_output_tokens, Some(512));
         let reset = config_of(&json!({"max_turns": null})).unwrap();
         assert_eq!(reset.apply(Some(&base)).max_turns, None, "null resets");
         assert!(config_of(&json!({"turbo": 1})).is_err(), "unknown refused");

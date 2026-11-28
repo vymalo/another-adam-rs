@@ -3,8 +3,8 @@
 Configuration of both agents is environment variables only. Problems are reported all at once at startup
 (`invalid configuration`, exit 78). Sources of truth: `crates/adam-service/src/config.rs` (the common ones),
 `bin/adam-coder/src/config.rs`, `bin/adam-agent/src/config.rs`, `crates/adam-env-kubernetes/src/settings.rs`,
-`bin/adam-egress/src/config.rs`, `crates/adam-git-sandbox/src/config.rs`, and for the one row below
-`crates/adam-notify-postgres/src/lib.rs`.
+`bin/adam-egress/src/config.rs`, `bin/run-signer/src/config.rs`, `crates/adam-git-sandbox/src/config.rs`, and for the one
+row below `crates/adam-notify-postgres/src/lib.rs`.
 The chart sets these from its values: [chart README](../../deploy/coder/README.md). Secrets are never in
 files or logs; they are `SecretString`s and absent from `Debug`.
 
@@ -153,7 +153,11 @@ through `config.extraEnv`. Source: [`adam-otel`](../../crates/adam-otel/README.m
 | Variable | Meaning | Default |
 |---|---|---|
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | the OTLP/HTTP collector, an absolute `http` or `https` URL with no user, password, query or fragment; unset or blank means no exporter and no thread | unset: off |
-| `OTEL_SERVICE_NAME` | `service.name` of every exported span's resource | `adam` |
+| `OTEL_SERVICE_NAME` | `service.name` of every exported span's and metric's resource | `adam` |
+
+Metrics ride the same variable and the same switch (`adam.runs`, a counter of committed transitions labelled by the run's state): with an endpoint set, the process's meter exports to
+`{endpoint}/v1/metrics` on a periodic reader (15 s); unset, nothing is built. A label is one of the crate's closed
+sets (`adam_otel::labels`), so a metric names a run's state or a declared tool, never a person, an id or an amount.
 
 A value the crate refuses is **one warning line and tracing stays off**, never an exit: a trace is not a reason
 an agent fails. With the endpoint set, the spans the runtime writes (`adam.run`, `adam.child`) are exported; a
@@ -258,6 +262,32 @@ one, and nothing is less safe without it. For each one that is set, the process 
 | `DEVCONTAINER_UP_TIMEOUT_SECS`, `DEVCONTAINER_SETUP_TIMEOUT_SECS` | pulling, building and creating; lifecycle commands |
 | `DEVCONTAINER_PREPULL` | pull the default image at startup |
 | `DEVCONTAINER_CLI`, `DEVCONTAINER_PODMAN`, `DEVCONTAINER_CACHE_DIR` | the devcontainer CLI, the container engine's client, its cache |
+
+## The run signer (`run-signer`)
+
+The sidecar that signs a run's model requests with the run's own certificate
+([ADR 0086](../decisions/0086-a-run-signs-its-model-requests-with-a-certificate.md)): an agent points
+`MODEL_BASE_URL` at it with `MODEL_AUTH=injector`, and it forwards each call to the model gateway with a
+`Turn-Signature` added ([ADR 0068](../decisions/0068-adam-signs-its-own-history.md), *Amended 2026-11-25 (the request
+signature)*). Source: `bin/run-signer/src/config.rs`. Problems are reported all at once (exit 78).
+
+| Variable | Meaning | Default |
+|---|---|---|
+| `RUN_SIGNER_LISTEN` | the address to listen on. **Loopback only**: anything else is exit 78, because the proxy signs a caller's request with the run's key | `127.0.0.1:8443` |
+| `RUN_SIGNER_UPSTREAM` | **required**: the model gateway's base URL, absolute `http` or `https` with a host, no query, no fragment and no credentials. The request's own path and query are appended to it, and it is reached **directly**: the client ignores `HTTP_PROXY`, `HTTPS_PROXY` and `ALL_PROXY`. A target `Url::parse` would rewrite (`..`, `%2e%2e`, `\`, `{}`) is refused `400` rather than signed over one path and sent over another | required |
+| `RUN_SIGNER_UPSTREAM_CA_FILE` | the PEM anchors the upstream client trusts beside the default roots. A file that cannot be read, is empty, is over 1 MiB or holds no certificate is exit 78 | `RUN_CERT_CA_FILE`'s bytes: the broker and the gateway are one trust domain by design today |
+| `RUN_CERT_ISSUER`, `RUN_CERT_ISSUER_URL`, `RUN_CERT_TOKEN_FILE`, `RUN_CERT_CA_FILE`, `RUN_CERT_RENEW_FRACTION` | the first three are **required here**, unlike the agents ([their rows](#turn-signing)): a signer with no issuer cannot sign, so every one of them unset is exit 78 naming the three required ones, and a half-set configuration is exit 78 with the same problems the agents report, beside this binary's own. `RUN_CERT_CA_FILE` is trusted for **both** the broker and the gateway. The token file is re-read on every call, never cached and never logged | the first three required; the two optional ones default as for the agents |
+| `RUST_LOG` | log filter; JSON logs on stdout | `info` |
+
+A request it refuses is an HTTP status, not an exit: `400` for a missing or malformed `X-Run-Id` or `Prompt-Statement`
+(a run certificate names the person, so the statement is required), for one named twice, or for a target it would not
+forward unchanged; `413` for a body over 16 MiB; `503` when the issuer or the gateway cannot be reached, or a renewal
+outlived its one retry; and `502` for any other signing failure. A `503` carries `type: unavailable` so the run parks on
+a timer; the others carry `about:blank`.
+
+Not variables: the body limit (16 MiB), the connect timeout (10 s), the read timeout (300 s: a black-holed gateway
+frees the request, and it stays above the shutdown grace), the number of runs kept in memory (1024, least recently
+used dropped first) and the shutdown grace (25 s) — `Limits` values, so a test can shorten them.
 
 ## Egress proxy (`adam-egress`)
 

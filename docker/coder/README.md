@@ -6,7 +6,7 @@
 docker buildx build -f docker/coder/Dockerfile .
 ```
 
-Stage 1 compiles six binaries for `x86_64-unknown-linux-musl` on the pinned `rust:1.98-trixie` (with
+Stage 1 compiles seven binaries for `x86_64-unknown-linux-musl` on the pinned `rust:1.98-trixie` (with
 `musl-tools`), so each is **statically linked** and starts in any x86-64 Linux image whatever its C library
 ([ADR 0053](../../docs/decisions/0053-sqlite-a-store-service-a-database-per-agent-and-a-static-coder.md)
 decision 11). Every one sets `mimalloc` as its global allocator (`#[global_allocator]`), because musl's own
@@ -18,6 +18,7 @@ is slow under many threads:
 | `adam-agent` | any agent folder over A2A (`--entrypoint tini -- adam-agent`) |
 | `adam-kube-exec` | runs one command in a run pod, for the coder |
 | `adam-egress` | the HTTPS-only egress proxy of the run pods |
+| `run-signer` | the loopback sidecar that signs a run's model requests with the run's own certificate (`MODEL_BASE_URL` at it with `MODEL_AUTH=injector`, ADR 0086) |
 | `adam-git-sandbox` | the server that runs the coder's git where no secret is readable |
 | `adam-git` | the relay that stands in for git and speaks to that server |
 

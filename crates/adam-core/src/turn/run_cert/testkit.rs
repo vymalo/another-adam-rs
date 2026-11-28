@@ -153,7 +153,10 @@ fn serial_of(der: &[u8]) -> u64 {
     clippy::expect_used,
     reason = "test code: a failed request is a failed case"
 )]
-fn request_for(label: &str) -> CertificateRequest {
+/// A real PKCS#10 request for a fresh key, seeded by `label`: what [`FakeRunCertIssuer`] parses
+/// since A2. A test outside this crate builds its issuer input with it, never with hand-written
+/// bytes (the fake refuses those).
+pub fn request_for(label: &str) -> CertificateRequest {
     let mut seed = [0_u8; 32];
     seed.copy_from_slice(&Sha256::digest(label.as_bytes()));
     let key = SigningKey::from_bytes(&seed);
