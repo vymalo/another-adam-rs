@@ -164,6 +164,7 @@ docker compose --profile app up -d --build --wait postgres mock-openai mock-gith
 | `sh dev/agent-e2e.sh` | the general agent answers "hi" in role; a restart on an edited folder changes the card and the answer |
 | `sh dev/agent-cards-e2e.sh` | the researcher folder answers with a surface of cards and a graph on a screen that has them, words only on one that has not (catalog 9, and the checklist subset, which has no `Cards`) |
 | `sh dev/painter-e2e.sh` | the painter folder: the instructions of its image MCP server reach the model, the picture is a shared `image/png` file the words name, and the server's prompt is the command `images__scene` (it starts `mock-image-mcp` and restarts `agent` on a copy of the folder with `AGENT_MCP_ALLOW_INSECURE=true`) |
+| `sh dev/resume-e2e.sh` | the coder's resume budget from a fresh start (spec row A3 of `docs/architecture/05-runtime.md` §21a): `/healthz` 200 and the first claim of a waiting run both under `READY_CEILING_MS` and `CLAIM_CEILING_MS` (defaults `5000`; the brief's floor of ~5 s). Asserts A2's invariant first (the run is `runnable` and the lease is NULL after the SIGTERM), so a violation of A2 is not misread as a violation of A3 |
 
 How the scripted models and mocks work, and how to change a script: [the local stack](../reference/dev-stack.md).
 Exit and assertion details are in each script's header.
