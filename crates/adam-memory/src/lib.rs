@@ -23,8 +23,11 @@
 //! [`MemoryScope`]; within it a lesson is keyed by its [`Audience`] and its root cause, and two
 //! scopes on one database never see each other's lessons (decision 4). A lesson is `Active` when
 //! served, and `Retired` when its evidence turned: kept, and no longer served (decision 10).
-//! [`InProcessMemory`] is the in-process reference; the PostgreSQL, MongoDB and Redis adapters are
-//! features of crates of their own (M2b, not built). The suite is `adam-memory-testkit`'s
+//! [`InProcessMemory`] is the in-process reference. The PostgreSQL adapter is a feature of a crate
+//! of its own (M2b, ANR-1292, not built); the MongoDB one is `adam-store-mongodb`'s `memory`
+//! feature (ANR-1293) and the Redis one is `adam-memory-redis` (ANR-1294). An adapter builds on the
+//! same rules the reference enforces: [`prepare`] stamps and checks a lesson, and
+//! [`sort_lessons_newest_first`] orders a recall. The suite is `adam-memory-testkit`'s
 //! `memory_conformance!`.
 //!
 //! ```
@@ -99,7 +102,7 @@ pub use error::{MemoryError, MemoryResult};
 pub use folder::FolderSiMemory;
 pub use lesson::{
     Audience, Lesson, LessonDraft, LessonLimits, LessonProvenance, LessonSettings, LessonState,
-    MemoryScope,
+    MemoryScope, prepare, sort_newest_first as sort_lessons_newest_first,
 };
 pub use lesson_memory::{InProcessLessonStore, InProcessMemory};
 pub use memory::InProcessSiMemory;

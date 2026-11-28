@@ -297,12 +297,19 @@ impl Withheld {
 /// [`Unknown`](Self::Unknown): a session's set is then incomplete, and
 /// `SessionBounds::admit` checks the shape of an entry alone, never that it matches a tool.
 ///
+/// **A name may be a shape** (the owner's answer to ANR-Q155, 2026-11-28). A declared name
+/// containing `*` stands for any run of characters, in the same syntax as a folder's `tools:`
+/// (`SessionBounds`'s `glob`), so a source that relays another system's tools can name the family
+/// it may offer and still be complete: the thread-tools source declares `*__*` for the
+/// `<server>__<tool>` tools of the servers a person attached. A shape is what **can** arrive, not
+/// what one turn offers, like every other name here.
+///
 /// [ADR 0054]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum Declared {
     /// Every tool the source can offer, by name, each once: what it offers on a turn **and** what it
     /// withholds until a load, a mode or the access tier allows it. The set, not the offering of one
-    /// turn.
+    /// turn. A name may be a shape (`*`, see the type's doc).
     All(Vec<String>),
     /// The source cannot name its tools before a run calls it: a remote endpoint that lists per
     /// conversation, or a listing that may change under it. A session's set is then incomplete.
@@ -456,11 +463,15 @@ pub trait ToolSource: Send + Sync + 'static {
     ///
     /// [`Declared::All`] is the whole set: a tool the source withholds on a turn (a mode that does
     /// not list it, a group a run has not loaded, an access tier that is too low) is named too,
-    /// because a later turn of the run may offer it. [`Declared::Unknown`], the default, says the
-    /// source cannot name its tools: a remote endpoint whose listing is another system's, or one
-    /// that changes with the conversation. A session's set is then incomplete and `admit` checks
-    /// the shape of an entry alone. The default is what a source written before this method
-    /// existed answers, so adding it breaks no implementer.
+    /// because a later turn of the run may offer it. A name may be a **shape**: a declared name
+    /// containing `*` stands, in the folder's syntax (`*` is any run of characters), for a family
+    /// the source can offer, so `*__*` names the relayed `<server>__<tool>` tools of a server a
+    /// person attached without naming each one. `SessionBounds::admit` admits an entry that selects
+    /// a concrete declared name with its pattern, or that a declared shape matches as a string.
+    /// [`Declared::Unknown`], the default, says the source cannot name its tools: a remote endpoint
+    /// whose listing is another system's, or one that changes with the conversation. A session's
+    /// set is then incomplete and `admit` checks the shape of an entry alone. The default is what a
+    /// source written before this method existed answers, so adding it breaks no implementer.
     fn declared(&self) -> Declared {
         Declared::Unknown
     }

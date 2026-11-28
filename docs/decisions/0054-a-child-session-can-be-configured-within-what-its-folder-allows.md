@@ -103,13 +103,15 @@ amendment is the owner's to make there.
    that node (`BoundDef::sources_of`: the modes', the node's `when` groups, the deployment's) and sets `tools_complete`
    only when all of them answered `All`. The modes, the groups, the access tier, the references and the screen declare `All`
    (most of them of nothing: they only hold tools back or add words), and the coder's repository-environment source declares
-   its one tool. **The thread-tools source declares `Unknown`**: the endpoint is another system's, it lists per conversation
+   its one tool. **The thread-tools source declares `Unknown`** (superseded by the ANR-1390 amendment below): the endpoint is another system's, it lists per conversation
    (the grant in the run's context; a new grant, a refused call or `LISTING_TTL` lists again) and it relays the tools of the
    servers a person attached as `<server>__<tool>`, so no list made at startup is every name it can offer. The interim is
    therefore **over as a rule** — an agent whose sources all declare has a complete set and decision 4's rule holds as
    written — but the two shipped agents add that one source, so their sets stay incomplete and a `tools` entry, or an entry
    with a `*`, that matches none is still admitted there; a concrete `deny_tools` name is still refused, as the row above
    says. A deployment that does not give an agent the thread-tools source has the strict check on it.
+   *(Amended 2026-11-28 by ANR-1390: the thread-tools source declares its contract's tools and the shape `*__*`, so both
+   shipped agents are complete; see the note below.)*
 
    *Amended 2026-11-28 (ANR-1304), the `tools` and `deny_tools` rows:* a lazy MCP server's tools are loaded by a tool of its
    own, `load__group__<server>` (ADR 0066), which an allow-list such as `github__*` does not name: the loader was withheld
@@ -121,6 +123,23 @@ amendment is the owner's to make there.
    header's config, the context's copy of the same lists and the agent's fixed tool set (`LlmAgent::own_names`) — all fixed
    for the round — so the tools array does not move between the turns of one round (ADR 0044). It is exact for a `when` MCP
    server's group, whose members are `<server>__<tool>`; a group whose members do not share its name prefix is not covered.
+
+   *Amended 2026-11-28 (ANR-1390), the same rows — a declaration may name a shape:* the owner's answer to ANR-Q155
+   (2026-11-28) is that a source may declare a **shape**, not only concrete names. A declared name may contain `*`, in the
+   folder's syntax (`glob`: `*` stands for any run of characters), and `Declared::All` is then still the whole set: the shapes
+   say what **can** arrive, not what one turn offers. The thread-tools source declares the contract's tools it knows by name
+   (`turn_output`, `ask_agent`, `request_upload`, and `get_ui_catalog` unless it hides it) **plus `*__*`**, the shape of the
+   `<server>__<tool>` tools it relays from the servers a person attached. `SessionBounds::admit` admits an entry when it
+   selects a name the set holds: a concrete declared name its pattern matches (`glob(entry, name)`), or a declared shape that
+   matches the entry as a string (`glob(shape, entry)`), so `*__*` admits `github__*`, `github__search` and `*` (the last
+   through the concrete names beside it). `deny_tools` is held to the same rule and none weaker: an entry that selects
+   neither a declared name nor a declared shape is still refused with the list, because a deny that silently denies nothing
+   is worse than a refusal — the person would believe a tool is blocked while it is offered. Two consequences a person will
+   meet: an entry whose shape half is empty (`github__`, `__`) is refused, because `*` matches the empty run and such a name
+   selects nothing at run time; and a pattern **weaker than the declared shape** (`*_issues`, `github_*`) is refused even
+   though it would select relayed tools, because the set cannot express that family — name it as `github__*` instead. **Both shipped agents are
+   therefore complete** and decision 4's rule holds as written: a `tools` entry that selects nothing is refused there. The
+   interim the 2026-11-27 note described is over.
 
    *Amended 2026-11-21 (ADR 0063)*: for `reasoning_effort` only, the declaration is the **model entry** in
    `MODEL_ALIASES_FILE` (the alias's `reasoning` object: its levels and its wire), not a global variable. A folder or
@@ -375,7 +394,8 @@ where a store is involved (`crates/adam-llm-agent/tests/sessions.rs` holds the s
     **concrete `deny_tools` name** on a worker (refused with the list, and a hint to name a source's tools by pattern), and a
     `tools` entry or a pattern is strict **only on an agent with no sources**; elsewhere a `tools` entry that matches nothing is
     admitted, recorded in the header and offers less, never more. The control plane knows no name and checks the shape. ANR-1319
-    ends the interim; this is a step, not the decision.
+    ends the interim; this is a step, not the decision. *(2026-11-28: ANR-1319 and ANR-1390 end it — both shipped agents are
+    complete, the thread-tools source declaring its contract's tools and the shape `*__*`; see the amendments above.)*
   * **The loop applies it**, not a tool source, so an embedder that builds an agent with `LlmAgentBuilder` has it too:
     `SessionNarrowing` (`crates/adam-llm-agent/src/session_tools.rs`) is consulted in `agent.rs` before every source's holds, at the
     request (`apply_sources`: a hidden tool is not shown) and at the call (`step_work`: a call to one is refused without running),
@@ -399,6 +419,7 @@ where a store is involved (`crates/adam-llm-agent/tests/sessions.rs` holds the s
 * Accepted when: an edit of a working round changes the next model call for *next model call* options and the next round for the
   others; an idle edit is a round with no model call and no report; an edit past a bound is refused; the history holds 16; a
   replay of a journal with an edit is the same.
+* *Built 2026-11-28 (ANR-216):* see the amendment at the end of this page.
 
 **5. Delete** (decision 10). Depends on 1.
 * Files: `sessions.rs` (`subagent_close` `delete`), `crates/adam-runtime/src/session.rs` (`deleted`, the listing filter, the due rule).
@@ -491,3 +512,44 @@ round that writes the tombstone until it has ended.
 2. **`delete: true` implies `cancel: true`**, as decision 10 says: a working round is stopped as a close with cancel
    stops it, and the closing round then writes the tombstone. The first cut of the change refused a working session
    instead; that was wrong, and the review caught it — the flag is honoured now.
+
+## Amended 2026-11-28 (slice 4, `subagent_edit`)
+
+Slice 4 is built as decision 11 reads, with these decisions where it left a choice.
+
+1. **The patch is a type of its own**, `SessionPatch` (`adam-runtime`), because `SessionConfig` cannot say "leave this alone"
+   apart from "return it to the folder's": both are an absent member there. A member of a patch is `Option<Option<T>>`, so
+   `null` is a reset and an absent one is untouched. `SessionPatch::apply(base)` is the one merge the model's `subagent_edit`
+   and the A2A `edit` share, and `subagent_start` builds a patch over nothing, so the two spellings of `config` cannot merge
+   differently.
+2. **The bounds are the ones of the moment**, and the base is clamped first. An edit merges its patch over the session's config
+   **clamped to `SessionBounds` of now** (decision 3's rule), then admits the whole result with `SessionBounds::admit`: an
+   untouched option can never be raised back by a lowered deployment, and a member the patch names past a bound is refused with
+   the words of a start (`config.max_turns is 500; at most 50`), leaving the session as it was. A helper the roster no longer
+   has refuses the edit (its bounds are unknown) rather than guess `SessionBounds::default()`, which could widen.
+3. **A working round is delivered the whole admitted config**, not the patch: `adam.session.edit`'s payload is a
+   `SessionEditRequest {config, by, members}`. The round applies it and merges nothing, so a replay reads the same bytes and
+   decides the same. The round keeps what it runs with in `Conversation::round_config`
+   (`SessionConfig::adopted_mid_round`: the edit's *next model call* options, its own of the *next round* ones — `time_limit`,
+   `max_rounds`, `report_schema`, `instructions`), while the header carries the edit's whole config for the next round. That is
+   the ADR's "pending in the header", and it is why `time_limit` and `max_rounds` do not move under a running round.
+4. **An edit is not lost when the round ends first.** `adam.session.edit` is not counted as unread input (`news_since`), as a
+   close request is not, so it does not reopen a finishing round; a round that ended before reading it leaves it in its inbox,
+   where `read_latest` applies it — a listing, a view and the next round's header all read the edit — and the tool's retry
+   falls back to the idle round when the round it steered into has already ended. `cancel_run` keeps a pending edit, as it keeps
+   a close request.
+5. **An idle session's edit is a round with `editing: true`** (`editing_round_payload`), which `LlmAgent` and the remote round
+   agent both end at once without a model call and with no report; it is not a cleanup round, so it counts toward `max_rounds`,
+   and it is not refused by the round cap (a close is not either). `read_output` and the listing skip it when they look for the
+   round that worked.
+6. **The history** is `SessionHeader.edits: Vec<SessionEdit>` — `{round, by, members}` with `by` a closed enum (`agent`,
+   `person`) — trimmed to `MAX_SESSION_EDITS` (16) by `SessionHeader::record_edit`, and carried by every later round, which
+   copies the header. `members` names the options the patch named, camelCase, in decision 4's order.
+7. **The A2A front** takes `metadata[URI].edit {config}` on a message to the child context, refuses a message that asks two of
+   start, close and edit, and rewrites the refusal's words to `edit.config.<member>`. The round event's session object reports
+   the new `config` and `edits`.
+8. **Not changed here:** `instructions` and `model` stay out of the tools' and the front's option lists until their own slices
+   list them (the type already carries `instructions`, and the split above already keeps it for the next round); a remote
+   helper's *working* round does not read an edit mid-round — the options it takes (`timeLimit`, `maxRounds`) are next-round
+   ones, so the edit waits in its inbox and the next round carries it; the A2A front still starts every round with the helper's
+   `within` and does not read the session's own `timeLimit` (a gap that predates this slice).

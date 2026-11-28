@@ -34,12 +34,53 @@ reads the lists from the round's session header first (`crates/adam-llm-agent/sr
 
 * **What differs between roles is the tool names**, never the numbers. A control plane's bounds (`AgentDef::session_bounds`)
   carry `tools: []`, `tools_complete: false`: shape only. A worker's carry the names of the bound node and of every source
-  that declares them (`ToolSource::declared`), and `tools_complete` only when every source of the node does; the coder and the
-  folder agent add the thread-tools source, whose endpoint lists another system's tools per conversation and answers
-  `Declared::Unknown`, so a `tools` entry that matches nothing is admitted there, and a concrete `denyTools` name no tool has
-  is refused (ANR-1319).
+  that declares them (`ToolSource::declared`), and `tools_complete` only when every source of the node does. A declared name
+  may be a **shape** (ADR 0054 amended 2026-11-28, ANR-1390): `*__*` stands for a relayed `<server>__<tool>`, and
+  `SessionBounds::admit` (`crates/adam-runtime/src/session.rs`, `selects`) admits an entry that selects a concrete declared
+  name with its pattern or that a declared shape matches as a string. The coder and the folder agent add the thread-tools
+  source, which declares the contract's tools it knows by name and `*__*`, so **their sets are complete**: a `tools` entry
+  that selects nothing is refused there, `github__*` is admitted, and a concrete `denyTools` name no tool has is still
+  refused (ANR-1319, ANR-1390). A source that answers `Declared::Unknown` still leaves a set incomplete and the check
+  shape-only.
 * **Tests:** `child_sessions.rs` unit tests `a_start_takes_tools_and_deny_tools_as_lists_of_names`,
   `a_remote_helper_refuses_tools_and_deny_tools`, `a_round_carries_the_tools_its_header_narrows_over_what_the_message_said`;
   `adam-runtime` `session.rs` `an_incomplete_set_refuses_a_concrete_deny_entry_it_does_not_know_and_checks_no_pattern`,
-  `a_complete_set_checks_patterns_and_allow_entries_too`; `adam-assembly/tests/session_bounds.rs`
-  `an_agent_with_a_source_has_an_incomplete_set_that_still_catches_a_deny_typo`.
+  `a_complete_set_checks_patterns_and_allow_entries_too`, `a_declared_shape_admits_a_relayed_servers_tools`;
+  `adam-assembly/tests/session_bounds.rs` `an_agent_with_a_source_has_an_incomplete_set_that_still_catches_a_deny_typo`,
+  `a_source_that_declares_a_shape_makes_the_set_complete_and_admits_a_servers_tools`; `bin/adam-agent/tests/agent.rs`
+  `a_helpers_bounds_are_complete_and_admit_a_relayed_servers_tools`; `bin/adam-coder/tests/agent_files.rs`
+  `the_helpers_bounds_are_complete_and_admit_a_relayed_servers_tools`.
+
+## `edit` of `child-sessions/v1` (ADR 0054 decision 11, slice 4)
+
+For people: [the `edit` paragraph](../../../docs/reference/a2a-server.md#child-sessions-child-sessionsv1) of the page
+above. `parse_edit` in `crates/adam-a2a-runtime/src/child_sessions.rs` reads `metadata[URI].edit {config}` — one member,
+`config`, an object of the same camelCase options `start.config` takes, where `null` is a **reset** — and refuses a message
+that asks two of `start`, `close` and `edit`. `asked` answers `Asked::Edit {patch}`, `submit_child` passes it to
+`message_to_session`, and that function does what `subagent_edit` does, in the same order and with the same function:
+`SessionBounds::clamp` the session's config to the bounds of now, `SessionPatch::apply` the patch over it,
+`SessionBounds::admit` the result, and rewrite the refusal's `config.<snake>` words to `edit.config.<camel>`.
+
+* A **working** round gets an `Inbound::new(SESSION_EDIT_KIND, SessionEditRequest {config, by: Person, members})` with the
+  message id; an **idle** session gets a round of `editing_round_payload(&header)` through `next_round`. Both count toward
+  `max_rounds` (`countable_rounds` counts an editing round: it is not `closing && !closed`), and neither is refused by the
+  round cap — as a close is not: an editing round spends no model call, and the cap still bounds the rounds that do.
+* The edit is handled **above** the spent check: raising the `tokenBudget` of a session that spent it is what the option is
+  for, so a message to a spent session is `UnsupportedOperation` while an edit of it is accepted (a close is exempt there
+  too). An empty `edit.config` is `InvalidParams`, as the tool refuses it, so it records no edit and spends no round.
+* `SessionEditRequest` is the whole admitted config, so the round applies it and never merges; `by: Person` is what
+  `SessionHeader.edits` records.
+* **Evidence:** `crates/adam-a2a-runtime/tests/child_sessions.rs` `an_edit_of_an_idle_session_is_a_round_that_calls_no_model`
+  (the editing round, `header.config`, `edits[0].by == Person`, the next round runs with it),
+  `an_edit_of_a_working_session_is_delivered_into_its_round` (delivered, no new round, the reader applies it),
+  `an_edit_past_a_bound_is_refused_and_changes_nothing` (`InvalidParams` naming `edit.config.maxTurns`),
+  `an_edit_that_asks_two_things_or_names_no_option_is_refused` (two of three, and `config: {}`),
+  `an_edit_raises_the_budget_of_a_session_that_spent_it`; `crates/adam-runtime/src/session.rs`
+  `a_patch_sets_resets_and_leaves_the_rest`, `an_edit_of_a_running_round_adopts_next_model_call_options_only`,
+  `a_header_keeps_the_last_sixteen_edits`, `an_edit_a_round_never_read_is_applied_by_its_reader`,
+  `an_editing_round_says_edit_and_carries_its_header`; `crates/adam-llm-agent/tests/sessions.rs`
+  `an_edit_of_a_working_round_changes_its_next_model_call`, `an_edit_of_an_idle_session_is_a_round_that_calls_no_model`,
+  `an_edit_past_a_bound_is_refused_and_changes_nothing`, `a_retried_edit_applies_once`,
+  `an_edit_of_instructions_applies_from_the_next_round`.
+* **Not verified without a compiler:** the five front tests above were written but not run (ANR-216); the runtime and
+  `adam-llm-agent` cases are the same.

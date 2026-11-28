@@ -142,16 +142,27 @@ run's calls are still signed by the process turn key. The broker's contract is v
 in, `{"v":1,"chain":["<base64 DER>", …]}` out, and the refusals `400` (`Invalid`), `401`/`403`
 (`Unauthenticated`), `429`/`5xx` (`Transient`). Source: [`adam-run-cert-broker`](../../crates/adam-run-cert-broker/README.md).
 
-## Traces (`adam-otel`, not wired yet)
+## Traces (`adam-otel`)
 
-The OTel layer of [ADR 0075](../decisions/0075-metrics-and-traces-are-off-by-default-and-say-nothing-about-a-person.md)
-reads two variables, and **no binary composes the layer yet** (ANR-1385) and `adam-service` does not pass them
-(ANR-1386), so setting either changes nothing today. Source: [`adam-otel`](../../crates/adam-otel/README.md).
+The OTel layer of [ADR 0075](../decisions/0075-metrics-and-traces-are-off-by-default-and-say-nothing-about-a-person.md):
+OTLP/HTTP spans, **off unless an endpoint is set**. `adam-coder`, `adam-agent`, `adam-egress` and
+`adam-git-sandbox` compose the layer beside their JSON log layer (ANR-1412); `adam-service` does not pass the
+variables and the chart has no `otel.*` value yet (ANR-1386, ADR 0075 decision 7), so a deployment sets them
+through `config.extraEnv`. Source: [`adam-otel`](../../crates/adam-otel/README.md).
 
 | Variable | Meaning | Default |
 |---|---|---|
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | the OTLP/HTTP collector, an absolute `http` or `https` URL with no user, password, query or fragment; unset or blank means no exporter and no thread | unset: off |
 | `OTEL_SERVICE_NAME` | `service.name` of every exported span's resource | `adam` |
+
+A value the crate refuses is **one warning line and tracing stays off**, never an exit: a trace is not a reason
+an agent fails. With the endpoint set, the spans the runtime writes (`adam.run`, `adam.child`) are exported; a
+failed export is the SDK's own log line and never a run's failure. `adam-egress` and `adam-git-sandbox` write
+events, not spans, so their log lines stay in the JSON layer.
+
+`adam-egress` and `adam-git-sandbox` link **no TLS provider** (they take `adam-otel` with `default-features = false`),
+so their exporter speaks plain `http` — an in-cluster collector. Exporting to an `https` collector from either
+needs the `aws-lc` feature on its `adam-otel` dependency, which adds `reqwest`/`rustls`/`aws-lc` to a small binary.
 
 ## Cross-process notifications (`adam-notify-postgres`)
 
@@ -175,7 +186,7 @@ cross-process listener: SQLite's notifier is always in-process, and MongoDB has 
 | `ADAM_EXTRA_MCP_FILE` | a file of extra MCP servers in the shape of `mcp.json`, **added** to the agent's own (a name clash is exit 78) | unset |
 | `ADAM_REFERENCES_FILE` | `adam-coder`, roles that run workers: a file `{"references": [{"name", "url", "branch"?, "description"}]}` of repositories the coder may **read** beside the one it works on and never write, **added** to the `references:` of the agent's files; it must be an existing file of valid references whose addresses the workspaces' policy accepts (an allowed host, an owner a GitHub App acts for), and a name the agent already declares is exit 78. See [References](workspace-and-environments.md#references) | unset |
 | `A2A_ALLOW_INSECURE_REMOTES` | `adam-agent`, roles that run workers: let a remote subagent (`a2a:`) be at plain `http` on another machine, such as a service of the same cluster; without it such a URL is exit 78. **The messages and the bearer then cross the pod network in clear text**: protect it with a NetworkPolicy that admits only the caller, or mesh mTLS. Plain `http` goes only to the card's own host, and never from an `https` card. Its token is the environment's too: `auth: bearer:VAR` names the variable ([remote subagents](agent-files.md#remote-subagents-a2a)) | `false` |
-| `SI_MEMORY` | the deployment's ceiling on the self-improvement memory (ADR 0081 decision 11), `on` or `off`; anything else is exit 78. It only **narrows** a folder's `si_memory:` key: `off` here is off whatever the folder says, and a folder's `off` is off whatever this says ([the key](agent-files.md#the-self-improvement-memory-si_memory)). Read by the roles that run workers | `on` |
+| `SI_MEMORY` | the deployment's ceiling on the self-improvement memory (ADR 0081 decision 11), `on` or `off`; anything else is exit 78. It only **narrows** a folder's `si_memory:` key: `off` here is off whatever the folder says, and a folder's `off` is off whatever this says ([the key](agent-files.md#the-self-improvement-memory-si_memory)). Read by `adam-agent`'s worker roles; **`adam-coder` does not read it yet** — it serves an embedded agent whose `si_memory` key nothing wires, so `on`/`off` there has no effect until that wiring lands (ANR-1370) | `on` |
 | `SI_MEMORY_DIR` | the folder L1 keeps its problems in (ADR 0081 decision 2), one folder per process: `adam-agent` opens it with the folder adapter and offers `si_recall`/`si_record` to a run whose `si_memory:` key and `SI_MEMORY` both allow one. **No default**: memory on with no folder means L1 is absent and the run goes on without it (decision 12); a path that is not an existing directory is exit 78. Read by `adam-agent`'s worker roles | (none) |
 
 ## The coder (`adam-coder`)
@@ -300,7 +311,7 @@ Put these in a `.env` next to `compose.yaml`.
 
 | Variable | Meaning |
 |---|---|
-| `ADAM_TEST_POSTGRES_URL`, `ADAM_TEST_MONGODB_URI` | the database suites; skipped when unset |
+| `ADAM_TEST_POSTGRES_URL`, `ADAM_TEST_MONGODB_URI`, `ADAM_TEST_REDIS_URL` | the database suites; skipped when unset |
 | `ADAM_TEST_TABLE_PREFIX`, `ADAM_TEST_MONGO_COLLECTION_PREFIX` | the Postgres table prefix (`adam_test_`) and the MongoDB collection prefix (`adam_`) the store suite and the transcript measurement write to; set the same value on `dev/p2-measure.sh` |
 | `ADAM_TEST_REQUIRE_DB=1` | a suite whose variable is unset **fails** instead of skipping (CI sets it) |
 | `ADAM_TEST_MOCK_OPENAI_URL`, `ADAM_TEST_MOCK_GITHUB_URL`, `ADAM_TEST_MOCK_GITHUB_MCP_URL` | the tests of the real clients against the compose mocks |

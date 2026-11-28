@@ -316,7 +316,8 @@ fn reasoning_member(
 impl ReasoningMember {
     /// Write the member, removing only what the extra body holds of the same fact: both
     /// `reasoning_effort` and `reasoning.effort` for the first two wires (an emptied `reasoning`
-    /// object that held the effort goes), `thinking` wholesale for the third (ADR 0063 decision 6). Other members stay.
+    /// object that held the effort goes), and `thinking.type` and `thinking.budget_tokens` for the
+    /// third, whose object's other members stay (ADR 0063, amended 2026-11-28). Other members stay.
     fn apply(self, members: &mut serde_json::Map<String, Value>) {
         match self {
             Self::Effort(level) => {
@@ -348,11 +349,20 @@ impl ReasoningMember {
                 members.insert("reasoning".to_owned(), Value::Object(reasoning));
             }
             Self::Thinking(budget) => {
-                members.remove("thinking");
-                members.insert(
-                    "thinking".to_owned(),
-                    json!({"type": "enabled", "budget_tokens": budget}),
-                );
+                // Only the two members the wire writes are the extra body's duplicate of the same
+                // fact: a sibling such as `clear_thinking` (GLM keeps earlier turns' reasoning with
+                // it) is the extra body's own and stays (ADR 0063, amended 2026-11-28). A member
+                // that is not an object cannot hold them, so the typed level replaces it.
+                let mut thinking = members
+                    .get("thinking")
+                    .and_then(Value::as_object)
+                    .cloned()
+                    .unwrap_or_default();
+                // The two `insert`s below are the removal: they overwrite whatever the extra body
+                // wrote of the same two members.
+                thinking.insert("type".to_owned(), json!("enabled"));
+                thinking.insert("budget_tokens".to_owned(), json!(budget));
+                members.insert("thinking".to_owned(), Value::Object(thinking));
             }
         }
     }
@@ -1467,12 +1477,12 @@ mod tests {
                 ReasoningWire::ThinkingBudget => {
                     assert_eq!(
                         sent["thinking"],
-                        json!({"type": "enabled", "budget_tokens": 8192}),
-                        "{sent}"
+                        json!({"type": "enabled", "budget_tokens": 8192, "clear_thinking": false}),
+                        "the wire's two members are written, the object's sibling stays: {sent}"
                     );
                     assert_eq!(
                         sent["reasoning_effort"], "medium",
-                        "the ADR removes only `thinking`: the extra body's effort stays: {sent}"
+                        "the wire does not write `reasoning_effort`, so the extra body's stays: {sent}"
                     );
                     assert_eq!(
                         sent["reasoning"],
@@ -1570,10 +1580,11 @@ mod tests {
         );
     }
 
-    /// `thinking` is removed wholesale, as the ADR says: an extra body's other members of it are
-    /// lost (the "merge them" idea is a follow-up).
+    /// The wire writes `thinking.type` and `thinking.budget_tokens` and leaves the object's other
+    /// members alone (ADR 0063, amended 2026-11-28): a provider's sibling such as `clear_thinking`
+    /// survives. Red with `members.remove("thinking")`, which dropped it.
     #[test]
-    fn the_thinking_budget_wire_replaces_thinking_wholesale() {
+    fn the_thinking_budget_wire_keeps_a_thinking_objects_other_members() {
         let mut req = request();
         req.reasoning_effort = Some(ReasoningEffort::Low);
         let mut profile = profile_of(&[ReasoningEffort::Low], ReasoningWire::ThinkingBudget);
@@ -1595,9 +1606,33 @@ mod tests {
         );
         assert_eq!(
             sent["thinking"],
-            json!({"type": "enabled", "budget_tokens": 1024}),
+            json!({"type": "enabled", "budget_tokens": 1024, "clear_thinking": false}),
             "{sent}"
         );
+    }
+
+    /// A `thinking` that is not an object cannot hold the wire's members: the typed level replaces it.
+    #[test]
+    fn the_thinking_budget_wire_replaces_a_thinking_that_is_not_an_object() {
+        let mut req = request();
+        req.reasoning_effort = Some(ReasoningEffort::Low);
+        let mut profile = profile_of(&[ReasoningEffort::Low], ReasoningWire::ThinkingBudget);
+        profile.reasoning_budgets = Some(BTreeMap::from([(ReasoningEffort::Low, 1024)]));
+        let profiles = profiles_of("gw-model", profile);
+        for thinking in [json!("enabled"), json!([1, 2]), json!(null)] {
+            let sent = body_of(
+                &req,
+                RequestOptions {
+                    profiles: Some(&profiles),
+                    ..with(Some(json!({"thinking": thinking.clone()})), None)
+                },
+            );
+            assert_eq!(
+                sent["thinking"],
+                json!({"type": "enabled", "budget_tokens": 1024}),
+                "{thinking} cannot hold the wire's members: {sent}"
+            );
+        }
     }
 
     #[test]

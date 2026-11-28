@@ -175,6 +175,7 @@ fn default_tool_access_follows_the_owner_decision_d3() {
             "subagent_start",
             "subagent_send",
             "subagent_read",
+            "subagent_edit",
             "subagent_close",
             "subagent_list"
         ]
@@ -581,11 +582,12 @@ fn hand_supplied_mcp_tools_bind_like_connected() {
                     // After the tools it selected: a long MCP result is read with it.
                     "read_output".to_owned(),
                     // The tool that calls the subagent, after the agent's own tools, then the
-                    // five that run a subagent in the background.
+                    // six that run a subagent in the background.
                     "researcher".to_owned(),
                     "subagent_start".to_owned(),
                     "subagent_send".to_owned(),
                     "subagent_read".to_owned(),
+                    "subagent_edit".to_owned(),
                     "subagent_close".to_owned(),
                     "subagent_list".to_owned()
                 ]
@@ -619,6 +621,7 @@ fn hand_supplied_mcp_tools_bind_like_connected() {
                     "subagent_start".to_owned(),
                     "subagent_send".to_owned(),
                     "subagent_read".to_owned(),
+                    "subagent_edit".to_owned(),
                     "subagent_close".to_owned(),
                     "subagent_list".to_owned()
                 ]

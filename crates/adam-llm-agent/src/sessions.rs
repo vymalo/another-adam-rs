@@ -1,5 +1,5 @@
-//! The five tools that run a subagent in the background as a **session** ([ADR 0045]): start one,
-//! send it a message, read its report, close it, list the open ones.
+//! The six tools that run a subagent in the background as a **session** ([ADR 0045]): start one,
+//! send it a message, read its report, edit its config, close it, list the open ones.
 //!
 //! A session is a conversation of child runs ("rounds") of one subagent, kept in the parent's own
 //! conversation. The tools hold nothing: every call reads the sessions from the store, so a replay,
@@ -24,8 +24,8 @@ use adam_core::RunId;
 use adam_model::ToolSpec;
 use adam_runtime::{
     Inbound, MAX_SESSION_PAGE, MAX_SESSION_TOOL_ENTRIES, RuntimeError, SESSION_CLOSE_KIND,
-    SessionBounds, SessionConfig, SessionHeader, SessionLimits, SessionState, SessionSummary,
-    SessionView,
+    SESSION_EDIT_KIND, SessionBounds, SessionConfig, SessionEditRequest, SessionEditor,
+    SessionHeader, SessionLimits, SessionPatch, SessionState, SessionSummary, SessionView,
 };
 use async_trait::async_trait;
 use serde_json::{Value, json};
@@ -45,16 +45,21 @@ pub const SUBAGENT_START: &str = "subagent_start";
 pub const SUBAGENT_SEND: &str = "subagent_send";
 /// The name of the tool that reads the report of a session.
 pub const SUBAGENT_READ: &str = "subagent_read";
+/// The name of the tool that edits a session's config ([ADR 0054], decision 11).
+///
+/// [ADR 0054]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md
+pub const SUBAGENT_EDIT: &str = "subagent_edit";
 /// The name of the tool that closes a session.
 pub const SUBAGENT_CLOSE: &str = "subagent_close";
 /// The name of the tool that lists the sessions.
 pub const SUBAGENT_LIST: &str = "subagent_list";
 
-/// The five tool names, in the order the model is offered them.
-pub const SESSION_TOOLS: [&str; 5] = [
+/// The six tool names, in the order the model is offered them.
+pub const SESSION_TOOLS: [&str; 6] = [
     SUBAGENT_START,
     SUBAGENT_SEND,
     SUBAGENT_READ,
+    SUBAGENT_EDIT,
     SUBAGENT_CLOSE,
     SUBAGENT_LIST,
 ];
@@ -110,7 +115,7 @@ pub struct SessionAgent {
     pub bounds: SessionBounds,
 }
 
-/// The five session tools, for the subagents of one agent.
+/// The six session tools, for the subagents of one agent.
 #[derive(Debug, Clone)]
 pub struct SessionTools {
     roster: Arc<Roster>,
@@ -168,7 +173,7 @@ impl SessionTools {
         }
     }
 
-    /// The five tools, in [`SESSION_TOOLS`] order.
+    /// The six tools, in [`SESSION_TOOLS`] order.
     pub fn tools(&self) -> Vec<DynTool> {
         let roster = &self.roster;
         vec![
@@ -179,6 +184,9 @@ impl SessionTools {
                 roster: roster.clone(),
             }),
             Arc::new(Read {
+                roster: roster.clone(),
+            }),
+            Arc::new(Edit {
                 roster: roster.clone(),
             }),
             Arc::new(Close {
@@ -289,7 +297,7 @@ struct GuideTool {
 }
 
 /// The session tools in [`SESSION_TOOLS`] order: the one source of [`SessionTools::guide_for`].
-const GUIDE: [GuideTool; 5] = [
+const GUIDE: [GuideTool; 6] = [
     GuideTool {
         name: SUBAGENT_START,
         purpose: "start a session on a helper and get its session id at once. Give it a \
@@ -318,6 +326,13 @@ const GUIDE: [GuideTool; 5] = [
             ("offset", false),
             ("limit", false),
         ],
+    },
+    GuideTool {
+        name: SUBAGENT_EDIT,
+        purpose: "change a session's options while it runs or between rounds, within the same \
+                  bounds a start has. A member set to null returns it to the helper's own. It \
+                  starts no work: send a message to make the session work with the new options.",
+        args: &[("session", true), ("config", true)],
     },
     GuideTool {
         name: SUBAGENT_CLOSE,
@@ -414,9 +429,11 @@ const REMOTE_REFUSED: [&str; 9] = [
     "report_schema",
 ];
 
-/// The [`SessionConfig`] a `subagent_start` call asked for, or the sentence that says what is wrong
-/// with it. **An unknown option is refused** (ADR 0054 decision 1): an ignored narrowing fails open.
-fn config_of(value: &Value) -> Result<SessionConfig, String> {
+/// The [`SessionPatch`] a `config` object of `subagent_start` or `subagent_edit` asked for, or the
+/// sentence that says what is wrong with it. **An unknown option is refused** (ADR 0054 decision 1):
+/// an ignored narrowing fails open. A member set to `null` returns that option to the folder's
+/// (decision 11): for a start that is the same as leaving it out, for an edit it is the reset.
+fn config_of(value: &Value) -> Result<SessionPatch, String> {
     let Some(object) = value.as_object() else {
         return Err("`config` must be an object of options".to_owned());
     };
@@ -432,6 +449,7 @@ fn config_of(value: &Value) -> Result<SessionConfig, String> {
         };
         if CONFIG_LISTS.contains(&key.as_str()) {
             if value.is_null() {
+                wire.insert((*name).to_owned(), Value::Null);
                 continue;
             }
             let named = value.as_array().is_some_and(|entries| {
@@ -447,35 +465,28 @@ fn config_of(value: &Value) -> Result<SessionConfig, String> {
             wire.insert((*name).to_owned(), value.clone());
             continue;
         }
-        // Every other option is a whole number of 32 bits. Say so by name here, so the refusal is
-        // ours: serde's names no option and echoes what the model wrote, without a bound. A `0` passes
         // The report schema is a JSON Schema, an object: `admit` holds it to the rest (its size, its
         // references, that it compiles).
         if *name == "reportSchema" {
             if !value.is_null() && !value.is_object() {
                 return Err("config.report_schema must be a JSON Schema, an object".to_owned());
             }
-            if value.is_null() {
-                continue;
-            }
             wire.insert((*name).to_owned(), value.clone());
             continue;
         }
-        // Every option is a whole number: 32 bits, but `token_budget`, which counts tokens and goes
-        // to 2^53 − 1. Say so by name here, so the refusal is ours: serde's names no option and
+        // Every other option is a whole number: 32 bits, but `token_budget`, which counts tokens and
+        // goes to 2^53 − 1. Say so by name here, so the refusal is ours: serde's names no option and
         // echoes what the model wrote, without a bound. A `0` passes to `admit`, which refuses it
         // with the words of each option.
-        match value {
-            Value::Null => continue,
-            Value::Number(n)
-                if n.as_u64().is_some_and(|n| {
-                    if *name == "tokenBudget" {
-                        n <= adam_runtime::MAX_SESSION_TOKEN_BUDGET
-                    } else {
-                        u32::try_from(n).is_ok()
-                    }
-                }) => {}
-            _ => {
+        if !value.is_null() {
+            let whole = value.as_u64().is_some_and(|n| {
+                if *name == "tokenBudget" {
+                    n <= adam_runtime::MAX_SESSION_TOKEN_BUDGET
+                } else {
+                    u32::try_from(n).is_ok()
+                }
+            });
+            if !whole {
                 let most = if *name == "tokenBudget" {
                     adam_runtime::MAX_SESSION_TOKEN_BUDGET
                 } else {
@@ -488,7 +499,7 @@ fn config_of(value: &Value) -> Result<SessionConfig, String> {
         }
         wire.insert((*name).to_owned(), value.clone());
     }
-    SessionConfig::from_value(Value::Object(wire)).map_err(|why| why.message().to_owned())
+    SessionPatch::from_value(Value::Object(wire)).map_err(|why| why.message().to_owned())
 }
 
 /// The time limit of a round of `agent`: the session's own `time_limit` (minutes, already held to
@@ -1058,7 +1069,7 @@ impl Tool for Start {
         // the A2A front uses (ADR 0054 decision 2): a request above a bound starts nothing.
         let config = match args.get("config") {
             None | Some(Value::Null) => None,
-            Some(value) => match config_of(value).and_then(|asked| {
+            Some(value) => match config_of(value).and_then(|patch| {
                 // A remote subagent's loop is another system's: it takes `time_limit` and
                 // `max_rounds` and refuses the rest by name (ADR 0054 decision 4), never records
                 // an option nothing would enforce.
@@ -1074,7 +1085,7 @@ impl Tool for Start {
                 }
                 agent
                     .bounds
-                    .admit(asked)
+                    .admit(patch.apply(None))
                     .map_err(|why| why.message().to_owned())
             }) {
                 Ok(config) if config.is_empty() => None,
@@ -1153,6 +1164,8 @@ impl Tool for Start {
             visible: ctx.context(crate::CHILD_SESSIONS_CONTEXT_KEY) == Some(&Value::Bool(true)),
             config,
             spent: 0,
+            editing: false,
+            edits: Vec::new(),
         };
         let input = round_message(ctx, prompt, &header);
         let within = round_within(agent, header.config.as_ref());
@@ -1260,7 +1273,11 @@ impl Tool for Send {
                 return refuse(spent_words(session, header));
             }
             let steered = || user_inbound(message, ctx.call_id());
-            if view.state == SessionState::Working {
+            // A round that only edits the session reads no message: a message to it starts the next
+            // round, which the edit's header already describes (ADR 0054, decision 11). While that
+            // round is still open the start is busy, and the loop looks again.
+            let editing = view.header.as_ref().is_some_and(|h| h.editing);
+            if view.state == SessionState::Working && !editing {
                 match starter.steer(&view, steered()).await {
                     Ok(()) => {
                         let state = starter.round_state(view.latest_run).await;
@@ -1332,11 +1349,15 @@ impl Tool for Send {
                 visible: false,
                 config: None,
                 spent: 0,
+                editing: false,
+                edits: Vec::new(),
             });
             header.config = config;
             header.round = view.round + 1;
-            // The round before may have been one that only cleaned up after a cancel.
+            // The round before may have been one that only cleaned up after a cancel, or one that
+            // only edited the session: neither says anything about this one.
             header.closing = false;
+            header.editing = false;
             // A round names the task that sent it, the one the orchestrator bound for it, not the
             // one that opened the session, whose lease may be over (ADR 0067, amended).
             header.root = Some(ctx.model_run_id());
@@ -1507,6 +1528,315 @@ impl Tool for Read {
 }
 
 // ---------------------------------------------------------------------------
+// subagent_edit
+// ---------------------------------------------------------------------------
+
+struct Edit {
+    roster: Arc<Roster>,
+}
+
+#[async_trait]
+impl Tool for Edit {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: SUBAGENT_EDIT.to_owned(),
+            description: format!(
+                "Change a session's options, while its round works or between its rounds. The \
+                 session keeps what it was started with for every option you leave out, and a \
+                 member set to null returns that option to the helper's own. The same bounds a \
+                 start has apply: a value above one is refused, naming the option, and the \
+                 session is left as it was. An option that a model call uses applies from the \
+                 next call, the others from the next round; this starts no work, so send a \
+                 message with {SUBAGENT_SEND} to make the session go on with the new options."
+            ),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "session": {
+                        "type": "string",
+                        "description": "The session id.",
+                    },
+                    "config": {
+                        "type": "object",
+                        "description": "The options to change: a member set to null returns it to \
+                                        the helper's own, and one you leave out is not touched.",
+                        "properties": {
+                            "max_turns": { "type": ["integer", "null"], "minimum": 1 },
+                            "max_tool_calls": { "type": ["integer", "null"], "minimum": 1 },
+                            "max_output_tokens": { "type": ["integer", "null"], "minimum": 1 },
+                            "context_window": { "type": ["integer", "null"], "minimum": 1 },
+                            "max_parallel_tool_calls": { "type": ["integer", "null"], "minimum": 1 },
+                            "time_limit": {
+                                "type": ["integer", "null"],
+                                "minimum": 1,
+                                "description": "Minutes one round may take.",
+                            },
+                            "max_rounds": { "type": ["integer", "null"], "minimum": 1 },
+                            "token_budget": {
+                                "type": ["integer", "null"],
+                                "minimum": 1000,
+                                "description": "The most tokens the whole session may spend, \
+                                                input and output: raise it to let a session that \
+                                                spent its budget go on.",
+                            },
+                            "tools": {
+                                "type": ["array", "null"],
+                                "items": { "type": "string" },
+                                "maxItems": MAX_SESSION_TOOL_ENTRIES,
+                                "description": "Only these tools: names or * patterns (github__* \
+                                                is one MCP server).",
+                            },
+                            "deny_tools": {
+                                "type": ["array", "null"],
+                                "items": { "type": "string" },
+                                "maxItems": MAX_SESSION_TOOL_ENTRIES,
+                                "description": "Hide these tools, same syntax; applied after tools.",
+                            },
+                            "report_schema": {
+                                "type": ["object", "null"],
+                                "description": "A JSON Schema (draft 2020-12, at most 16 KiB, \
+                                                with no reference outside itself) that the \
+                                                subagent's final answer must match.",
+                            },
+                        },
+                        "additionalProperties": false,
+                    },
+                },
+                "required": required_of(SUBAGENT_EDIT),
+                "additionalProperties": false,
+            }),
+        }
+    }
+
+    fn time_limit(&self) -> Option<Duration> {
+        Some(SESSION_TOOL_TIME_LIMIT)
+    }
+
+    fn step_style(&self) -> StepStyle {
+        StepStyle::default()
+            .with_label("Edit subagent")
+            .with_icon(StepIcon::Agent)
+    }
+
+    async fn call(&self, ctx: &ToolCtx, args: Value) -> Result<ToolOutput, ToolError> {
+        let session = match session_arg(&args, SUBAGENT_EDIT) {
+            Ok(session) => session,
+            Err(why) => return refuse(why),
+        };
+        let Some(raw) = args.get("config").filter(|value| !value.is_null()) else {
+            return refuse(format!(
+                "`{SUBAGENT_EDIT}` needs `config`, the options to change: a member set to null \
+                 returns it to the helper's own, and one you leave out is not touched"
+            ));
+        };
+        let patch = match config_of(raw) {
+            Ok(patch) => patch,
+            Err(why) => return refuse(why),
+        };
+        if patch.is_empty() {
+            return refuse(
+                "`config` names no option: name the ones to change, or set a member to null to \
+                 return it to the helper's own",
+            );
+        }
+        let members = patch.members();
+        let starter = ctx.child_starter()?;
+        let round_id = ctx.child_run_id();
+        // A steer can find its round ended, and a new round can find another open: look again.
+        for _ in 0..3 {
+            let Some(mut view) = starter
+                .session(session)
+                .await
+                .map_err(|e| runtime_error(&e))?
+            else {
+                return refuse(no_such_session(session));
+            };
+            // The round this call started on an earlier try.
+            if view.latest_run == round_id {
+                return Ok(edited(
+                    session,
+                    view.round,
+                    &members,
+                    "new_round",
+                    view.state,
+                ));
+            }
+            if view.closed {
+                return refuse(closed_words(session, view.idle_expired));
+            }
+            // The helper's bounds are the ones of the time of the edit (ADR 0054, decision 2): a
+            // deployment that lowered a limit since is obeyed, and a helper the roster no longer
+            // has refuses the edit rather than guess bounds. A session's config is clamped to them
+            // first, as every later round's is, so an untouched option is never raised back and a
+            // member the patch names is held to the bound that is in force now.
+            let Some(agent) = self.roster.by_registered(&view.agent) else {
+                return refuse(format!(
+                    "session `{session}` runs on a helper this agent no longer has, so its bounds \
+                     are unknown: close it with `{SUBAGENT_CLOSE}` and start a new one with \
+                     `{SUBAGENT_START}`"
+                ));
+            };
+            if agent.remote
+                && let Some(option) = REMOTE_REFUSED
+                    .iter()
+                    .find(|own| raw.get(**own).is_some_and(|v| !v.is_null()))
+            {
+                return refuse(format!(
+                    "config.{option} is not an option of a remote subagent; it takes only \
+                     time_limit and max_rounds"
+                ));
+            }
+            let base = view
+                .header
+                .as_ref()
+                .and_then(|h| h.config.as_ref())
+                .map(|asked| agent.bounds.clamp(asked));
+            let admitted = match agent.bounds.admit(patch.apply(base.as_ref())) {
+                Ok(config) => config,
+                Err(why) => return refuse(why.message().to_owned()),
+            };
+            let request = SessionEditRequest {
+                config: (!admitted.is_empty()).then_some(admitted),
+                by: SessionEditor::Agent,
+                members: members.clone(),
+            };
+            // A round that only edits the session reads no inbox: an edit steered into it would be
+            // a no-op answered as delivered, so such a round is treated as ended, and the edit
+            // starts the next round (or the editing round) as it would after any other round.
+            let editing = view.header.as_ref().is_some_and(|h| h.editing);
+            if view.state == SessionState::Working && !editing {
+                // The open round reads it at its next step and journals it there (ADR 0054,
+                // decision 11). It is not counted as unread input: a round that finishes before
+                // reading it leaves it in its inbox, where a reader of the session finds it and the
+                // next round carries it.
+                let payload = serde_json::to_value(&request).map_err(|e| {
+                    ToolError::Permanent(format!("the edit does not serialise: {e}"))
+                })?;
+                let inbound = Inbound::new(SESSION_EDIT_KIND, payload).with_id(ctx.call_id());
+                match starter.steer(&view, inbound).await {
+                    Ok(()) => {
+                        // Read already? Then this is a repeat of this call. Otherwise the round
+                        // that ended in the meantime gets the edit as a round of its own, below.
+                        let state = starter.round_state(view.latest_run).await;
+                        let read = state.ok().flatten().is_some_and(|state| {
+                            state
+                                .get("read_ids")
+                                .and_then(Value::as_array)
+                                .is_some_and(|ids| ids.iter().any(|id| id == ctx.call_id()))
+                        });
+                        if read {
+                            return Ok(edited(
+                                session, view.round, &members, "steered", view.state,
+                            ));
+                        }
+                        let Some(now) = starter
+                            .session(session)
+                            .await
+                            .map_err(|e| runtime_error(&e))?
+                        else {
+                            return refuse(no_such_session(session));
+                        };
+                        // The round ended and the session closed in between: a closed session takes
+                        // no editing round, as it takes no message.
+                        if now.closed {
+                            return refuse(closed_words(session, now.idle_expired));
+                        }
+                        if now.state == SessionState::Working {
+                            return Ok(edited(session, now.round, &members, "steered", now.state));
+                        }
+                        view = now;
+                    }
+                    Err(e) if is_busy_or_finished(&e) => continue,
+                    Err(e) => return Err(runtime_error(&e)),
+                }
+            }
+            // The round has ended and the session is open: a round that only edits it. It calls no
+            // model, has no report, and counts toward `max_rounds` as a close does (ADR 0054,
+            // decision 11) — and, like a close, it is **not refused by the round cap**: it spends
+            // no model call, and the cap still bounds the rounds that do (a send's check), so an
+            // edit that raises `max_rounds` or the budget is exactly what a session at the cap
+            // needs. The A2A front makes the same round with the same rule.
+            let mut header = view.header.clone().unwrap_or_else(|| SessionHeader {
+                id: session,
+                agent: view.agent.clone(),
+                description: String::new(),
+                keep_open: true,
+                closed: false,
+                closing: false,
+                deleted: false,
+                round: 0,
+                root: None,
+                workspace: None,
+                visible: false,
+                config: None,
+                spent: 0,
+                editing: false,
+                edits: Vec::new(),
+            });
+            header.round = view.round + 1;
+            header.closing = false;
+            header.editing = true;
+            header.apply_edit(&request);
+            let input = Inbound::new(MESSAGE_KIND, adam_runtime::editing_round_payload(&header));
+            let within = round_within(agent, header.config.as_ref());
+            match starter
+                .start_round(
+                    session,
+                    round_id,
+                    &view.agent,
+                    input,
+                    Some(view.latest_run),
+                    within,
+                )
+                .await
+            {
+                Ok(_) => {
+                    return Ok(edited(
+                        session,
+                        header.round,
+                        &members,
+                        "new_round",
+                        view.state,
+                    ));
+                }
+                Err(e) if is_busy_or_finished(&e) => {}
+                Err(e) => return Err(runtime_error(&e)),
+            }
+        }
+        Err(ToolError::Transient(format!(
+            "session `{session}` kept changing while it was edited"
+        )))
+    }
+}
+
+/// The result of an edit: the session, the round it took effect in, the options it named, how it
+/// was delivered, and what the session is doing — `working` when the edit reached an open round,
+/// `idle` when it started the round that only edits it (which calls no model and ends at once, so
+/// nothing is working after it).
+fn edited(
+    session: RunId,
+    round: u32,
+    members: &[String],
+    how: &str,
+    state: SessionState,
+) -> ToolOutput {
+    let state = match state {
+        SessionState::Working => "working",
+        SessionState::Idle | SessionState::Closed => "idle",
+    };
+    ToolOutput::text(
+        json!({
+            "session": session,
+            "round": round,
+            "state": state,
+            "edited": members,
+            "delivered": how,
+        })
+        .to_string(),
+    )
+}
+
+// ---------------------------------------------------------------------------
 // subagent_close
 // ---------------------------------------------------------------------------
 
@@ -1635,10 +1965,13 @@ impl Tool for Close {
                 visible: false,
                 config: None,
                 spent: 0,
+                editing: false,
+                edits: Vec::new(),
             });
             header.round = view.round + 1;
             header.closed = true;
             header.closing = true;
+            header.editing = false;
             header.deleted = delete;
             let input = Inbound::new(MESSAGE_KIND, adam_runtime::closing_round_payload(&header));
             match starter
@@ -1847,6 +2180,35 @@ mod tests {
                 since: None,
             },
         )
+    }
+
+    /// A member of `config` set to `null` is a reset (ADR 0054, decision 11), not an option the
+    /// start or the edit ignores: the patch names it, and `apply` returns it to the folder's.
+    #[test]
+    fn a_config_member_set_to_null_is_named_and_returns_to_the_folders() {
+        let patch = config_of(&json!({"max_turns": null, "max_output_tokens": 512})).unwrap();
+        assert_eq!(
+            patch.members(),
+            vec!["maxTurns", "maxOutputTokens"],
+            "a member returned to the folder's is named too"
+        );
+        let base = SessionConfig {
+            max_turns: Some(20),
+            max_output_tokens: Some(2048),
+            ..SessionConfig::default()
+        };
+        let merged = patch.apply(Some(&base));
+        assert_eq!(
+            merged.max_turns,
+            Some(20),
+            "an absent member is not touched"
+        );
+        assert_eq!(merged.max_output_tokens, Some(512));
+        let reset = config_of(&json!({"max_turns": null})).unwrap();
+        assert_eq!(reset.apply(Some(&base)).max_turns, None, "null resets");
+        assert!(config_of(&json!({"turbo": 1})).is_err(), "unknown refused");
+        assert!(config_of(&json!({"max_turns": "many"})).is_err());
+        assert!(config_of(&json!({})).unwrap().is_empty());
     }
 
     #[test]
