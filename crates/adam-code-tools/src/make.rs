@@ -6,11 +6,11 @@
 //! tail and kept, secrets hidden from the child), but **the files are the command's to change**: it
 //! takes a place for a write, and its guard holds it to [`Guarding::Make`] (files may change, git may
 //! not). A command after which the guard finds git changed, or cannot read it, is undone entirely and
-//! refused. After the command ran, and **before** the guard is settled, the workspace's
-//! [`after_run`](CommandWorkspace::after_run) follows (the coder moves its check epoch, even for a
-//! command its guard then undoes); its text is appended to a result whose files changed. It is never
-//! a check. When `after_run` fails, the guard is settled first, so a change the command made to
-//! git is undone, and then its error is the tool's.
+//! refused. The guard is settled **first** — that is what records a `Make` guard's report of the
+//! files — and the workspace's [`after_run`](CommandWorkspace::after_run) then reads it (the coder
+//! moves its check epoch, even for a command its guard undoes); its text is appended to a result
+//! whose files changed. It is never a check. When `after_run` fails, the guard has already settled,
+//! so a change the command made to git is undone, and its error is the tool's.
 
 use std::fmt::Write as _;
 
@@ -33,8 +33,9 @@ pub const MAX_LISTED: usize = 20;
 /// In order: the command is required, the `timeout` within the limits, the place found for a write,
 /// the `cwd` inside it, the session made (it may take a while, so before the place is watched), the
 /// guard taken for a [`Make`](Guarding::Make) (its refusal is the answer, and nothing runs), then the
-/// command runs, its output is settled, [`after_run`](CommandWorkspace::after_run) follows, and the
-/// guard is settled: a command it undid, or after which git could not be read, is refused; a missing
+/// command runs, its output is settled, the guard is settled, and
+/// [`after_run`](CommandWorkspace::after_run) follows it: a command it undid, or after which git could
+/// not be read, is refused; a missing
 /// tool is the workspace's answer; otherwise the result, with what `git status` lists when files
 /// changed and the text of `after_run`, and its repeat key.
 pub async fn run(
