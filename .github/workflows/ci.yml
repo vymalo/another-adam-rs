@@ -707,6 +707,10 @@ jobs:
   # the job, like `adam-egress`. What it does not prove: the coder over a model through it, the images (a small
   # local one plays the run image, the coder's, the proxy's and the sandbox's), IPv6 (kind is IPv4 only: only
   # that no rule names an IPv6 range is checked) and a CNI other than kindnet.
+  # kind-cache-isolation.sh then proves, on the same cluster, that no shared writable cache exists (ADR 0040,
+  # amended 2026-11-26): the rendered run pod template carries no /cache mount, a file run A writes under /cache
+  # is invisible to run B, the control (two pods on one claim) does share it, and the admission policy admits the
+  # work claim and cache.allowedClaims and refuses any other claim.
   # ADAM_TEST_REQUIRE_KUBERNETES makes the test fail instead of skipping, so a typo in the variables cannot
   # turn the job green. The runner's preinstalled `kind` is used with the node image pinned here
   # (Kubernetes v1.37.0, the chart's floor, ADR 0080; whose network plugin, kindnet, enforces NetworkPolicies:
@@ -735,3 +739,5 @@ jobs:
           kubectl version
       - name: The chart's run pod objects, the cluster test as the coder's ServiceAccount, and the network policies
         run: sh deploy/coder/tests/kind-run-pods.sh
+      - name: "No shared writable cache: two runs cannot share a poisoned file"
+        run: sh deploy/coder/tests/kind-cache-isolation.sh
