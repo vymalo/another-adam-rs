@@ -6,11 +6,11 @@
 //! tail and kept, secrets hidden from the child), but **the files are the command's to change**: it
 //! takes a place for a write, and its guard holds it to [`Guarding::Make`] (files may change, git may
 //! not). A command after which the guard finds git changed, or cannot read it, is undone entirely and
-//! refused. After the command ran, and **before** the guard is settled, the workspace's
-//! [`after_run`](CommandWorkspace::after_run) follows (the coder moves its check epoch, even for a
-//! command its guard then undoes); its text is appended to a result whose files changed. It is never
-//! a check. When `after_run` fails, the guard is settled first, so a change the command made to
-//! git is undone, and then its error is the tool's.
+//! refused. The guard is settled **first** — that is what records a `Make` guard's report of the
+//! files — and the workspace's [`after_run`](CommandWorkspace::after_run) then reads it (the coder
+//! moves its check epoch, even for a command its guard undoes); its text is appended to a result
+//! whose files changed. It is never a check. When `after_run` fails, the guard has already settled,
+//! so a change the command made to git is undone, and its error is the tool's.
 //!
 //! A command that succeeds is shown as one line by default ([`DEFAULT_OUTPUT`]): its result is the
 //! files it made, and its output is kept for `read_output`. A workspace may give `run` another
@@ -44,8 +44,9 @@ pub const DEFAULT_OUTPUT: OutputMode = OutputMode::OnError;
 /// [`DEFAULT_OUTPUT`] unless it was given another), the place found for a write,
 /// the `cwd` inside it, the session made (it may take a while, so before the place is watched), the
 /// guard taken for a [`Make`](Guarding::Make) (its refusal is the answer, and nothing runs), then the
-/// command runs, its output is settled, [`after_run`](CommandWorkspace::after_run) follows, and the
-/// guard is settled: a command it undid, or after which git could not be read, is refused; a missing
+/// command runs, its output is settled, the guard is settled, and
+/// [`after_run`](CommandWorkspace::after_run) follows it: a command it undid, or after which git could
+/// not be read, is refused; a missing
 /// tool is the workspace's answer; otherwise the result, with what `git status` lists when files
 /// changed and the text of `after_run`, and its repeat key.
 pub async fn run(
@@ -109,31 +110,22 @@ pub async fn run(
     .map_err(|e| run_error(redactor, &e))?;
     output::settle_as(ws, ctx, &mut outcome, mode).await;
 
-    // The command ran: what follows it is done now, before git is checked, so it is done for a
-    // command the guard then undoes too. On an error the guard is settled all the same, so git is
-    // never left as the command changed it.
-    let published = match ws.after_run(ctx, &place).await {
-        Ok(text) => text,
-        Err(e) => {
-            let settled = guard.settle().await;
-            if matches!(
-                settled,
-                Settled::Undone { restored: false } | Settled::Unreadable { restored: false }
-            ) {
-                tracing::warn!(
-                    place = place.name(),
-                    "after a failed after_run, the guard could not restore the place exactly"
-                );
-            }
-            return Err(e);
-        }
-    };
-
+    // The guard settles **first**: a `Make` guard's report of the files is recorded there (the
+    // entry's `after`), and `after_run` is what reads it — called before this, it finds an entry with
+    // no report and answers nothing, so the model was told git saw no change and never learned which
+    // files the command added (ANR-1455). Settling first also keeps the order the guard documents.
+    //
     // Did it touch git? The files are its to change; HEAD, the branch, the refs, the
     // configuration and `.git` are not. A place whose git cannot be read after the command is not
     // known to be untouched, so it is undone as one that changed git would be; the model is told
     // which of the two it was.
-    let changed = match guard.settle().await {
+    let settled = guard.settle().await;
+
+    // The command ran: what follows it is done now, before git's verdict is applied, so it is done
+    // for a command the guard then undoes too.
+    let published = ws.after_run(ctx, &place).await?;
+
+    let changed = match settled {
         Settled::Unreadable { restored } => {
             ctx.emit_progress(format!("could not check git after: {shown}; undid it"))
                 .await;

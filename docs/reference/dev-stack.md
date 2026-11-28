@@ -57,7 +57,7 @@ flowchart LR
 | `git-server` | `http://127.0.0.1:8083/local/sandbox.git` | bare repositories over smart HTTP (nginx + git-http-backend), seeded from `dev/git-server/seed/<owner>/<name>/`, no authentication |
 | `coder` (profile `app`) | `http://127.0.0.1:8080/` | the coder built from `docker/coder/Dockerfile`, bearer token `dev-token`; its folder `bin/adam-coder/agent` is mounted read-only at `/etc/adam/agent` |
 | `github-mcp` (profile `app`) | none (the coder's network) | the real GitHub MCP server (`github-mcp-server http --read-only`), the coder's sidecar with no credential; idle here, the coder reads `mock-github-mcp` |
-| `agent` (profile `app`) | `http://127.0.0.1:8084/` | `adam-agent` from the **coder's image** (entrypoint `tini -- adam-agent`), token `dev-token`, serving `dev/agents/assistant/agent`, model `mock-assistant`; shares the coder's database (runs are scoped by agent name) |
+| `agent` (profile `app`) | `http://127.0.0.1:8084/` | `adam-agent` from the **coder's image** (entrypoint `tini -- adam-agent`), token `dev-token`, serving `dev/agents/assistant/agent`, model `mock-assistant`; shares the coder's database (runs are scoped by agent name). Its model is profiled by [`dev/agents/assistant/model-aliases.json`](../../dev/agents/assistant/model-aliases.json) with the four reasoning levels `none`, `low`, `medium` and `high` over the `reasoning_effort` wire, so its card lists `reasoning/v1` and `dev/gateway-usage-check.sh` can pick one |
 
 The coder waits for `postgres`, `mock-openai`, `mock-github` and `git-server`. Its `mcp.json` in this stack is
 `dev/coder-agent/mcp.json`, mounted over the folder's, with `GITHUB_MCP_URL=http://mock-github-mcp:8080` and

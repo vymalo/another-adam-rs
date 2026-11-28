@@ -26,7 +26,7 @@ read_skill_file	868	217
 request_repository	1431	357
 reviewer	720	180
 run	2210	552
-run_checks	2796	699
+run_checks	2948	737
 run_command	1998	499
 search_files	1378	344
 share_file	1840	460

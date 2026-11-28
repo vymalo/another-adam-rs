@@ -307,9 +307,14 @@ services:
       # What an `mcp.json` in the folder may name: nothing but https and loopback unless set here.
       # Development only: plain http to another container (the painter's image server).
       MCP_ALLOW_INSECURE: ${AGENT_MCP_ALLOW_INSECURE:-false}
+      # The per-model profiles (ADR 0063/0064). The mock model takes four reasoning levels, so the
+      # agent's card lists `reasoning/v1` on the dev stack and `dev/gateway-usage-check.sh` can pick
+      # one; the level is reported in each call's `usage/v1` report.
+      MODEL_ALIASES_FILE: /etc/adam/model-aliases.json
     ports: ["127.0.0.1:${AGENT_PORT:-8084}:8080"]
     volumes:
       - ${AGENT_FOLDER:-./dev/agents/assistant/agent}:/etc/adam/agent:ro
+      - ./dev/agents/assistant/model-aliases.json:/etc/adam/model-aliases.json:ro
     healthcheck:
       # Plain TCP connect: the image is not guaranteed to ship curl.
       test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/8080"]

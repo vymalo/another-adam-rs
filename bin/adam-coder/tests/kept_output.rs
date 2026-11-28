@@ -970,17 +970,20 @@ async fn run_checks_shows_the_same_bounded_view() {
     assert!(text.contains("head and tail shown, kept as o-"), "{text}");
     assert!(text.contains("read_output"), "{text}");
 
+    // Another command than the first call's: a repeat of a passed check on the same tree is
+    // answered from its record (ANR-247), not run again.
     let ctx = rig.call_ctx("default");
     let out = RunChecks
-        .call(&ctx, json!({"command": "seq 1 30000"}))
+        .call(&ctx, json!({"command": "seq 1 30000 # default"}))
         .await
         .unwrap();
     let id = output_id_of(&ctx);
     assert_eq!(
         out.content,
         format!(
-            "$ seq 1 30000\nexit code 0: passed\n[output: 168894 bytes, not shown because the \
-             command succeeded; kept as {id}; read_output {{\"id\":\"{id}\"}} reads it]\n"
+            "$ seq 1 30000 # default\nexit code 0: passed\n[output: 168894 bytes, not shown \
+             because the command succeeded; kept as {id}; read_output {{\"id\":\"{id}\"}} reads \
+             it]\n"
         )
     );
     assert!(rig.read(&id, -1).await.content.starts_with("30000\n"));
@@ -1011,8 +1014,10 @@ const COMMAND_TOOLS: [(&str, bool, &str); 3] = [
 async fn a_command_that_succeeds_is_one_line_with_on_error_and_read_output_reads_it() {
     let rig = Rig::new().await;
     for (tool, on_error_by_default, passed) in COMMAND_TOOLS {
-        let command = format!("seq 1 3 # {tool}");
         for output in [Some("on_error"), Some("full"), None] {
+            // A command of its own per call: `run_checks` answers a repeat of a passed check on the
+            // same tree from its record (ANR-247), which is not what this case looks at.
+            let command = format!("seq 1 3 # {tool} {output:?}");
             let ctx = rig.call_ctx(&format!("{tool}-{output:?}"));
             let mut args = json!({ "command": command });
             if let Some(output) = output {
@@ -1165,7 +1170,6 @@ async fn the_folders_output_defaults_are_what_a_call_without_output_shows() {
     };
     let rig = Rig::with(|s| s.set_output_defaults(&flipped)).await;
     for (tool, on_error_by_default, passed) in COMMAND_TOOLS {
-        let command = format!("seq 1 3 # folder {tool}");
         // The tool's own default, asked for, then nothing asked: the folder's, which is the other.
         let own = if on_error_by_default {
             "on_error"
@@ -1176,6 +1180,9 @@ async fn the_folders_output_defaults_are_what_a_call_without_output_shows() {
             (Some(own), on_error_by_default),
             (None, !on_error_by_default),
         ] {
+            // A command of its own per call: `run_checks` answers a repeat of a passed check on the
+            // same tree from its record (ANR-247).
+            let command = format!("seq 1 3 # folder {tool} {output:?}");
             let ctx = rig.call_ctx(&format!("folder-{tool}-{output:?}"));
             let mut args = json!({ "command": command });
             if let Some(output) = output {
