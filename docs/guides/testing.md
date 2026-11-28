@@ -160,8 +160,9 @@ superuser, for its reconnect test). See [Store adapters](../reference/store-adap
 
 Scripts in `dev/` drive the compose stack through A2A and assert the whole chain on the mocks. Each script's
 header lists its steps and variables. CI runs them in `.github/workflows/coder.yml` ("Compose e2e") on the image
-it has just built: a pull request runs the eight default coder scenarios and two App-mode ones (more when it
-carries the `e2e-full` label or changes `dev/`, `docker/coder/` or `compose.yaml`), main and a manual `workflow_dispatch` run all of
+it has just built: a pull request runs the eight default coder scenarios, the hook-program scenario
+(`dev/hooks-e2e.sh`) and two App-mode ones (all 21 when it carries the `e2e-full` label or changes `dev/`,
+`docker/coder/` or `compose.yaml`), main and a manual `workflow_dispatch` run all of
 them. Start the stack first:
 
 ```sh
@@ -175,6 +176,7 @@ docker compose --profile app up -d --build --wait postgres mock-openai mock-gith
 | `sh dev/greeting-e2e.sh` | "hi" gets a greeting built from the folder's persona lines, streamed, and its one model call reported over `usage/v1` (the task carries the totals); the same task goes on to a pull request; a restart on an edited folder changes the answer |
 | `sh dev/coder-choices-e2e.sh` | three questions asked as one A2UI form, one action answers them; a screen that cannot read it gets the options as text (the screen's capabilities are `a2uiRendererCapabilities["1.0"]` and its catalog is catalog 9, a `ui-catalog/v2` document) |
 | `sh dev/agent-e2e.sh` | the general agent answers "hi" in role; a restart on an edited folder changes the card and the answer |
+| `sh dev/hooks-e2e.sh` | the deployment's hook program (`dev/hooks/no-git-push.sh`, declared by `dev/hooks/hooks.json`, ADR 0050 slices P1 and P2) denies the coder's `commit_and_push` at `tool.before`: the call's step ends `failed` with the program's reason, git-server's heads do not move and mock-github sees no pull request. Start the stack with `-f compose.yaml -f dev/compose.hooks.yaml` |
 | `sh dev/agent-cards-e2e.sh` | the researcher folder answers with a surface of cards and a graph on a screen that has them, words only on one that has not (catalog 9, and the checklist subset, which has no `Cards`) |
 | `sh dev/painter-e2e.sh` | the painter folder: the instructions of its image MCP server reach the model, the picture is a shared `image/png` file the words name, and the server's prompt is the command `images__scene` (it starts `mock-image-mcp` and restarts `agent` on a copy of the folder with `AGENT_MCP_ALLOW_INSECURE=true`) |
 | `sh dev/resume-e2e.sh` | the coder's resume budget from a fresh start (spec row A3 of `docs/architecture/05-runtime.md` §21a): `/healthz` 200 and the first claim of a waiting run both under `READY_CEILING_MS` and `CLAIM_CEILING_MS` (defaults `5000`; the brief's floor of ~5 s). Asserts A2's invariant first (the run is `runnable` and the lease is NULL after the SIGTERM), so a violation of A2 is not misread as a violation of A3 |

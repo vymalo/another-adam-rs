@@ -1030,7 +1030,7 @@ async fn a_stream_error_waits_for_a_started_call_before_failing_the_try() {
     h.script(turn(vec![c1]));
     h.script(answer("done"));
     let agent = h.agent(10, |b| b.tool(Probe::new(&log, &began)));
-    let (_rt, run, view) = h.run(agent, "go").await;
+    let (_rt, _run, view) = h.run(agent, "go").await;
     assert_eq!(view.status, RunStatus::Done, "{view:?}");
     assert_eq!(log.starts("c1"), 2, "the retry ran the call again");
     assert_eq!(

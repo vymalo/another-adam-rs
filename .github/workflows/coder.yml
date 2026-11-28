@@ -28,8 +28,9 @@ name: coder
 # answers (dev/coder-choices-e2e.sh), and the same service on the researcher folder answers with
 # source cards and a graph on a screen that draws them (dev/agent-cards-e2e.sh), and on the painter folder
 # it makes a picture with an image MCP server and shares it as a file (dev/painter-e2e.sh). There is no second
-# image. A pull request runs the seven default coder scenarios and two of the App-mode ones; one that carries the
-# e2e-full label, or changes dev/, docker/coder/ or compose.yaml, runs all 19. main and a manual dispatch run all of
+# image. A pull request runs the seven default coder scenarios, the hook-program scenario
+# (dev/hooks-e2e.sh), and two of the App-mode ones; one that carries the
+# e2e-full label, or changes dev/, docker/coder/ or compose.yaml, runs all 20. main and a manual dispatch run all of
 # them (the other agent folders and the other five App scenarios).
 # On main the very image that passed is the one pushed.
 #
@@ -498,6 +499,18 @@ jobs:
             SCENARIO=create-repo ANSWER=yes sh dev/coder-e2e.sh
             SCENARIO=create-repo ANSWER=no sh dev/coder-e2e.sh
           fi
+          # The deployment's hook programs (ADR 0050, slice P2). dev/compose.hooks.yaml mounts
+          # dev/hooks/ (a program that speaks adam-hooks/1 and answers `tool.before` with a deny for
+          # `commit_and_push`) and sets ADAM_HOOKS_FILE and HOOKS_ALLOW_PROGRAMS=true on the coder.
+          # The task is the default scripted one, so it reaches the push: the call's step must fail
+          # with the program's reason, git-server's heads must not move and mock-github must see no
+          # pull request. The App block above left the coder as an installation, so this scenario runs
+          # last and puts the default stack back afterwards (as that block does), before the resume
+          # budget recreates the coder itself.
+          docker compose -f compose.yaml -f dev/compose.hooks.yaml --profile app up -d --no-build --wait \
+            postgres mock-openai mock-github mock-github-mcp git-server coder agent
+          sh dev/hooks-e2e.sh
+          docker compose --profile app up -d --no-build --wait coder
           # Resume budget (spec row A3 of docs/architecture/05-runtime.md): a fresh coder must reach
           # `/healthz` 200 and claim a waiting run under the script's ceilings. The script recreates
           # the coder (down + remove the coder-work volume + up), so it is last in this step: the

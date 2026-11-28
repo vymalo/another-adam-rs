@@ -1,10 +1,12 @@
-//! The deployment's hook programs (ADR 0050, decision 15; slice **P2a**): `ADAM_HOOKS_FILE` and
-//! `HOOKS_ALLOW_PROGRAMS`.
+//! The deployment's hook programs (ADR 0050, decision 15; slices **P2a** and **P2b**):
+//! `ADAM_HOOKS_FILE` and `HOOKS_ALLOW_PROGRAMS`.
 //!
 //! A hook program is declared **once, by the deployment**, in the file the environment names, and
 //! nowhere else: an agent file names compiled plugins only, a repository an agent works on cannot
-//! declare one (a file under such a repository is refused), and a message never can. The file is
-//! JSON:
+//! declare one, and a message never can. A file inside a directory an agent works on is refused by
+//! [`HooksSettings::parse_in`](HooksSettings::parse_in) when the caller passes those roots as
+//! `protected` — the refusal is the embedding host's to apply, and no binary passes a root today.
+//! The file is JSON:
 //!
 //! ```json
 //! {
@@ -32,6 +34,11 @@
 //!
 //! **The switch.** A file that names programs is refused (exit 78 in a binary) unless
 //! `HOOKS_ALLOW_PROGRAMS=true`, as a deployment that allows stdio MCP servers must say so.
+//!
+//! **Wired (slice P2b, ANR-1301).** A binary that runs workers turns the programs that apply to
+//! the agent it serves into the host's hook set at startup
+//! ([`HooksSettings::hook_set_for`](HooksSettings::hook_set_for)), and the assembly gives that set
+//! to the root and every subagent. A program that cannot start is exit 78, naming the program.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -276,6 +283,72 @@ impl HooksSettings {
     pub fn is_empty(&self) -> bool {
         self.programs.is_empty()
     }
+
+    /// The host's hooks for the agent called `agent` (ADR 0050, slice **P2b**): the programs that
+    /// apply to it, started and asked hello, in the file's order. Empty when the deployment
+    /// declared none, which is the same as no file at all: a process without a file behaves as it
+    /// did before this slice.
+    ///
+    /// `scrub` is the deployment's scrubber, applied to every payload a program is given and to
+    /// the reason it answers with (a program sees what a step would, never a secret).
+    ///
+    /// `agent` is **the root agent's name**, and the set then applies to every agent of the
+    /// assembly, the root and its subagents: a set cannot be narrower than the assembly it is
+    /// installed on (ADR 0050, slice P2b). A program whose `agents` does not name the root agent is
+    /// therefore not started, and a warning names it — an `agents` list naming only a subagent is
+    /// not started either.
+    ///
+    /// The set's [`HookLimits`](adam_plugin::HookLimits) are one retry and **the greatest deadline
+    /// among the programs it started**, at least the default's: a program is enforced by the
+    /// adapter at its own deadline, and a set shorter than that would refuse a compliant answer
+    /// (ADR 0050: the host builds the set with `HookSet::with_limits`).
+    ///
+    /// # Errors
+    ///
+    /// The first program that cannot be started: the error names the program and says why (a
+    /// path that is not there, a hello that is not answered, another protocol). A binary reports
+    /// it as exit 78: a deployment that declared a program and cannot run it does not serve.
+    pub fn hook_set_for(
+        &self,
+        agent: &str,
+        scrub: impl Fn(&str) -> String + Send + Sync + 'static,
+    ) -> Result<adam_plugin::HookSet, adam_hook_exec::Error> {
+        let scrub: std::sync::Arc<dyn Fn(&str) -> String + Send + Sync> =
+            std::sync::Arc::new(scrub);
+        let mut set = adam_plugin::HookSet::new();
+        let mut limits = adam_plugin::HookLimits::default();
+        for program in self.programs() {
+            if !program.applies_to(agent) {
+                tracing::warn!(
+                    program = %program.name,
+                    agents = ?program.agents,
+                    served = agent,
+                    "a hook program names agents this process does not serve: it was not started \
+                     (the file's filter is the root agent's name, and its set applies to every \
+                     agent of the assembly)"
+                );
+                continue;
+            }
+            let scrub = std::sync::Arc::clone(&scrub);
+            let started = adam_hook_exec::HookExec::start(
+                program.config().scrub(move |text: &str| scrub(text)),
+            )?;
+            limits.deadline = limits.deadline.max(program.deadline);
+            set = set.with(std::sync::Arc::new(started));
+        }
+        if set.is_empty() {
+            return Ok(set);
+        }
+        let set = set.with_limits(limits);
+        tracing::info!(
+            programs = ?set.names(),
+            deadline_ms = limits.deadline.as_millis() as u64,
+            retries = limits.retries,
+            agent,
+            "the deployment's hook programs started"
+        );
+        Ok(set)
+    }
 }
 
 /// The protected root `path` is under, when it is under one.
@@ -510,5 +583,86 @@ mod tests {
         assert!(settings.is_empty());
         assert_eq!(problems.len(), 1, "{problems:?}");
         assert!(problems[0].contains("is not a file"), "{problems:?}");
+    }
+
+    /// Slice P2b: the host's set is the programs that apply to the agent it serves, started; a
+    /// program that cannot start names itself and is `Invalid` (exit 78 in a binary).
+    #[test]
+    fn the_hosts_set_is_the_programs_that_apply_and_a_broken_one_names_itself() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write(
+            dir.path(),
+            "hooks.json",
+            r#"{"programs":[{"name":"no-push","command":"./missing","agents":["coder"],
+                "points":{"decide":["tool.before"]}}]}"#,
+        );
+        let (settings, problems) =
+            parse(&[(HOOKS_FILE, path.to_str().unwrap()), (HOOKS_ALLOW, "true")]);
+        assert!(problems.is_empty(), "{problems:?}");
+        // A program filtered to another agent is not started, and the set is empty.
+        assert!(
+            settings
+                .hook_set_for("assistant", str::to_owned)
+                .expect("no program applies")
+                .is_empty()
+        );
+        let error = settings
+            .hook_set_for("coder", str::to_owned)
+            .expect_err("the program is not there");
+        assert!(error.to_string().contains("no-push"), "{error}");
+        assert_eq!(
+            adam_error::Classify::class(&error),
+            adam_error::ErrorClass::Invalid
+        );
+    }
+
+    /// Slice P2b, the set's deadline: a program that keeps its own 2 s is refused by a set built
+    /// with `HookLimits::default()` (1 s), so `hook_set_for` gives the set the greatest deadline of
+    /// the programs it started. The program here is a shell script that answers the hello and
+    /// nothing else; it never answers an event, which this test does not ask it.
+    #[cfg(unix)]
+    #[test]
+    fn the_sets_deadline_covers_the_slowest_program() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let script = r#"#!/bin/sh
+while IFS= read -r line; do
+  case $line in
+    *hello*) printf '%s\n' '{"protocol":"adam-hooks/1","name":"slow","version":1}' ;;
+    *shutdown*) exit 0 ;;
+  esac
+done
+"#;
+        let program = dir.path().join("slow.sh");
+        std::fs::write(&program, script).unwrap();
+        let mut mode = std::fs::metadata(&program).unwrap().permissions();
+        mode.set_mode(mode.mode() | 0o111);
+        std::fs::set_permissions(&program, mode).unwrap();
+        let path = write(
+            dir.path(),
+            "hooks.json",
+            r#"{"programs":[{"name":"slow","command":"./slow.sh","deadlineMs":2000,
+                "points":{"decide":["tool.before"]}}]}"#,
+        );
+        let (settings, problems) =
+            parse(&[(HOOKS_FILE, path.to_str().unwrap()), (HOOKS_ALLOW, "true")]);
+        assert!(problems.is_empty(), "{problems:?}");
+        let set = settings
+            .hook_set_for("coder", str::to_owned)
+            .expect("the script answers the hello");
+        assert_eq!(set.names(), vec!["slow"]);
+        // The bug this fixes: a default set refuses a compliant 2 s answer before the adapter's
+        // own deadline (ADR 0050, the P1 note).
+        assert!(
+            adam_plugin::HookLimits::default().deadline < std::time::Duration::from_secs(2),
+            "a default set no longer undercuts 2 s: this test no longer proves the fix"
+        );
+        assert!(
+            set.limits().deadline >= std::time::Duration::from_secs(2),
+            "the set's deadline is {:?}, want at least 2 s",
+            set.limits().deadline
+        );
+        assert_eq!(set.limits().retries, 1);
     }
 }

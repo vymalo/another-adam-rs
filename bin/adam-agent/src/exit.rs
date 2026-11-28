@@ -27,3 +27,20 @@ fn class_of(cause: &(dyn Error + 'static)) -> Option<ErrorClass> {
     }
     cause.downcast_ref::<AssemblyError>().map(Classify::class)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// ADR 0050 slice P2b: a hook program that cannot start stops the process (78). Remove the
+    /// `AgentError::Hooks` arm from `own_class` and this test fails with 1: `class_of` answers
+    /// nothing for it and the walk finds no class.
+    #[test]
+    fn a_hook_program_that_cannot_start_is_78() {
+        let e = AgentError::Hooks(adam_hook_exec::Error::Spawn {
+            program: "no-push".into(),
+            message: "No such file or directory".into(),
+        });
+        assert_eq!(exit_code(&e), EX_CONFIG);
+    }
+}

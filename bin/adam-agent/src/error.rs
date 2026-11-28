@@ -46,6 +46,12 @@ pub enum AgentError {
     /// placeholder the frontmatter does not declare, a model alias the assembly refuses.
     #[error("assembling the agent")]
     Assembly(#[source] Box<AssemblyError>),
+    /// A hook program of `ADAM_HOOKS_FILE` cannot be started (ADR 0050, slice P2b). The deployment
+    /// declared it and this process must run it: a program that is not there, does not answer the
+    /// hello or speaks another protocol stops the start (exit 78, fail closed). The reason names
+    /// the program.
+    #[error("starting a hook program ADAM_HOOKS_FILE names")]
+    Hooks(#[source] adam_hook_exec::Error),
     /// The service stopped or could not start: Postgres, the listen address, a component.
     #[error("running the service")]
     Serve(#[source] ServeError),
@@ -58,6 +64,9 @@ impl AgentError {
         match self {
             Self::Folder { .. } => Some(ErrorClass::Invalid),
             Self::Card(e) | Self::Mcp(e) | Self::ExtraMcp(e) | Self::Assembly(e) => Some(e.class()),
+            // `HookExec::start` reports only the classes a restart does not fix (spawn, hello,
+            // protocol, malformed, config): all `Invalid`, so exit 78.
+            Self::Hooks(_) => Some(ErrorClass::Invalid),
             Self::Model(_) | Self::Serve(_) => None,
         }
     }

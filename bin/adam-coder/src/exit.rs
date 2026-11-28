@@ -56,6 +56,11 @@ fn class_of(cause: &(dyn Error + 'static)) -> Option<ErrorClass> {
     if let Some(e) = cause.downcast_ref::<crate::tools::ReferencesError>() {
         return Some(e.class());
     }
+    // The deployment's hook programs (`ADAM_HOOKS_FILE`, ADR 0050 slice P2b): a program that cannot
+    // start is a mistake of the deployment's file, 78 (its class is `Invalid`).
+    if let Some(e) = cause.downcast_ref::<adam_hook_exec::Error>() {
+        return Some(e.class());
+    }
     cause.downcast_ref::<AssemblyError>().map(Classify::class)
 }
 
@@ -131,6 +136,19 @@ mod tests {
             why: "host not allowed".into(),
         };
         assert_eq!(coded(refused), 78);
+    }
+
+    /// The deployment's hook programs (ADR 0050 slice P2b): a program that cannot start is a
+    /// mistake in the deployment's file, 78. Remove the `adam_hook_exec::Error` downcast from
+    /// `class_of` and this test fails: the walk reaches the error, knows no class for it, and
+    /// returns 1.
+    #[test]
+    fn a_hook_program_that_cannot_start_is_78() {
+        let e = adam_hook_exec::Error::Spawn {
+            program: "no-push".into(),
+            message: "No such file or directory".into(),
+        };
+        assert_eq!(coded(e), 78);
     }
 
     /// A mistake in the agent files, or the files and the code disagreeing, is the deployment's:

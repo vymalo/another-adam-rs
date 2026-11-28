@@ -64,5 +64,8 @@ adam-hook-exec`, `cargo nextest run -p adam-hook-exec`, `node tools/docs-check/c
 ## Not built
 
 The deployment's file and switch (`ADAM_HOOKS_FILE`, `HOOKS_ALLOW_PROGRAMS`) and the wiring into `adam-agent`
-and `adam-coder` are slice **P2**; the chart's `hooks.file` is **P3**. Actions are **H1d**: a reply that asks for
-one is refused with `Unsupported`, never dropped.
+and `adam-coder` are slice **P2**, built 2026-11-28 (ANR-1301): `crates/adam-service/src/hooks.rs` parses the file
+and `HooksSettings::hook_set_for` starts the programs that apply to the agent, both binaries give the set to the
+assembly (`BoundDef::hooks`), so the root and every subagent run it first, and a program that cannot start is exit
+78 (`dev/hooks-e2e.sh` is the stack-level proof). The chart's `hooks.file` is **P3**. Actions are **H1d**: a reply
+that asks for one is refused with `Unsupported`, never dropped.

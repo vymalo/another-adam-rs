@@ -88,7 +88,10 @@ the adam crates pinned in `orchestrator/Cargo.toml`.
      recorded with the call (`HookedOutput`) or the message (`MessageDecision`). A hook gets no `Ctx`
      and adds no step of its own. An embedded host gives its hooks to `adam-engine` with
      `EngineBuilder::hooks`/`.plugin` (below), which runs them in every agent before an agent file's
-     `plugins:`.
+     `plugins:`. A host that builds folder agents through the assembly instead gives the same set
+     with `AgentDef::bind(..)?.hooks(set)` (`adam::BoundDef::hooks`), which installs it on the root
+     and every subagent; `adam_service::HooksSettings::hook_set_for(agent, scrub)` turns a
+     deployment's `ADAM_HOOKS_FILE` into one (ADR 0050, slice P2).
      https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0050-hooks-around-the-agent-loop-compiled-first-and-programs-second.md
    * **Limiting commands in your own tools** (ADR 0065): `adam_code_tools::Governor` pairs an
      `adam_budget::Admission` (`adam-admission-local`'s `LocalAdmission` over a `Budget`) with a

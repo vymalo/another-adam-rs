@@ -188,7 +188,9 @@ pub struct Config {
     /// The variables added to [`SAFE_VARS`]; never a secret (ADR 0050, decision 15).
     pub env: BTreeMap<String, String>,
     /// The agents this program applies to (`None`: all of them). The wiring decides with
-    /// [`Config::applies_to`]; the adapter itself is installed per agent.
+    /// [`Config::applies_to`]; the adapter itself is installed once, on the assembly, so the whole
+    /// set runs in every agent of it (a host that wants one program per agent builds one set each
+    /// and filters with [`Config::applies_to`] itself).
     pub agents: Option<Vec<String>>,
     /// The empty private directory the program runs in. `None`: the adapter makes one and removes
     /// it when it goes (ADR 0050, decision 15: never the agent's workspace).
@@ -280,6 +282,11 @@ impl Config {
     }
 
     /// Whether this program applies to the agent called `agent`.
+    ///
+    /// The deployment's wiring filters the file once, with the root agent's name
+    /// (`adam_service::HooksSettings::hook_set_for`), and installs the resulting set on every agent
+    /// of the assembly; this method stays the rule for a host that installs one program per agent
+    /// and asks per node, and the file and the adapter must not disagree about it.
     #[must_use]
     pub fn applies_to(&self, agent: &str) -> bool {
         match &self.agents {
