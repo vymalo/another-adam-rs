@@ -1,0 +1,7 @@
+{
+  "type": "about:blank",
+  "title": "The CSR is not usable",
+  "status": 400,
+  "code": "bad_csr",
+  "detail": "the CSR does not parse, or its key is not Ed25519"
+}

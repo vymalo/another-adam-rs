@@ -40,6 +40,79 @@ use crate::turn::{
 /// round trip per window rather than one per model call.
 pub const RENEW_RETRY_SECS: i64 = 15;
 
+/// The point of a leaf's life at which a [`RunKeyring`] renews: **two thirds** by default, the
+/// owner's decision ([ADR 0086] decision 5). A deployment may move it with
+/// `RUN_CERT_RENEW_FRACTION`; the key is replaced as a whole, so the point only decides when.
+///
+/// The fraction is exact (`n/d`, both integers) rather than a float, so two deployments that set
+/// the same value renew at the same nanosecond.
+///
+/// [ADR 0086]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0086-a-run-signs-its-model-requests-with-a-certificate.md
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RenewFraction {
+    numerator: u32,
+    denominator: u32,
+}
+
+impl RenewFraction {
+    /// Two thirds, the default.
+    pub const TWO_THIRDS: Self = Self {
+        numerator: 2,
+        denominator: 3,
+    };
+
+    /// `numerator/denominator`, which must be strictly between 0 and 1.
+    ///
+    /// # Errors
+    ///
+    /// [`BadRenewFraction`] when either term is 0, or `numerator >= denominator`.
+    pub fn new(numerator: u32, denominator: u32) -> Result<Self, BadRenewFraction> {
+        if numerator == 0 || denominator == 0 || numerator >= denominator {
+            return Err(BadRenewFraction);
+        }
+        Ok(Self {
+            numerator,
+            denominator,
+        })
+    }
+
+    /// The numerator.
+    pub fn numerator(&self) -> u32 {
+        self.numerator
+    }
+
+    /// The denominator.
+    pub fn denominator(&self) -> u32 {
+        self.denominator
+    }
+
+    /// The instant `numerator/denominator` of the way from `not_before` to `not_after`, clamped to
+    /// `not_after` when the arithmetic cannot be represented.
+    pub fn at(&self, not_before: Timestamp, not_after: Timestamp) -> Timestamp {
+        let life = not_after.as_nanosecond() - not_before.as_nanosecond();
+        let at = not_before.as_nanosecond()
+            + life * i128::from(self.numerator) / i128::from(self.denominator);
+        jiff::Timestamp::from_nanosecond(at).map_or(not_after, Timestamp)
+    }
+}
+
+impl Default for RenewFraction {
+    fn default() -> Self {
+        Self::TWO_THIRDS
+    }
+}
+
+/// A renewal point that is not strictly between the leaf's two ends ([`RenewFraction::new`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("a renewal fraction is n/d with 0 < n < d")]
+pub struct BadRenewFraction;
+
+impl Classify for BadRenewFraction {
+    fn class(&self) -> ErrorClass {
+        ErrorClass::Invalid
+    }
+}
+
 /// The instant a [`RunKeyring`] reads for its renewal and its expiry. A server uses
 /// [`SystemClock`]; a test uses its own, so the two thirds and the expiry are seen without waiting.
 pub trait RunClock: Send + Sync + 'static {
@@ -151,6 +224,7 @@ pub struct RunKeyring {
     issuer: DynRunCertIssuer,
     subject: RunSubject,
     clock: Arc<dyn RunClock>,
+    fraction: RenewFraction,
     state: Mutex<State>,
 }
 
@@ -199,8 +273,22 @@ impl RunKeyring {
             issuer,
             subject,
             clock,
+            fraction: RenewFraction::default(),
             state: Mutex::new(State::default()),
         }
+    }
+
+    /// The same, renewing at `fraction` of the leaf's life instead of two thirds
+    /// (`RUN_CERT_RENEW_FRACTION`). The key is still replaced as a whole; only the instant moves.
+    #[must_use]
+    pub fn with_renew_fraction(mut self, fraction: RenewFraction) -> Self {
+        self.fraction = fraction;
+        self
+    }
+
+    /// The fraction of the leaf's life at which this keyring renews.
+    pub fn renew_fraction(&self) -> RenewFraction {
+        self.fraction
     }
 
     /// The person and the run this keyring certifies.
@@ -289,7 +377,7 @@ impl RunKeyring {
             chain,
             set: Arc::new(set),
             not_after,
-            renew_at: two_thirds(not_before, not_after),
+            renew_at: self.fraction.at(not_before, not_after),
         })
     }
 }
@@ -364,13 +452,6 @@ fn fail(why: RunKeyError) -> TurnKeyError {
         ErrorClass::Unauthenticated => TurnKeyError::Refused(Box::new(why)),
         _ => TurnKeyError::Unavailable(Box::new(why)),
     }
-}
-
-/// The instant two thirds of the way from `not_before` to `not_after` ([ADR 0086] decision 5).
-fn two_thirds(not_before: Timestamp, not_after: Timestamp) -> Timestamp {
-    let life = not_after.as_nanosecond() - not_before.as_nanosecond();
-    let at = not_before.as_nanosecond() + life * 2 / 3;
-    jiff::Timestamp::from_nanosecond(at).map_or(not_after, Timestamp)
 }
 
 /// A new Ed25519 key from the system's random numbers, its seed wiped at once ([ADR 0086]
@@ -667,7 +748,7 @@ mod tests {
             chain,
             key,
             not_after,
-            renew_at: two_thirds(not_before, not_after),
+            renew_at: RenewFraction::TWO_THIRDS.at(not_before, not_after),
         };
         let keys = RunKeyring::with_clock(issuer, subject(), clock);
         let error = RunKeyError::Request(Box::new(BadRunSubject));
@@ -702,6 +783,49 @@ mod tests {
 
     fn hex(bytes: &[u8]) -> String {
         bytes.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    #[test]
+    fn a_renewal_fraction_is_strictly_between_zero_and_one() {
+        assert_eq!(RenewFraction::default(), RenewFraction::TWO_THIRDS);
+        assert_eq!(RenewFraction::new(2, 3).unwrap(), RenewFraction::TWO_THIRDS);
+        assert_eq!(RenewFraction::new(1, 2).unwrap().numerator(), 1);
+        assert_eq!(RenewFraction::new(1, 2).unwrap().denominator(), 2);
+        for (n, d) in [(0, 3), (3, 3), (4, 3), (2, 0)] {
+            assert_eq!(RenewFraction::new(n, d), Err(BadRenewFraction), "{n}/{d}");
+        }
+        assert_eq!(BadRenewFraction.class(), ErrorClass::Invalid);
+
+        let start = Timestamp::UNIX_EPOCH;
+        let end = start + SignedDuration::from_hours(3);
+        assert_eq!(
+            RenewFraction::TWO_THIRDS.at(start, end),
+            start + SignedDuration::from_hours(2)
+        );
+        assert_eq!(
+            RenewFraction::new(1, 2).unwrap().at(start, end),
+            start + SignedDuration::from_secs(90 * 60)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_keyring_renews_at_the_fraction_it_is_given() {
+        let clock = clock();
+        let keys = keyring(&clock).with_renew_fraction(RenewFraction::new(1, 2).unwrap());
+        assert_eq!(keys.renew_fraction(), RenewFraction::new(1, 2).unwrap());
+        let first = keys.current().await.unwrap().kid().clone();
+        clock.set(at(90 * 60 - 1));
+        assert_eq!(
+            keys.current().await.unwrap().kid(),
+            &first,
+            "the key renewed before half the leaf's life"
+        );
+        clock.set(at(90 * 60));
+        assert_ne!(
+            keys.current().await.unwrap().kid(),
+            &first,
+            "the key did not renew at half the leaf's life"
+        );
     }
 
     #[test]
