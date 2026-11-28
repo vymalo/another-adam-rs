@@ -229,7 +229,7 @@ impl CommandWorkspace for PersonDir {
         &self,
         _ctx: &ToolCtx,
         place: &Place,
-        _guarding: Guarding,
+        mode: Guarding,
     ) -> Result<Box<dyn CommandGuard>, String> {
         let key = place.path().to_path_buf();
         let (before, cut) = match listing(&key) {
@@ -256,6 +256,7 @@ impl CommandWorkspace for PersonDir {
         Ok(Box::new(Recorded {
             key,
             seen: Arc::clone(&self.seen),
+            mode,
         }))
     }
 
@@ -282,18 +283,21 @@ impl CommandWorkspace for PersonDir {
 ///
 /// The entry's lifetime is this guard's lifetime: [`Drop`] removes the entry from the map when
 /// [`CommandGuard::settle`] has not run (so the place is released — a command that errored before
-/// settling must not lock out every later one). A settled guard leaves the entry in place for
-/// [`after_run`](CommandWorkspace::after_run) to read once and clear.
+/// settling must not lock out every later one). A settled guard's clearing depends on
+/// [`Guarding`]: a `Look` guard's report is never read (`run_command` does not call
+/// [`after_run`](CommandWorkspace::after_run)), so `settle` removes the entry; a `Make` guard's
+/// report is read by `after_run`, so `settle` leaves the entry in place for it to clear.
 struct Recorded {
     key: PathBuf,
     seen: SeenByPlace,
+    mode: Guarding,
 }
 
 impl Drop for Recorded {
     fn drop(&mut self) {
         // `settle` consumes the box and runs before Drop: when it succeeded, it set
-        // `entry.after = Some(_)` and `after_run` is responsible for clearing the entry, so Drop
-        // must not race with it. When settle didn't run (`Err(_)` from `commands::run` propagated
+        // `entry.after = Some(_)` (Make) or removed the entry entirely (Look), and Drop must
+        // not race with either. When settle didn't run (`Err(_)` from `commands::run` propagated
         // before the box was consumed, a tool's own error, or a panic), `entry.after` is still
         // `None` and the place must be released.
         let mut seen = self.seen.lock().unwrap_or_else(|e| e.into_inner());
@@ -313,16 +317,29 @@ impl CommandGuard for Recorded {
             // The place cannot be read now: whether it changed is not known, and nothing is undone.
             Err(_) => return Settled::Unwatched,
         };
-        let changed = {
-            let mut seen = self.seen.lock().unwrap_or_else(|e| e.into_inner());
-            match seen.get_mut(&self.key) {
-                Some(entry) => {
-                    entry.cut = entry.cut || cut;
-                    let changed = entry.before != after;
-                    entry.after = Some(after);
-                    changed
+        // A Look guard's report is never read (`run_command` does not call `after_run`):
+        // remove the entry now so the next command in the place is accepted. A Make guard's
+        // report is read by `after_run` (called by `make::run` between the command and this
+        // settle); leave the entry for it. `cut` only matters for Make.
+        let changed = match self.mode {
+            Guarding::Look => {
+                let mut seen = self.seen.lock().unwrap_or_else(|e| e.into_inner());
+                match seen.remove(&self.key) {
+                    Some(entry) => entry.before != after,
+                    None => false,
                 }
-                None => false,
+            }
+            Guarding::Make => {
+                let mut seen = self.seen.lock().unwrap_or_else(|e| e.into_inner());
+                match seen.get_mut(&self.key) {
+                    Some(entry) => {
+                        entry.cut = entry.cut || cut;
+                        let changed = entry.before != after;
+                        entry.after = Some(after);
+                        changed
+                    }
+                    None => false,
+                }
             }
         };
         if changed {
@@ -558,6 +575,72 @@ mod tests {
         assert!(
             report.is_empty(),
             "no phantom change from the dropped guard: {report:?}"
+        );
+    }
+
+    /// The decisive test for the leak the previous round fixed: two `run_command` calls in a row
+    /// (the local agent's command tool, which uses `Guarding::Look`) both succeed, then a
+    /// `make::run` (`Guarding::Make`) that creates a file, and a fourth `run_command` after it
+    /// is also accepted. Before the Look-mode guard was cleared at settle, every second call
+    /// refused with `"a command is already running in \`person\`; wait for it to finish"` — the
+    /// local agent's command tool worked exactly once.
+    #[tokio::test]
+    async fn two_run_commands_in_a_row_are_both_accepted() {
+        let (_dir, place) = rig();
+        let person = PersonDir::new(place.path(), std::iter::empty::<&str>()).unwrap();
+
+        // Two `run_command` calls in a row: both must be accepted (the second is not refused
+        // with "already running").
+        let first =
+            crate::inspect::run_command(&person, &ctx(), "true".to_owned(), None, None, None)
+                .await
+                .expect("first run_command is Ok");
+        assert!(
+            !first.is_error,
+            "first run_command is not an error: {first:?}"
+        );
+
+        let second =
+            crate::inspect::run_command(&person, &ctx(), "true".to_owned(), None, None, None)
+                .await
+                .expect("second run_command is Ok");
+        assert!(
+            !second.is_error,
+            "second run_command is not an error (the Look guard was cleared at settle): {second:?}"
+        );
+        assert!(
+            !second.content.contains("already running"),
+            "the second is not refused with 'already running': {second:?}"
+        );
+
+        // A `make::run` that creates a file: the entry is cleared by `after_run` (called inside
+        // `make::run` between the command and settle), so a second `run_command` after it is
+        // accepted. The file is on disk, the command's exit is zero, and the result text says
+        // the command ran.
+        let (dir_m, place_m) = rig();
+        let person_m = PersonDir::new(place_m.path(), std::iter::empty::<&str>()).unwrap();
+        let made = crate::make::run(
+            &person_m,
+            &ctx(),
+            "touch by_make.txt".to_owned(),
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("make::run is Ok");
+        assert!(!made.is_error, "make::run did not error: {made:?}");
+        assert!(
+            dir_m.path().join("by_make.txt").exists(),
+            "make::run created the file on disk"
+        );
+        let after_make =
+            crate::inspect::run_command(&person_m, &ctx(), "true".to_owned(), None, None, None)
+                .await
+                .expect("run_command after make is Ok");
+        assert!(
+            !after_make.is_error,
+            "run_command after make is not an error: {after_make:?}"
         );
     }
 }
