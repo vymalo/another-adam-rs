@@ -103,7 +103,7 @@ amendment is the owner's to make there.
    that node (`BoundDef::sources_of`: the modes', the node's `when` groups, the deployment's) and sets `tools_complete`
    only when all of them answered `All`. The modes, the groups, the access tier, the references and the screen declare `All`
    (most of them of nothing: they only hold tools back or add words), and the coder's repository-environment source declares
-   its one tool. **The thread-tools source declares `Unknown`**: the endpoint is another system's, it lists per conversation
+   its one tool. **The thread-tools source declares `Unknown`** (superseded by the ANR-1390 amendment below): the endpoint is another system's, it lists per conversation
    (the grant in the run's context; a new grant, a refused call or `LISTING_TTL` lists again) and it relays the tools of the
    servers a person attached as `<server>__<tool>`, so no list made at startup is every name it can offer. The interim is
    therefore **over as a rule** — an agent whose sources all declare has a complete set and decision 4's rule holds as
@@ -134,7 +134,10 @@ amendment is the owner's to make there.
    matches the entry as a string (`glob(shape, entry)`), so `*__*` admits `github__*`, `github__search` and `*` (the last
    through the concrete names beside it). `deny_tools` is held to the same rule and none weaker: an entry that selects
    neither a declared name nor a declared shape is still refused with the list, because a deny that silently denies nothing
-   is worse than a refusal — the person would believe a tool is blocked while it is offered. **Both shipped agents are
+   is worse than a refusal — the person would believe a tool is blocked while it is offered. Two consequences a person will
+   meet: an entry whose shape half is empty (`github__`, `__`) is refused, because `*` matches the empty run and such a name
+   selects nothing at run time; and a pattern **weaker than the declared shape** (`*_issues`, `github_*`) is refused even
+   though it would select relayed tools, because the set cannot express that family — name it as `github__*` instead. **Both shipped agents are
    therefore complete** and decision 4's rule holds as written: a `tools` entry that selects nothing is refused there. The
    interim the 2026-11-27 note described is over.
 

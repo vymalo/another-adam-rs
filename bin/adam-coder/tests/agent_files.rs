@@ -529,7 +529,7 @@ async fn the_helpers_bounds_are_complete_and_admit_a_relayed_servers_tools() {
     let all = agent.assembly().session_bounds();
     assert_eq!(all.len(), 2, "the coder's two helpers: {all:?}");
     let asked = |value| adam_runtime::SessionConfig::from_value(value).expect("a config");
-    for (name, bound) in &all {
+    for (name, bound) in all {
         assert!(
             bound.tools_complete,
             "{name}: every source declares its tools: {bound:?}"

@@ -332,7 +332,7 @@ selects a concrete declared name with its pattern or a declared shape matches it
 source, which declares the contract's tools and that shape), so there: a `tools` entry or a pattern that selects nothing is
 refused with the list, and a concrete `deny_tools` name that is none of the subagent's tools too. A source that cannot name
 its tools leaves the set incomplete, and there a `tools` entry or a pattern that selects nothing is admitted and just offers
-less. A remote subagent takes neither. They apply from the next model call; a later round carries them on.
+less. A remote subagent takes neither. They apply from the next model call; a later round carries them on. A pattern weaker than the declared shape (`*_issues`, `github_*`) is refused even though it would select relayed tools: name the family as `github__*`. An entry whose shape half is empty (`github__`, `__`) is refused too, because `*` matches the empty run and it selects nothing at run time.
 
 `report_schema` is a JSON Schema (draft 2020-12, at most 16 KiB, no reference outside itself) that the subagent's final answer
 must match, for a helper that runs here (a remote one refuses it). The subagent is not shown the schema unless its first answer

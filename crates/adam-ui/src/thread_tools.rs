@@ -99,7 +99,7 @@ pub const ASK_AGENT: &str = "ask_agent";
 pub const REQUEST_UPLOAD: &str = "request_upload";
 
 /// The shape of a tool the orchestration layer relays from a server attached to the conversation
-/// (`<server>__<tool>`, [`is_relayed`]), as a declaration's name: `*` is any run of characters, so
+/// (`<server>__<tool>`, `is_relayed`), as a declaration's name: `*` is any run of characters, so
 /// this stands for every relayed tool without naming one.
 pub const RELAYED_SHAPE: &str = "*__*";
 
@@ -588,7 +588,7 @@ fn is_relayed(name: &str) -> bool {
 /// clash (a plain name the agent has too) is still a warning.
 ///
 /// **What it declares.** The whole set it can offer, so a session's set of tools is complete: the
-/// contract's tools it knows by name and does not hide ([`CONTRACT_TOOLS`]) and
+/// contract's tools it knows by name and does not hide (`CONTRACT_TOOLS`) and
 /// [`RELAYED_SHAPE`], the shape of the tools it relays from a server a person attached (ADR 0054
 /// decision 4, amended 2026-11-28).
 ///
@@ -658,8 +658,11 @@ impl ToolSource for ThreadTools {
     /// **The whole set, as a shape.** The endpoint is another system's and lists per conversation
     /// (the grant in the run's context, a new grant, a refused call or [`LISTING_TTL`] lists again),
     /// but what it can list is the contract's: the tools this source knows by name and does not
-    /// hide ([`CONTRACT_TOOLS`]), and the tools of the servers a person attached, relayed as
-    /// `<server>__<tool>`, which [`RELAYED_SHAPE`] names as a shape. So a session's set of tools is
+    /// hide (`CONTRACT_TOOLS`), and the tools of the servers a person attached, relayed as
+    /// `<server>__<tool>`, which [`RELAYED_SHAPE`] names as a shape. **Unverified** (2026-11-28):
+    /// that the endpoint never lists a name outside this contract. It is the whole justification for
+    /// a complete set, and it is why `Unknown` was the honest answer before ANR-1390; a name it
+    /// lists beyond the contract would be refused by `SessionBounds::admit` while being offered. So a session's set of tools is
     /// **complete**: `SessionBounds::admit` refuses an entry that selects nothing, and admits one
     /// naming a relayed server's tools (`github__*`, `github__search`) or the shape itself
     /// (ADR 0054 decision 4, amended 2026-11-28). The declaration says what **can** arrive, not what

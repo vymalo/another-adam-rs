@@ -941,7 +941,9 @@ pub struct SessionBounds {
     /// * a `deny_tools` entry with a `*` is checked only when the set is complete, and by the same
     ///   rule as an allow entry — a shape admits a pattern over the family it declares, and never an
     ///   entry that selects nothing. A deny that silently denies nothing is worse than a refusal:
-    ///   the person would believe the tool is blocked while it is offered.
+    ///   the person would believe the tool is blocked while it is offered. A pattern over a family
+    ///   the set declares but no source provides today (`deny_tools: ["github__*"]` with no server
+    ///   attached) is admitted: it denies nothing now and denies that family if a server appears.
     ///
     /// With no name known (a control plane) only the shape is checked, so it admits what a worker
     /// will accept.
@@ -1177,7 +1179,8 @@ impl SessionBounds {
             return Err(Refusal::new(
                 Some(option),
                 format!(
-                    "config.{option} has {entry:?}, which matches none of its tools: {list}{hint}"
+                    "config.{option} has {entry:?}, which matches none of the names this agent declares: \
+                     {list}{hint}"
                 ),
             ));
         }
@@ -1221,11 +1224,23 @@ pub fn glob(pattern: &str, name: &str) -> bool {
 fn selects(names: &[String], entry: &str) -> bool {
     names.iter().any(|name| {
         if name.contains('*') {
-            glob(name, entry)
+            // `*` matches the empty run, so the shape alone would admit `github__` or `__`: a
+            // relayed name has text on both sides of its `__`, and an entry without it selects
+            // nothing at run time.
+            glob(name, entry) && relayed_shape(entry)
         } else {
             glob(entry, name)
         }
     })
+}
+
+/// Whether `entry` could name a relayed `<server>__<tool>`: text on both sides of its first `__`,
+/// which is what the narrowing itself requires of a tool it matches.
+fn relayed_shape(entry: &str) -> bool {
+    match entry.split_once("__") {
+        Some((server, tool)) => !server.is_empty() && !tool.is_empty(),
+        None => false,
+    }
 }
 
 impl SessionBounds {
@@ -3259,7 +3274,7 @@ mod tests {
             assert_eq!(why.option(), Some(option));
             assert!(
                 why.message().contains(&format!(
-                    "config.{option} has \"red_file\", which matches none of its tools: \
+                    "config.{option} has \"red_file\", which matches none of the names this agent declares: \
                      read_file, write_file, linear__list_issues, linear__get_issue"
                 )),
                 "{why}"
@@ -3280,7 +3295,7 @@ mod tests {
         assert_eq!(why.option(), Some("deny_tools"));
         assert!(
             why.message().contains(
-                "config.deny_tools has \"red_file\", which matches none of its tools: read_file, \
+                "config.deny_tools has \"red_file\", which matches none of the names this agent declares: read_file, \
                  write_file, linear__list_issues, linear__get_issue; the agent may get more tools \
                  while it runs: a pattern such as \"red_file*\" names those"
             ),
@@ -3318,7 +3333,7 @@ mod tests {
             bare.admit(listing(&["x"], &[]))
                 .unwrap_err()
                 .message()
-                .ends_with("matches none of its tools: none")
+                .ends_with("matches none of the names this agent declares: none")
         );
     }
 
@@ -3362,7 +3377,7 @@ mod tests {
             assert_eq!(why.option(), Some("tools"), "{entry}");
             assert!(
                 why.message()
-                    .contains("matches none of its tools: turn_output, *__*"),
+                    .contains("matches none of the names this agent declares: turn_output, *__*"),
                 "{entry}: {why}"
             );
             assert!(!why.message().contains("while it runs"), "{entry}: {why}");
@@ -3379,7 +3394,7 @@ mod tests {
         assert_eq!(why.option(), Some("deny_tools"));
         assert!(
             why.message()
-                .contains("matches none of its tools: turn_output, *__*"),
+                .contains("matches none of the names this agent declares: turn_output, *__*"),
             "{why}"
         );
     }
