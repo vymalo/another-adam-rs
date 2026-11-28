@@ -40,7 +40,7 @@
 //! When the notes hold a record for the same call — the same commands in the same order,
 //! directory, slot and timeout on exactly the tree the commands are about to run on (the tree id
 //! of the worktree as it would be committed: tracked changes and untracked, not ignored files,
-//! nothing else; see [`super::gitcli::working_tree_id`]; the call is told apart by the SHA-256 of
+//! nothing else; see `super::gitcli::working_tree_id`; the call is told apart by the SHA-256 of
 //! its commands' raw text, each behind its length, so two calls that differ only in a secret, or
 //! in where one command ends and the next begins, are two checks) — the commands are not run. The
 //! key is the tree id and the call, **never the time**.
