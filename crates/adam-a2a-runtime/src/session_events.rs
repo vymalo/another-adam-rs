@@ -166,7 +166,8 @@ pub(crate) struct Seen {
     pub context: String,
     pub agent: String,
     pub description: String,
-    pub keep_open: bool,
+    /// Who may write to the session (ADR 0089).
+    pub mode: adam_runtime::SessionMode,
     pub by: By,
     pub round: u32,
     pub task: RunId,
@@ -191,9 +192,9 @@ impl Seen {
             "contextId": self.context,
             "agent": self.agent,
             "description": self.description,
-            "keepOpen": self.keep_open,
             "by": self.by.word(),
         });
+        crate::child_sessions::put_mode(&mut object, self.mode);
         if let Some(config) = self
             .config
             .as_ref()
@@ -417,7 +418,7 @@ impl RuntimeTaskBackend {
             context: session_conversation_id(context, s.id),
             agent: self.session_agent_name(&s.agent),
             description: s.description.clone(),
-            keep_open: s.keep_open,
+            mode: s.mode,
             config: s.config.clone(),
             by: if s.started_outside_a_run() {
                 By::Person
@@ -453,8 +454,8 @@ fn settle(prev: &Seen, state: RoundState) -> Option<Seen> {
     }
     let mut settled = prev.clone();
     settled.state = state;
-    // A session that is not kept open closes with its round.
-    settled.closed = prev.closed || !prev.keep_open;
+    // A one-shot session closes with its round.
+    settled.closed = prev.closed || !prev.mode.keeps_open();
     Some(settled)
 }
 
@@ -468,7 +469,7 @@ mod tests {
             context: "c/s/x".into(),
             agent: "planner".into(),
             description: "d".into(),
-            keep_open: true,
+            mode: adam_runtime::SessionMode::Open,
             by: By::Agent,
             round,
             task: RunId::new(),
@@ -612,6 +613,7 @@ mod tests {
                 "description",
                 "event",
                 "keepOpen",
+                "mode",
                 "report",
                 "round",
                 "session"
@@ -728,9 +730,15 @@ mod tests {
     #[test]
     fn a_settled_round_closes_a_session_that_is_not_kept_open() {
         let prev = Seen {
-            keep_open: false,
+            mode: adam_runtime::SessionMode::OneShot,
             ..seen(1, Working, false)
         };
+        // A sealed session stays open as an open one does: only who may write differs.
+        let sealed = Seen {
+            mode: adam_runtime::SessionMode::Sealed,
+            ..seen(1, Working, false)
+        };
+        assert!(!settle(&sealed, Done).unwrap().closed);
         let settled = settle(&prev, Done).unwrap();
         assert!(settled.closed && settled.state == Done);
         let kept = seen(1, Working, false);
@@ -800,7 +808,7 @@ mod tests {
             id: session,
             agent: "helper".into(),
             description: "Plan it".into(),
-            keep_open: true,
+            mode: adam_runtime::SessionMode::Open,
             closed: false,
             closing: false,
             deleted: false,

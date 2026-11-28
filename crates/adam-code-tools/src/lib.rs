@@ -35,6 +35,7 @@ pub use commands::{
     CommandGuard, CommandLimits, CommandWorkspace, DynCommandWorkspace, Guarding, Settled,
     Unwatched,
 };
+pub use output::{OutputDefaults, OutputMode};
 pub use person::PersonDir;
 pub use redact::Redactor;
 pub use workspace::{

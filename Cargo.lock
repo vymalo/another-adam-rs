@@ -231,6 +231,7 @@ dependencies = [
  "adam-a2a-runtime",
  "adam-core",
  "adam-error",
+ "adam-export",
  "adam-hook-exec",
  "adam-host",
  "adam-llm-agent",
@@ -398,6 +399,7 @@ dependencies = [
  "adam-core",
  "adam-env-kubernetes",
  "adam-error",
+ "adam-export",
  "adam-hook-exec",
  "adam-host",
  "adam-llm-agent",
@@ -580,6 +582,41 @@ name = "adam-error"
 version = "0.7.0"
 dependencies = [
  "thiserror",
+]
+
+[[package]]
+name = "adam-export"
+version = "0.7.0"
+dependencies = [
+ "adam-core",
+ "adam-error",
+ "adam-llm-agent",
+ "adam-model",
+ "adam-runtime",
+ "async-trait",
+ "getrandom 0.4.3",
+ "regex",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "adam-export-testkit"
+version = "0.7.0"
+dependencies = [
+ "adam-core",
+ "adam-error",
+ "adam-export",
+ "adam-llm-agent",
+ "adam-model",
+ "adam-runtime",
+ "async-trait",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]
@@ -1023,13 +1060,16 @@ dependencies = [
  "adam-budget",
  "adam-core",
  "adam-error",
+ "adam-export",
  "adam-hook-exec",
  "adam-host",
+ "adam-llm-agent",
  "adam-mcp",
  "adam-model",
  "adam-model-oauth",
  "adam-model-openai",
  "adam-notify-postgres",
+ "adam-otel",
  "adam-plugin",
  "adam-postgres",
  "adam-run-cert-broker",
@@ -1040,6 +1080,8 @@ dependencies = [
  "async-trait",
  "axum",
  "jiff",
+ "opentelemetry",
+ "opentelemetry_sdk",
  "rustix",
  "rustls",
  "secrecy",

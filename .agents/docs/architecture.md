@@ -31,6 +31,92 @@ bindings ([ADR 0031](../../docs/decisions/0031-swagger-ui-and-the-a2a-rest-bindi
 * The chart was rendered, not applied to a cluster; how it reaches the cluster after the tag bump is
   outside this repository.
 
+## The model's window (ADR 0088, slice W1)
+
+Built 2026-11-27. The invariant: **one rule answers a model alias's window**, and every reader asks the client.
+
+* The rule: `adam_model::resolve_context_window` (`crates/adam-model/src/profiles.rs:221`): the profile's
+  `contextWindow`, else the window configured for that alias outside the profiles (`DEFAULT_MODEL_CONTEXT_WINDOW`), else
+  `None`; a hand-built `0` falls through. The loader refuses `0` and anything above `MAX_CONTEXT_WINDOW` (2^53 − 1,
+  `profiles.rs:211`) in `window` (`profiles.rs:624`), like a cap of `0`. A preset has no window: it is a fact of the
+  model, and a preset carries no limit of the model either.
+* The clients answer through it: the trait default (`crates/adam-model/src/client.rs:44`, the profile only),
+  `MockModel` (`crates/adam-model/src/mock.rs:203`) and `OpenAiCompatible` (`crates/adam-model-openai/src/lib.rs:985`);
+  `GateModel` and `Arc<T>` forward. `ModelConfig::client` gives the client both `DEFAULT_MODEL_CONTEXT_WINDOW` for `MODEL`
+  and the profiles (`crates/adam-service/src/config.rs:1347`, `:1358`).
+* The readers ask the client per alias: the compaction budget of the live alias
+  (`crates/adam-llm-agent/src/agent.rs:3741`, narrowed by a session's `context_window` in
+  `compaction::effective_window`), each `usage/v1` report (`agent.rs:4224`), and the output cap's clamp
+  (`crates/adam-assembly/src/assembly.rs:758`). A subagent is built on the same client with its own alias, so its
+  window is its own profile's.
+* The engine (amended 2026-11-28): `EngineBuilder::start` wraps the host's client in `Profiled`
+  (`crates/adam-engine/src/profiled.rs`) when `EngineBuilder::models` gave profiles, before the assembly is built, so the
+  three readers above see the profiles' windows without the host giving its client the same profiles. For an alias the
+  client has a profile of, the client answers alone (its profile wins whole, not merged: its requests are sent by it);
+  otherwise `resolve_context_window(engine's profile, client.context_window(alias))`, the client's answer without a
+  profile being its configured window. `profile()` answers likewise; everything else forwards. Check: no second rule,
+  and the wrap stays before `bound.model(..)`. The reasoning wire and extra body are still the client's own profiles.
+
+Tests: `profiles.rs` `a_context_window_is_one_to_two_to_the_53_minus_one_tokens`,
+`the_profiles_window_wins_over_the_configured_one`; `client.rs` `the_default_window_is_the_profiles`; `mock.rs`
+`a_profiles_window_wins_over_the_told_one`; `adam-model-openai` `a_profiles_window_wins_over_the_configured_one_alias_by_alias`;
+`adam-service` `a_profiles_context_window_wins_over_default_model_context_window`; `adam-llm-agent` `tests/usage.rs`
+`each_report_carries_the_window_its_aliases_profile_names` and `tests/compaction.rs`
+`the_budget_is_taken_from_the_window_of_the_models_profile`; `adam-assembly` `tests/cap.rs`
+`a_subagent_on_another_alias_has_its_own_profiles_window`; `adam-engine` `tests/engine.rs`
+`the_profiles_window_reaches_a_client_without_profiles` and the unit tests of `src/profiled.rs`.
+
+## The history budget's default (ADR 0088, slice W3)
+
+Built 2026-11-28. The invariants: **one constant is the default**, and **a history the window cannot hold never
+squeezes the output cap to nothing**.
+
+* The default: `adam_llm_agent::DEFAULT_MAX_HISTORY_TOKENS` = 200,000 (`crates/adam-llm-agent/src/agent.rs:918`), the
+  value of `Limits::default()` (`agent.rs:955`); a folder that omits `limits.max_history_tokens` takes it through
+  `def::limits` (`crates/adam-assembly/src/def.rs:1539`). No other crate writes the number: grep for `200_000` beside
+  `max_history_tokens` before adding one.
+* The compaction budget is unchanged: the smaller of the window's budget and the limit, `0` the window's alone
+  (`crates/adam-llm-agent/src/compaction.rs:241`).
+* The output cap's clamp (`crates/adam-assembly/src/assembly.rs:761`) reserves `min(max_history_tokens, window / 2)`,
+  and `window / 2` for `0`, for every alias. Before W3 only a model the agent does not run on itself had the half
+  bound; with the 200,000 default the agent's own model on a 131,072-token window (the dev stack) would have asked for
+  one output token. A folder's explicit history over half the window now gives way too, which amends ADR 0064
+  decision 4 (dated note there).
+* The coder's folder states the value (`bin/adam-coder/agent/instructions.md:11`) rather than leaving it to the
+  default, so its budget is read where its other limits are and a change of the library's default does not move it.
+
+Tests: `compaction.rs` `the_default_history_budget_is_the_budget_when_no_window_is_known`,
+`a_known_smaller_window_wins_over_the_default_history_budget`; `def.rs` `an_omitted_history_budget_is_the_loops_default`;
+`adam-assembly` `tests/cap.rs` `a_history_the_window_cannot_hold_leaves_the_output_half_the_window` and the cases
+before it; `adam-engine` `the_deployments_profiles_reach_an_engines_agent` (80,000 on a 200,000 window).
+
+## The default window's variable (ADR 0088, slice W2)
+
+Built 2026-11-28. The invariant: **one variable answers the window outside the profiles, and two answers fail closed.**
+
+* The reader: `parse_default_context_window` in `crates/adam-service/src/config.rs`, called once by
+  `ModelConfig::parse` (so once at startup per binary): `DEFAULT_MODEL_CONTEXT_WINDOW`, else the deprecated
+  `MODEL_CONTEXT_WINDOW`. A set alias logs one `WARN` naming the new variable, whether or not the new one is set.
+  Both set: equal (as numbers, so `" 131072 "` equals `131072`) is the value; different is one problem naming both
+  variables and neither value, which the binaries turn into a `ConfigError` (exit 78). A value one of them refuses is
+  that variable's problem alone, not a conflict. Blank is unset (`not_blank`).
+* Both are held to `MAX_CONTEXT_WINDOW` by `parse_context_window(name, ..)`, whose problem starts with the name.
+* The result is still `ModelConfig::context_window`, the `configured` argument of `resolve_context_window`: W1's
+  rule is unchanged, the profile's `contextWindow` wins.
+* The chart: `coder.modelContextWindow` (`deploy/coder/templates/_helpers.tpl`) renders `DEFAULT_MODEL_CONTEXT_WINDOW`
+  in `templates/statefulset.yaml`; `templates/_validate.tpl` refuses the value beside either name in
+  `config.extraEnv`. No golden sets the value, so no golden changed; `tests/render-check.sh` holds the name.
+* Every in-repository writer moved: `compose.yaml`, `dev/compose.real-model.yaml`. `bench/` did not: it starts the
+  coder image pinned in `bench/pins.json` (`sha-9a9e6c5`, 2026-11-21), which reads only the old name; it moves with the pin.
+* The alias is removed in a later minor release, with a dated *Amended* note on ADR 0088.
+
+Tests: `adam-service` `model_context_window_is_a_deprecated_alias_of_default_model_context_window` (new alone, old
+alone with one warning, equal, different, one invalid, blank alias; the `WARN` lines captured with a
+`tracing_subscriber` writer), `the_context_window_is_a_positive_count_for_the_models_alias` (both names' bounds);
+`adam-agent` `src/config.rs` `the_context_window_is_read_by_the_workers_and_a_bad_one_stops_the_start` (exit 78 for
+a conflict). For people: [Environment](../../docs/reference/environment.md), the chart's
+[README](../../deploy/coder/README.md#the-models-context-window).
+
 ## Signed turns on re-entry (ADR 0068, slice T3a-3)
 
 For people: [Signed turns](../../docs/architecture.md#signed-turns-each-assistant-and-tool-turn-is-signed-when-it-is-committed).
@@ -146,6 +232,41 @@ Read 2026-11-26 at the head of PR #453.
 * **Vector.** `crates/adam-llm-agent/tests/vectors/turn_chain_vector.py` regenerates the golden constants of `signing.rs`
   (checked identical 2026-11-26).
 
+## Child runs: a subagent's tool starts a one-shot session (ADR 0089, slice C1)
+
+For people: [Child runs](../../docs/architecture.md#child-runs). *Verified 2026-11-27* by reading the code and running the
+tests named here.
+
+* **Where.** `SubagentTool::call` (`crates/adam-assembly/src/subagent.rs`) calls `ToolCtx::start_one_shot_session`
+  (`crates/adam-llm-agent/src/tool.rs`), which is `sessions::start_one_shot` (`crates/adam-llm-agent/src/sessions.rs`):
+  `first_header` (shared with `subagent_start`'s `Start::call`, so the two cannot disagree on `root`, `workspace`,
+  `visible`) with `closed: true`, then `ChildStarter::start_round(id, id, ..)`, the same path as `subagent_start`. The id is
+  `ToolCtx::child_run_id()`, unchanged, so a replay finds the child.
+* **Closed from the start.** `header.closed` makes `read_latest` (`crates/adam-runtime/src/session.rs`) read the session
+  closed while its round works, so `subagent_send` refuses it (`closed_words`), the A2A front refuses a message to its
+  context (`message_to_session`), and, new in C1, a message naming its round with `steer/v1` is refused too
+  (`submit_child` in `crates/adam-a2a-runtime/src/child_sessions.rs`; the answer to a question and a resume still pass).
+* **Told once.** `LlmAgent::note_answered_round` (`crates/adam-llm-agent/src/agent.rs`) adds the child to
+  `reported_rounds` at both `AwaitRun` answers, when the agent tells session reports (`session_agents` set), so `is_due`
+  never tells it again as a report. The window is 128 rounds (`MAX_REPORTED_ROUNDS`) and a listing one page of 100
+  (`MAX_SESSION_PAGE`), the open ones first, so a child answered long ago falls out of the listing before it falls out of
+  the window.
+* **What is not a session's.** No session limit (`max_open`, `max_working`) is checked, as none was before; the parent
+  is not "has started a session" (`has_started_session` reads `subagent_start` and `subagent_send` only), so
+  `end_sessions` and the turn-end wait do not change; the usage of the child is counted by `count_child`, as before.
+* **A child from before C1.** A journal whose call started a plain child (no conversation) is replayed: `start_round`
+  answers `InvalidSession` ("a run with this id exists and is not this round") and `start_one_shot` starts the plain
+  child again, which finds it. The same fallback covers a conversation id past `MAX_SESSION_CONVERSATION_BYTES` (a deeply
+  nested child).
+* **Not changed.** A remote subagent's own tool (`RemoteSubagentTool`) still calls the remote from the parent's step
+  (`AwaitRemote`): it has no child run to give a conversation to. C2 gives `subagent_start` its options for both.
+* **Tests.** `crates/adam-assembly/tests/subagents.rs`:
+  `a_subagents_call_is_a_one_shot_session_that_is_closed_after_its_round`,
+  `two_calls_of_one_turn_are_two_sessions_with_their_own_conversations`,
+  `a_child_started_before_it_was_a_session_is_found_by_the_call`, and the conversation id in
+  `a_parent_restarted_mid_wait_still_gets_the_childs_answer`; `crates/adam-a2a-runtime/tests/child_sessions.rs`:
+  `a_one_shot_session_is_listed_and_takes_no_message_from_the_person`; `crates/adam-export/tests/export.rs`:
+  `a_subagents_run_is_a_record_of_its_own_linked_to_its_parent`.
 
 ## L2 memory beside the run store
 

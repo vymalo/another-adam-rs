@@ -827,6 +827,10 @@ fn sorted_entries(dir: &Path) -> Vec<(std::ffi::OsString, std::fs::FileType, Pat
 /// paths, the same on every call: a file does not come and go with the order the file system lists.
 fn walk_capped(root: &Path, extensions: &[&str], cap: usize) -> HashMap<PathBuf, (u64, u128)> {
     let mut found = HashMap::new();
+    // A server that watches no file (the Dockerfile's) costs no walk.
+    if extensions.is_empty() {
+        return found;
+    }
     let mut stack = vec![sorted_entries(root).into_iter()];
     while let Some(top) = stack.last_mut() {
         let Some((name, kind, path)) = top.next() else {

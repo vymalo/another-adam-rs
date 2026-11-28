@@ -57,6 +57,7 @@ mod engine;
 mod error;
 mod events;
 pub mod local_agent;
+mod profiled;
 mod resources;
 mod types;
 

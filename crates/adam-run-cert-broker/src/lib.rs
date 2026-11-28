@@ -278,28 +278,47 @@ impl RunCertIssuer for BrokerIssuer {
 /// [`BrokerError::CaFile`] when `ca_pem` is larger than [`MAX_CA_PEM_BYTES`], is not PEM, or holds
 /// no certificate; [`BrokerError::Client`] when the TLS backend refuses the configuration.
 pub fn http_client(ca_pem: Option<&[u8]>) -> Result<HttpClient, BrokerError> {
-    let mut builder = reqwest::Client::builder()
-        .user_agent(concat!("adam-run-cert-broker/", env!("CARGO_PKG_VERSION")))
-        .connect_timeout(CONNECT_TIMEOUT)
-        .timeout(REQUEST_TIMEOUT)
-        // The request carries the projected token and a CSR naming the run: a proxy inherited from
-        // the environment would hand both to another host.
-        .no_proxy()
-        .redirect(reqwest::redirect::Policy::none());
-    if let Some(pem) = ca_pem {
-        if pem.len() > MAX_CA_PEM_BYTES {
-            return Err(BrokerError::CaFile(
-                format!("it is longer than {MAX_CA_PEM_BYTES} bytes").into(),
-            ));
+    let base = || {
+        reqwest::Client::builder()
+            .user_agent(concat!("adam-run-cert-broker/", env!("CARGO_PKG_VERSION")))
+            .connect_timeout(CONNECT_TIMEOUT)
+            .timeout(REQUEST_TIMEOUT)
+            // The request carries the projected token and a CSR naming the run: a proxy inherited
+            // from the environment would hand both to another host.
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+    };
+    let certificates = match ca_pem {
+        Some(pem) => {
+            if pem.len() > MAX_CA_PEM_BYTES {
+                return Err(BrokerError::CaFile(
+                    format!("it is longer than {MAX_CA_PEM_BYTES} bytes").into(),
+                ));
+            }
+            let certificates = reqwest::Certificate::from_pem_bundle(pem)
+                .map_err(|e| BrokerError::CaFile(Box::new(e.without_url())))?;
+            if certificates.is_empty() {
+                return Err(BrokerError::CaFile("it holds no certificate".into()));
+            }
+            certificates
         }
-        let certificates = reqwest::Certificate::from_pem_bundle(pem)
-            .map_err(|e| BrokerError::CaFile(Box::new(e.without_url())))?;
-        if certificates.is_empty() {
-            return Err(BrokerError::CaFile("it holds no certificate".into()));
-        }
-        builder = builder.tls_certs_merge(certificates);
+        None => Vec::new(),
+    };
+    let merged = if certificates.is_empty() {
+        base()
+    } else {
+        base().tls_certs_merge(certificates.clone())
+    };
+    match merged.build() {
+        Ok(client) => Ok(client),
+        // A system with no roots (a slim base without `ca-certificates`) cannot give the platform
+        // verifier any: trust the given CA alone, or nothing. An `http` broker still answers, and
+        // an `https` one is refused at its handshake, never trusted unverified.
+        Err(first) => base()
+            .tls_certs_only(certificates)
+            .build()
+            .map_err(|_| BrokerError::Client(first)),
     }
-    builder.build().map_err(BrokerError::Client)
 }
 
 /// The route of `run` under `base_url`, keeping any path prefix the base carries.

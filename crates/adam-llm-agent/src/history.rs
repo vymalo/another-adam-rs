@@ -357,14 +357,24 @@ pub(crate) fn record_shortenings(
     record_shortenings_from(messages, max_tokens, output_id_of, counted).is_some()
 }
 
-/// [`record_shortenings`], giving the position of the first message it changed (`None`: none). A
-/// signed message at or after it no longer holds its signature ([`crate::signing::unsign_from`]).
+/// What one shortening of a history did ([`record_shortenings_from`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Shortened {
+    /// The position of the first message it changed: a signed message at or after it no longer
+    /// holds its signature ([`crate::signing::unsign_from`]).
+    pub(crate) first: usize,
+    /// The characters it took out of the history, less the markers and lines it left
+    /// ([`ShorteningUsage::chars_removed`](adam_runtime::ShorteningUsage::chars_removed)).
+    pub(crate) chars_removed: usize,
+}
+
+/// [`record_shortenings`], saying what it changed (`None`: nothing).
 pub(crate) fn record_shortenings_from(
     messages: &mut [Message],
     max_tokens: u32,
     output_id_of: &dyn Fn(&str) -> Option<String>,
     counted: &mut Chars,
-) -> Option<usize> {
+) -> Option<Shortened> {
     if max_tokens == 0 {
         return None;
     }
@@ -375,6 +385,7 @@ pub(crate) fn record_shortenings_from(
     if total <= budget {
         return None;
     }
+    let before = total;
     let target = budget - budget / 4;
     let protected_from = messages
         .iter()
@@ -422,7 +433,10 @@ pub(crate) fn record_shortenings_from(
     }
     counted.chars = total;
     counted.len = messages.len();
-    first_changed
+    first_changed.map(|first| Shortened {
+        first,
+        chars_removed: before.saturating_sub(total),
+    })
 }
 
 #[cfg(test)]
@@ -1124,10 +1138,16 @@ mod tests {
             None
         );
         assert_eq!(messages, before);
-        let first = record_shortenings_from(&mut messages, 1_000, &no_ids, &mut Chars::default())
-            .expect("shortened");
+        let shortened =
+            record_shortenings_from(&mut messages, 1_000, &no_ids, &mut Chars::default())
+                .expect("shortened");
+        let first = shortened.first;
         assert!(first >= 2, "{first}");
         assert_eq!(messages[..first], before[..first]);
         assert_ne!(messages[first], before[first]);
+        // What it took out is what the history lost, the marker it left counted against it.
+        let chars = |messages: &[Message]| messages.iter().map(message_chars).sum::<usize>();
+        assert_eq!(shortened.chars_removed, chars(&before) - chars(&messages));
+        assert!(shortened.chars_removed > 15_000, "{shortened:?}");
     }
 }

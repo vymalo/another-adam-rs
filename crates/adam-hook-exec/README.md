@@ -57,4 +57,11 @@ restarted after its backoff; an observer that decides refused; and a configurati
 
 `tests/replay.rs` is the slice's end-to-end proof: a worker dies inside a tool call, a second worker
 replays the journal, and the program's own log shows the recorded step asked once and the
-unrecorded one twice.
+unrecorded one twice. A run whose program dies at its first request fails once the step's retries
+are spent, and the call never runs: every attempt asks the model again, so the mock gives each one
+the same call.
+
+The program's log holds every line it reads, so a request count counts its `event` lines, never the
+hello or the shutdown. Every line the adapter writes ends with `\n`, the hello and the queued
+requests alike: without it the program waits for the rest of a line that is already whole, and every
+call misses its deadline.

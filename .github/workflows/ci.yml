@@ -394,6 +394,10 @@ jobs:
       # A database suite that would skip (variable unset) fails instead: see
       # adam_core::testing. Without this, a typo here turns the suites green.
       ADAM_TEST_REQUIRE_DB: "1"
+      # Line tables only: a panic's backtrace keeps its files and lines, and the workspace's test
+      # binaries (each links the whole tree) fit the runner's disk. With full debug info the runner
+      # was lost mid-step, ~16 minutes in, with no log uploaded (PR #487, 2026-11-28).
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable

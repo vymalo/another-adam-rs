@@ -340,7 +340,7 @@ The three tools of [the coder's language servers](coder-agent.md#language-server
 |---|---|---|
 | the program is not on `PATH` (or `--version` does not run) | `No language server for Rust in this environment (`rust-analyzer` is not on PATH in ...). Use `run_checks` or `run_command` with `cargo check` instead.` (a result, not an error) | nothing was started |
 | the file is of no language the servers know | `No language server serves `notes.txt`: they serve .rs (Rust), ...` (a result) | nothing was started |
-| the server is working through its index at the end of `wait` | a first line `[still indexing after 30 s (server up 34 s): the result may be incomplete; call again, the server is kept]` | kept |
+| the server is working through its index at the end of `wait` | a first line `[still indexing after 30 s of at most 30 s (server up 34 s): the result may be incomplete; call again, the server is kept]` (the time spent, then the `wait` bound) | kept |
 | the symbol is not on the line, or fewer times than `occurrence` | `` `second` is not on line 1 of `src/lib.rs`. The line reads: ... `` (an error result) | not asked |
 | the symbol is on the line only inside longer words | `` `id` is not on line 1 of `src/v.rs` as a word (it is there only inside longer words). The line reads: ... `` (an error result) | not asked |
 | the server published nothing for the file in the time given (not an empty set: that is `(no errors or warnings)`) | `No diagnostics received for `src/lib.rs` within 3 s: the server published none for it (it may not have looked at the file yet, or it publishes only when there is something to say). Call again, ...` (a result) | kept |

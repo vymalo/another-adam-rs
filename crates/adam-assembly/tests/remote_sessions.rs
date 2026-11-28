@@ -611,6 +611,62 @@ async fn a_remote_session_keeps_its_context_across_rounds() {
     }
 }
 
+/// ADR 0089 slice C2: a remote session takes `mode` and `wait` as a local one does, since its
+/// rounds are local runs of the round agent: `sealed` with `wait: true` parks the start on round 1,
+/// answers the remote's report as the call's result, and leaves the session idle for the parent's
+/// next round, which continues the remote's context.
+#[tokio::test]
+async fn a_remote_session_takes_mode_and_wait_as_a_local_one_does() {
+    for (backend, store) in stores().await {
+        let rig = Rig::new(1, false).await;
+        let rt = rig.runtime(&store, None);
+        let parent = rig
+            .start(&rt, |model, session| {
+                model
+                    .push_tool_calls(vec![call(
+                        "c1",
+                        "subagent_start",
+                        json!({"agent": "billing", "description": "billing",
+                               "prompt": "invoice 7", "mode": "sealed", "wait": true}),
+                    )])
+                    .push_tool_calls(vec![send("c2", session, "invoice 8")])
+                    .push_tool_calls(vec![read("c3", session)])
+                    .push_text("settled");
+            })
+            .await;
+        let worker = spawn_worker(&rt);
+        wait_done(&rt, parent).await;
+        worker.stop().await;
+
+        let session = child_run_id(parent, "c1");
+        let results = results(&rig.model);
+        let first = text_of(&results, "c1");
+        assert!(
+            first.starts_with(&format!("session {session} (billing")),
+            "{backend}: {first}"
+        );
+        assert!(first.contains("done: invoice 7"), "{backend}: {first}");
+        assert_eq!(
+            json_of(&results, "c2")["delivered"],
+            "new_round",
+            "{backend}"
+        );
+        assert!(
+            text_of(&results, "c3").contains("done: invoice 8"),
+            "{backend}"
+        );
+        let round = rt.state(session).await.unwrap().expect("round 1");
+        assert_eq!(round["session"]["mode"], "sealed", "{backend}: {round}");
+        let submits = rig.remote.submits();
+        assert_eq!(submits.len(), 2, "{backend}: {submits:?}");
+        assert_eq!(
+            submits[1].context_id.as_ref(),
+            Some(&rig.remote.made()[0].1),
+            "{backend}: round 2 continues the remote's context"
+        );
+    }
+}
+
 #[tokio::test]
 async fn a_message_to_a_working_remote_session_is_steered_when_the_card_lists_steer() {
     for (backend, store) in stores().await {

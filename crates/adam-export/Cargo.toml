@@ -1,0 +1,30 @@
+[package]
+name = "adam-export"
+description = "Export adam-rs runs as training records: one JSON Lines record per run or per assistant turn in the chat shape, with facets, outcomes, redaction and pseudonymous ids (ADR 0087)"
+readme = "README.md"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+adam-core.workspace = true
+adam-error.workspace = true
+adam-llm-agent.workspace = true
+adam-model.workspace = true
+adam-runtime.workspace = true
+async-trait.workspace = true
+getrandom.workspace = true
+regex.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+
+[lints]
+workspace = true

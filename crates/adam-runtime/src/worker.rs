@@ -39,6 +39,56 @@ use crate::seal::{Seal, Sealer, attach, chain_over};
 
 type InFlight = Arc<Mutex<HashSet<RunId>>>;
 
+/// How long a run this worker refused stays out of its claims ([ADR 0076], the claim path): long
+/// enough that the next poll does not take it again, short enough that a worker of its own epoch
+/// (or a rollout that finishes) finds it quickly.
+///
+/// [ADR 0076]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0076-a-run-records-the-journal-epoch-it-started-on.md
+const SKIP_PERIOD: Duration = Duration::from_secs(60);
+
+/// The most runs one worker keeps in its skip set: past it the entries held longest are dropped,
+/// so a store that keeps handing back runs of a newer epoch cannot grow it without bound.
+const MAX_SKIPPED: usize = 4096;
+
+/// The runs this worker refused because their journal is a **newer** epoch ([ADR 0076]): handed to
+/// [`Store::claim_due`](adam_core::Store::claim_due) as `busy` for [`SKIP_PERIOD`], so the next
+/// poll does not offer them again and an older worker does not spin on a run it cannot finish.
+///
+/// [ADR 0076]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0076-a-run-records-the-journal-epoch-it-started-on.md
+#[derive(Debug, Default)]
+pub(crate) struct SkipSet {
+    until: std::collections::HashMap<RunId, Timestamp>,
+}
+
+impl SkipSet {
+    /// Keep `run` out of this worker's claims until `now + SKIP_PERIOD`.
+    pub(crate) fn hold(&mut self, run: RunId, now: Timestamp) {
+        if self.until.len() >= MAX_SKIPPED && !self.until.contains_key(&run) {
+            // Drop the entries that have expired; if none has, drop the one held longest, which is
+            // the one whose period started first.
+            let horizon = now - adam_core::time::span_of(SKIP_PERIOD);
+            self.until.retain(|_, until| *until > horizon);
+            if self.until.len() >= MAX_SKIPPED
+                && let Some(oldest) = self
+                    .until
+                    .iter()
+                    .min_by_key(|(_, until)| **until)
+                    .map(|(run, _)| *run)
+            {
+                self.until.remove(&oldest);
+            }
+        }
+        self.until
+            .insert(run, now + adam_core::time::span_of(SKIP_PERIOD));
+    }
+
+    /// The runs still held, for `claim_due`'s `busy`. Expired entries are forgotten here.
+    pub(crate) fn busy(&mut self, now: Timestamp) -> Vec<RunId> {
+        self.until.retain(|_, until| *until > now);
+        self.until.keys().copied().collect()
+    }
+}
+
 /// The `detail` of the status event a worker emits when it first claims a run.
 pub(crate) const CLAIMED: &str = "claimed";
 
@@ -105,12 +155,21 @@ impl Runtime {
                 // now is still outside it when the claim returns, and a step that left it has
                 // committed and released before: no claim returns a snapshot that is older than
                 // what this worker wrote, and none is cleared by the release of an earlier step.
-                let busy: Vec<RunId> = in_flight
+                let mut busy: Vec<RunId> = in_flight
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner)
                     .iter()
                     .copied()
                     .collect();
+                // What this worker refused for its epoch stays out of its claims for a period
+                // ([ADR 0076]): `busy` already means "never offered, not counted against `limit`".
+                busy.extend(
+                    inner
+                        .skip
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .busy(inner.clock.now()),
+                );
                 let claimed = inner
                     .store
                     .claim_due(
@@ -540,6 +599,10 @@ struct Next {
     head_artifacts: Option<Vec<Artifact>>,
     /// The digests the shadow's upload pass stored (the union the commit references).
     shadow_blobs: Vec<BlobId>,
+    /// The blobs the agent's state references, named with [`Ctx::reference_blobs`]: the commit
+    /// records them beside the file artifacts' digests. Empty for a transition whose state is not
+    /// kept (a failure, a retry).
+    blobs: Vec<BlobId>,
     /// The digest and size of every file artifact in the head's upload pass, in artifact order, so
     /// `Head::of` does not re-hash the bytes.
     shadow_files: Vec<(BlobId, u64)>,
@@ -735,7 +798,14 @@ async fn transition_inner(
                 worker_epoch,
                 "leaving a run of a newer journal epoch untouched"
             );
-            return false;
+            // Hand it back and keep it out of this worker's next polls for a period, so an older
+            // worker in a rollout does not spin on a run only a newer one can finish.
+            inner
+                .skip
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .hold(run, inner.clock.now());
+            return true;
         }
         EpochVerdict::TooOld => {
             let reason = format!(
@@ -1097,6 +1167,7 @@ fn plan(
         reopen,
         read,
         artifacts,
+        blobs,
     } = out;
     // Starting point for a transition that made progress. A v5 run's step must split: its state is
     // the head plus the body, and a step that writes no head would put the whole state in the head,
@@ -1123,6 +1194,7 @@ fn plan(
             split_refused,
             head_artifacts: None,
             shadow_blobs: Vec::new(),
+            blobs: blobs.clone(),
             shadow_files: Vec::new(),
             deadline: base.deadline,
             remaining_secs: base.remaining_secs,
@@ -1148,6 +1220,7 @@ fn plan(
         split_refused: false,
         head_artifacts: None,
         shadow_blobs: Vec::new(),
+        blobs: Vec::new(),
         shadow_files: Vec::new(),
         deadline: base.deadline,
         remaining_secs: base.remaining_secs,
@@ -1224,6 +1297,7 @@ fn plan(
                     split_refused: false,
                     head_artifacts: None,
                     shadow_blobs: Vec::new(),
+                    blobs: Vec::new(),
                     shadow_files: Vec::new(),
                     deadline: base.deadline,
                     remaining_secs: base.remaining_secs,
@@ -1825,6 +1899,7 @@ async fn commit(
             blobs.extend(crate::blob::upload_files(&inner.store, &next.artifacts).await);
             (blobs, None)
         };
+        blobs.extend(next.blobs.iter().cloned());
         blobs.sort();
         blobs.dedup();
         let mut update = build_update(
@@ -2191,6 +2266,7 @@ mod claim_tests {
             split_refused: false,
             head_artifacts: None,
             shadow_blobs: Vec::new(),
+            blobs: Vec::new(),
             shadow_files: Vec::new(),
             deadline: None,
             remaining_secs: None,
@@ -2385,5 +2461,124 @@ mod epoch_verdict_tests {
     fn a_run_below_the_oldest_replayable_epoch_is_failed() {
         assert_eq!(epoch_verdict(0, 2, 1), EpochVerdict::TooOld);
         assert_eq!(epoch_verdict(1, 3, 2), EpochVerdict::TooOld);
+    }
+}
+
+/// The skip set ([ADR 0076], the claim path): held for a period, bounded, and nothing else.
+///
+/// [ADR 0076]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0076-a-run-records-the-journal-epoch-it-started-on.md
+#[cfg(test)]
+mod skip_set_tests {
+    use super::{MAX_SKIPPED, SKIP_PERIOD, SkipSet};
+    use adam_core::RunId;
+    use adam_core::time::{Timestamp, span_of};
+
+    fn at(offset_secs: i64) -> Timestamp {
+        Timestamp::now()
+            + span_of(std::time::Duration::from_secs(offset_secs.unsigned_abs()))
+                * if offset_secs < 0 { -1 } else { 1 }
+    }
+
+    #[test]
+    fn a_held_run_is_busy_until_its_period_passes() {
+        let mut set = SkipSet::default();
+        let now = Timestamp::now();
+        let run = RunId::new();
+        set.hold(run, now);
+        assert_eq!(
+            set.busy(now),
+            vec![run],
+            "held from the moment it is refused"
+        );
+        // One second short of the period, still held; at the period, forgotten.
+        let almost = now + span_of(SKIP_PERIOD - std::time::Duration::from_secs(1));
+        assert_eq!(set.busy(almost), vec![run]);
+        let after = now + span_of(SKIP_PERIOD);
+        assert!(set.busy(after).is_empty(), "the period has passed");
+    }
+
+    #[test]
+    fn the_set_is_bounded_and_drops_the_oldest() {
+        let mut set = SkipSet::default();
+        let now = Timestamp::now();
+        for _ in 0..(MAX_SKIPPED + 8) {
+            set.hold(RunId::new(), now);
+        }
+        assert!(
+            set.busy(now).len() <= MAX_SKIPPED,
+            "a store that keeps handing back newer-epoch runs cannot grow it without bound"
+        );
+    }
+
+    /// The card's decisive test (ANR-963): over ten polls, an older worker claims a run it refused
+    /// **once**, because the skip set keeps it out of `claim_due`'s `busy` until the period passes.
+    #[tokio::test]
+    async fn a_refused_run_is_claimed_once_over_ten_polls() {
+        use adam_core::store::ClaimScope;
+        use adam_core::{MemoryStore, NewRun, Store};
+        use serde_json::json;
+
+        let store = MemoryStore::new();
+        let created = store
+            .create_run(NewRun::new("agent", json!({"v": 1, "agent": {}, "seq": 0})))
+            .await
+            .expect("the run is created");
+        let run = created.id;
+
+        let agents = ["agent".to_owned()];
+        let mut skip = SkipSet::default();
+        let mut now = Timestamp::now();
+        let mut claims = 0;
+        for _ in 0..10 {
+            let busy = skip.busy(now);
+            let leases = store
+                .claim_due(
+                    &agents,
+                    "old-worker",
+                    ClaimScope::Any,
+                    &busy,
+                    now,
+                    std::time::Duration::from_secs(30),
+                    1,
+                )
+                .await
+                .expect("the store answers");
+            for lease in leases {
+                claims += 1;
+                // What the worker does with a run of a newer epoch: hand the lease back and hold it.
+                store
+                    .release_lease(lease.run.id, "old-worker")
+                    .await
+                    .expect("released");
+                skip.hold(lease.run.id, now);
+            }
+            now = now + span_of(std::time::Duration::from_secs(1));
+        }
+        assert_eq!(claims, 1, "refused once over ten polls, not once per poll");
+        // And a newer worker, which does not hold it, takes it straight away.
+        let taken = store
+            .claim_due(
+                &agents,
+                "new-worker",
+                ClaimScope::Any,
+                &[],
+                now,
+                std::time::Duration::from_secs(30),
+                1,
+            )
+            .await
+            .expect("the store answers");
+        assert_eq!(taken.len(), 1, "a worker of the run's epoch claims it");
+        assert_eq!(taken[0].run.id, run);
+    }
+
+    #[test]
+    fn holding_the_same_run_again_does_not_grow_the_set() {
+        let mut set = SkipSet::default();
+        let now = Timestamp::now();
+        let run = RunId::new();
+        set.hold(run, now);
+        set.hold(run, now);
+        assert_eq!(set.busy(now), vec![run]);
     }
 }

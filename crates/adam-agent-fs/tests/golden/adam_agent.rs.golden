@@ -5,7 +5,7 @@
 pub static AGENTS: &[::adam_agent_fs::EmbeddedAgent] = &[
     ::adam_agent_fs::EmbeddedAgent {
         name: "coder",
-        digest: "sha256:d421e2ae8ad261499ef9ba0e822604611dec818d8f728800c4ca15c13cd8c131",
+        digest: "sha256:fed0432b9163d008de990167515ce26bf02bf1ffd424c315846a6e856617e90f",
         path: "agent/instructions.md",
         frontmatter_json: r#"{"name":"coder","description":"Turns a coding task into a verified pull request.","tools":["prepare_workspace","run_checks","ask_user","linear__*"],"model":"coder-large","skills":"all","limits":{"max_turns":200,"max_tool_calls":400,"max_output_tokens":8192,"max_history_tokens":100000},"vars":{"max_check_cycles":"3","strict":"true"},"card":{"name":"adam-coder","skills":[{"id":"coding-task","name":"Coding task to pull request","description":"Given a repository and a task, makes the change and opens a pull request.","tags":["code","git","pull-request"],"examples":["In https://github.com/acme/widgets, add a hello.txt containing hi."]}]},"metadata":{"owner":"platform-team","version":"1.2"}}"#,
         instructions: ::adam_agent_fs::EmbeddedInstructions {
@@ -59,6 +59,7 @@ See [the style guide](references/style.md)."#,
                 url: "https://billing.example.com/.well-known/agent-card.json",
                 auth: Some(::adam_agent_fs::EmbeddedAuth::Bearer { env: "BILLING_AGENT_TOKEN" }),
                 files: false,
+                session: Some(::adam_agent_fs::SessionDef { mode: Some(::adam_agent_fs::SessionModeDef::Sealed), wait: Some(true) }),
                 note: r#"Give it the account id and the question."#,
                 path: "agent/subagents/billing.md",
             }),

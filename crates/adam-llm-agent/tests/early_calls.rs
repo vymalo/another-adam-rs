@@ -1009,6 +1009,129 @@ async fn a_crash_after_a_complete_call_writes_nothing_and_the_replay_asks_again(
     );
 }
 
+/// ADR 0049's amendment: "a stream error ... **waits for the started calls within their own time
+/// limits**, discards their results and fails the transition transiently; the retry asks the model
+/// again and runs the calls again." With a call still running when the stream fails, the try must
+/// wait for it — the probe logs its end only after its work — and the retry runs it again.
+///
+/// Red if the loop drops the started futures instead of awaiting them: `ends("c1")` would be 1,
+/// because the probe never reached its end.
+#[tokio::test]
+async fn a_stream_error_waits_for_a_started_call_before_failing_the_try() {
+    let h = Harness::new();
+    let log = Arc::new(Log::default());
+    let began = Arc::new(Notify::new());
+    let c1 = call("c1", "probe", json!({"use": "independent", "ms": 200}));
+    h.script(vec![
+        started("c1", "probe"),
+        complete(&c1),
+        Step::Delta(Err(ModelError::transient("connection reset"))),
+    ]);
+    h.script(turn(vec![c1]));
+    h.script(answer("done"));
+    let agent = h.agent(10, |b| b.tool(Probe::new(&log, &began)));
+    let (_rt, run, view) = h.run(agent, "go").await;
+    assert_eq!(view.status, RunStatus::Done, "{view:?}");
+    assert_eq!(log.starts("c1"), 2, "the retry ran the call again");
+    assert_eq!(
+        log.ends("c1"),
+        2,
+        "the failed try waited for the call it had started"
+    );
+    let events: Vec<String> = log.events.lock().unwrap().clone();
+    assert_eq!(
+        events,
+        ["start:c1", "end:c1", "start:c1", "end:c1"],
+        "the started call ended before the retry began: {events:?}"
+    );
+}
+
+/// ADR 0049's amendment: "at any limit the journal is `model:N`, then `tool:<id>` in call order".
+/// A turn recorded at 10 — every call announced and completed early — is replayed at 1, where the
+/// gate starts nothing early, and the calls run in the same order and journal the same way.
+///
+/// Red if the replay's order follows the limit instead of the calls: at 1 the turn would have to
+/// reverse or interleave them for the assertion to fail.
+#[tokio::test]
+async fn a_replay_makes_the_same_calls_in_the_same_order_at_a_lower_limit() {
+    let h = Harness::new();
+    let log = Arc::new(Log::default());
+    let began = Arc::new(Notify::new());
+    let calls: Vec<ToolCall> = (1..=3)
+        .map(|n| {
+            call(
+                &format!("c{n}"),
+                "probe",
+                json!({"use": "independent", "ms": 0, "tag": n}),
+            )
+        })
+        .collect();
+    let mut steps = Vec::new();
+    for c in &calls {
+        steps.push(started(&c.id, "probe"));
+        steps.push(complete(c));
+    }
+    steps.push(Step::Hang);
+    h.script(steps);
+    let rt = h.runtime(
+        h.agent(10, |b| b.tool(Probe::new(&log, &began))),
+        Duration::from_millis(300),
+    );
+    let run = rt
+        .start("llm", user_message("go"), None)
+        .await
+        .expect("start");
+    let worker = Worker::spawn(&rt);
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while log.starts("c3") == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "the third call did not start early"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    worker.kill().await;
+    assert!(
+        h.journal(run).await.is_empty(),
+        "a crash mid-stream writes nothing"
+    );
+    let recorded: Vec<String> = log.events.lock().unwrap().clone();
+    assert_eq!(
+        recorded.len(),
+        6,
+        "three calls started and ended in the first try: {recorded:?}"
+    );
+
+    // The same turn, at a limit where nothing starts early: the calls run one at a time, in order.
+    h.script(turn(calls));
+    h.script(answer("done"));
+    let rt = h.runtime(
+        h.agent(1, |b| b.tool(Probe::new(&log, &began))),
+        Duration::from_secs(10),
+    );
+    let worker = Worker::spawn(&rt);
+    let view = wait_terminal(&rt, run).await;
+    worker.stop().await;
+    assert_eq!(view.status, RunStatus::Done, "{view:?}");
+    assert_eq!(
+        h.journal(run)
+            .await
+            .iter()
+            .map(|(_, name)| name.as_str())
+            .collect::<Vec<_>>(),
+        ["model:0", "tool:c1", "tool:c2", "tool:c3", "model:1"],
+        "the turn, then the calls in call order"
+    );
+    let replayed: Vec<String> = log.events.lock().unwrap().clone()[6..].to_vec();
+    assert_eq!(
+        replayed,
+        [
+            "start:c1", "end:c1", "start:c2", "end:c2", "start:c3", "end:c3"
+        ],
+        "the replay ran the calls in the same order: {replayed:?}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // 6. A doom-loop refusal
 // ---------------------------------------------------------------------------

@@ -16,18 +16,29 @@ path = "src/lib.rs"
 [[bin]]
 name = "adam-git-sandbox"
 path = "src/bin/adam-git-sandbox.rs"
+required-features = ["server"]
 
 [[bin]]
 name = "adam-git"
 path = "src/bin/adam-git.rs"
+required-features = ["server"]
+
+[features]
+# What the two binaries need beside the library: the allocator (`mimalloc`, a C build) and the
+# server's OTel layer (`adam_otel::init`). On by default, so `cargo build -p adam-git-sandbox` builds
+# them; off for a crate that takes the library (adam-workspace), so adam-engine's embedded set
+# links no HTTP client and no C allocator, and checks for a phone target (ADR 0047).
+default = ["server"]
+server = ["dep:mimalloc", "adam-otel/sdk"]
 
 [dependencies]
 adam-error.workspace = true
-# The OTel layer (ADR 0075, ANR-1412). No TLS provider: this server is small and the collector of a
-# cluster is plain `http`; add the `aws-lc` feature here to export over `https`.
+# The OTel layer (ADR 0075, ANR-1412), for the server binary only (feature `server`). No TLS
+# provider: this server is small and the collector of a cluster is plain `http`; add `adam-otel`'s
+# `aws-lc` feature to export over `https`.
 adam-otel.workspace = true
 base64.workspace = true
-mimalloc.workspace = true
+mimalloc = { workspace = true, optional = true }
 # `kill_process_group`, `umask` and `openat` as safe functions, so the crate stays `forbid(unsafe_code)`.
 # Already in the tree through `adam-service` and `adam-workspace`.
 rustix = { version = "1", default-features = false, features = ["fs", "process", "std"] }

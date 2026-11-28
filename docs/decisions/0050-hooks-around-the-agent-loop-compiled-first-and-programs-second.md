@@ -606,6 +606,12 @@ orders), a hook that clears `hide` cannot unhide a caller's name, every refused 
 `Invalid`, a caller's value may be rewritten, a failing hook keeps its class and name, a seam with no hooks prepares what
 `LocalSession` does, and the coder's hiding tests pass unchanged.
 
+*Amended 2026-11-28 (ADR 0089 slice C2):* `session.started` also carries `mode` (`one_shot`, `sealed` or `open`), beside the
+`keep_open` it means, which stays for the hooks of before. A `subagent_start` with `wait: true` says `session.started` when
+the call parks, from its arguments and with `wait: true`, and `session.round.ended` when its first report settles the call,
+as a `subagent_read` that waits does. Proof: `a_start_that_waits_answers_its_first_report_once` and
+`observers_see_a_child_and_a_session_in_order` in `crates/adam-llm-agent/tests/sessions.rs`.
+
 *Amended 2026-11-28 (the deciding type renamed, ANR-1438):* the type the notes above call `Verdict` is
 `Decision` — `Continue`, `Deny`, `Ask`, `Stop`, and the new `Act(HookAction)`, where `HookAction` is the
 `#[non_exhaustive]` set decision 11 describes (`Compact` first; a plugin declares further ones with an

@@ -486,9 +486,8 @@ async fn a_removed_variable_is_logged_once_at_startup() {
             .lines()
             .filter_map(|line| serde_json::from_str::<Value>(line).ok())
             .filter(|log| {
-                log["fields"]["message"]
-                    .as_str()
-                    .is_some_and(|m| m.starts_with(&format!("{name} is set and ignored")))
+                log["fields"]["message"] == "a variable is set and ignored"
+                    && log["fields"]["variable"] == name
             })
             .collect();
         assert_eq!(warned.len(), 1, "{name}: one line:\n{out}");
@@ -2704,16 +2703,15 @@ async fn every_removed_devcontainer_variable_is_warned_about_once_without_its_va
             .lines()
             .filter_map(|line| serde_json::from_str::<Value>(line).ok())
             .filter(|log| {
-                log["fields"]["message"]
-                    .as_str()
-                    .is_some_and(|m| m.starts_with(&format!("{name} is set and ignored")))
+                log["fields"]["message"] == "a variable is set and ignored"
+                    && log["fields"]["variable"] == name
             })
             .collect();
         assert_eq!(warned.len(), 1, "{name}: one line:\n{out}");
         assert_eq!(warned[0]["level"], "WARN", "{name}");
         assert_eq!(warned[0]["fields"]["variable"], name);
         assert!(
-            warned[0]["fields"]["message"]
+            warned[0]["fields"]["reason"]
                 .as_str()
                 .unwrap()
                 .contains("ADR 0052"),
@@ -3636,4 +3634,55 @@ async fn the_prompts_of_the_extra_mcp_servers_are_commands_of_the_coder() {
     let status = front.exit_within(Duration::from_secs(15)).await;
     assert_eq!(status.code(), Some(0), "{}", front.logs());
     db.finish().await;
+}
+
+/// `adam-coder export` needs only `DATABASE_URL` (the embedded agent files when `ADAM_AGENT_DIR`
+/// is unset): over a fresh SQLite file it exits 0 with nothing on stdout, logs its summary on
+/// stderr, and a wrong command line is exit 64.
+#[tokio::test]
+async fn export_over_an_empty_store_writes_nothing_and_exits_0() {
+    let dir = tempfile::tempdir().unwrap();
+    let database_url = format!("sqlite://{}", dir.path().join("adam.sqlite").display());
+    let export = |args: &[&str]| {
+        let args: Vec<String> = args.iter().map(|a| (*a).to_owned()).collect();
+        let database_url = database_url.clone();
+        async move {
+            Command::new(env!("CARGO_BIN_EXE_adam-coder"))
+                .arg("export")
+                .args(args)
+                .env_clear()
+                .env("PATH", std::env::var("PATH").unwrap_or_default())
+                .env("DATABASE_URL", database_url)
+                .stdin(Stdio::null())
+                .output()
+                .await
+                .expect("adam-coder export runs")
+        }
+    };
+    let done = export(&["--status", "all"]).await;
+    let stderr = String::from_utf8_lossy(&done.stderr);
+    assert_eq!(done.status.code(), Some(0), "{stderr}");
+    assert!(
+        done.stdout.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&done.stdout)
+    );
+    let summary = stderr
+        .lines()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .find(|l| l["fields"]["message"] == "export finished")
+        .unwrap_or_else(|| panic!("no summary line:\n{stderr}"));
+    assert_eq!(summary["fields"]["written"], 0);
+    let random_key = stderr
+        .lines()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .find(|l| {
+            l["fields"]["message"]
+                .as_str()
+                .is_some_and(|m| m.starts_with("no pseudonym key is set"))
+        })
+        .unwrap_or_else(|| panic!("a random key is said:\n{stderr}"));
+    assert_eq!(random_key["fields"]["variable"], "EXPORT_PSEUDONYM_KEY");
+    assert_eq!(export(&["--agent", "nobody"]).await.status.code(), Some(78));
+    assert_eq!(export(&["--current-tools"]).await.status.code(), Some(64));
 }

@@ -62,6 +62,7 @@ use crate::model_wait::{
 use crate::order;
 use crate::paging::backstop;
 use crate::plan::Plan;
+use crate::request::RecordedRequest;
 use crate::schedule::{self, Entry, Ordered, Queue, Segment};
 use crate::session_tools::{SessionNarrowing, narrowing_of};
 use crate::sessions::{
@@ -287,6 +288,33 @@ fn has_effect(tool: &str) -> bool {
 /// Whether a round of the session is doing work somebody will want to read. A round that only
 /// closes the session is not: it calls no model, ends by itself and reports nothing new, so a run
 /// neither waits for it at the end of a turn nor cancels it when it ends.
+/// `event` with a session's `mode` (ADR 0089 slice C2) and the `keep_open` it means, which a hook
+/// of before reads.
+fn with_mode(
+    event: adam_plugin::HookEvent,
+    mode: adam_runtime::SessionMode,
+) -> adam_plugin::HookEvent {
+    event
+        .plain("mode", mode.as_str())
+        .plain("keep_open", mode.keeps_open())
+}
+
+/// `event` with the mode a session tool's answer names ([`with_mode`]); an answer of before names
+/// only `keep_open`, which is said as it is.
+fn with_answer_mode(event: adam_plugin::HookEvent, answer: &Value) -> adam_plugin::HookEvent {
+    match answer
+        .get("mode")
+        .and_then(Value::as_str)
+        .and_then(adam_runtime::SessionMode::parse)
+    {
+        Some(mode) => with_mode(event, mode),
+        None => match answer.get("keep_open").and_then(Value::as_bool) {
+            Some(keep) => event.plain("keep_open", keep),
+            None => event,
+        },
+    }
+}
+
 fn does_work(session: &SessionSummary) -> bool {
     session.does_work()
 }
@@ -321,9 +349,9 @@ pub const UNATTENDED: &str = "nobody answers this run: a schedule started it, no
 can be asked. Do what you can without asking, and say in your final answer what is still needed";
 
 /// The result a tool that asks the person gets in a child run that may not ask (ADR 0045 decision
-/// 9): only a round of a kept-open session that a client shows (`child-sessions/v1`) has somebody
-/// to answer it, so the model is told to go on and say what it needs in its report.
-pub const NOT_ASKABLE: &str = "nobody can answer this run: only a kept-open subagent session whose \
+/// 9): only a round of an `open` session (ADR 0089) that a client shows (`child-sessions/v1`) has
+/// somebody to answer it, so the model is told to go on and say what it needs in its report.
+pub const NOT_ASKABLE: &str = "nobody can answer this run: only an open subagent session whose \
 client shows child sessions may ask the person. Do what you can without asking, and say in your \
 final answer what is still needed";
 
@@ -956,6 +984,11 @@ fn ask_end(
     }
 }
 
+/// The history budget of an agent whose `limits.max_history_tokens` is omitted, in tokens (ADR 0088):
+/// [`Limits::default`]'s. The budget a run compacts at is the smaller of this and what the model's
+/// window leaves, so a known smaller window still wins.
+pub const DEFAULT_MAX_HISTORY_TOKENS: u32 = 200_000;
+
 /// Bounds on one run. A run that reaches `max_turns` or `max_tool_calls` gets one closing model
 /// call in which it may call no tool, and ends with that answer marked `limited` (the output's
 /// `limited` and `limit`); if the closing call says nothing the run fails with a message naming the
@@ -980,7 +1013,8 @@ pub struct Limits {
     /// down to three quarters of the budget (so that it happens rarely and each request starts with
     /// the one before: [`Conversation::shortenings`] says when); the results the model has not seen
     /// yet are never touched, and the journal still holds the original outputs. `0` disables
-    /// truncation.
+    /// truncation, and the window's budget alone decides when the run compacts. Default
+    /// [`DEFAULT_MAX_HISTORY_TOKENS`].
     pub max_history_tokens: u32,
 }
 
@@ -990,7 +1024,7 @@ impl Default for Limits {
             max_turns: 50,
             max_tool_calls: 200,
             max_output_tokens: 4096,
-            max_history_tokens: 100_000,
+            max_history_tokens: DEFAULT_MAX_HISTORY_TOKENS,
         }
     }
 }
@@ -1255,6 +1289,13 @@ struct Recorded {
     /// Absent when it did not, and in journals written before it existed.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     grew: bool,
+    /// The final request's system prompt and tools, stored as blobs while the model answered
+    /// ([`RecordedRequest`], ADR 0087 decision 7): the turn transition keeps it in
+    /// [`Conversation::request`](crate::Conversation::request) and names its blobs in the commit,
+    /// so a replay does the same without storing or reading anything. Absent when the store keeps
+    /// no blobs or a put failed (recording is fail-open), and in journals written before it existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    request: Option<RecordedRequest>,
 }
 
 /// The report of one round, read for a model call that did not ask for it: the result of a
@@ -1457,6 +1498,7 @@ pub struct LlmAgentBuilder {
     stream_text: bool,
     step_io: StepIo,
     session_agents: Vec<String>,
+    session_default_modes: Vec<(String, adam_runtime::SessionMode)>,
     session_reports: bool,
     max_parallel: usize,
     tool_retry: BTreeMap<String, RetryPolicy>,
@@ -1621,6 +1663,23 @@ impl LlmAgentBuilder {
     #[must_use]
     pub fn session_agents(mut self, agents: impl IntoIterator<Item = impl Into<String>>) -> Self {
         self.session_agents = agents.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// The mode `subagent_start` gives each subagent when a call names none ([ADR 0089] slice C3:
+    /// the `session.mode` of its file), by the name the model writes in `agent`:
+    /// [`SessionTools::default_modes`](crate::SessionTools::default_modes). Only the
+    /// `session.started` event of a start that waits reads it, which is said when the call parks,
+    /// from the call's arguments; a subagent not listed here is `one_shot` there. The default is
+    /// none.
+    ///
+    /// [ADR 0089]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0089-every-child-is-a-session-and-the-one-shot-subagent-tool-goes.md
+    #[must_use]
+    pub fn session_default_modes(
+        mut self,
+        modes: impl IntoIterator<Item = (String, adam_runtime::SessionMode)>,
+    ) -> Self {
+        self.session_default_modes = modes.into_iter().collect();
         self
     }
 
@@ -1928,6 +1987,7 @@ impl LlmAgentBuilder {
             stream_text: self.stream_text,
             step_io: self.step_io,
             session_agents: self.session_agents.into(),
+            session_default_modes: self.session_default_modes.into(),
             session_reports: self.session_reports,
             max_parallel: self.max_parallel,
             tool_retry: self.tool_retry,
@@ -2148,6 +2208,8 @@ pub struct LlmAgent {
     step_io: StepIo,
     /// The registered names of the subagents whose sessions the turn-end wait looks at.
     session_agents: Arc<[String]>,
+    /// The mode a `subagent_start` naming none gives each subagent, by the model's name for it.
+    session_default_modes: Arc<[(String, adam_runtime::SessionMode)]>,
     /// Whether a report of a session that ended reaches the model without a read of its own.
     session_reports: bool,
     /// The most tool calls of a turn that run at the same time.
@@ -2295,6 +2357,7 @@ impl LlmAgent {
             stream_text: true,
             step_io: StepIo::default(),
             session_agents: Vec::new(),
+            session_default_modes: Vec::new(),
             session_reports: true,
             max_parallel: DEFAULT_MAX_PARALLEL,
             tool_retry: BTreeMap::new(),
@@ -3119,6 +3182,17 @@ impl LlmAgent {
         status
     }
 
+    /// A child the run waited on has answered its call ([`Self::answer_run`]): when this agent tells
+    /// the model the reports of sessions, the child is counted as reported, so a child that is a
+    /// session's round (a subagent's one-shot session, ADR 0089 slice C1) is told once, as the
+    /// call's result, and never again as a report of its session. A plain child run is in no
+    /// listing, so counting it changes nothing; an agent that tells no reports keeps no count.
+    fn note_answered_round(&self, state: &mut Conversation, child: RunId) {
+        if !self.session_agents.is_empty() {
+            state.note_reported(&[child]);
+        }
+    }
+
     /// The model wait the head of a child's state says it has (ADR 0067 decision 5): its own, or
     /// the copy it keeps of its own child's — a park is shown through each parent, one level at a
     /// time. `None` for a child that works or waits on something else, and for a wait this build
@@ -3333,6 +3407,10 @@ impl LlmAgent {
         let early_slot: Arc<Mutex<Option<Early<'_>>>> = Arc::new(Mutex::new(None));
         let slot = Arc::clone(&early_slot);
         let agent = self;
+        // The request is recorded for export (ADR 0087 decision 7) through the store's blobs; the
+        // blobs the state already names are not sent again.
+        let blob_writer = ctx.blob_writer();
+        let known_request = state.request.clone();
         let recorded: Result<Recorded, ModelFailure> = ctx
             .step(&format!("model:{turn}"), move || async move {
                 if !named.is_empty() {
@@ -3451,17 +3529,45 @@ impl LlmAgent {
                         }
                     }
                 }
+                // The request is final: its system prompt and tools are stored as blobs while the
+                // model answers, and their ids journaled with the answer. Fail-open: this is
+                // training metadata, not the run's truth, so a store that keeps no blobs or a put
+                // that fails records nothing and never fails the call. No image is recorded: the
+                // images are in the messages, never in the system prompt or the tools.
+                let pending = crate::request::Pending::of(&blob_writer, turn, &request);
+                let recording = async {
+                    match pending {
+                        Some(pending) => pending.store(&blob_writer, known_request.as_ref()).await,
+                        None => None,
+                    }
+                };
                 if !stream_text {
                     // The request races the run's cancellation: a cancel drops it, and with it the
                     // connection, instead of letting the provider finish an answer nobody will read.
                     let span = model_span(&request.model, false);
-                    let answer = tokio::select! {
-                        biased;
-                        () = cancel.cancelled() => return Err(ModelFailure::cancelled()),
-                        answer = model.complete(request).instrument(span.clone()) => answer.map_err(ModelFailure::from)?,
-                    };
+                    // ANR-1462: the call's tokens and latency, under the alias it was made to. The
+                    // timer is inside the joined future, so it measures the call and not the
+                    // request recording that runs beside it.
+                    let alias = request.model.clone();
+                    let (recorded_request, (answer, elapsed)) = tokio::join!(recording, async {
+                        let started = std::time::Instant::now();
+                        let answer = tokio::select! {
+                            biased;
+                            () = cancel.cancelled() => Err(ModelFailure::cancelled()),
+                            answer = model.complete(request).instrument(span.clone()) => answer.map_err(ModelFailure::from),
+                        };
+                        (answer, started.elapsed())
+                    });
+                    let answer = answer?;
                     span.record("input_tokens", answer.usage.input_tokens);
                     span.record("output_tokens", answer.usage.output_tokens);
+                    crate::metrics::record_model_call(
+                        &opentelemetry::global::meter(crate::metrics::SCOPE),
+                        &alias,
+                        answer.usage.input_tokens,
+                        answer.usage.output_tokens,
+                        elapsed,
+                    );
                     return Ok(Recorded {
                         response: unthought(&emitter, run, turn, false, answer).await,
                         stream: None,
@@ -3476,6 +3582,7 @@ impl LlmAgent {
                         loaders,
                         task_loaded,
                         grew,
+                        request: recorded_request,
                     });
                 }
                 // The words go out while they are written, under an id made here, inside the step, and
@@ -3484,20 +3591,41 @@ impl LlmAgent {
                 // The notes are this turn's (a source's listing, read above): a source's call
                 // reports and is labelled as the turn says, not as the turn before it did.
                 let mut early = Early::new(agent, early_facts, notes.clone(), own_order.clone());
-                let streamed = text_stream::stream_response(
-                    &model,
-                    request,
-                    &emitter,
-                    &cancel,
-                    Some(&mut early),
-                    move || stream_id(run, turn),
-                    move || reasoning_stream_id(run, turn),
-                )
-                .await;
+                // ANR-1462: the streamed turn is the default one, so it is measured like the
+                // unstreamed turn — the timer inside the joined future, so the request recording
+                // that runs beside it is not in the latency. A failed or cancelled stream returns
+                // before the recording, since its answer (and its usage) was dropped. The interval
+                // ends when the last piece is emitted, so it carries the emitter's writes too: the
+                // words are not otherwise separable from the call that produced them.
+                let alias = request.model.clone();
+                let (recorded_request, (streamed, elapsed)) = tokio::join!(
+                    recording,
+                    async {
+                        let started = std::time::Instant::now();
+                        let streamed = text_stream::stream_response(
+                            &model,
+                            request,
+                            &emitter,
+                            &cancel,
+                            Some(&mut early),
+                            move || stream_id(run, turn),
+                            move || reasoning_stream_id(run, turn),
+                        )
+                        .await;
+                        (streamed, started.elapsed())
+                    }
+                );
                 // The batch goes back to the turn, whatever the stream did with it: the calls that
                 // started are the turn's to settle (their steps are written only after it).
                 *slot.lock().unwrap_or_else(PoisonError::into_inner) = Some(early);
                 let streamed = streamed.map_err(ModelFailure::from)?;
+                crate::metrics::record_model_call(
+                    &opentelemetry::global::meter(crate::metrics::SCOPE),
+                    &alias,
+                    streamed.response.usage.input_tokens,
+                    streamed.response.usage.output_tokens,
+                    elapsed,
+                );
                 Ok(Recorded {
                     response: unthought(&emitter, run, turn, true, streamed.response).await,
                     stream: streamed.stream,
@@ -3512,6 +3640,7 @@ impl LlmAgent {
                     loaders,
                     task_loaded,
                     grew,
+                    request: recorded_request,
                 })
             })
             .await?;
@@ -3582,7 +3711,15 @@ impl LlmAgent {
                 loaders,
                 task_loaded,
                 grew,
+                request,
             }) => {
+                // The last call's request, as recorded (or not) by this call, and its blobs named
+                // in this transition's commit so their bytes are kept while the run references
+                // them. A replay names the same ids from the journal.
+                if let Some(request) = &request {
+                    ctx.reference_blobs(request.blob_ids());
+                }
+                state.note_request(request);
                 // What the request carried **before the tier withheld any** is the truth of the
                 // loaded set: every loaded tool it did not carry is journaled as removed, and a
                 // growth is recorded only when the final request actually grew.
@@ -4211,6 +4348,8 @@ impl LlmAgent {
                     }
                 }
                 let span = model_span(&request.model, true);
+                let alias = request.model.clone();
+                let started = std::time::Instant::now();
                 let answer = tokio::select! {
                     biased;
                     () = cancel.cancelled() => return Err(ModelFailure::cancelled()),
@@ -4218,6 +4357,13 @@ impl LlmAgent {
                 };
                 span.record("input_tokens", answer.usage.input_tokens);
                 span.record("output_tokens", answer.usage.output_tokens);
+                crate::metrics::record_model_call(
+                    &opentelemetry::global::meter(crate::metrics::SCOPE),
+                    &alias,
+                    answer.usage.input_tokens,
+                    answer.usage.output_tokens,
+                    started.elapsed(),
+                );
                 let text = answer.message.text();
                 Ok(Summarised {
                     summary: (!text.trim().is_empty()).then_some(text),
@@ -5053,6 +5199,7 @@ impl LlmAgent {
                         return Ok(Flow::Wait);
                     };
                     let outcome = Self::answer_run(state, &wait, child);
+                    self.note_answered_round(state, run);
                     self.observe_child(
                         ctx,
                         state.root_run,
@@ -6141,6 +6288,11 @@ impl LlmAgent {
         if !awaits_approval {
             self.observe_tool_ended(ctx, root, &call.name, &call.id, &outcome);
         }
+        if let Err(ToolError::AwaitSession { session }) = &outcome
+            && call.name == SUBAGENT_START
+        {
+            self.observe_waited_start(ctx, root, call, *session);
+        }
         // The custom events the step recorded (ADR 0050, decision 6), after `tool.completed` and in
         // the order the call emitted them: read from the record, so a replay says them again.
         if let Ok(hooked) = &outcome {
@@ -6323,8 +6475,8 @@ impl LlmAgent {
                 .await;
                 ToolResult::error(&call.id, backstop(&reason, &call.name, false).into_owned())
             }
-            // Only a round of a kept-open session a client shows may ask the person (ADR 0045
-            // decision 9): a child that cannot would wait for an answer nobody can give.
+            // Only a round of an `open` session a client shows may ask the person (ADR 0045
+            // decision 9, ADR 0089): a child that cannot would wait for an answer nobody can give.
             Err(ToolError::NeedsInput { question, .. }) if !may_ask => {
                 let reason = format!("{NOT_ASKABLE}. The question was: {question}");
                 say(
@@ -6553,9 +6705,10 @@ impl LlmAgent {
     ) -> Option<adam_plugin::HookEvent> {
         use adam_plugin::EventKind;
         let kind = match tool {
+            // A start that waited (ADR 0089 slice C2) settles as a read does: with the report.
+            SUBAGENT_START | SUBAGENT_READ if !reported.is_empty() => EventKind::SessionRoundEnded,
             SUBAGENT_START => EventKind::SessionStarted,
             SUBAGENT_SEND => EventKind::SessionRoundStarted,
-            SUBAGENT_READ if !reported.is_empty() => EventKind::SessionRoundEnded,
             SUBAGENT_CLOSE => EventKind::SessionClosed,
             _ => return None,
         };
@@ -6576,15 +6729,52 @@ impl LlmAgent {
                 if let Some(agent) = body.get("agent").and_then(Value::as_str) {
                     event = event.text("agent", agent, &scrub);
                 }
-                if let Some(keep) = body.get("keep_open").and_then(Value::as_bool) {
-                    event = event.plain("keep_open", keep);
-                }
+                event = with_answer_mode(event, &body);
                 if let Some(round) = body.get("round").and_then(Value::as_u64) {
                     event = event.plain("round", round);
                 }
             }
         }
         Some(event)
+    }
+
+    /// `session.started` for a `subagent_start` that waits for its first report (ADR 0089 slice
+    /// C2): it is said when the call parks, from the call's own arguments, since the answer that
+    /// settles it is the report (`session.round.ended`), not the start.
+    fn observe_waited_start(
+        &self,
+        ctx: &Ctx,
+        root: Option<RunId>,
+        call: &ToolCall,
+        session: RunId,
+    ) {
+        use adam_plugin::EventKind;
+        if self.hooks.is_empty() {
+            return;
+        }
+        let scrub = |s: &str| self.step_io.scrub(s);
+        let kind = EventKind::SessionStarted;
+        let header = self.event_header(ctx, root, &format!("tool:{}", call.id), kind);
+        let mut event = adam_plugin::HookEvent::new(kind, header)
+            .text("call_id", &call.id, &scrub)
+            .text("session", &session.to_string(), &scrub);
+        let agent = call.arguments.get("agent").and_then(Value::as_str);
+        if let Some(agent) = agent {
+            event = event.text("agent", agent, &scrub);
+        }
+        // The call parked, so it was admitted: the mode it names is the session's, and a call
+        // that names none has its subagent's default (ADR 0089 slice C3).
+        let mode = match crate::sessions::mode_arg(&call.arguments) {
+            Ok(Some(asked)) => asked.mode,
+            Ok(None) | Err(_) => self
+                .session_default_modes
+                .iter()
+                .find(|(name, _)| Some(name.as_str()) == agent)
+                .map(|(_, mode)| *mode)
+                .unwrap_or_default(),
+        };
+        event = with_mode(event, mode).plain("wait", true);
+        self.flush_events(vec![event]);
     }
 
     /// `child.started` or `child.ended`, for the one-shot child run a tool waits for.
@@ -8466,7 +8656,7 @@ impl LlmAgent {
                 state.compactions.len(),
             )
         };
-        if let Some(first) = record_shortenings_from(
+        if let Some(shortened) = record_shortenings_from(
             &mut state.messages,
             self.limits.max_history_tokens,
             &output_id_of,
@@ -8474,8 +8664,19 @@ impl LlmAgent {
         ) {
             // A shortened row's bytes changed, and every later row's `prv` with it: their turn
             // signatures no longer hold, and the commit signs them again (ADR 0068).
-            crate::signing::unsign_from(&mut state.messages, first);
+            crate::signing::unsign_from(&mut state.messages, shortened.first);
             state.shortenings.push(state.turns);
+            // Counted in the run's usage, which the task carries (ADR 0090): a deployment sees
+            // what moved the cached prompt prefix.
+            let chars_removed = u64::try_from(shortened.chars_removed).unwrap_or(u64::MAX);
+            state.shortening_usage.shortened(chars_removed);
+            tracing::info!(
+                run = %run,
+                turn = state.turns,
+                chars_removed,
+                "old tool results were shortened to fit the history budget; the cached prompt \
+                 prefix moves at the first one"
+            );
             state.last_prompt = None;
             // The images of a result that was shortened left the history with it.
             state.drop_unnamed_images();
@@ -8645,6 +8846,7 @@ impl LlmAgent {
             match finished {
                 Some(child) => {
                     let outcome = Self::answer_run(&mut state, &wait, &child);
+                    self.note_answered_round(&mut state, wait.run);
                     self.observe_child(
                         ctx,
                         state.root_run,
@@ -9132,6 +9334,7 @@ mod failure_tests {
             loaders: None,
             task_loaded: Vec::new(),
             grew: false,
+            request: None,
         };
         let json = serde_json::to_value(&streamed).unwrap();
         assert_eq!(json["stream"], "run-m0-a1b2c3d4");
@@ -9159,6 +9362,7 @@ mod failure_tests {
             loaders: None,
             task_loaded: Vec::new(),
             grew: false,
+            request: None,
         };
         assert_eq!(serde_json::to_value(&plain).unwrap(), bare);
 
@@ -9178,6 +9382,7 @@ mod failure_tests {
             loaders: None,
             task_loaded: Vec::new(),
             grew: false,
+            request: None,
         };
         let json = serde_json::to_value(&noted).unwrap();
         assert_eq!(
@@ -9204,6 +9409,7 @@ mod failure_tests {
             loaders: None,
             task_loaded: Vec::new(),
             grew: false,
+            request: None,
         };
         let json = serde_json::to_value(&reported).unwrap();
         assert_eq!(json["call"], "run-c0-a1b2c3d4");
@@ -9234,6 +9440,7 @@ mod failure_tests {
             loaders: None,
             task_loaded: Vec::new(),
             grew: false,
+            request: None,
         };
         let json = serde_json::to_value(&told).unwrap();
         assert_eq!(json["sessions_open"], true);
@@ -9241,6 +9448,23 @@ mod failure_tests {
         assert_eq!(back.reports.len(), 1);
         assert_eq!(back.reports[0].round, round);
         assert_eq!(back.sessions_open, Some(true));
+
+        // The recorded request (ADR 0087 decision 7) is beside the response, and absent from an old
+        // record, which reads as none.
+        assert_eq!(old.request, None);
+        let request = RecordedRequest {
+            turn: 0,
+            system: Some(adam_runtime::blob_id(b"You are a test agent.")),
+            tools: adam_runtime::blob_id(b"[]"),
+        };
+        let with_request = Recorded {
+            request: Some(request.clone()),
+            ..plain
+        };
+        let json = serde_json::to_value(&with_request).unwrap();
+        assert_eq!(json["request"]["turn"], 0);
+        let back: Recorded = serde_json::from_value(json).unwrap();
+        assert_eq!(back.request, Some(request));
     }
 
     fn plain_json_has_reports(record: &Recorded) -> bool {

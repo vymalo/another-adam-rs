@@ -63,13 +63,15 @@ Every value below is made up.
 | `tasks` | optional: task sources and grading, see Tasks |
 
 The file is `$BENCH_CONFIG` (default `~/.config/adam-bench/config.json`); results are in `$BENCH_HOME`
-(default `~/.local/share/adam-bench`, also refused inside a work tree, as are `--ledger` and `--out`). The schema is `SCHEMA` in
+(default `~/.local/share/adam-bench`, also refused inside a work tree, as are `--ledger`, `--against` and `--out`). The schema is `SCHEMA` in
 `bench/lib/config.mjs`.
 
 ```sh
 BENCH_MODEL_API_KEY=... node bench/bin/bench.mjs config    # what may be shown of the configuration
 node bench/bin/bench.mjs report                            # report.md from the ledger
-node bench/bin/bench.mjs numbers                           # the three faster-coder figures, from the ledger
+node bench/bin/bench.mjs numbers                           # the figures per agent, from the ledger (NUMBERS.md)
+node bench/bin/bench.mjs numbers --ledger after.jsonl --against before.jsonl
+                                                           # ADR 0090: both ledgers and the change, on the tasks both finished
 ```
 
 ## How a run goes
@@ -149,7 +151,7 @@ for on every restart. The report lists such a run among those left out, with its
 | `bench/lib/scripted-model.mjs` | an OpenAI-compatible server for the tests |
 | `bench/lib/stats.mjs` | Wilson intervals, the exact McNemar test, a seeded bootstrap |
 | `bench/lib/report.mjs` | the report |
-| `bench/lib/numbers.mjs` | the three figures the faster-coder epic rests on, from the ledger (`bench numbers`), and what the ledger cannot answer ([NUMBERS.md](NUMBERS.md)) |
+| `bench/lib/numbers.mjs` | the figures from the ledger (`bench numbers`): the three the faster-coder epic rests on, `read_output` calls and input tokens per task, the comparison of two ledgers on the tasks both finished (`--against`, ADR 0090 decision 5), and what the ledger cannot answer ([NUMBERS.md](NUMBERS.md)) |
 | `bench/lib/toml.mjs` | the TOML subset of `task.toml` |
 | `bench/lib/task.mjs` | the task format and its validator |
 | `bench/lib/upstream.mjs` | the pinned clone of the public tasks and `SHA256SUMS` |
@@ -506,7 +508,7 @@ Both agents clone that bare repository; patch collection leaves the links out (`
 | `ADAM_AGENT_DIR` | `/etc/adam/agent`, mounted read-only from the image's revision (`git archive`), **without `mcp.json`**: no GitHub MCP server, as OpenCode has none |
 | `WORKSPACE_SWEEP_SECS` | `0`: the worktree stays until it is copied |
 | `RUN_ENVIRONMENT`, `DEVCONTAINER_RUNTIME` | `local`, `off`: a run's commands run in the coder's own container, which is the task image |
-| `MODEL_BASE_URL`, `MODEL_API_KEY`, `MODEL`, `MODEL_CONTEXT_WINDOW` | the meter's address with the run's token, a dummy, `bench-model`, the configured window |
+| `MODEL_BASE_URL`, `MODEL_API_KEY`, `MODEL`, `MODEL_CONTEXT_WINDOW` | the meter's address with the run's token, a dummy, `bench-model`, the configured window. The window keeps the old name, now the deprecated alias of `DEFAULT_MODEL_CONTEXT_WINDOW` (ADR 0088), because the pinned image predates the new one: it moves with the pin |
 | `A2A_BEARER_TOKENS` | a random value for each run |
 | `GIT_SANDBOX_SOCKET`, `DEVCONTAINER_DEPLOYMENT_ID` | the git sandbox's socket on the work directory; `bench-slot-N` |
 | the turn limit | the agent folder's `max_turns` is set to `limits.steps`, the value OpenCode's `steps` gets |

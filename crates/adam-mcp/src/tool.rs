@@ -13,7 +13,7 @@
 //!     C-->>T: peer, generation
 //!     T->>S: tools/call (call_tool_once), within call_timeout and ctx.cancelled()
 //!     S-->>T: result
-//!     T-->>L: ToolOutput (text of the content, scrubbed of expanded values, over 64 KiB: kept, the first page and an output id, read with read_output; is_error kept;<br/>with files: true, its images, audio and blobs as file artifacts and a line each)
+//!     T-->>L: ToolOutput (text of the content, scrubbed of expanded values, over the policy's result bound (16 KiB by default): kept, a first page within the bound and an output id, read with read_output; is_error kept;<br/>with files: true, its images, audio and blobs as file artifacts and a line each)
 //!     Note over L: the result is journaled; a replay returns it without calling again
 //! ```
 
@@ -38,7 +38,7 @@ use crate::connection::Connection;
 use crate::redact::Redactor;
 use adam_llm_agent::MAX_KEPT_BYTES;
 
-use crate::text::{MAX_MESSAGE_BYTES, MAX_RESULT_BYTES, cap_text};
+use crate::text::{MAX_MESSAGE_BYTES, cap_text};
 
 /// A tool of an MCP server. The model sees it as `<server>__<tool>`.
 ///
@@ -64,6 +64,8 @@ pub(crate) struct McpTool {
     /// How long the connection may take to be made (made again, or made for this call alone), which
     /// a call can wait for before it is sent.
     connect_timeout: Duration,
+    /// The most bytes of a result the model reads whole ([`McpPolicy::result_bytes`](crate::McpPolicy::result_bytes)).
+    result_bytes: usize,
     /// `files: true` on its server: the files of a result are shared, not described.
     files: bool,
     /// Its calls may run beside the turn's other calls (`parallel` of the server's entry, on by
@@ -108,6 +110,7 @@ impl McpTool {
         target: Target,
         call_timeout: Duration,
         connect_timeout: Duration,
+        result_bytes: usize,
         files: bool,
         parallel: bool,
     ) -> Self {
@@ -119,6 +122,7 @@ impl McpTool {
             target,
             call_timeout,
             connect_timeout,
+            result_bytes,
             files,
             parallel,
         }
@@ -162,7 +166,7 @@ impl McpTool {
         if !images.is_empty() && !output.is_error {
             output = self.admit_images(ctx, images, output).await;
         }
-        (keep_overflow(ctx, output).await, broken)
+        (keep_overflow(ctx, output, self.result_bytes).await, broken)
     }
 
     /// Offer the images of a result to the model: each admitted one rides on the result and is
@@ -231,6 +235,7 @@ impl McpTool {
             Ok(CallToolResponse::Complete(result)) => map_result(
                 &result,
                 redactor,
+                self.result_bytes,
                 self.files.then(|| ShareAs {
                     stem: &self.remote,
                     budget: ctx.files_left(),
@@ -460,30 +465,30 @@ impl Tool for McpTool {
     }
 }
 
-/// A text over [`MAX_RESULT_BYTES`] is **kept** and its first page shown (see
-/// [`adam_llm_agent::keep_long`]): the model reads the rest with `read_output`. An error result is
-/// not kept: it is cut as ever.
-async fn keep_overflow(ctx: &ToolCtx, mut output: ToolOutput) -> ToolOutput {
-    if output.content.len() <= MAX_RESULT_BYTES {
+/// A text over `bound` bytes (the policy's [`result_bytes`](crate::McpPolicy::result_bytes)) is
+/// **kept** and shown as a first page within `bound` (see [`adam_llm_agent::keep_long_within`]): the
+/// model reads the rest with `read_output`. An error result is not kept: it is cut at `bound`.
+async fn keep_overflow(ctx: &ToolCtx, mut output: ToolOutput, bound: usize) -> ToolOutput {
+    if output.content.len() <= bound {
         return output;
     }
     if output.is_error {
-        output.content = cap_text(output.content, MAX_RESULT_BYTES);
+        output.content = cap_text(output.content, bound);
         return output;
     }
     // Over what is kept: the keeper is given the first part, with the count of what is left out, and
     // cuts its end back where no secret it knows straddles it (the end is not a place to trust).
     let limit = MAX_KEPT_BYTES + adam_llm_agent::SCRUB_OVERLAP;
-    let (shown, kept) = if output.content.len() > limit {
+    let (text, omitted) = if output.content.len() > limit {
         let mut end = limit;
         while !output.content.is_char_boundary(end) {
             end -= 1;
         }
-        let omitted = (output.content.len() - end) as u64;
-        adam_llm_agent::keep_long_cut(ctx, &output.content[..end], omitted).await
+        (&output.content[..end], (output.content.len() - end) as u64)
     } else {
-        adam_llm_agent::keep_long(ctx, &output.content).await
+        (output.content.as_str(), 0)
     };
+    let (shown, kept) = adam_llm_agent::keep_long_within(ctx, text, omitted, bound).await;
     output.content = shown;
     output.kept = kept;
     output
@@ -502,9 +507,10 @@ fn kind(value: &Value) -> &'static str {
 
 /// A server's answer as text for the model: the blocks joined by newlines, scrubbed of what
 /// `redactor` knows (a server that echoes a credential it was given must not hand it to the model
-/// and the journal), and **not cut** (a text over [`MAX_RESULT_BYTES`] is kept and paged by the
-/// caller, [`keep_overflow`], which cuts it at [`MAX_KEPT_BYTES`] and tells the keeper that it did);
-/// an error result when the server says `isError`.
+/// and the journal), and **not cut** (a text over `result_bytes` is kept and paged by the caller,
+/// [`keep_overflow`], which cuts it at [`MAX_KEPT_BYTES`] and tells the keeper that it did); an
+/// error result when the server says `isError`. Structured content alone is compact while it fits
+/// `result_bytes`, and pretty-printed past it, so that it pages by lines.
 ///
 /// With `files` (the tool's name on a server with `files: true`), each image, audio clip and blob
 /// becomes a file artifact of the result and its block one line, [`Artifact::shared_line`] (see
@@ -513,6 +519,7 @@ fn kind(value: &Value) -> &'static str {
 pub(crate) fn map_result(
     result: &CallToolResult,
     redactor: &Redactor,
+    result_bytes: usize,
     files: Option<ShareAs<'_>>,
 ) -> ToolOutput {
     let mut sharing = files.map(|share| Sharing::new(share, redactor));
@@ -528,7 +535,7 @@ pub(crate) fn map_result(
     } else if let Some(structured) = &result.structured_content {
         // Compact while it fits a result; a long one is kept and paged by lines, which needs lines.
         let compact = structured.to_string();
-        if compact.len() > MAX_RESULT_BYTES {
+        if compact.len() > result_bytes {
             serde_json::to_string_pretty(structured).unwrap_or(compact)
         } else {
             compact
@@ -698,6 +705,7 @@ mod tests {
     use rmcp::model::{Resource, ResourceContents};
 
     use super::*;
+    use crate::policy::DEFAULT_RESULT_BYTES;
 
     /// What a server says its image is, as a media type and nothing else.
     #[test]
@@ -740,7 +748,7 @@ mod tests {
             }),
             ContentBlock::resource_link(Resource::new("file:///c.txt", "c")),
         ]);
-        let output = map_result(&result, &Redactor::default(), None);
+        let output = map_result(&result, &Redactor::default(), DEFAULT_RESULT_BYTES, None);
         assert!(!output.is_error);
         assert_eq!(
             output.content,
@@ -811,7 +819,12 @@ mod tests {
             ContentBlock::embedded_text("file:///notes.txt", "notes"),
             ContentBlock::resource_link(Resource::new("file:///c.txt", "c")),
         ]);
-        let output = map_result(&result, &Redactor::default(), share("browser_screenshot"));
+        let output = map_result(
+            &result,
+            &Redactor::default(),
+            DEFAULT_RESULT_BYTES,
+            share("browser_screenshot"),
+        );
         assert!(!output.is_error, "{}", output.content);
         let names = names(&output);
         assert!(
@@ -871,6 +884,7 @@ mod tests {
             names(&map_result(
                 &result,
                 &Redactor::default(),
+                DEFAULT_RESULT_BYTES,
                 share("browser_screenshot"),
             ))[0]
                 .clone()
@@ -887,7 +901,12 @@ mod tests {
             blob("x://y", None, PNG),
             blob("x://z", Some("not a type"), b"\0\x01"),
         ]);
-        let output = map_result(&result, &Redactor::default(), share("t"));
+        let output = map_result(
+            &result,
+            &Redactor::default(),
+            DEFAULT_RESULT_BYTES,
+            share("t"),
+        );
         assert!(!output.is_error, "{}", output.content);
         let names = names(&output);
         assert!(is_named(&names[0], "t", "bin"), "{names:?}");
@@ -921,7 +940,12 @@ mod tests {
             ContentBlock::image("!".repeat(MAX_ARTIFACT_FILE_BYTES * 2), "image/png"),
             ContentBlock::image(b64(PNG), "image/png"),
         ]);
-        let output = map_result(&result, &Redactor::default(), share("shot"));
+        let output = map_result(
+            &result,
+            &Redactor::default(),
+            DEFAULT_RESULT_BYTES,
+            share("shot"),
+        );
         assert!(
             output.is_error,
             "a file the person does not get is a failure"
@@ -960,7 +984,12 @@ mod tests {
             ContentBlock::image(b64(&bytes), "image/png")
         };
         let result = CallToolResult::success(vec![big(1), big(2), big(3)]);
-        let output = map_result(&result, &Redactor::default(), share("shot"));
+        let output = map_result(
+            &result,
+            &Redactor::default(),
+            DEFAULT_RESULT_BYTES,
+            share("shot"),
+        );
         assert!(output.is_error);
         assert_eq!(
             output.artifacts.len(),
@@ -984,6 +1013,7 @@ mod tests {
         let tight = map_result(
             &result,
             &Redactor::default(),
+            DEFAULT_RESULT_BYTES,
             Some(ShareAs {
                 stem: "shot",
                 budget: 1024,
@@ -1010,7 +1040,12 @@ mod tests {
             ContentBlock::image(wrapped, "image/png"),
             ContentBlock::image("not base64 at all!", "image/png"),
         ]);
-        let output = map_result(&result, &Redactor::default(), share("t"));
+        let output = map_result(
+            &result,
+            &Redactor::default(),
+            DEFAULT_RESULT_BYTES,
+            share("t"),
+        );
         assert!(output.is_error);
         assert_eq!(output.artifacts[1].file.as_ref().unwrap().bytes, b"hi!x");
         assert_eq!(output.artifacts[2].file.as_ref().unwrap().bytes, PNG);
@@ -1036,6 +1071,7 @@ mod tests {
         let output = map_result(
             &CallToolResult::success(blocks),
             &Redactor::default(),
+            DEFAULT_RESULT_BYTES,
             share("t"),
         );
         assert_eq!(output.artifacts.len(), MAX_FILES_PER_RESULT);
@@ -1063,7 +1099,7 @@ mod tests {
                 b"\xfftok-6d2f-secret",
             ),
         ]);
-        let output = map_result(&result, &redactor, share("t"));
+        let output = map_result(&result, &redactor, DEFAULT_RESULT_BYTES, share("t"));
         assert!(output.is_error, "the server said isError");
         assert_eq!(
             output.artifacts[0].file.as_ref().unwrap().bytes,
@@ -1078,11 +1114,17 @@ mod tests {
 
     #[test]
     fn nothing_and_structured_content_have_their_own_text() {
-        let empty = map_result(&CallToolResult::success(vec![]), &Redactor::default(), None);
+        let empty = map_result(
+            &CallToolResult::success(vec![]),
+            &Redactor::default(),
+            DEFAULT_RESULT_BYTES,
+            None,
+        );
         assert_eq!(empty.content, "(the tool returned no content)");
         let structured = map_result(
             &CallToolResult::structured(serde_json::json!({"n": 3})),
             &Redactor::default(),
+            DEFAULT_RESULT_BYTES,
             None,
         );
         assert!(!structured.is_error);
@@ -1094,6 +1136,7 @@ mod tests {
         let output = map_result(
             &CallToolResult::error(vec![ContentBlock::text("no such issue")]),
             &Redactor::default(),
+            DEFAULT_RESULT_BYTES,
             None,
         );
         assert!(output.is_error);
@@ -1114,35 +1157,38 @@ mod tests {
         )
     }
 
-    /// `map_result` no longer cuts at 64 KiB: the text is whole (to the keeper's bound) and
+    /// `map_result` does not cut at the result bound: the text is whole (to the keeper's bound) and
     /// [`keep_overflow`] decides what the model is shown.
     #[test]
-    fn a_result_over_64_kib_is_whole_until_it_is_kept() {
-        let big = "x".repeat(MAX_RESULT_BYTES + 100);
+    fn a_result_over_the_bound_is_whole_until_it_is_kept() {
+        let big = "x".repeat(DEFAULT_RESULT_BYTES + 100);
         let output = map_result(
             &CallToolResult::success(vec![ContentBlock::text(big.clone())]),
             &Redactor::default(),
+            DEFAULT_RESULT_BYTES,
             None,
         );
         assert!(!output.is_error);
         assert_eq!(output.content, big);
     }
 
-    #[tokio::test]
-    async fn a_result_over_64_kib_is_kept_and_its_first_page_returned() {
+    /// A result over the bound is kept, and what the model is shown (the line that names it, the
+    /// first page and its final line) fits the bound; the pages, from the offsets the final lines
+    /// name, give the whole text back.
+    async fn kept_within(bound: usize) -> String {
         let text = rows(4000); // 4,000 lines of 53 bytes: 212,000 bytes
         let store = Arc::new(adam_llm_agent::KeptStore(Arc::new(
             adam_llm_agent::MemoryKept::new(),
         )));
         let ctx = ctx().with_state(store.clone());
-        let output = keep_overflow(&ctx, ToolOutput::text(text.clone())).await;
+        let output = keep_overflow(&ctx, ToolOutput::text(text.clone()), bound).await;
         assert!(
             output.kept.is_none(),
             "the store has it, the state does not"
         );
         assert!(
-            output.content.len() < MAX_RESULT_BYTES,
-            "{}",
+            output.content.len() <= bound,
+            "{} over {bound}",
             output.content.len()
         );
         let id = adam_llm_agent::output_id_of(&ctx);
@@ -1169,6 +1215,33 @@ mod tests {
             page = store.0.page(&run, &id, offset, 2000).await.unwrap();
         }
         assert_eq!(all, text, "no byte lost");
+        output.content
+    }
+
+    #[tokio::test]
+    async fn a_result_over_16_kib_is_kept_and_a_first_page_within_16_kib_returned() {
+        let shown = kept_within(DEFAULT_RESULT_BYTES).await;
+        // Near the bound, not a few lines of it: the page holds as many lines as fit.
+        assert!(shown.len() > DEFAULT_RESULT_BYTES - 200, "{}", shown.len());
+    }
+
+    /// The bound the deployment sets (the coder's `CHECK_OUTPUT_TAIL_BYTES`) is the one kept to,
+    /// smaller or larger than the default.
+    #[tokio::test]
+    async fn a_configured_bound_is_the_one_a_result_is_kept_and_shown_within() {
+        let small = kept_within(4096).await;
+        assert!(small.len() > 4096 - 200, "{}", small.len());
+        let large = kept_within(40 * 1024).await;
+        assert!(large.len() > DEFAULT_RESULT_BYTES, "{}", large.len());
+        // Under the bound, nothing is kept: a 20 KiB result is whole when the bound is 32 KiB, and
+        // kept at the default.
+        let text = rows(380);
+        let whole = keep_overflow(&ctx(), ToolOutput::text(text.clone()), 32 * 1024).await;
+        assert_eq!(whole.content, text);
+        let ctx = ctx().with_kept(adam_llm_agent::MAX_RUN_KEPT_BYTES, Arc::default());
+        let kept = keep_overflow(&ctx, ToolOutput::text(text.clone()), DEFAULT_RESULT_BYTES).await;
+        assert_eq!(kept.kept.map(|k| k.text), Some(text));
+        assert!(kept.content.len() <= DEFAULT_RESULT_BYTES);
     }
 
     #[tokio::test]
@@ -1176,7 +1249,8 @@ mod tests {
         let text = rows(4000);
         let room = adam_llm_agent::MAX_RUN_KEPT_BYTES;
         let ctx = ctx().with_kept(room, Arc::default());
-        let output = keep_overflow(&ctx, ToolOutput::text(text.clone())).await;
+        let output =
+            keep_overflow(&ctx, ToolOutput::text(text.clone()), DEFAULT_RESULT_BYTES).await;
         let kept = output
             .kept
             .expect("handed to the loop to keep in the run's state");
@@ -1190,7 +1264,7 @@ mod tests {
 
         // Over what the run may still keep: the first page and a line that says the rest is lost.
         let ctx = self::ctx().with_kept(1000, Arc::default());
-        let output = keep_overflow(&ctx, ToolOutput::text(text)).await;
+        let output = keep_overflow(&ctx, ToolOutput::text(text), DEFAULT_RESULT_BYTES).await;
         assert!(output.kept.is_none());
         assert!(
             output.content.starts_with("row-000000"),
@@ -1204,7 +1278,7 @@ mod tests {
             "{}",
             &output.content[output.content.len() - 200..]
         );
-        assert!(output.content.len() < MAX_RESULT_BYTES);
+        assert!(output.content.len() <= DEFAULT_RESULT_BYTES);
     }
 
     /// A secret of the keeper's (the coder's own, which the server's redactor does not know) that
@@ -1222,13 +1296,14 @@ mod tests {
         let output = map_result(
             &CallToolResult::success(vec![ContentBlock::text(text)]),
             &Redactor::default(),
+            DEFAULT_RESULT_BYTES,
             None,
         );
         let store = Arc::new(KeptStore(Arc::new(MemoryKept::new().scrubbing(move |t| {
             t.replace(secret, "[redacted: secret removed, do not reuse]")
         }))));
         let ctx = ctx().with_state(store.clone());
-        let output = keep_overflow(&ctx, output).await;
+        let output = keep_overflow(&ctx, output, DEFAULT_RESULT_BYTES).await;
         let id = adam_llm_agent::output_id_of(&ctx);
         let run = ctx.root_run_id().to_string();
         let last = store.0.page(&run, &id, -3, 10).await.unwrap();
@@ -1242,13 +1317,21 @@ mod tests {
     #[tokio::test]
     async fn an_error_result_is_cut_as_it_always_was_and_a_short_one_is_untouched() {
         let ctx = ctx();
-        let long = keep_overflow(&ctx, ToolOutput::error("e".repeat(MAX_RESULT_BYTES + 100))).await;
+        let long = keep_overflow(
+            &ctx,
+            ToolOutput::error("e".repeat(DEFAULT_RESULT_BYTES + 100)),
+            DEFAULT_RESULT_BYTES,
+        )
+        .await;
         assert!(long.is_error && long.kept.is_none());
         assert!(
             long.content
-                .contains("[cut here: 65536 of 65636 bytes shown]")
+                .contains("[cut here: 16384 of 16484 bytes shown]")
         );
-        let short = keep_overflow(&ctx, ToolOutput::text("fine")).await;
+        // At the bound the deployment set.
+        let set = keep_overflow(&ctx, ToolOutput::error("e".repeat(5000)), 4096).await;
+        assert!(set.content.contains("[cut here: 4096 of 5000 bytes shown]"));
+        let short = keep_overflow(&ctx, ToolOutput::text("fine"), DEFAULT_RESULT_BYTES).await;
         assert_eq!(short.content, "fine");
     }
 
@@ -1260,13 +1343,13 @@ mod tests {
         // A server that answers with structured content alone (no text block).
         let mut result = CallToolResult::success(vec![]);
         result.structured_content = Some(serde_json::json!({ "items": items }));
-        let output = map_result(&result, &Redactor::default(), None);
-        assert!(output.content.len() > MAX_RESULT_BYTES);
+        let output = map_result(&result, &Redactor::default(), DEFAULT_RESULT_BYTES, None);
+        assert!(output.content.len() > DEFAULT_RESULT_BYTES);
         assert!(output.content.lines().count() > 3000, "one value per line");
         // A small one stays compact.
         let mut small = CallToolResult::success(vec![]);
         small.structured_content = Some(serde_json::json!({"n": 3}));
-        let small = map_result(&small, &Redactor::default(), None);
+        let small = map_result(&small, &Redactor::default(), DEFAULT_RESULT_BYTES, None);
         assert_eq!(small.content, "{\"n\":3}");
     }
 
@@ -1280,10 +1363,11 @@ mod tests {
         let output = map_result(
             &CallToolResult::success(vec![ContentBlock::text(text)]),
             &redactor,
+            DEFAULT_RESULT_BYTES,
             None,
         );
         let ctx = ctx().with_kept(adam_llm_agent::MAX_RUN_KEPT_BYTES, Arc::default());
-        let output = keep_overflow(&ctx, output).await;
+        let output = keep_overflow(&ctx, output, DEFAULT_RESULT_BYTES).await;
         let kept = output.kept.unwrap();
         assert!(
             !kept.text.contains("zq9x")
@@ -1309,13 +1393,14 @@ mod tests {
         let output = map_result(
             &CallToolResult::success(vec![ContentBlock::text(text)]),
             &Redactor::default(),
+            DEFAULT_RESULT_BYTES,
             None,
         );
         let store = Arc::new(KeptStore(Arc::new(MemoryKept::new().scrubbing(move |t| {
             t.replace(secret, "[redacted: secret removed, do not reuse]")
         }))));
         let ctx = ctx().with_state(store.clone());
-        let output = keep_overflow(&ctx, output).await;
+        let output = keep_overflow(&ctx, output, DEFAULT_RESULT_BYTES).await;
         assert!(output.content.contains("only the first"), "cut is said");
         let id = adam_llm_agent::output_id_of(&ctx);
         let run = ctx.root_run_id().to_string();
@@ -1363,6 +1448,7 @@ mod tests {
                 ContentBlock::embedded_text("file:///a", "and tok-6d2f-secret again"),
             ]),
             &redactor,
+            DEFAULT_RESULT_BYTES,
             None,
         );
         assert_eq!(
@@ -1372,6 +1458,7 @@ mod tests {
         let failed = map_result(
             &CallToolResult::error(vec![ContentBlock::text("denied for tok-6d2f-secret")]),
             &redactor,
+            DEFAULT_RESULT_BYTES,
             None,
         );
         assert!(failed.is_error);
@@ -1382,6 +1469,7 @@ mod tests {
         let structured = map_result(
             &CallToolResult::structured(serde_json::json!({"t": "tok-6d2f-secret"})),
             &redactor,
+            DEFAULT_RESULT_BYTES,
             None,
         );
         assert!(
@@ -1389,13 +1477,14 @@ mod tests {
             "{}",
             structured.content
         );
-        // A value that straddles the 64 KiB cut is gone before the text is cut.
-        let padding = "x".repeat(MAX_RESULT_BYTES - 5);
+        // A value that straddles the 16 KiB cut is gone before the text is cut.
+        let padding = "x".repeat(DEFAULT_RESULT_BYTES - 5);
         let straddling = map_result(
             &CallToolResult::success(vec![ContentBlock::text(format!(
                 "{padding}tok-6d2f-secret"
             ))]),
             &redactor,
+            DEFAULT_RESULT_BYTES,
             None,
         );
         assert!(!straddling.content.contains("tok-6"), "cut before scrubbed");

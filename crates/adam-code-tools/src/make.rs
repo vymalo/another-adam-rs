@@ -1,4 +1,4 @@
-//! `run { command, cwd?, repo?, timeout? }`: make something with a shell command, and keep it, over
+//! `run { command, cwd?, repo?, timeout?, output? }`: make something with a shell command, and keep it, over
 //! the commands' port ([`CommandWorkspace`]).
 //!
 //! It runs exactly as [`run_command`](crate::inspect::run_command) does (the place, a `cwd` inside
@@ -11,6 +11,11 @@
 //! moves its check epoch, even for a command its guard undoes); its text is appended to a result
 //! whose files changed. It is never a check. When `after_run` fails, the guard has already settled,
 //! so a change the command made to git is undone, and its error is the tool's.
+//!
+//! A command that succeeds is shown as one line by default ([`DEFAULT_OUTPUT`]): its result is the
+//! files it made, and its output is kept for `read_output`. A workspace may give `run` another
+//! default ([`CommandLimits::output`](crate::commands::CommandLimits::output); the coder's folder,
+//! `limits.output.run`), and a call may ask for `output: "full"` ([`OutputMode`]), which wins.
 
 use std::fmt::Write as _;
 
@@ -20,17 +25,23 @@ use crate::commands::{self, CommandWorkspace, Guarding, Settled, run_error};
 use crate::find::non_empty;
 use crate::git::status_text;
 use crate::inspect::{noted, render};
-use crate::output;
+use crate::output::{self, OutputMode};
 use crate::shell::{ShellOutcome, missing_tool, resolve_cwd, shell_spec};
 use crate::workspace::{Intent, Outcome};
 
 /// Most changed files the result lists.
 pub const MAX_LISTED: usize = 20;
 
+/// What `run` shows of an output when the call asks for nothing: one line for a command that
+/// succeeded, since its result is the files it made (ADR 0090, decision 3).
+pub const DEFAULT_OUTPUT: OutputMode = OutputMode::OnError;
+
 /// The tool `run` over `ws`. Its description is the caller's own declaration (the coder's
 /// `tools::make`).
 ///
-/// In order: the command is required, the `timeout` within the limits, the place found for a write,
+/// In order: the command is required, the `timeout` within the limits, the `output` one of its
+/// values ([`OutputMode::of`], default the workspace's [`OutputDefaults::run`](crate::output::OutputDefaults::run), which is
+/// [`DEFAULT_OUTPUT`] unless it was given another), the place found for a write,
 /// the `cwd` inside it, the session made (it may take a while, so before the place is watched), the
 /// guard taken for a [`Make`](Guarding::Make) (its refusal is the answer, and nothing runs), then the
 /// command runs, its output is settled, the guard is settled, and
@@ -49,6 +60,8 @@ pub async fn run(
     repo: Option<String>,
     // Seconds before the command is killed; at most the workspace's limit, which is also the default
     timeout: Option<i64>,
+    // What the result shows of the output: `on_error` or `full`; default `on_error`
+    output: Option<String>,
 ) -> Outcome {
     let Some(command) = non_empty(&command) else {
         return Ok(ToolOutput::error("command is required"));
@@ -56,6 +69,10 @@ pub async fn run(
     let limits = ws.limits();
     let timeout = match output::timeout_of(&limits, timeout) {
         Ok(timeout) => timeout,
+        Err(reason) => return Ok(ToolOutput::error(reason)),
+    };
+    let mode = match OutputMode::of(output.as_deref(), limits.output.run) {
+        Ok(mode) => mode,
         Err(reason) => return Ok(ToolOutput::error(reason)),
     };
     // A repository's worktree or a scratch project: the command works on either.
@@ -91,7 +108,7 @@ pub async fn run(
     )
     .await
     .map_err(|e| run_error(redactor, &e))?;
-    output::settle(ws, ctx, &mut outcome).await;
+    output::settle_as(ws, ctx, &mut outcome, mode).await;
 
     // The guard settles **first**: a `Make` guard's report of the files is recorded there (the
     // entry's `after`), and `after_run` is what reads it — called before this, it finds an entry with
@@ -143,7 +160,7 @@ pub async fn run(
         return Ok(ToolOutput::error(said));
     }
 
-    let mut text = render(&shown, &outcome);
+    let mut text = render(&shown, &outcome, mode);
     match changed {
         Some(true) => {
             text.push_str(&changes_note(status_text(place.git()).await.as_deref()));

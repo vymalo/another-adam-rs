@@ -125,6 +125,35 @@ impl Tool for Ask {
     }
 }
 
+/// A subagent's own tool on the helper: a call runs it as a one-shot session of the parent and
+/// waits for its answer (`adam_assembly::SubagentTool`, ADR 0089 slice C1).
+struct OneShot {
+    helper: String,
+}
+
+#[async_trait]
+impl Tool for OneShot {
+    fn spec(&self) -> adam_model::ToolSpec {
+        adam_model::ToolSpec {
+            name: "helper_once".into(),
+            description: "asks the helper once".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {"message": {"type": "string"}},
+                "required": ["message"],
+            }),
+        }
+    }
+
+    async fn call(&self, ctx: &ToolCtx, args: Value) -> Result<ToolOutput, ToolError> {
+        let message = args["message"].as_str().unwrap_or_default();
+        let run = ctx
+            .start_one_shot_session(&self.helper, message, None)
+            .await?;
+        Err(ToolError::AwaitRun { run })
+    }
+}
+
 struct Rig {
     store: DynStore,
     runtime: Runtime,
@@ -160,6 +189,8 @@ struct Options {
     view_poll: Duration,
     /// The helper has a tool that asks the person.
     asks: bool,
+    /// The parent has a subagent's own tool on the helper ([`OneShot`]).
+    one_shot: bool,
     /// The bounds the card's helper is held to for a `start.config` (ADR 0054).
     bounds: Option<SessionBounds>,
 }
@@ -178,6 +209,7 @@ impl Options {
             idle: None,
             view_poll: Duration::from_millis(10),
             asks: false,
+            one_shot: false,
             bounds: None,
         }
     }
@@ -219,6 +251,7 @@ impl Rig {
                 within: None,
                 remote: false,
                 bounds: SessionBounds::default(),
+                session: adam_llm_agent::SessionDefaults::default(),
             },
             // A helper the model may start but the card does not list.
             SessionAgent {
@@ -228,12 +261,18 @@ impl Rig {
                 within: None,
                 remote: false,
                 bounds: SessionBounds::default(),
+                session: adam_llm_agent::SessionDefaults::default(),
             },
         ]);
         let mut parent_agent = LlmAgent::builder(&parent, parent_model, "m")
             .session_agents([helper.clone(), hidden.clone()]);
         for tool in tools.tools() {
             parent_agent = parent_agent.dyn_tool(tool);
+        }
+        if options.one_shot {
+            parent_agent = parent_agent.tool(OneShot {
+                helper: helper.clone(),
+            });
         }
         let events = BroadcastSink::default();
         let mut builder = Runtime::builder(store.clone());
@@ -1366,6 +1405,76 @@ async fn a_message_to_a_working_session_goes_into_its_round() {
     }
 }
 
+/// A subagent's own tool runs it as a one-shot session (ADR 0089 slice C1): the person sees it in
+/// the parent's sessions, working and then closed, and cannot write to it, neither to its context
+/// nor by naming its round, even with `steer/v1`; the parent gets its answer as the call's result.
+#[tokio::test]
+async fn a_one_shot_session_is_listed_and_takes_no_message_from_the_person() {
+    for store in stores().await {
+        let rig = Rig::with(
+            &store,
+            Options {
+                hold_helper_on: Some(0),
+                one_shot: true,
+                ..Options::new()
+            },
+        );
+        rig.helper_mock.push_text("the helper's answer");
+        rig.parent_mock
+            .push_tool_calls(vec![ToolCall::new(
+                "c1",
+                "helper_once",
+                json!({"message": "work"}),
+            )])
+            .push_text("parent done");
+        let parent = rig
+            .submit(&alice(), said("use the helper", Some("ctx-once")), None)
+            .await
+            .unwrap();
+        rig.gate.reached.notified().await;
+
+        let task = rig.task(&alice(), &parent.id).await;
+        let sessions = object(&task)["sessions"].clone();
+        assert_eq!(sessions.as_array().unwrap().len(), 1, "{sessions}");
+        assert_eq!(sessions[0]["state"], "working", "{sessions}");
+        assert_eq!(sessions[0]["keepOpen"], false, "{sessions}");
+        let (child, round) = (
+            sessions[0]["contextId"].as_str().unwrap().to_owned(),
+            sessions[0]["round"]["taskId"].as_str().unwrap().to_owned(),
+        );
+        assert!(unsupported(
+            rig.submit(&alice(), said("also this", Some(&child)), None)
+                .await
+        ));
+        let mut steering = alice();
+        steering.extensions.push(STEER_EXTENSION.to_owned());
+        assert!(unsupported(
+            rig.submit(&steering, said("steer", Some(&child)), Some(&round))
+                .await
+        ));
+
+        rig.gate.release.notify_one();
+        let done = rig.until(&alice(), &parent.id, TaskState::Completed).await;
+        let sessions = object(&done)["sessions"].clone();
+        assert_eq!(sessions[0]["state"], "closed", "{sessions}");
+        assert!(unsupported(
+            rig.submit(&alice(), said("late", Some(&child)), None).await
+        ));
+        let requests = rig.parent_mock.requests();
+        assert_eq!(requests.len(), 2, "no report is told after the answer");
+        match requests[1].messages.last().unwrap() {
+            adam_model::Message::Tool {
+                call_id, content, ..
+            } => assert_eq!(
+                (call_id.as_str(), content.as_str()),
+                ("c1", "the helper's answer")
+            ),
+            other => panic!("the last message is not the call's result: {other:?}"),
+        }
+        rig.stop().await;
+    }
+}
+
 /// `CancelTask` of a working round stops it and a kept-open session goes idle.
 #[tokio::test]
 async fn cancel_of_a_working_round_makes_a_kept_open_session_idle() {
@@ -1788,6 +1897,7 @@ async fn a_session_the_model_starts_is_listed_and_a_person_can_talk_to_it() {
         assert_eq!(sessions[0]["agent"], "planner");
         assert_eq!(sessions[0]["description"], "look");
         assert_eq!(sessions[0]["keepOpen"], true);
+        assert_eq!(sessions[0]["mode"], "open", "what keep_open true means");
 
         let first = rig.task(&alice(), &round).await;
         assert_eq!(object(&first)["by"], "agent");
@@ -1815,6 +1925,91 @@ async fn a_session_the_model_starts_is_listed_and_a_person_can_talk_to_it() {
             "the person's round is its own parent"
         );
         rig.stop().await;
+    }
+}
+
+/// ADR 0089 slice C2: a session the model starts `sealed` or `one_shot` is the agent's to write
+/// to. The session object says its mode; the person's message to its child context and their steer
+/// of its working round are refused, naming the mode; once its round has ended a sealed session is
+/// idle and still refuses the person, who may close it, and a one-shot one is closed.
+#[tokio::test]
+async fn a_sealed_or_one_shot_session_of_the_agent_refuses_the_persons_message_and_steer() {
+    for store in stores().await {
+        for mode in ["sealed", "one_shot"] {
+            let rig = Rig::with(
+                &store,
+                Options {
+                    hold_helper_on: Some(0),
+                    ..Options::new()
+                },
+            );
+            rig.helper_mock.push_text("helped");
+            rig.parent_mock
+                .push_tool_calls(vec![ToolCall::new(
+                    "c1",
+                    "subagent_start",
+                    json!({"agent": "helper", "description": "look", "prompt": "go", "mode": mode}),
+                )])
+                .push_text("started")
+                .push_text("digested");
+            let parent = rig
+                .submit(&alice(), said("start a helper", Some(&uniq("ctx"))), None)
+                .await
+                .unwrap();
+            rig.gate.reached.notified().await;
+            let task = rig.task(&alice(), &parent.id).await;
+            let sessions = object(&task)["sessions"].clone();
+            assert_eq!(sessions[0]["mode"], mode, "{sessions}");
+            assert_eq!(sessions[0]["keepOpen"], mode == "sealed", "{sessions}");
+            let (child, round) = (
+                sessions[0]["contextId"].as_str().unwrap().to_owned(),
+                sessions[0]["round"]["taskId"].as_str().unwrap().to_owned(),
+            );
+            assert_eq!(object(&rig.task(&alice(), &round).await)["mode"], mode);
+            let words = refusal(
+                rig.submit(&alice(), said("also this", Some(&child)), None)
+                    .await,
+            );
+            assert!(words.contains(&format!("is {mode}")), "{words}");
+            let mut steering = alice();
+            steering.extensions.push(STEER_EXTENSION.to_owned());
+            let words = refusal(
+                rig.submit(&steering, said("steer", Some(&child)), Some(&round))
+                    .await,
+            );
+            assert!(words.contains(&format!("is {mode}")), "{words}");
+            // An edit is writing too (ADR 0089, amended 2026-11-28): refused in the same words.
+            let words = refusal(
+                rig.submit(&alice(), edit_message(&child, json!({"maxTurns": 2})), None)
+                    .await,
+            );
+            assert!(words.contains(&format!("is {mode}")), "{words}");
+
+            rig.gate.release.notify_one();
+            let done = rig.until(&alice(), &parent.id, TaskState::Completed).await;
+            let sessions = object(&done)["sessions"].clone();
+            let after = if mode == "sealed" { "idle" } else { "closed" };
+            assert_eq!(sessions[0]["state"], after, "{sessions}");
+            assert!(unsupported(
+                rig.submit(&alice(), said("late", Some(&child)), None).await
+            ));
+            if mode == "sealed" {
+                let words = refusal(
+                    rig.submit(&alice(), edit_message(&child, json!({"maxTurns": 2})), None)
+                        .await,
+                );
+                assert!(
+                    words.contains("is sealed"),
+                    "an idle sealed session: {words}"
+                );
+                let closing = rig
+                    .submit(&alice(), close_message(&child, false), None)
+                    .await
+                    .expect("a person may close a session they cannot write to");
+                assert_eq!(object(&closing)["state"], "closed", "{closing:?}");
+            }
+            rig.stop().await;
+        }
     }
 }
 
