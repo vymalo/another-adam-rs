@@ -832,6 +832,10 @@ impl EnvSession for HookedSession {
     }
 
     fn prepare(&self, spec: &ExecSpec) -> Result<PreparedCommand, EnvError> {
+        // The caller's boundary, taken before any hook runs: a hook may *add* a hidden name, never
+        // lift one. Without this snapshot a hook that cleared or replaced `hide` would move the
+        // agent's own boundary, which is the one thing this seam exists to keep fixed.
+        let mut hide = spec.hide.clone();
         let mut spec = spec.clone();
         for hook in self.hooks.iter() {
             let before: BTreeSet<String> = spec.env.keys().cloned().collect();
@@ -857,11 +861,18 @@ impl EnvSession for HookedSession {
             }
         }
         // Hidden names always win (ADR 0050, decision 13): a hook is the deployment's policy, and
-        // hiding is the agent's own boundary, so no order of hooks can move it. The addition is
-        // dropped rather than refused, so the command still runs without the variable: a hook's
-        // mistake never leaves a hidden name visible, and never stops the run either.
-        let hide = &spec.hide;
-        spec.env.retain(|name, _| !hide.contains(name));
+        // hiding is the agent's own boundary, so no order of hooks can move it — a name a hook hid
+        // is kept, and one it unhid stays hidden. The addition is dropped rather than refused, so
+        // the command still runs without the variable: a hook's mistake never leaves a hidden name
+        // visible, and never stops the run either.
+        for name in &spec.hide {
+            if !hide.contains(name) {
+                hide.push(name.clone());
+            }
+        }
+        spec.hide = hide;
+        let hidden = &spec.hide;
+        spec.env.retain(|name, _| !hidden.contains(name));
         self.inner.prepare(&spec)
     }
 
@@ -1377,6 +1388,46 @@ mod tests {
         assert!(out.status.success(), "{out:?}");
         assert_eq!(String::from_utf8_lossy(&out.stdout), "1");
         assert!(spec.env.is_empty(), "the caller's spec is not changed");
+    }
+
+    /// A hook that tries to move the boundary: it clears every hidden name and adds the variable.
+    struct Unhides;
+
+    impl ExecHook for Unhides {
+        fn name(&self) -> &str {
+            "unhides"
+        }
+
+        fn prepare(&self, spec: &mut ExecSpec) -> Result<(), ExecHookError> {
+            spec.hide.clear();
+            spec.env
+                .insert("GITHUB_TOKEN".to_owned(), "set by a hook".to_owned());
+            Ok(())
+        }
+    }
+
+    /// A hook may add a hidden name, never lift one: a hook that clears `hide` leaves the caller's
+    /// boundary where it was. Red with the caller's list not snapshotted before the hooks run: the
+    /// name would leave both the filter and the session's own removal.
+    #[tokio::test]
+    async fn a_hook_cannot_unhide_a_name_the_caller_hid() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = HookedEnvironment::new(
+            Arc::new(Local),
+            vec![Arc::new(Unhides) as Arc<dyn ExecHook>],
+        );
+        let session = env.ensure(&a_run(dir.path()), &NoProgress).await.unwrap();
+        let spec = ExecSpec::shell(r#"printf '%s' "${GITHUB_TOKEN-unset}""#, dir.path())
+            .hide(["GITHUB_TOKEN"]);
+        let prepared = session.prepare(&spec).unwrap();
+        assert!(
+            !prepared.env.contains_key(&OsString::from("GITHUB_TOKEN")),
+            "the caller's boundary holds: {prepared:?}"
+        );
+        assert_eq!(prepared.env_remove, ["GITHUB_TOKEN"]);
+        let out = prepared.command().output().await.unwrap();
+        assert!(out.status.success(), "{out:?}");
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "unset");
     }
 
     /// The card's red case (ADR 0050, slice H10): a hook that adds a hidden name, applied **after**

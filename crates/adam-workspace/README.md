@@ -763,8 +763,10 @@ such calls cannot wait on each other either.
 | `Git`, `Http`, `Io` | `Internal` |
 
 `EnvError` implements `Classify` too: `Unavailable`, `Lost` and `Timeout` are `Transient` (worth another try), `Config`,
-`Refused` and `Build` are `Invalid` (the repository's configuration or the request is at fault), `Io` is `Internal`. No
-variant carries a secret; `Build` carries the end of the build's output, which the caller scrubs.
+`Refused` and `Build` are `Invalid` (the repository's configuration or the request is at fault), `Io` is `Internal`, and
+`Hook` takes its class from the hook's own `ExecHookError` (`Variable` is `Invalid`, `Failed` carries the hook's class, so
+a transient hook failure is retried by a caller that decides from classes). No variant carries a secret; `Build` carries the
+end of the build's output, which the caller scrubs.
 
 Only `Transient` and `RateLimited` are retryable. The `GitHub` code host
 answers HTTP 429, and a 403 that GitHub marks as a rate limit, with
