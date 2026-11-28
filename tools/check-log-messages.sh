@@ -54,6 +54,11 @@ must_pass "a literal brace" 'tracing::warn!("a {{literal}} brace");'
 must_pass "a test module" 'fn x() { tracing::warn!("a static message"); }
 #[cfg(test)]
 mod tests { fn y() { tracing::warn!("{v}"); } }'
+must_flag "a message after a cfg(test) field" 'struct S {
+    #[cfg(test)]
+    slot: u8,
+}
+fn x() { tracing::warn!("a value: {v}"); }'
 
 hits=$(python3 tools/scan-log-messages.py crates bin || true)
 if [ -n "$hits" ]; then
