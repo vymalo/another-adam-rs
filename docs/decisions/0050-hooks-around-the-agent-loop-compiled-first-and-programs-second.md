@@ -568,6 +568,44 @@ and `adam-engine` takes them (`EngineBuilder::hooks`, `plugin`), shows a parked 
 `HookSet` is `Clone`, and the `input_required` event of an approval says its question through the agent's `StepIo`
 redactor. The A2A test that drives an approval end to end is still not built.
 
+*Amended 2026-11-27 (slice **P1** built):* `adam-hook-exec` is the `adam-hooks/1` adapter — one `Plugin` whose
+deciding points and observed events are requests to a long-lived child — and its protocol page is
+[hook programs](../reference/hooks-protocol.md). Readings to confirm:
+* **The key.** The shipped `Plugin` trait has no `HookCtx` (H1 ships `before_tool(&mut HookedCall<'_>)`), so a
+  deciding hook has no journal key to send: the adapter sends `<plugin>/<point>/<id>`, unique per request, and a
+  replay sends no request at all (proven). An observer sends the event's `header.key`, which decision 14 keeps
+  stable across replays, so a program that writes elsewhere dedupes on it.
+* **The deadline.** `HookLimits` is per `HookSet`, not per plugin, so the adapter enforces decision 8's 2 s (at
+  most 30 s) inside the call and reports `Transient`. A host whose set deadline is shorter than the adapter's
+  fails a compliant program after the fact: it must build the set with `HookSet::with_limits`.
+* **Actions** are refused (`Unsupported`) rather than silently dropped, because slice H1d is not built.
+* **A reply is scrubbed**: a verdict's reason goes through the deployment's scrubber before it is recorded, and a
+  malformed reply's serde detail is logged rather than carried into `HookError.reason`, which the journal and the
+  model read.
+* **`SAFE_VARS` is duplicated** from `adam-mcp`, where it is private; depending on `adam-mcp` would bring its
+  whole transport. The two lists must stay equal.
+* **The child runs in an empty private directory** (made by the adapter, removed when it goes, unless the
+  deployment names one), never in the agent's workspace.
+Proof: `crates/adam-hook-exec/tests/exec.rs` — a verdict and a rewrite per deciding point, garbage refused, a
+dead program transient and the set giving up, the whole child environment, a rewrite over a scrubbed span
+refused, a missed deadline, three deadlines killing the program, the restart after the backoff, sixteen calls at
+once, an observer that decides refused, and a configuration that may not override a safe variable; and
+`crates/adam-hook-exec/tests/replay.rs` — a replay asks the recorded step once and the unrecorded one twice, the
+program's own log being the evidence, and a run fails when its program never answers.
+
+*Amended 2026-11-28 (slice **H10** built):* the command environment is a list of hooks. `ExecHook::prepare(&mut ExecSpec)`
+and `ExecHookError` live in `adam-workspace`, beside `ExecSpec` — not in `adam-plugin`, which would then depend on git,
+reqwest and rustix and make every plugin implementer carry them — `HookedEnvironment` composes them around an inner
+`Environment`, and `HidingEnvironment` is one such hook. Readings to confirm: a hook that adds a hidden name has the
+addition **dropped, not refused** (the command still runs, without the variable, because the card's proof needs it), and
+the caller's hidden names are **snapshotted before the hooks run**, so a hook may add a hidden name but never lift one — a
+hook that clears `hide` changes nothing. `DENIED_ENV` refuses `PATH`, `LD_*`, `BASH_ENV`, `ENV`, `IFS` and also `HOME`,
+`LANG` and `TMPDIR`: the same list `adam-hook-exec` enforces for a program, and the two must stay equal. Proof:
+`crates/adam-workspace/src/environment.rs` — a hook that adds a hidden name after the hiding hook leaves it hidden (both
+orders), a hook that clears `hide` cannot unhide a caller's name, every refused name fails with `EnvError::Hook` and class
+`Invalid`, a caller's value may be rewritten, a failing hook keeps its class and name, a seam with no hooks prepares what
+`LocalSession` does, and the coder's hiding tests pass unchanged.
+
 *Amended 2026-11-28 (ADR 0089 slice C2):* `session.started` also carries `mode` (`one_shot`, `sealed` or `open`), beside the
 `keep_open` it means, which stays for the hooks of before. A `subagent_start` with `wait: true` says `session.started` when
 the call parks, from its arguments and with `wait: true`, and `session.round.ended` when its first report settles the call,

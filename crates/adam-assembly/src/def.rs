@@ -8,15 +8,16 @@ use std::time::Duration;
 
 use adam_agent_fs::{
     AgentManifest, Diagnostic, EmbeddedAgent, InstructionPart, Instructions, Limits as FileLimits,
-    ManifestSource, McpConfig, ModelRef, SessionDef, SessionModeDef, SkillSelection, Strictness,
-    Subagent, ToolList, ToolsLoading,
+    ManifestSource, McpConfig, ModelRef, SessionDef, SessionModeDef, SiMemoryKey, SiMemoryOptions,
+    SiMemoryWord, SkillSelection, Strictness, Subagent, ToolList, ToolsLoading,
 };
 use adam_core::{DynSecretSource, ProcessEnv};
 use adam_llm_agent::{
-    DynTool, DynToolSource, Limits, LlmStarter, SESSION_TOOLS, SessionDefaults, ToolSet,
+    DynTool, DynToolSource, Limits, LlmStarter, SESSION_TOOLS, SessionDefaults, SessionTools,
+    ToolSet,
 };
 use adam_model::ReasoningEffort;
-use adam_runtime::{RuntimeBuilder, SessionLimits, SessionMode};
+use adam_runtime::{RuntimeBuilder, SessionLimits, SessionMode, glob};
 use secrecy::SecretString;
 
 use crate::assembly::{BoundDef, Rounds};
@@ -129,6 +130,38 @@ impl Default for RemoteSettings {
     }
 }
 
+/// The deployment's ceiling on the self-improvement memory (ADR 0081 decision 11): `SI_MEMORY`,
+/// `on` for `adam-coder` and `adam-agent`, `off` for `adam-engine`.
+///
+/// It only **narrows** the folder's `si_memory:` key: `Off` here is off whatever the folder says,
+/// and a folder's `off` is off whatever the ceiling says.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SiMemoryCeiling {
+    /// The folder's key decides; an absent key is on.
+    #[default]
+    On,
+    /// No self-improvement memory, whatever the folder says.
+    Off,
+}
+
+/// What a run's self-improvement memory is, once the deployment's ceiling and the folder's
+/// `si_memory:` key are both read ([`AgentDef::si_memory`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SiMemorySetting {
+    /// No memory: nothing is built, no folder is read and no tool is offered.
+    Off,
+    /// On, with the folder's options (the deployment's bounds where it names none).
+    On(SiMemoryOptions),
+}
+
+impl SiMemorySetting {
+    /// Whether a run holds a memory at all.
+    #[must_use]
+    pub fn is_on(&self) -> bool {
+        matches!(self, Self::On(_))
+    }
+}
+
 /// An agent as its files describe it, before it is tied to tools, state and a model.
 ///
 /// Made from a manifest with [`from_manifest`](Self::from_manifest) (the embedded one from
@@ -178,6 +211,8 @@ pub struct AgentDef {
     reasoning_effort: Option<ReasoningEffort>,
     /// The compiled plugins `plugins:` may name ([`plugin`](Self::plugin)).
     plugins: BTreeMap<String, PluginFactory>,
+    /// The deployment's ceiling on the self-improvement memory ([`si_memory_ceiling`](Self::si_memory_ceiling)).
+    si_memory_ceiling: SiMemoryCeiling,
 }
 
 /// The plugins one agent runs, by registered name.
@@ -216,6 +251,7 @@ impl AgentDef {
             max_parallel: None,
             reasoning_effort: None,
             plugins: BTreeMap::new(),
+            si_memory_ceiling: SiMemoryCeiling::default(),
         })
     }
 
@@ -444,6 +480,39 @@ impl AgentDef {
         self
     }
 
+    /// The deployment's ceiling on the self-improvement memory (ADR 0081 decision 11): `SI_MEMORY`,
+    /// `on` by default and `off` for a deployment that runs none. It reaches
+    /// [`si_memory`](Self::si_memory), which the process reads to decide whether a run holds a
+    /// memory at all.
+    #[must_use]
+    pub fn si_memory_ceiling(mut self, ceiling: SiMemoryCeiling) -> Self {
+        self.si_memory_ceiling = ceiling;
+        self
+    }
+
+    /// What the run's self-improvement memory is: the deployment's ceiling
+    /// ([`si_memory_ceiling`](Self::si_memory_ceiling)) and the folder's `si_memory:` key, both
+    /// read (ADR 0081 decision 11).
+    ///
+    /// Either can only narrow the other: a ceiling of [`SiMemoryCeiling::Off`] is
+    /// [`SiMemorySetting::Off`] whatever the folder says, a folder's `si_memory: off` is
+    /// [`SiMemorySetting::Off`] whatever the deployment allows, and an absent key follows the
+    /// ceiling. Pure, so a control plane that serves the card reads what the workers that run the
+    /// agent will do.
+    #[must_use]
+    pub fn si_memory(&self) -> SiMemorySetting {
+        if self.si_memory_ceiling == SiMemoryCeiling::Off {
+            return SiMemorySetting::Off;
+        }
+        match &self.manifest.frontmatter.si_memory {
+            Some(SiMemoryKey::Word(SiMemoryWord::Off)) => SiMemorySetting::Off,
+            Some(SiMemoryKey::Options(options)) => SiMemorySetting::On(options.clone()),
+            Some(SiMemoryKey::Word(SiMemoryWord::On)) | None => {
+                SiMemorySetting::On(SiMemoryOptions::default())
+            }
+        }
+    }
+
     /// The limits the sessions of the root agent run under: the deployment's
     /// ([`session_limits`](Self::session_limits)) lowered by the root's file. Pure, and the same
     /// on every process role, so a control plane that serves the card without binding the agent
@@ -467,7 +536,12 @@ impl AgentDef {
     /// worker does.
     ///
     /// Both roles call one function (`bounds_of`), so a control plane that answers A2A and a worker
-    /// that runs the rounds admit the same `start.config`. **Give both roles the same
+    /// that runs the rounds admit the same numbers in a `start.config`. **They do not admit the same
+    /// tool names**: a worker knows the names of the tools it binds and refuses a concrete
+    /// `deny_tools` entry no tool has (and, when every source declares what it can offer, any `tools`
+    /// entry that selects none; a declared name may be a shape, `*__*` for a relayed
+    /// `<server>__<tool>`); this control plane knows no name (`SessionBounds::tools` is empty), so it
+    /// checks the shape alone and admits what a worker may still refuse. **Give both roles the same
     /// `MAX_PARALLEL_TOOL_CALLS` and `SESSION_MAX_ROUNDS`**: a control plane with a larger value
     /// would admit what a worker then narrows at run time, never the reverse. The model's window is
     /// a fact of the model, which neither role knows here: `context_window` is `None`, `admit`
@@ -484,6 +558,8 @@ impl AgentDef {
                     &target,
                     self.max_parallel,
                     max_rounds,
+                    Vec::new(),
+                    false,
                 );
                 (target.name, bounds)
             })
@@ -1160,6 +1236,14 @@ impl Walk<'_> {
             &mut tools,
             parent.is_none().then_some(self.session_limits),
         )?;
+        // An agent that has the session tools reads what they are, after the skills catalog: the
+        // same bytes for the same helpers, whatever the deployment's limits (ADR 0054 decision 9).
+        if !session_targets.is_empty() {
+            prompt.push_str("\n\n");
+            prompt.push_str(&SessionTools::guide_for(
+                session_targets.iter().map(|target| target.name.as_str()),
+            ));
+        }
         let retry = retry_policies(&origin, manifest, &tools)?;
         let plugins = self.plugins_of(&origin, manifest, parent)?;
         // The root's modes: a name in a mode's `tools:` is one of the agent's tools (fail closed),
@@ -1796,26 +1880,6 @@ fn retry_policies(
     Ok(policies)
 }
 
-/// Whether `name` matches `pattern`, where `*` stands for any run of characters.
-fn glob(pattern: &str, name: &str) -> bool {
-    let parts: Vec<&str> = pattern.split('*').collect();
-    // `split` yields at least one piece; without a `*` there is exactly one.
-    let (first, rest) = (parts[0], &parts[1..]);
-    let Some((last, middles)) = rest.split_last() else {
-        return pattern == name;
-    };
-    let Some(mut tail) = name.strip_prefix(first) else {
-        return false;
-    };
-    for middle in middles {
-        let Some(at) = tail.find(middle) else {
-            return false;
-        };
-        tail = &tail[at + middle.len()..];
-    }
-    tail.ends_with(last)
-}
-
 /// Render the prompt of one agent: `instructions.md` and each `instructions/*.md`, then joined
 /// the way [`Instructions::prompt`] joins them.
 fn render_prompt(
@@ -1917,22 +1981,67 @@ fn render_prompt(
 mod tests {
     use super::*;
 
+    /// One agent whose file carries `extra` as additional frontmatter lines.
+    fn def_with(extra: &str) -> AgentDef {
+        let root = tempfile::tempdir().expect("a temporary directory");
+        std::fs::create_dir_all(root.path().join("agent")).expect("the folder");
+        std::fs::write(
+            root.path().join("agent/instructions.md"),
+            format!("---\nname: chat\ndescription: Chats.\ntools: []\n{extra}---\nHello.\n"),
+        )
+        .expect("the instructions");
+        AgentDef::from_source(&adam_agent_fs::Dir::new(root.path()), Strictness::Lenient)
+            .expect("a loadable folder")
+            .remove(0)
+    }
+
+    /// ADR 0081 decision 11: the folder's `off` is off whatever the deployment allows, the
+    /// deployment's `off` is off whatever the folder says, and an absent key follows the ceiling.
     #[test]
-    fn a_star_matches_any_run() {
-        assert!(glob("linear__*", "linear__list_issues"));
-        assert!(glob("linear__*", "linear__"));
-        assert!(!glob("linear__*", "github__list"));
-        assert!(!glob("linear__*", "linear_"));
-        assert!(glob("*_issues", "linear__list_issues"));
-        assert!(glob("*", "anything"));
-        assert!(glob("a*b*c", "aXbYc"));
-        assert!(glob("a*b*c", "abc"));
-        assert!(!glob("a*b*c", "acb"));
-        assert!(!glob("a*b*c", "aXbY"));
-        assert!(glob("exact", "exact"));
-        assert!(!glob("exact", "exactly"));
-        // The pieces of a pattern cannot overlap: `ab*ba` needs four characters.
-        assert!(!glob("ab*ba", "aba"));
+    fn a_folder_says_off_and_the_deployment_says_off_and_either_wins() {
+        assert_eq!(
+            def_with("si_memory: off\n").si_memory(),
+            SiMemorySetting::Off
+        );
+        assert_eq!(
+            def_with("si_memory: off\n")
+                .si_memory_ceiling(SiMemoryCeiling::On)
+                .si_memory(),
+            SiMemorySetting::Off,
+            "the folder's off is off"
+        );
+        assert_eq!(
+            def_with("si_memory: on\n")
+                .si_memory_ceiling(SiMemoryCeiling::Off)
+                .si_memory(),
+            SiMemorySetting::Off,
+            "SI_MEMORY=off beats a folder's on"
+        );
+        assert_eq!(
+            def_with("")
+                .si_memory_ceiling(SiMemoryCeiling::Off)
+                .si_memory(),
+            SiMemorySetting::Off,
+            "an absent key follows the ceiling"
+        );
+        assert_eq!(
+            def_with("").si_memory(),
+            SiMemorySetting::On(SiMemoryOptions::default()),
+            "on by default"
+        );
+    }
+
+    /// A folder that names options turns memory on and keeps them, so the run reads the bounds it
+    /// wrote rather than the defaults.
+    #[test]
+    fn a_folder_that_names_options_keeps_them() {
+        let setting = def_with("si_memory:\n  recall: false\n  preload_kib: 8\n").si_memory();
+        let SiMemorySetting::On(ref options) = setting else {
+            panic!("options are on");
+        };
+        assert_eq!(options.recall, Some(false));
+        assert_eq!(options.preload_kib, Some(8));
+        assert!(setting.is_on());
     }
 
     #[test]

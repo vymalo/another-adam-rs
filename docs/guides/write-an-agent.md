@@ -62,6 +62,7 @@ agent/
 | `tools_loading:` | `eager` puts every tool in every request, as before the key existed, including a server whose `mcp.json` entry has a `when`; `lazy` (the default) starts lean and lets a run load tools in groups (ADR 0066). `searchable` is accepted and behaves as `lazy` until searchable groups land |
 | `skills:`, `preload_skills:` | which skills the model sees, and which are put in the prompt whole |
 | `session:` | subagent only: `mode` (`one_shot`, `sealed`, `open`) is what a `subagent_start` that names none gets and the widest it may ask; `wait` is a default only (ADR 0089; [agent files](../reference/agent-files.md#agent-and-subagent-files-instructionsmd-subagentsmd-agentmd)) |
+| `plugins:` | compiled hooks the deployment registered by name (`AgentDef::plugin`); a subagent inherits them, and a name nobody registered stops startup (exit 78) |
 
 Rules worth knowing:
 
@@ -102,6 +103,13 @@ Rules worth knowing:
   client (or a person typing `/review acme/app`) invokes it; the agent expands it before the run starts. A
   `/word` that is not one of yours stays plain text, and nothing in a template is ever executed
   ([format and limits](../reference/agent-files.md#commands-commandsnamemd)).
+* **`plugins:` names hooks the deployment compiled in, never a program.** Each entry is a name or `{name, options}`
+  of scalars, and it must be one the binary or the embedding host registered (`AgentDef::plugin`, or `plugin_with`
+  when the options decide how the plugin is made). A name nobody registered stops startup (exit 78), a subagent runs
+  its parent's plugins and then its own, and an option whose name looks like a secret is refused. **No shipped binary
+  registers one yet** (*verified 2026-11-27*), so `plugins:` in a folder `adam-agent` or `adam-coder` serves is exit 78:
+  the audit plugin (`adam-plugin`'s `Audit`, one JSON line per observed event) and any hook you write are for a host
+  that registers them ([the key](../reference/agent-files.md#file-formats), [the plugin API](../decisions/0050-hooks-around-the-agent-loop-compiled-first-and-programs-second.md)).
 * **Edits apply at the next start.** The folder is read once; restart, no rebuild.
 
 ## When it does not start

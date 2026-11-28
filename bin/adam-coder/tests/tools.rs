@@ -680,6 +680,216 @@ async fn run_checks_times_out_and_caps_its_output() {
     );
 }
 
+/// Three independent checks that each sleep run at the same time: the call takes about one check's
+/// time, and with a bound of 1 (`MAX_PARALLEL_TOOL_CALLS=1`) three times that.
+#[tokio::test]
+async fn three_independent_checks_run_at_the_same_time() {
+    let fx = Fixture::with(|settings| settings.max_parallel_tool_calls = 3).await;
+    let rig = Rig::from(fx);
+    rig.prepare().await;
+    let started = std::time::Instant::now();
+    let out = RunChecks
+        .call(
+            &rig.ctx,
+            json!({"commands": ["sleep 1", "sleep 1", "sleep 1"]}),
+        )
+        .await
+        .unwrap();
+    let took = started.elapsed();
+    assert!(!out.is_error, "{}", out.content);
+    assert_eq!(checks_of(&out)["passed"], true);
+    assert!(
+        took < std::time::Duration::from_millis(2_500),
+        "three checks at the same time took {took:?}"
+    );
+
+    let fx = Fixture::with(|settings| settings.max_parallel_tool_calls = 1).await;
+    let rig = Rig::from(fx);
+    rig.prepare().await;
+    let started = std::time::Instant::now();
+    let out = RunChecks
+        .call(
+            &rig.ctx,
+            json!({"commands": ["sleep 1", "sleep 1", "sleep 1"]}),
+        )
+        .await
+        .unwrap();
+    let took = started.elapsed();
+    assert!(!out.is_error, "{}", out.content);
+    assert!(
+        took >= std::time::Duration::from_secs(3),
+        "three checks one after another took {took:?}"
+    );
+}
+
+/// The output of every check is kept whole and in the caller's order, and the report names them in
+/// that order. With the default `output` (`on_error`, ADR 0090) each passing command is one line
+/// whose output id is its own; with `full` its output is shown.
+#[tokio::test]
+async fn the_output_of_every_check_is_kept_in_the_callers_order() {
+    let rig = Rig::new().await;
+    rig.prepare().await;
+    let quiet = RunChecks
+        .call(
+            &rig.ctx,
+            json!({"commands": ["echo one", "echo two", "echo three"]}),
+        )
+        .await
+        .unwrap();
+    assert!(!quiet.is_error, "{}", quiet.content);
+    let mut ids: Vec<&str> = quiet
+        .content
+        .split("read_output {\"id\":\"")
+        .skip(1)
+        .filter_map(|rest| rest.split('"').next())
+        .collect();
+    assert_eq!(
+        ids.len(),
+        3,
+        "one kept output per command: {}",
+        quiet.content
+    );
+    ids.sort_unstable();
+    ids.dedup();
+    assert_eq!(
+        ids.len(),
+        3,
+        "each command keeps its own id: {}",
+        quiet.content
+    );
+    assert!(!quiet.content.contains("\none\n"), "{}", quiet.content);
+
+    let out = RunChecks
+        .call(
+            &rig.ctx,
+            json!({"commands": ["echo one", "echo two", "echo three"], "output": "full"}),
+        )
+        .await
+        .unwrap();
+    assert!(!out.is_error, "{}", out.content);
+    let one = out.content.find("$ echo one").unwrap();
+    let two = out.content.find("$ echo two").unwrap();
+    let three = out.content.find("$ echo three").unwrap();
+    assert!(one < two && two < three, "{}", out.content);
+    assert!(out.content.contains("\none\n") && out.content.contains("\nthree\n"));
+    let checks = checks_of(&out);
+    assert_eq!(checks["passed"], true);
+    assert_eq!(checks["summary"], "3 of 3 checks passed");
+    assert!(checks["findings"].is_null(), "{checks}");
+}
+
+/// A failing check still fails the gate, whatever the others did: the call is an error, the artifact
+/// says `passed: false`, the passing checks are absent from the findings and the failing ones are
+/// listed in the order the caller gave them.
+#[tokio::test]
+async fn a_failing_check_fails_the_gate_and_the_findings_keep_the_callers_order() {
+    let rig = Rig::new().await;
+    rig.prepare().await;
+    let first = common::red("echo first-failed; exit 2");
+    let second = common::red("echo second-failed; exit 3");
+    let out = RunChecks
+        .call(
+            &rig.ctx,
+            json!({"commands": ["echo ok", first.clone(), second.clone()]}),
+        )
+        .await
+        .unwrap();
+    assert!(out.is_error, "{}", out.content);
+    let checks = checks_of(&out);
+    assert_eq!(checks["passed"], false);
+    assert_eq!(checks["summary"], "2 of 3 checks failed");
+    let listed: Vec<&str> = checks["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|finding| finding["check"].as_str().unwrap())
+        .collect();
+    assert_eq!(listed, [first.as_str(), second.as_str()]);
+    assert!(
+        checks["findings"][0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("first-failed")
+    );
+    // One call, one cycle, however many of its commands failed.
+    assert_eq!(notes_of(&rig).await.checks.failures, 1);
+}
+
+/// The reuse of a failure keys on the whole list: the same commands in the same order on the same
+/// tree are answered from the earlier call, with no cycle and no artifact; another list runs again.
+#[tokio::test]
+async fn a_failed_list_is_not_run_again_on_the_same_tree() {
+    let rig = Rig::new().await;
+    rig.prepare().await;
+    std::fs::write(rig.worktree().join("broken.flag"), "x\n").unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let counter = dir.path().join("runs");
+    let fails = common::red(&format!(
+        "echo fails >> {}; test ! -f broken.flag",
+        counter.display()
+    ));
+    let passes = common::red(&format!("echo passes >> {}", counter.display()));
+    let list = json!({"commands": [fails, passes]});
+
+    let first = RunChecks.call(&rig.ctx, list.clone()).await.unwrap();
+    assert!(first.is_error, "{}", first.content);
+    assert_eq!(
+        runs_of(&counter),
+        2,
+        "each command ran once in the worktree"
+    );
+
+    let again = RunChecks
+        .call(&another_call(&rig, "call-2"), list)
+        .await
+        .unwrap();
+    assert!(again.is_error, "{}", again.content);
+    assert_eq!(
+        runs_of(&counter),
+        2,
+        "the same list on the same tree is not run again"
+    );
+    assert!(
+        again.artifacts.is_empty(),
+        "a reused failure emits no artifact: {:?}",
+        again.artifacts
+    );
+    assert!(again.content.contains("not run again"), "{}", again.content);
+    let notes = notes_of(&rig).await;
+    assert_eq!(notes.checks.failures, 1);
+    assert_eq!(notes.checks.history.len(), 1, "the reuse records nothing");
+}
+
+/// `command` and `commands` are exclusive: one of them, exactly.
+#[tokio::test]
+async fn run_checks_takes_one_command_or_a_list_never_both() {
+    let rig = Rig::new().await;
+    rig.prepare().await;
+    for args in [json!({}), json!({"command": "true", "commands": ["true"]})] {
+        let out = RunChecks.call(&rig.ctx, args).await;
+        assert!(is_error(&out), "{out:?}");
+        let said = text(out);
+        assert!(
+            said.contains("`command`") && said.contains("`commands`"),
+            "{said}"
+        );
+    }
+    for args in [json!({"commands": []}), json!({"commands": ["true", " "]})] {
+        let out = RunChecks.call(&rig.ctx, args).await;
+        assert!(is_error(&out), "{out:?}");
+    }
+    let out = RunChecks
+        .call(&rig.ctx, json!({"commands": ["true", " "]}))
+        .await;
+    assert!(text(out).contains("commands[1]"));
+    // A NUL is refused: the reuse key could not tell it from a boundary between two commands.
+    let out = RunChecks
+        .call(&rig.ctx, json!({"command": "echo a\u{0}b"}))
+        .await;
+    assert!(is_error(&out), "{out:?}");
+    assert!(text(out).contains("NUL"));
+}
+
 #[tokio::test]
 async fn a_replayed_failing_check_counts_one_cycle() {
     let rig = Rig::new().await;
@@ -2414,7 +2624,9 @@ async fn ask_user_needs_input_with_the_question() {
 async fn malformed_arguments_are_reported_to_the_model() {
     let rig = Rig::new().await;
     for (tool, args) in [
-        (&RunChecks as &dyn Tool, json!({})),
+        // `{}` is not malformed for `run_checks` any more: neither `command` nor `commands` is
+        // refused by the tool itself, with words that name both. A list of the wrong type is.
+        (&RunChecks as &dyn Tool, json!({"commands": "ls"})),
         (&RunChecks, json!({"command": 5})),
         (&CommitAndPush, json!({"message": ["a"]})),
         (&OpenPullRequest, json!({"title": "t"})),
@@ -7695,6 +7907,7 @@ fn failed(call: &str, scratch: bool) -> CheckRecord {
         call_id: call.to_owned(),
         command: "check".into(),
         passed: false,
+        commands: 1,
         exit_code: Some(1),
         tail: "red".into(),
         tree: None,

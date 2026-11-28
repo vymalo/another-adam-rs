@@ -224,9 +224,8 @@ The person watching a turn of yours sees two different things, and each has its 
   does not match changes nothing and says why.
 - `share_file { path, repo?, name? }`: give the person a file of the worktree (see "Files"). It
   does not commit or push it; a scratch project's file is lost at the end of the task unless shared.
-- `run_checks { command, repo? }`: run one of the project's own checks in the worktree,
-  in the workspace's environment. It returns the exit code
-  and the tail of the output.
+- `run_checks { command | commands, repo? }`: run one of the project's own checks in the worktree,
+  in the workspace's environment, and returns each exit code and output tail.
   Use it **only** for the checks the project really runs (what its CI, README or
   Makefile run), never to look around (`run_command`) and never to make a file (`run`):
   a failed run costs a cycle, and a passing run counts as the code passing its checks.

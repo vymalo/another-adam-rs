@@ -126,8 +126,8 @@ limits:                        # LlmAgent Limits; Claude's `maxTurns` is read as
   output: { run_command: on_error }  # root only: what a command tool shows when a call gives no `output` (below; read by adam-coder; ADR 0090)
 session: { mode: sealed, wait: true }   # subagent only: what a session its parent starts defaults to, and the widest mode it may be (below; ADR 0089)
 retry:                         # a retry policy per tool (below); this agent's own, none inherits
-plugins: [audit]                # compiled plugins the deployment registered; subagents inherit them (ADR 0050); an unknown name exits 78
   web_search: { attempts: 5, backoff: 2s, max_backoff: 5m, on: [rate-limited] }
+plugins: [audit]                # compiled hooks the deployment registered (below); a subagent inherits them; a name nobody registered exits 78
 vars: { max_check_cycles: 3 }  # defaults for {{placeholders}} in the body; code may override
 references:                    # root only: repositories the coder reads and never writes (below)
   - { name: design-system, url: "https://github.com/acme/design-system", description: Tokens and components the UI follows. }
@@ -190,7 +190,7 @@ You are the coder agent. Stop after at most {{max_check_cycles}} failed check cy
   `lazy` (the default) starts lean, and a run loads tools in groups; `eager` puts every tool in every request, as
   before the key existed, and **a server whose `mcp.json` entry has a `when` is offered too** (nothing is withheld).
   `searchable` is accepted and behaves as `lazy` until searchable groups land.
-* **`plugins:` names compiled plugins** ([ADR 0050](../decisions/0050-hooks-around-the-agent-loop-compiled-first-and-programs-second.md), slice H6): each entry is a name or `{name, options}` of scalars. The deployment registers plugins by name (`AgentDef::plugin`); a name it did not register stops the agent (exit 78). A subagent runs its parent's plugins and then its own. An option that looks like a secret is refused. An agent file never declares a hook program.
+* **`plugins:` names compiled hooks the deployment registered** ([ADR 0050](../decisions/0050-hooks-around-the-agent-loop-compiled-first-and-programs-second.md), slices H6a and H6b): each entry is a name or `{name, options}` of scalars, and the name is one the **deployment** registered — `AgentDef::plugin` for a plugin that serves every agent alike, `AgentDef::plugin_with` when the entry's options decide how it is made. A name nobody registered stops the agent at startup (exit 78); an option whose name looks like a secret is refused; a subagent runs its parent's plugins and then its own. An agent file never declares a hook program, and `hooks:` stays an ignored key. **No shipped binary registers one yet** (*verified 2026-11-27*: no `bin/` names a plugin), so `adam-agent` and `adam-coder` read the key and have nothing to bind: `plugins:` in a folder they serve is exit 78 until a binary or an embedding host registers the name. `adam-plugin` ships `Audit`, which writes each observed event as one JSON line (slice H6b) and is registered under whatever name the deployment chooses.
 * **`retry:` is a retry policy per tool** ([ADR 0061](../decisions/0061-a-step-names-its-retry-policy.md)): a map from
   one of the agent's tool names (its own, an MCP server's `<server>__<tool>`, a skill or subagent tool) to `attempts`
   (required, 1 to 20, the tries in all), `backoff` and `max_backoff` (`500ms`, `1s`, `30m`, `1h`; at most `1h`, and
@@ -488,7 +488,7 @@ sequenceDiagram
 * **YAML 1.2** (`serde-saphyr` 1.3.0, *verified 2026-09-29*, MIT or Apache-2.0), with `strict_booleans`, so `no`
   is a string. Unknown keys are read into `serde_json::Value` and become warnings.
 * **Agent files.** One schema, `AgentFrontmatter`, for the root agent, a directory subagent and a flat
-  subagent file: `name`, `description`, `tools`, `model`, `skills`, `preload_skills`, `limits`, `vars`,
+  subagent file: `name`, `description`, `tools`, `model`, `skills`, `preload_skills`, `si_memory`, `limits`, `vars`,
   `card` (root only), `a2a` and `auth` (remote subagent), `session` (subagent only; an unknown key or word in it is an
   error), `metadata`. A subagent needs a `description`. The
   keys `api_key`, `apiKey`, `token`, `secret`, `password` and `base_url` are errors (compared without case,
@@ -748,6 +748,32 @@ stateDiagram-v2
   replaced and the skills added (a public id is replaced). It is served only to authenticated callers and only when the
   server authenticates ([the A2A server](a2a-server.md#the-extended-card)); an empty `extended: {}` declares nothing, and a
   file holds no secret, so put nothing in it that you would not give every holder of a token.
+
+## The self-improvement memory (`si_memory:`)
+
+[ADR 0081](../decisions/0081-an-agent-keeps-a-self-improvement-memory-near-it-and-what-holds-becomes-the-deployments-memory.md)
+decision 11: `adam-coder` and `adam-agent` run a self-improvement memory by default, and a folder tunes or turns
+it off.
+
+```yaml
+si_memory: off            # nothing is built: no folder is read and no memory tool is offered
+si_memory: on             # on, with the deployment's bounds
+si_memory:                # on, tuned
+  recall: false           # whether `si_recall` is offered
+  record: true            # whether `si_record` is offered
+  preload_kib: 8          # how much is read into the first request
+  scopes: [agent, repository]
+```
+
+* **The deployment's ceiling wins downwards.** `SI_MEMORY=off` ([environment](environment.md#environment-variables))
+  is off whatever the folder says; a folder's `off` is off whatever the deployment allows; an absent key follows the
+  ceiling. Neither can widen the other.
+* **Fail closed.** An unknown option under `si_memory:` is a **load error**, not a warning — memory on with a
+  misspelt option would run with bounds nobody wrote — and so is a secret-looking one (`si_memory.token`).
+* **`memory:` is not this key.** Claude Code's `memory:` stays ignored with a warning; the key is `si_memory`.
+* A remote subagent (`a2a:`) has no local memory: the key is ignored there with a warning, like `tools:` and
+  `limits:`.
+
 
 ## Skills at run time
 

@@ -73,10 +73,20 @@ const CREATION_ON: &str = "If the person has no repository for it and says you m
 /// gets. A pinned file, so the diff of a change to it is what a reviewer reads.
 const SKILLS: &str = include_str!("fixtures/agent/skills.txt");
 
-/// What the model is sent for `cycles` and the shipped name: the body (see [`expected_body`]) and
-/// the skills section the assembly appends after a blank line.
+/// The section the assembly appends after the skills for the session tools (ADR 0054, decision 9):
+/// the helpers of the shipped folder, `explorer` and `reviewer`, and what each tool does. A pinned
+/// file, like [`SKILLS`].
+const SESSIONS: &str = include_str!("fixtures/agent/sessions.txt");
+
+/// What the model is sent for `cycles` and the shipped name: the body (see [`expected_body`]), the
+/// skills section and the session tools' section, each appended after a blank line.
 fn expected_prompt(cycles: u32) -> String {
-    format!("{}\n\n{}", expected_body(cycles), SKILLS.trim_end())
+    format!(
+        "{}\n\n{}\n\n{}",
+        expected_body(cycles),
+        SKILLS.trim_end(),
+        SESSIONS.trim_end()
+    )
 }
 
 /// The body of `agent/instructions.md` for `cycles` and the shipped name: the snapshot with both
@@ -508,6 +518,55 @@ async fn the_assembled_agent_is_what_the_hand_written_one_was() {
     assert!(agent.assembly().remotes().is_empty());
 }
 
+/// ADR 0054 decision 4, amended 2026-11-28 (ANR-1390): the coder adds the thread-tools source,
+/// which declares the contract tools it knows by name and the shape `*__*` of the tools it relays
+/// from a server a person attached. Its helpers' sets are therefore **complete**, so a `tools`
+/// entry that selects nothing is refused with the list (the shape among the names) and one naming a
+/// relayed server's tools is admitted. This is the check ANR-1319 could not turn on for this agent.
+#[tokio::test]
+async fn the_helpers_bounds_are_complete_and_admit_a_relayed_servers_tools() {
+    let (_fx, agent) = coder(3).await;
+    let all = agent.assembly().session_bounds();
+    assert_eq!(all.len(), 2, "the coder's two helpers: {all:?}");
+    let asked = |value| adam_runtime::SessionConfig::from_value(value).expect("a config");
+    for (name, bound) in all {
+        assert!(
+            bound.tools_complete,
+            "{name}: every source declares its tools: {bound:?}"
+        );
+        assert!(
+            bound
+                .tools
+                .iter()
+                .any(|tool| tool.as_str() == adam_ui::RELAYED_SHAPE),
+            "{name}: the shape of a relayed tool is declared: {bound:?}"
+        );
+        let why = bound
+            .admit(asked(json!({"tools": ["a_typo"]})))
+            .expect_err("an allow entry selecting nothing");
+        assert_eq!(why.option(), Some("tools"), "{name}");
+        assert!(
+            why.message()
+                .contains("matches none of the names this agent declares:"),
+            "{name}: {why}"
+        );
+        assert!(
+            why.message().contains(adam_ui::RELAYED_SHAPE),
+            "{name}: the shape is listed as itself: {why}"
+        );
+        assert!(
+            bound.admit(asked(json!({"tools": ["github__*"]}))).is_ok(),
+            "{name}: a relayed server's tools are what the shape declares"
+        );
+        assert!(
+            bound
+                .admit(asked(json!({"tools": ["github__search"]})))
+                .is_ok(),
+            "{name}: a relayed tool's name too"
+        );
+    }
+}
+
 #[tokio::test]
 async fn a_model_alias_the_assembly_refuses_is_an_error_not_a_panic_for_try_new() {
     let fx = Fixture::new().await;
@@ -749,9 +808,10 @@ async fn editing_the_folder_changes_what_the_model_is_sent() {
     assert_eq!(
         system,
         format!(
-            "{}\n\nAlways answer in French.\n\n{}",
+            "{}\n\nAlways answer in French.\n\n{}\n\n{}",
             expected_body(5),
-            SKILLS.trim_end()
+            SKILLS.trim_end(),
+            SESSIONS.trim_end()
         ),
         "the shipped prompt, and the edit"
     );
@@ -1668,12 +1728,10 @@ async fn the_coders_skills_parse_and_are_in_the_catalog() {
     }
     // Neither skill bundles a file: the catalog is the whole section but for the fixed sentence.
     assert!(!info.prompt.contains("<skill_resources>"));
-    assert!(info.prompt.ends_with(SKILLS.trim_end()));
-    // And no line was added to the instructions: the body is the snapshot.
-    assert_eq!(
-        info.prompt,
-        format!("{}\n\n{}", expected_body(3), SKILLS.trim_end())
-    );
+    assert!(info.prompt.ends_with(SESSIONS.trim_end()));
+    // And no line was added to the instructions: the body is the snapshot, then the catalog, then
+    // the session tools' section.
+    assert_eq!(info.prompt, expected_prompt(3));
 }
 
 /// The deployment's model profile gives the coder's model reasoning levels (`MODEL_ALIASES_FILE`,

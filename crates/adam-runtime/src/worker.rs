@@ -18,6 +18,7 @@ use adam_core::{
     StoreError, StoreResult,
 };
 use adam_error::{Classify, ErrorClass, report};
+use tracing::Instrument as _;
 use uuid::Uuid;
 
 use crate::agent::{AgentError, Transition};
@@ -559,12 +560,45 @@ enum Plan {
     Leave,
 }
 
+/// The span of one run's transition ([ANR-1345]): the state the run is in, from a **closed set**
+/// ([`RunStatus::as_str`]), and nothing else.
+///
+/// A run id, a conversation id, an agent's name, a prompt or a tool argument is **never** a field.
+/// A collector joins on ids across everything it receives, so an id in a span is a correlation
+/// between runs that nothing here needs, and a run's content is not telemetry (pantry
+/// `otel-conventions`). A child run's transition is a child span, so a trace shows the tree.
+///
+/// Nothing is exported yet: this is the substrate the OTel layer of ANR-1350 exports. A process
+/// with no subscriber that renders spans is unaffected.
+///
+/// [ANR-1345]: https://github.com/vymalo/another-adam-rs/issues
+fn run_span(status: RunStatus, child: bool) -> tracing::Span {
+    if child {
+        tracing::info_span!("adam.child", state = status.as_str())
+    } else {
+        tracing::info_span!("adam.run", state = status.as_str())
+    }
+}
+
+/// The transition of one run, in its [`run_span`].
+async fn transition(
+    inner: &Arc<Inner>,
+    rec: RunRecord,
+    claimed: Result<Claimed, RuntimeError>,
+    cancel: CancelToken,
+) -> bool {
+    let span = run_span(rec.status, rec.parent_id.is_some());
+    transition_inner(inner, rec, claimed, cancel)
+        .instrument(span)
+        .await
+}
+
 /// Returns whether the lease should be released.
 ///
 /// `claimed` is [`RunRecord::state`] of `rec`, decoded and joined by [`advance`]: a transition
 /// reads the state once, and the failure it carries (an unreadable or unjoinable state) is
 /// committed here.
-async fn transition(
+async fn transition_inner(
     inner: &Arc<Inner>,
     rec: RunRecord,
     claimed: Result<Claimed, RuntimeError>,
@@ -2154,5 +2188,82 @@ mod claim_tests {
         let (out, update) = sign(unsigned).await;
         out.expect("an unsigned head is adopted");
         assert!(update.head.expect("head").get("signature").is_none());
+    }
+}
+
+/// The span of a run's transition ([ANR-1345]): its state and nothing that identifies the run.
+///
+/// [ANR-1345]: https://github.com/vymalo/another-adam-rs/issues
+#[cfg(test)]
+mod run_span_tests {
+    use super::run_span;
+    use adam_core::RunStatus;
+    use std::sync::{Arc, Mutex};
+    use tracing_subscriber::fmt::MakeWriter;
+
+    /// A writer the test reads back: what the subscriber rendered.
+    #[derive(Clone, Default)]
+    struct Captured(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Captured {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> MakeWriter<'a> for Captured {
+        type Writer = Self;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// The span `run_span(status, child)` renders, as text.
+    fn rendered(status: RunStatus, child: bool) -> String {
+        let sink = Captured::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(sink.clone())
+            .with_span_events(tracing_subscriber::fmt::format::FmtSpan::FULL)
+            .with_max_level(tracing::Level::INFO)
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            run_span(status, child).in_scope(|| {});
+        });
+        let bytes = sink
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        String::from_utf8(bytes).expect("utf-8")
+    }
+
+    #[test]
+    fn a_run_span_carries_its_state_and_nothing_that_identifies_the_run() {
+        let text = rendered(RunStatus::Runnable, false);
+        assert!(text.contains("adam.run"), "{text}");
+        assert!(
+            text.contains("state=\"runnable\"") || text.contains("state=runnable"),
+            "{text}"
+        );
+        // The fields a collector could join on, and the content a run holds, are never here.
+        for forbidden in ["run=", "run_id", "conversation", "prompt", "argument"] {
+            assert!(!text.contains(forbidden), "{forbidden} in {text}");
+        }
+    }
+
+    #[test]
+    fn a_childs_transition_is_a_child_span() {
+        let text = rendered(RunStatus::Parked, true);
+        assert!(text.contains("adam.child"), "{text}");
+        assert!(text.contains("parked"), "{text}");
     }
 }

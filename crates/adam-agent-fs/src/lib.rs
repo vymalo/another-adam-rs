@@ -72,10 +72,10 @@ pub use schema::{
     McpWhen, ModeFrontmatter, ModelRef, OutputDef, OutputModeDef, PluginRef, REFERENCE_BRANCH_MAX,
     REFERENCE_DESCRIPTION_MAX, REFERENCE_URL_MAX, REFERENCES_FILE_MAX, RETRY_CLASS_NAMES,
     ReferenceDef, ReferencesRead, RemoteKind, RetryDef, ScheduleFrontmatter, Segment, SessionDef,
-    SessionModeDef, SkillFrontmatter, SkillSelection, ToolList, ToolsLoading, check_references,
-    group_name_fits, is_agent_name, is_env_name, is_reference_name, is_retry_tool_name,
-    is_skill_name, is_tool_name, parse_references_file, read_references_leniently, retry_duration,
-    split_env_references,
+    SessionModeDef, SiMemoryKey, SiMemoryOptions, SiMemoryWord, SkillFrontmatter, SkillSelection,
+    ToolList, ToolsLoading, check_references, group_name_fits, is_agent_name, is_env_name,
+    is_reference_name, is_retry_tool_name, is_skill_name, is_tool_name, parse_references_file,
+    read_references_leniently, retry_duration, split_env_references,
 };
 pub use source::{Dir, ManifestSource};
 pub use when::{AFTER_MAX, At, Cron, When, WhenError, parse_after, parse_at, time_zone};

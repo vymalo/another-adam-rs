@@ -30,7 +30,7 @@
 
 use std::path::PathBuf;
 
-use adam::AGENT_DIR_ENV;
+use adam::{AGENT_DIR_ENV, SiMemoryCeiling};
 pub use adam_service::{ConfigError, McpSettings};
 use adam_service::{ModelConfig, ServiceConfig};
 
@@ -60,7 +60,14 @@ pub struct WorkerConfig {
     /// `A2A_ALLOW_INSECURE_REMOTES`: a remote subagent (`a2a:`) may be at a plain `http` URL that is
     /// not this machine (`AgentDef::allow_insecure_remotes`). Off: such a URL stops the process.
     pub allow_insecure_remotes: bool,
+    /// `SI_MEMORY`: the deployment's ceiling on the self-improvement memory, `on` by default
+    /// (`AgentDef::si_memory_ceiling`, ADR 0081 decision 11). It only narrows the folder's
+    /// `si_memory:` key, never widens it.
+    pub si_memory: SiMemoryCeiling,
 }
+
+/// The variable that is the deployment's ceiling on the self-improvement memory.
+pub const SI_MEMORY_ENV: &str = "SI_MEMORY";
 
 /// The variable that lets a remote subagent be at a plain `http` URL on another machine.
 pub const ALLOW_INSECURE_REMOTES_ENV: &str = "A2A_ALLOW_INSECURE_REMOTES";
@@ -82,6 +89,7 @@ impl std::fmt::Debug for WorkerConfig {
             .field("mcp", &self.mcp)
             .field("extra_mcp_file", &self.extra_mcp_file)
             .field("allow_insecure_remotes", &self.allow_insecure_remotes)
+            .field("si_memory", &self.si_memory)
             .finish()
     }
 }
@@ -122,6 +130,10 @@ impl Config {
                 ALLOW_INSECURE_REMOTES_ENV,
                 &mut problems,
             ),
+            si_memory: parse_si_memory(
+                &|name: &str| lookup(name).filter(|v| !v.trim().is_empty()),
+                &mut problems,
+            ),
         });
 
         ConfigError::check(problems)?;
@@ -158,6 +170,28 @@ pub(crate) fn parse_agent_dir(
                 ));
             }
             path
+        }
+    }
+}
+
+/// `SI_MEMORY`: `on` (the default, and for a blank value) or `off`; anything else is a problem and
+/// the process does not start, as ADR 0081 decision 12 requires of a bad memory configuration.
+fn parse_si_memory(
+    get: &impl Fn(&str) -> Option<String>,
+    problems: &mut Vec<String>,
+) -> SiMemoryCeiling {
+    let Some(raw) = get(SI_MEMORY_ENV) else {
+        return SiMemoryCeiling::On;
+    };
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "on" => SiMemoryCeiling::On,
+        "off" => SiMemoryCeiling::Off,
+        _ => {
+            problems.push(format!(
+                "{SI_MEMORY_ENV} must be `on` or `off`, got {:?}",
+                raw.trim()
+            ));
+            SiMemoryCeiling::On
         }
     }
 }
@@ -340,6 +374,43 @@ mod tests {
         // A control plane binds no subagent and does not read it.
         vars.insert("ROLE".into(), "control-plane".into());
         assert!(parse(&vars).is_ok());
+    }
+
+    /// `SI_MEMORY` is the deployment's ceiling on the self-improvement memory (ADR 0081): `on` by
+    /// default, `off` when the deployment runs none, and anything else stops the start with the
+    /// configuration's exit code (78). A control plane binds no agent and does not read it.
+    #[test]
+    fn the_memory_ceiling_is_read_by_the_workers_and_a_bad_one_stops_the_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut vars = full(dir.path());
+        assert_eq!(
+            parse(&vars).unwrap().worker.unwrap().si_memory,
+            SiMemoryCeiling::On,
+            "on when unset"
+        );
+        vars.insert(SI_MEMORY_ENV.into(), "off".into());
+        assert_eq!(
+            parse(&vars).unwrap().worker.unwrap().si_memory,
+            SiMemoryCeiling::Off
+        );
+        vars.insert(SI_MEMORY_ENV.into(), "  ".into());
+        assert_eq!(
+            parse(&vars).unwrap().worker.unwrap().si_memory,
+            SiMemoryCeiling::On,
+            "blank is unset"
+        );
+        vars.insert(SI_MEMORY_ENV.into(), "sometimes".into());
+        let error = parse(&vars).unwrap_err();
+        assert!(
+            error
+                .problems
+                .iter()
+                .any(|p| p.contains("SI_MEMORY must be `on` or `off`")),
+            "{error}"
+        );
+        assert_eq!(adam_service::exit_code(&error), 78);
+        vars.insert("ROLE".into(), "control-plane".into());
+        assert!(parse(&vars).unwrap().worker.is_none());
     }
 
     /// `DEFAULT_MODEL_CONTEXT_WINDOW` is read with the model: a count of tokens, or a startup error

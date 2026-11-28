@@ -162,6 +162,21 @@ pub const MODEL_CONTEXT_KEY: &str = "vymalo.model";
 /// list are withheld, and the access tier still caps every one it does.
 pub const MODE_CONTEXT_KEY: &str = "vymalo.mode";
 
+/// The context key under which a session's round carries the tools its `config` narrows (ADR 0054
+/// slice 3): `{"tools": [..], "denyTools": [..]}`, only the members the config sets, and an empty
+/// object when it sets neither, so a round never inherits another round's value. Written by
+/// `subagent_start` and `subagent_send` (and the A2A front) from the header's clamped config.
+///
+/// **A second reading, not the truth**: the loop reads the lists from the run's session header
+/// (`Conversation::session`), which is committed with the run, and from this key too, holding back
+/// a tool when either says so (`read_output` is never held back). The key cannot be the truth: an
+/// oversized context is dropped, and a narrowing must not go with it.
+///
+/// **Not one of [`PROTECTED_CONTEXT_KEYS`]**: a child of the session must not inherit its parent's
+/// narrowing, so the key is not copied into a child run
+/// ([`ToolCtx::start_child`](crate::ToolCtx::start_child)); it speaks for the round that carries it.
+pub const SESSION_TOOLS_CONTEXT_KEY: &str = "vymalo.session.tools";
+
 /// The context key under which a message says **who it was sent for** (`thread-tools/v1`): the
 /// thread's addressed agent, `{"caller": "main"}`, or an agent another agent asked, `{"caller":
 /// "ask:<n>", ..}`, read from the claims of the grant's token. A run of an asked agent has no person
@@ -411,6 +426,11 @@ pub enum LimitKind {
     /// The model called the same tool, with the same arguments and the same result before, over
     /// and over (`doom_loop`): the third call in a row was refused twice.
     RepeatedCall,
+    /// The session spent its `token_budget` ([ADR 0054], decision 6): the next model call was its
+    /// closing turn.
+    ///
+    /// [ADR 0054]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md
+    TokenBudget,
 }
 
 impl LimitKind {
@@ -420,6 +440,7 @@ impl LimitKind {
             Self::MaxTurns => "max_turns",
             Self::MaxToolCalls => "max_tool_calls",
             Self::RepeatedCall => "repeated_call",
+            Self::TokenBudget => "token_budget",
         }
     }
 }
@@ -632,6 +653,17 @@ pub struct Conversation {
     /// [`usage_totals`](Self::usage_totals)).
     #[serde(default)]
     pub usage: Usage,
+    /// The tokens of the session this run is a round of, so far ([ADR 0054], decision 6): the
+    /// earlier rounds', carried by the header ([`SessionHeader::spent`](adam_runtime::SessionHeader)),
+    /// plus this round's own model calls, input and output as `usage/v1` counts them. The loop
+    /// writes it into the header at every commit, so the runtime's listing reads it from the
+    /// round's record, and a send refuses a session that spent its budget without another store
+    /// read. `0` for a run that is no round of a session, and what state written before it existed
+    /// reads; not written while `0`.
+    ///
+    /// [ADR 0054]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub spent: u64,
     /// The tokens of every model call of the task, one entry per provider and model: this run's own
     /// calls and, once each child run has answered, the children's (theirs, and their own children's).
     /// What the A2A server writes on the task as the `usage/v1` totals when it ends or waits. Absent
@@ -772,6 +804,12 @@ pub struct Conversation {
     /// Absent from state written before it existed, and not written while `0`.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub thinking_cuts: u32,
+    /// How many corrective turns the round's final answer has been given because it did not match
+    /// the session's `report_schema` (ADR 0054, slice 9): two at most, counted in `max_turns`, then
+    /// the round fails. Reset when a message reaches the run. Absent from state written before it
+    /// existed, and not written while `0`.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub report_corrections: u32,
     /// The latest model turn stopped at the output limit (`FinishReason::Length`): a call of it whose
     /// arguments are not JSON is most likely cut off, and its error says so. Absent from state
     /// written before it existed, and not written while `false`.
@@ -1054,6 +1092,10 @@ impl Conversation {
 }
 
 fn is_zero(n: &u32) -> bool {
+    *n == 0
+}
+
+fn is_zero_u64(n: &u64) -> bool {
     *n == 0
 }
 
@@ -1849,6 +1891,9 @@ impl Conversation {
             context: self.context.clone(),
             plan: self.plan.clone(),
             session: self.session.clone(),
+            // The session's spend comes with its header: a run that continues a round of a session
+            // goes on from the tokens its earlier rounds and it already spent.
+            spent: self.spent,
             // The groups the run loaded are still loaded: its first request must offer the tools
             // the run before ended with, or the array would lose them. The turns the array grew at
             // are not carried: this run has no request before its first. The loaders and the

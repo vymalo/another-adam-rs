@@ -429,6 +429,24 @@ fn cases() -> Vec<Case> {
             "`retry.web.search` is not a tool name",
         ),
         (
+            "si_memory with an unknown option",
+            vec![(
+                "agent/instructions.md",
+                "---\nname: root\nsi_memory: { recall: true, preload: 8 }\n---\nHi.\n",
+            )],
+            Error,
+            "unknown key `si_memory.preload`; expected one of: recall, record, preload_kib, scopes",
+        ),
+        (
+            "si_memory with a secret-looking option",
+            vec![(
+                "agent/instructions.md",
+                "---\nname: root\nsi_memory: { token: abc }\n---\nHi.\n",
+            )],
+            Error,
+            "`si_memory.token` is not allowed",
+        ),
+        (
             "retry with an unknown key",
             vec![(
                 "agent/instructions.md",

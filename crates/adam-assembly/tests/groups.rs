@@ -8,9 +8,10 @@ mod common;
 use std::sync::Arc;
 
 use adam_assembly::Assembly;
-use adam_llm_agent::{Conversation, ToolSet, user_message};
+use adam_core::RunId;
+use adam_llm_agent::{Conversation, MESSAGE_KIND, ToolSet, user_message};
 use adam_model::{MockModel, ModelRequest, ToolCall};
-use adam_runtime::RunView;
+use adam_runtime::{Inbound, RunView, SessionConfig, SessionHeader};
 use serde_json::json;
 
 /// `github` has no `when` (eager); `linear` and `docs` load only when the task mentions one of
@@ -555,6 +556,155 @@ async fn a_group_load_appends_its_tools_and_records_the_turn() {
         !text.contains("not loaded for this run"),
         "the loaded tool was not refused: {text}"
     );
+}
+
+// --- a session's own tools, and the loader of the group they select -----------------------------
+
+/// A round's session header, as `subagent_start` writes one (ADR 0054, slice 3): the config the
+/// round runs with. No parent, and the round closes when it ends.
+fn narrowed_session(tools: &[&str]) -> SessionHeader {
+    // `SessionConfig` is `#[non_exhaustive]`: another crate sets its fields one by one.
+    #[allow(clippy::field_reassign_with_default)]
+    let mut config = SessionConfig::default();
+    config.tools = Some(tools.iter().map(|tool| (*tool).to_owned()).collect());
+    SessionHeader {
+        id: RunId::new(),
+        agent: "root".into(),
+        description: "a narrowed round".into(),
+        mode: adam_runtime::SessionMode::OneShot,
+        closed: false,
+        closing: false,
+        deleted: false,
+        round: 1,
+        root: None,
+        workspace: None,
+        visible: false,
+        config: Some(config),
+        spent: 0,
+    }
+}
+
+/// Run `task` as a round of a session narrowed to `tools`: the requests and the view. The header is
+/// the one the session tools write, so the loop reads the same header a real round carries.
+async fn run_narrowed(
+    mock: &Arc<MockModel>,
+    assembly: &Assembly,
+    task: &str,
+    tools: &[&str],
+) -> (Vec<ModelRequest>, RunView) {
+    let runtime = common::runtime(assembly);
+    let payload = json!({"text": task, "session": narrowed_session(tools)});
+    let run = runtime
+        .start("root", Inbound::new(MESSAGE_KIND, payload), None)
+        .await
+        .unwrap();
+    let worker = common::spawn_worker(&runtime);
+    let view = common::wait_done(&runtime, run).await;
+    worker.stop().await;
+    (mock.requests(), view)
+}
+
+/// A lazy `docs` server whose two tools the agent's folder gives it, for the session tests.
+fn docs_assembly(mock: &Arc<MockModel>) -> Assembly {
+    const MCP_DOCS: &str = r#"{"mcpServers": {
+      "docs": {"type": "http", "url": "https://mcp.example/docs", "tools": ["search", "read"],
+               "when": {"keywords": ["docs"]}}
+    }}"#;
+    common::def(&[
+        (
+            "agent/instructions.md",
+            &common::instructions("name: root\ntools: ['docs__*']", "You are root."),
+        ),
+        ("agent/mcp.json", MCP_DOCS),
+    ])
+    .mcp_tools("root", common::tools(&["docs__search", "docs__read"]))
+    .bind(ToolSet::new())
+    .unwrap()
+    .model(mock.clone(), "default")
+    .unwrap()
+}
+
+/// A session narrowed to a server's tools keeps that server's group loader (ANR-1304): `tools:
+/// ["docs__*"]` holds the group's tools back, as lazy does, and the loader withholds them until it
+/// is called, so the session can load the group it asked for. The load appends the tools the list
+/// selects and nothing more (ADR 0044, decision 1; ADR 0066).
+#[tokio::test]
+async fn a_session_narrowed_to_a_servers_tools_keeps_its_group_loader() {
+    let mock = Arc::new(MockModel::new());
+    let assembly = docs_assembly(&mock);
+    mock.push_tool_calls(vec![call_with("c1", "load__group__docs", json!({}))])
+        .push_tool_calls(vec![call("c2", "docs__read")])
+        .push_text("done");
+    let (requests, view) = run_narrowed(&mock, &assembly, "fix a typo", &["docs__*"]).await;
+    assert_eq!(requests.len(), 3, "the load, the call and the answer");
+    assert!(
+        has(&requests[0], "load__group__docs"),
+        "the list selects the server's tools, so it keeps its loader: {:?}",
+        tool_names(&requests[0])
+    );
+    assert!(
+        !has(&requests[0], "docs__search") && !has(&requests[0], "docs__read"),
+        "the group's tools are withheld until the group is loaded: {:?}",
+        tool_names(&requests[0])
+    );
+    assert_eq!(
+        tool_names(&requests[1]),
+        [
+            "load__group__docs",
+            "read_output",
+            "docs__search",
+            "docs__read"
+        ],
+        "the load appended the group's tools, after every tool the session had"
+    );
+    assert_eq!(
+        &requests[1].tools[..requests[0].tools.len()],
+        &requests[0].tools[..],
+        "the array grew by a suffix, never by an insertion"
+    );
+    let state = state_of(&view);
+    assert_eq!(state.loaded.len(), 1, "{:?}", state.loaded);
+    assert_eq!(state.loaded[0].loader, "load__group__docs");
+    assert_eq!(state.loaded[0].tools, ["docs__search", "docs__read"]);
+    let text = format!("{:?}", requests[2].messages);
+    assert!(
+        text.contains("docs__read-out"),
+        "the loaded tool ran: {text}"
+    );
+    assert!(
+        !text.contains("is not offered to this session"),
+        "nothing the list selects was refused: {text}"
+    );
+}
+
+/// A session whose list names none of a server's tools keeps no loader for it (ANR-1304): a loader
+/// that could load nothing is not handed out, and a call to it is refused without running. It is
+/// the guard on the rule above: keeping every loader a server has would hand out one that loads
+/// nothing.
+#[tokio::test]
+async fn a_session_that_selects_nothing_of_a_server_keeps_no_loader() {
+    let mock = Arc::new(MockModel::new());
+    let assembly = docs_assembly(&mock);
+    mock.push_tool_calls(vec![call_with("c1", "load__group__docs", json!({}))])
+        .push_text("done");
+    let (requests, view) = run_narrowed(&mock, &assembly, "fix a typo", &["read_output"]).await;
+    assert_eq!(requests.len(), 2, "the refused call and the answer");
+    assert!(
+        !has(&requests[0], "load__group__docs"),
+        "the list names nothing of `docs`, so its loader is not offered: {:?}",
+        tool_names(&requests[0])
+    );
+    let refused = requests[1].messages.last().expect("the refusal").text();
+    assert!(
+        refused.contains("`load__group__docs` is not offered to this session"),
+        "{refused}"
+    );
+    assert!(
+        !refused.contains("Loaded the group"),
+        "the loader did not run: {refused}"
+    );
+    let state = state_of(&view);
+    assert!(state.loaded.is_empty(), "{:?}", state.loaded);
 }
 
 /// A loader of a name no group has is an unknown tool, and nothing moves.

@@ -41,6 +41,7 @@ These pages are for people. The procedures and evidence that coding agents use l
 | API | [Extensions](reference/extensions.md) | every A2A extension URI an adam card can list: when it is listed, whether it is served, and its contract on the system's site |
 | Configuration | [Environment variables](reference/environment.md) | every variable of the binaries, the compose stack and the tests |
 | Configuration | [Agent files and `#[tool]`](reference/agent-files.md) | the folder layout and formats, validation, skills, subagents, MCP, dev reload, the macro |
+| Configuration | [Hook programs (`adam-hooks/1`)](reference/hooks-protocol.md) | the JSON lines a program on stdio speaks, the points it decides, its environment and what happens when it fails |
 | Configuration | [The chart](../deploy/coder/README.md) | every value of the coder's Helm chart |
 | Configuration | [Parity of the surfaces](reference/parity.md) | every setting and feature by surface (coder, folder agent, embedded engine, orchestrator, platform), and the gaps |
 | Errors | [Errors](reference/errors.md) | error classes, the variant-to-class tree, A2A codes and exit codes |

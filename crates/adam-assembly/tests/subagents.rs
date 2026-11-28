@@ -14,7 +14,9 @@ use adam_agent_fixture::AGENT;
 use adam_agent_fs::Subagent;
 use adam_assembly::{AgentDef, Assembly, Error, SubagentTool, ToolClash};
 use adam_core::{DynStore, MemoryStore, RunId, RunStatus, Store};
-use adam_llm_agent::{FnTool, LlmStarter, Tool, ToolError, ToolOutput, ToolSet, user_message};
+use adam_llm_agent::{
+    FnTool, LlmStarter, SessionTools, Tool, ToolError, ToolOutput, ToolSet, user_message,
+};
 use adam_model::{Message, MockModel, ModelRequest, ToolCall};
 use adam_runtime::{
     Inbound, RESUME_KIND, Runtime, SessionState, child_run_id, session_conversation_id,
@@ -208,7 +210,12 @@ async fn a_parent_calls_its_subagent_which_calls_its_own_and_the_parent_goes_on(
             unreachable!()
         };
         // The parent: its own tool, and one for the subagent, described by the subagent's file.
-        assert_eq!(plain(&r0.system).as_deref(), Some("You are the root."));
+        // The root's instructions, then the section about the session tools (ADR 0054 decision 9).
+        let root_system = format!(
+            "You are the root.\n\n{}",
+            SessionTools::guide_for(["researcher"])
+        );
+        assert_eq!(plain(&r0.system).as_deref(), Some(root_system.as_str()));
         assert_eq!(
             offered(r0),
             [
@@ -248,7 +255,7 @@ async fn a_parent_calls_its_subagent_which_calls_its_own_and_the_parent_goes_on(
             last_tool_result(r5, "c1"),
             ("report: ten lines".into(), false)
         );
-        assert_eq!(plain(&r5.system).as_deref(), Some("You are the root."));
+        assert_eq!(plain(&r5.system).as_deref(), Some(root_system.as_str()));
         // Only the child used `fetch`; the parent's tool was not called by anyone.
         assert_eq!(fetch_calls.load(SeqCst), 1);
         assert_eq!(parent_calls.load(SeqCst), 0);

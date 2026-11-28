@@ -19,3 +19,18 @@ Files a skill bundles are listed under <skill_resources> when it is loaded; read
     <description>Sorts an incoming issue into a queue.</description>
   </skill>
 </available_skills>
+
+## Child sessions
+
+A session runs a helper in the background: you keep working while it works. The helpers you can start a session on: `billing`, `legacy`, `researcher`, `reviewer`.
+
+The session tools (an argument marked `?` is optional):
+- `subagent_start` (`agent`, `description`, `prompt`, `mode?`, `wait?`, `config?`): start a session on a helper and get its session id at once, or its first report with `wait`. `mode` says who may send it more after its first round: nobody (`one_shot`), only you (`sealed`), or you and the person (`open`). Give it a `config` to narrow its limits.
+- `subagent_send` (`session`, `message`): send a message to a session. It starts the next round of an idle session, and is steered into a round that works. A closed session takes none.
+- `subagent_read` (`session`, `wait?`, `offset?`, `limit?`): read the report of a session's latest round, paged by lines. Pass `wait` to wait for a working round to end; never poll.
+- `subagent_close` (`session`, `cancel?`, `delete?`): close a session for good: it takes no more messages. A working round finishes unless you pass `cancel`, and `delete` removes an idle session from every listing.
+- `subagent_list` (`offset?`, `limit?`): list the sessions of this conversation and their state, the open ones first, paged by sessions.
+
+Options of `config`: `max_turns`, `max_tool_calls`, `max_output_tokens`, `context_window`, `max_parallel_tool_calls`, `time_limit`, `max_rounds`, `token_budget`, `tools`, `deny_tools`, `report_schema`. They only narrow what a helper allows: a value above what the helper allows is refused, and the refusal names the option and says what is allowed. An option you leave out is the helper's own.
+
+A helper does not see this conversation: put everything it needs in `prompt`. Unless a helper's own file says otherwise, a session closes when its round has ended. Keep one open (`mode` `sealed` or `open`) only when you will send it more, and close what you kept open with `subagent_close` when you are done.

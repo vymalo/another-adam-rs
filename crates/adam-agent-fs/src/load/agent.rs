@@ -10,8 +10,8 @@ use crate::schema::{
     AgentFrontmatter, DEFAULT_RETRY_BACKOFF, MAX_INLINE_UPLOAD_BYTES_LIMIT, MAX_MINUTES_LIMIT,
     MAX_OPEN_SESSIONS_LIMIT, MAX_PARALLEL_LIMIT, MAX_PROCESSES_LIMIT, MAX_RETRY_ATTEMPTS,
     MAX_RETRY_BACKOFF, MAX_SESSION_ROUNDS_LIMIT, MAX_WORKING_SESSIONS_LIMIT, ModelRef,
-    RETRY_CLASS_NAMES, ToolList, ToolsLoading, check_references, is_agent_name, is_env_name,
-    is_retry_tool_name, is_tool_name, retry_duration,
+    RETRY_CLASS_NAMES, SiMemoryKey, ToolList, ToolsLoading, check_references, is_agent_name,
+    is_env_name, is_retry_tool_name, is_tool_name, retry_duration,
 };
 
 /// The most characters GitHub Copilot accepts in an agent prompt. Verified 2026-09-29,
@@ -545,6 +545,33 @@ fn check_keys(sink: &mut Sink<'_>, split: &Split<'_>, fm: &AgentFrontmatter) {
             sink.warn(line, format!("unknown key `{key}` is ignored"));
         }
     }
+    // `si_memory` is adam's own key and fail-closed (ADR 0081 decision 12): a misspelt option
+    // would run memory on with bounds nobody wrote, so every unknown one is an error.
+    if let Some(SiMemoryKey::Options(options)) = &fm.si_memory {
+        let line = key_line(split, "si_memory");
+        for key in options.extra.keys() {
+            let normalized: String = key
+                .chars()
+                .filter(|c| *c != '_' && *c != '-')
+                .flat_map(char::to_lowercase)
+                .collect();
+            if SECRET_KEYS.contains(&normalized.as_str()) {
+                sink.error(
+                    line,
+                    format!(
+                        "`si_memory.{key}` is not allowed: secrets and endpoints belong in the environment"
+                    ),
+                );
+            } else {
+                sink.error(
+                    line,
+                    format!(
+                        "unknown key `si_memory.{key}`; expected one of: recall, record, preload_kib, scopes"
+                    ),
+                );
+            }
+        }
+    }
     if let Some(limits) = &fm.limits {
         for key in limits.extra.keys() {
             sink.warn(
@@ -830,6 +857,7 @@ fn remote_spec(
         ("preload_skills", fm.preload_skills.is_some()),
         ("limits", fm.limits.is_some()),
         ("vars", !fm.vars.is_empty()),
+        ("si_memory", fm.si_memory.is_some()),
     ]
     .into_iter()
     .filter_map(|(k, set)| set.then_some(k))

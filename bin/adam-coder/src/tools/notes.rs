@@ -37,6 +37,12 @@ pub struct CheckRecord {
     pub command: String,
     /// Exit code 0 and no timeout.
     pub passed: bool,
+    /// How many commands the call ran: `1` for a call of one command, more for a call of a list. A
+    /// record written before a call could name a list has none (`0`), and its failure is answered in
+    /// the singular, as it was. The answer a reused failure gives says "the checks" in the plural
+    /// only when this is more than one.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub commands: u32,
     /// Exit code, `None` on timeout or signal.
     pub exit_code: Option<i32>,
     /// The output tail the model saw (the "findings" of a failed run).
@@ -70,7 +76,10 @@ pub struct CheckRecord {
     #[serde(default, skip_serializing_if = "is_zero_u64")]
     pub timeout_secs: u64,
     /// The SHA-256 of the **raw** command, which the redactor may have changed in
-    /// [`command`](Self::command): two commands that differ only in a secret are two checks.
+    /// [`command`](Self::command): two commands that differ only in a secret are two checks. For a
+    /// call of several commands it is the SHA-256 of each command behind its length, in order, so
+    /// where one ends and the next begins is part of it (a command holding a NUL is refused, which
+    /// keeps that unambiguous).
     /// Absent (empty) in notes written before it existed, and then never reused.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub command_sha: String,
@@ -193,7 +202,7 @@ fn is_zero_u64(n: &u64) -> bool {
 pub struct CheckKey<'a> {
     /// The tree id of the code the command is about to run on.
     pub tree: &'a str,
-    /// The SHA-256 of the command's raw text (see [`CheckRecord::command_sha`]).
+    /// The SHA-256 of the call's raw commands (see [`CheckRecord::command_sha`]).
     pub command_sha: &'a str,
     /// The directory the command runs in, relative to the worktree (`""` for its root).
     pub cwd: &'a str,
@@ -233,10 +242,16 @@ pub struct MissingHit {
 
 impl RunNotes {
     /// Record that call `call_id` found `tool` missing and return how many **earlier** calls found
-    /// the same tool missing. Recording the same call again changes nothing and returns the same
-    /// count, so a replayed call gets the answer it got.
+    /// the same tool missing. Recording the same call and tool again changes nothing and returns the
+    /// same count, so a replayed call gets the answer it got, and a call that found two tools
+    /// missing records both (a call of several commands may). A note written before a call could
+    /// find more than one holds one hit for the call, which this still matches.
     pub fn record_missing_tool(&mut self, call_id: &str, tool: &str) -> usize {
-        let at = match self.missing_tools.iter().position(|h| h.call_id == call_id) {
+        let at = match self
+            .missing_tools
+            .iter()
+            .position(|h| h.call_id == call_id && h.tool == tool)
+        {
             Some(at) => at,
             None => {
                 self.missing_tools.push(MissingHit {
@@ -1411,6 +1426,7 @@ mod tests {
             call_id: call.into(),
             command: "cargo test".into(),
             passed,
+            commands: 1,
             exit_code: Some(i32::from(!passed)),
             tail: "out".into(),
             tree: Some("t1".into()),
@@ -1693,6 +1709,10 @@ mod tests {
         .unwrap();
         assert_eq!(legacy.epoch, LEGACY_EPOCH);
         assert_eq!(legacy.timeout_secs, 0);
+        assert_eq!(
+            legacy.commands, 0,
+            "a call from before a list was one command"
+        );
         assert!(legacy.command_sha.is_empty());
         let mut notes = RunNotes::default();
         notes.record_check(legacy);
@@ -2042,5 +2062,26 @@ mod tests {
         // A yes to adding a repository names it.
         notes.record_consents([consent("request_repository", "github.com/acme/lib")]);
         assert_eq!(notes.named_repos, ["github.com/acme/lib"]);
+    }
+
+    /// A call of several commands may find two tools missing: each is recorded, a replay of the call
+    /// finds both already there (and answers the same), and a later call that finds one again counts
+    /// the earlier hit. A note written before a call could find two holds one hit for the call, which
+    /// is the same match.
+    #[test]
+    fn a_call_records_every_missing_tool_it_finds() {
+        let mut notes = RunNotes::default();
+        assert_eq!(notes.record_missing_tool("call-1", "mvn"), 0);
+        assert_eq!(
+            notes.record_missing_tool("call-1", "gradle"),
+            0,
+            "another tool of the same call"
+        );
+        assert_eq!(notes.missing_tools.len(), 2);
+        // A replay of the same call and tool changes nothing and answers the same.
+        assert_eq!(notes.record_missing_tool("call-1", "mvn"), 0);
+        assert_eq!(notes.missing_tools.len(), 2);
+        // A later call that finds `mvn` again knows it was reported before.
+        assert_eq!(notes.record_missing_tool("call-2", "mvn"), 1);
     }
 }

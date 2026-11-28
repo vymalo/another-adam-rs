@@ -1,4 +1,4 @@
-//! `run_checks { command, cwd?, repo?, timeout?, output? }`, and the `checks` artifact it reports.
+//! `run_checks { command | commands, cwd?, repo?, timeout?, output? }`, and the `checks` artifact it reports.
 //!
 //! # The `checks` artifact
 //!
@@ -14,6 +14,21 @@
 //! The data part is a [`ChecksReport`]. A consumer that sees several `checks` artifacts takes the
 //! last one for a commit.
 //!
+//! # Several independent checks at once
+//!
+//! A call names one command with `command`, or several **independent** ones with `commands`:
+//! exactly one of the two, never both. Independent is the whole point: a command that writes the
+//! worktree, or reads what another of the list writes, is not the same check when it runs beside it,
+//! and goes in a call of its own. The commands run at the same time, at most
+//! [`CoderSettings::max_parallel_tool_calls`](super::CoderSettings::max_parallel_tool_calls) at once
+//! (the run's own bound on the tool calls of a turn, so a deployment that sets it to 1 runs them one
+//! after another), each through the process pool (`MAX_PROCESSES`, ADR 0065). The call reports what
+//! running them one after another would: every command the caller gave still runs, each one's own
+//! output is kept whole (the same tail bound), `passed` is true only when every one of them passed,
+//! and `findings` names the failing ones **in the order the caller gave them**. A call costs **one**
+//! check cycle when any of its commands fails (the call is the unit), and the failure the notes
+//! answer with is keyed on the whole list: the same commands, in the same order, on the same tree.
+//!
 //! The report and the tree it checked are kept in the run's notes (the last one, and a short history
 //! of them, in every slot of the workspace), so that `commit_and_push` can bind the most recent
 //! report on a tree to the commit it pushes when that commit has the same tree, whichever slot ran
@@ -22,22 +37,24 @@
 //!
 //! # A failed check is not run again on the same tree
 //!
-//! When the notes hold a **failed** record for the same command, directory, slot and timeout on
-//! exactly the tree the command is about to run on, made at the current `ChecksNotes::epoch` (`run`
-//! and the file tools bump it; the command is told apart by the SHA-256 of its raw text, so two
-//! commands that differ only in a secret are two checks), the
-//! command is not run: the result quotes that run's findings, names the call that made them, spends
-//! no check cycle and emits no `checks` artifact (the earlier run's is the verdict on this tree).
-//! It is still a failure, so the gate refuses a pull request on the tree. A passing record is never
-//! reused (the model may be confirming it, and the environment may have changed), and neither is a
-//! pre-existing failure (it spends no cycle and the model is told the failure is the repository's).
+//! When the notes hold a **failed** record for the same call — the same commands in the same order,
+//! directory, slot and timeout on exactly the tree the commands are about to run on, made at the
+//! current `ChecksNotes::epoch` (`run` and the file tools bump it; the call is told apart by the
+//! SHA-256 of its commands' raw text, each behind its length, so two calls that differ only in a
+//! secret, or in where one command ends and the next begins, are two checks), the call is not run:
+//! the result quotes that run's findings, names the call that made
+//! them, spends no check cycle and emits no `checks` artifact (the earlier run's is the verdict on
+//! this tree). It is still a failure, so the gate refuses a pull request on the tree. A passing
+//! record is never reused (the model may be confirming it, and the environment may have changed),
+//! and neither is a pre-existing failure (it spends no cycle and the model is told the failure is
+//! the repository's).
 //!
 //! # A check that passes is one line
 //!
-//! By default ([`DEFAULT_OUTPUT`], `output: "on_error"`) a check that passes is shown as its
-//! command, `exit code 0: passed` and one line with the size of its output and the id it is kept
-//! under (`read_output` reads it); a check that fails is shown as before, and so is every check
-//! with `output: "full"` (ADR 0090). The folder's `limits.output.run_checks` may set the other
+//! By default ([`DEFAULT_OUTPUT`], `output: "on_error"`) a command that passes is shown as
+//! itself, `exit code 0: passed` and one line with the size of its output and the id it is kept
+//! under (`read_output` reads it; each command of a call has its own id); a command that fails is
+//! shown as before, and so is every command with `output: "full"` (ADR 0090). The folder's `limits.output.run_checks` may set the other
 //! default ([`CoderSettings::checks_output`](crate::CoderSettings::checks_output)); a call's
 //! `output` wins. Only the result changes: the `checks` artifact, the record in the notes and the
 //! check cycles are the same either way.
@@ -45,7 +62,7 @@
 use adam::Artifact;
 use adam::prelude::*;
 use adam_llm_agent::sha256_hex;
-use adam_workspace::{EnvDescription, EnvKind};
+use adam_workspace::{EnvDescription, EnvKind, EnvSession};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -63,6 +80,11 @@ use super::{Outcome, ToolEnv, non_empty, notes_error, run_error};
 /// What `run_checks` shows of an output when the call asks for nothing: one line for a check that
 /// passed, which needs no output (ADR 0090, decision 3).
 pub const DEFAULT_OUTPUT: OutputMode = OutputMode::OnError;
+
+/// The most commands one `run_checks` call may take: the tool's time limit grows with the count
+/// (one wave per `MAX_PARALLEL_TOOL_CALLS` commands, plus one re-run per failing command), so an
+/// uncapped list would turn the loop's backstop into no bound at all.
+const MAX_COMMANDS: usize = 16;
 
 /// The name of the artifact `run_checks` emits.
 pub const CHECKS_ARTIFACT: &str = "checks";
@@ -172,37 +194,48 @@ pub struct ChecksReport {
 /// How a summary says the check ran on uncommitted changes; `sha10)` follows.
 const DIRTY_NOTE: &str = " (on uncommitted changes on top of ";
 
-/// What a `run_checks` call knows about the run, for the report.
+/// One command of a call, and how it went.
 struct Run<'a> {
     /// The command, already scrubbed.
     command: &'a str,
     outcome: &'a ShellOutcome,
     timeout: std::time::Duration,
-    /// `HEAD` of the workspace repository, if it has one.
-    head: Option<&'a str>,
-    /// The worktree differed from `HEAD` when the check ran.
-    dirty: bool,
-    /// The tree of the worktree as it would be committed.
-    tree: Option<&'a str>,
-    /// The repository of the slot the command ran in.
-    repository: Option<&'a str>,
-    /// Where the command ran.
-    environment: Option<EnvironmentReport>,
     /// The base commit the command also failed on: a pre-existing failure.
     preexisting: Option<&'a str>,
 }
 
+/// What a `run_checks` call knows about the run, for the report: the code the commands ran on, and
+/// each of them in the order the caller gave them.
+struct Batch<'a> {
+    /// The commands it ran, in the caller's order.
+    runs: &'a [Run<'a>],
+    /// `HEAD` of the workspace repository, if it has one.
+    head: Option<&'a str>,
+    /// The worktree differed from `HEAD` when the checks ran.
+    dirty: bool,
+    /// The tree of the worktree as it would be committed.
+    tree: Option<&'a str>,
+    /// The repository of the slot the commands ran in.
+    repository: Option<&'a str>,
+    /// Where the commands ran.
+    environment: Option<EnvironmentReport>,
+}
+
 impl ChecksReport {
-    /// The report of one run.
-    fn of(run: &Run<'_>) -> Self {
-        let passed = run.outcome.passed();
-        let commit = run.head.filter(|h| is_sha(h));
+    /// The report of one call: every command it ran, in the caller's order.
+    fn of(batch: &Batch<'_>) -> Self {
+        let commit = batch.head.filter(|h| is_sha(h));
+        let failing: Vec<&Run<'_>> = batch
+            .runs
+            .iter()
+            .filter(|run| !run.outcome.passed())
+            .collect();
         let mut findings = Vec::new();
-        let verdict = verdict(run.outcome, run.timeout);
-        if !passed {
+        for run in &failing {
+            let verdict = verdict(run.outcome, run.timeout);
             let tail = run.outcome.tail.trim();
             let message = if tail.is_empty() {
-                verdict.clone()
+                verdict
             } else {
                 format!("{verdict}\n{tail}")
             };
@@ -219,29 +252,14 @@ impl ChecksReport {
                     .to_owned(),
             });
         }
-
-        let command = one_line(run.command, MAX_SUMMARY_COMMAND);
-        let mut summary = if passed {
-            format!("`{command}` passed")
-        } else {
-            format!("`{command}` failed: {verdict}")
-        };
-        if let (true, Some(sha)) = (run.dirty, commit) {
-            summary.push_str(&format!("{DIRTY_NOTE}{})", &sha[..sha.len().min(10)]));
-        }
-        let preexisting = run.preexisting.filter(|base| is_sha(base));
-        if let Some(base) = preexisting {
-            summary.push_str(&format!(
-                "; it fails on the base ({}) too: a pre-existing failure",
-                &base[..base.len().min(10)]
-            ));
-        }
+        let preexisting = preexisting_of(&failing);
+        let summary = summary_of(batch, &failing, commit);
         Self {
-            passed: passed && commit.is_some(),
+            passed: failing.is_empty() && commit.is_some(),
             commit: commit.unwrap_or_default().to_owned(),
-            tree: run.tree.filter(|t| is_sha(t)).map(str::to_owned),
-            repository: run.repository.map(str::to_owned),
-            environment: run.environment.clone(),
+            tree: batch.tree.filter(|t| is_sha(t)).map(str::to_owned),
+            repository: batch.repository.map(str::to_owned),
+            environment: batch.environment.clone(),
             preexisting: preexisting.is_some(),
             base_commit: preexisting.map(str::to_owned),
             summary: Some(summary),
@@ -351,6 +369,84 @@ fn one_line(text: &str, max: usize) -> String {
         end -= 1;
     }
     format!("{}...", &line[..end])
+}
+
+/// The summary line of a call: for one command exactly what it always was, and for several how many
+/// failed out of how many, with the same notes about uncommitted changes and a pre-existing failure.
+fn summary_of(batch: &Batch<'_>, failing: &[&Run<'_>], commit: Option<&str>) -> String {
+    let mut summary = if let [run] = batch.runs {
+        let command = one_line(run.command, MAX_SUMMARY_COMMAND);
+        if run.outcome.passed() {
+            format!("`{command}` passed")
+        } else {
+            format!("`{command}` failed: {}", verdict(run.outcome, run.timeout))
+        }
+    } else {
+        let total = batch.runs.len();
+        let failed = failing.len();
+        if failed == 0 {
+            format!("{total} of {total} checks passed")
+        } else {
+            format!("{failed} of {total} checks failed")
+        }
+    };
+    if let (true, Some(sha)) = (batch.dirty, commit) {
+        summary.push_str(&format!("{DIRTY_NOTE}{})", &sha[..sha.len().min(10)]));
+    }
+    if let Some(base) = preexisting_of(failing) {
+        summary.push_str(&format!(
+            "; it fails on the base ({}) too: a pre-existing failure",
+            &base[..base.len().min(10)]
+        ));
+    }
+    summary
+}
+
+/// The base commit a call's failure is pre-existing on: `Some` only when **every** failing command
+/// failed on the same base commit too (then the call spends no check cycle, as one command always
+/// did). `None` when nothing failed, when a failure is the run's, or when the bases differ.
+fn preexisting_of<'a>(failing: &[&Run<'a>]) -> Option<&'a str> {
+    let mut base: Option<&'a str> = None;
+    for run in failing {
+        let here = run.preexisting.filter(|b| is_sha(b))?;
+        match base {
+            Some(seen) if seen != here => return None,
+            _ => base = Some(here),
+        }
+    }
+    base
+}
+
+/// The commands of a call as one text, in the caller's order: the command itself when there is one,
+/// as it always was.
+fn joined(shown: &[String]) -> String {
+    shown.join("; ")
+}
+
+/// What makes two calls the same check: the SHA-256 of their commands' raw text, in order. One
+/// command hashes as it always did (`sha256(command)`), so a failure recorded before a call could
+/// name a list is still reused; several hash each command behind its length in bytes, so no two
+/// lists share a digest. [`commands_of`] refuses a NUL, which would make the length prefix the only
+/// thing telling `["a\0b"]` from `["a", "b"]`.
+fn call_sha(commands: &[String]) -> String {
+    if let [one] = commands {
+        return sha256_hex(one.as_bytes());
+    }
+    let mut bytes = Vec::new();
+    for command in commands {
+        bytes.extend_from_slice(&(command.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(command.as_bytes());
+    }
+    sha256_hex(&bytes)
+}
+
+/// The results of `jobs`, polled at most `bound` at a time, in the order they were given.
+async fn at_most<T, F: std::future::Future<Output = T>>(jobs: Vec<F>, bound: usize) -> Vec<T> {
+    use futures::StreamExt as _;
+    futures::stream::iter(jobs)
+        .buffered(bound.max(1))
+        .collect()
+        .await
 }
 
 /// `text` without its start, at most `max` bytes, cut on a character boundary.
@@ -561,15 +657,33 @@ fn unchanged_failure_text(record: &CheckRecord, command: &str, failures: u32, ma
     let short = &tree[..tree.len().min(10)];
     let code = super::notes::exit_phrase(record.exit_code);
     let tail = record.tail.trim();
+    // A call of one command says its code, as it always did; a call of several names each failing
+    // command behind its own line, and its tail already holds them.
+    let failed = record.report.as_ref().map_or(1, |report| {
+        report
+            .findings
+            .iter()
+            .filter(|finding| finding.check != "commit")
+            .count()
+    });
     let findings = if tail.is_empty() {
         format!("({code}, and the command printed nothing)")
+    } else if failed > 1 {
+        format!("the failing checks:\n{tail}")
     } else {
         format!("{code}:\n{tail}")
+    };
+    // One command keeps the words it always had; a call of several says the checks, in the plural,
+    // whatever its findings were capped to.
+    let again = if record.commands > 1 {
+        "the checks were not run again, because they would fail the same way"
+    } else {
+        "the command was not run again, because it would fail the same way"
     };
     format!(
         "The worktree is unchanged since `{command}` failed on tree {short}, and nothing a check \
          reads has changed since (no `run` or file change since, and the environment was not \
-         rebuilt): the command was not run again, because it would fail the same way. This call \
+         rebuilt): {again}. This call \
          cost no check cycle ({failures} of {max} used so far), and it emits no new `checks` \
          artifact: the one the earlier run reported is the verdict on this tree. This is still a \
          failure, not a green: a pull request on this tree is refused. What call `{}` found:\n\
@@ -578,41 +692,219 @@ fn unchanged_failure_text(record: &CheckRecord, command: &str, failures: u32, ma
     )
 }
 
-// Runs a command in the worktree and reports how it went.
+/// The commands a call names: `command`, or `commands`, exactly one of the two (whether it is
+/// given is decided before trimming, so a blank `command` beside a list is still both). Every
+/// command is trimmed, an empty one is refused, and a NUL is refused: it is what the reuse key's
+/// length prefix has to tell from the boundary between two commands (see [`call_sha`]).
+fn commands_of(
+    command: Option<String>,
+    commands: Option<Vec<String>>,
+) -> Result<Vec<String>, String> {
+    match (command, commands) {
+        (Some(_), Some(_)) => Err(
+            "give either `command` (one command) or `commands` (a list of \
+                                   independent commands), not both"
+                .to_owned(),
+        ),
+        (None, None) => Err(
+            "give `command` (one command) or `commands` (a list of independent \
+                             commands to run at the same time)"
+                .to_owned(),
+        ),
+        (Some(command), None) => {
+            let Some(command) = non_empty(&command) else {
+                return Err("`command` is empty: give the shell command to run".to_owned());
+            };
+            refuse_nul(command, "`command`")?;
+            Ok(vec![command.to_owned()])
+        }
+        (None, Some(commands)) => {
+            if commands.is_empty() {
+                return Err(
+                    "`commands` is empty: name at least one command, or use `command` for one"
+                        .to_owned(),
+                );
+            }
+            if commands.len() > MAX_COMMANDS {
+                return Err(format!(
+                    "`commands` holds {} commands: at most {MAX_COMMANDS} in one call, so that its \
+                     time limit stays a bound (split a longer list into calls)",
+                    commands.len()
+                ));
+            }
+            let mut list = Vec::with_capacity(commands.len());
+            for (n, command) in commands.iter().enumerate() {
+                let Some(command) = non_empty(command) else {
+                    return Err(format!(
+                        "`commands[{n}]` is empty: every command must be a shell command to run"
+                    ));
+                };
+                refuse_nul(command, &format!("`commands[{n}]`"))?;
+                list.push(command.to_owned());
+            }
+            Ok(list)
+        }
+    }
+}
+
+/// Refuse `command` (which the call named `name`) when it holds a NUL: a shell command cannot, and
+/// the reuse key could not tell it from the boundary between two commands.
+fn refuse_nul(command: &str, name: &str) -> Result<(), String> {
+    if command.contains('\0') {
+        return Err(format!(
+            "{name} holds a NUL character (U+0000), which a shell command cannot: remove it"
+        ));
+    }
+    Ok(())
+}
+
+/// The commands the shell could not find, by their place in the call: a missing toolchain is not a
+/// failing check (see [`missing_tool_text`]).
+fn missing_of(commands: &[String], outcomes: &[ShellOutcome]) -> Vec<(usize, MissingTool)> {
+    let mut missing = Vec::new();
+    for (n, outcome) in outcomes.iter().enumerate() {
+        if let Some(tool) = missing_tool(outcome, &commands[n]) {
+            missing.push((n, tool));
+        }
+    }
+    missing
+}
+
+/// Run `commands` in `dir`, at most `bound` at a time, each through the run's environment (and the
+/// process pool behind it), and return what each did in the caller's order. Each command settles its
+/// own output, so a long output is kept under an id of its own.
+#[allow(clippy::too_many_arguments)] // what each command of the call runs with
+async fn run_all(
+    env: &ToolEnv,
+    ctx: &ToolCtx,
+    session: &dyn EnvSession,
+    dir: &std::path::Path,
+    commands: &[String],
+    timeout: std::time::Duration,
+    mode: OutputMode,
+    bound: usize,
+) -> Result<Vec<ShellOutcome>, ToolError> {
+    let one = commands.len() == 1;
+    let jobs: Vec<_> = commands
+        .iter()
+        .enumerate()
+        .map(|(n, command)| {
+            // A part of a call keeps its own output id (`o-...`): one id for every command would
+            // have one output overwrite another in what `read_output` pages through. The first
+            // command keeps the call's own id, so that a compaction which dropped the result still
+            // knows an output of it is kept.
+            let part = if one || n == 0 {
+                ctx.clone()
+            } else {
+                ctx.clone()
+                    .with_call_id(format!("{}#{}", ctx.call_id(), n + 1))
+            };
+            let spec = shell_spec(dir, command);
+            async move {
+                let mut outcome = env
+                    .run(
+                        &part,
+                        session,
+                        spec,
+                        timeout,
+                        env.settings.check_output_tail,
+                        true,
+                    )
+                    .await
+                    .map_err(|e| run_error(&env.redactor, &e))?;
+                super::output::settle_as(env, &part, &mut outcome, mode).await;
+                Ok(outcome)
+            }
+        })
+        .collect();
+    let results: Vec<Result<ShellOutcome, ToolError>> = at_most(jobs, bound).await;
+    results.into_iter().collect()
+}
+
+/// The exit code the record keeps: the first failing command's, in the caller's order (a timeout or
+/// a signal has none). One command keeps its own code, as it always was; the record's tail names
+/// each failing command's own.
+fn first_failing_exit(outcomes: &[ShellOutcome]) -> Option<i32> {
+    if let [outcome] = outcomes {
+        return outcome.exit_code;
+    }
+    outcomes
+        .iter()
+        .find(|outcome| !outcome.passed())
+        .and_then(|outcome| outcome.exit_code)
+}
+
+/// The output a record keeps for a failure asked again on the same tree: one command's tail as it
+/// always was, and for several each failing command's tail behind a line that names it.
+fn recorded_tail(outcomes: &[ShellOutcome], shown: &[String]) -> String {
+    if let [outcome] = outcomes {
+        return outcome.tail.clone();
+    }
+    let mut parts = Vec::new();
+    for (n, outcome) in outcomes.iter().enumerate() {
+        if !outcome.passed() {
+            parts.push(format!("$ {}\n{}", shown[n], outcome.tail.trim_end()));
+        }
+    }
+    parts.join("\n")
+}
+
+/// What makes two calls of a list the same failure for the repeated-call rule: the failing
+/// commands' keys in order. A call of one command keeps its own key, as it always was.
+fn batch_repeat_key(outcomes: &[ShellOutcome]) -> String {
+    if let [outcome] = outcomes {
+        return outcome.repeat_key().unwrap_or_default();
+    }
+    outcomes
+        .iter()
+        .filter_map(ShellOutcome::repeat_key)
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+// Runs the commands of a call in the worktree and reports how each went.
 //
 // * `bash -lc <command>` (`sh -lc` without bash), cwd inside the worktree (`cwd`, if given, must stay
 //   inside it), the process group killed after the timeout, only the output
 //   tail kept.
-// * A failed run costs one check cycle. After `max_check_cycles` failures the
-//   tool no longer runs anything and tells the model to stop and report.
+// * A failed call costs one check cycle, however many of its commands failed. After
+//   `max_check_cycles` failures the tool no longer runs anything and tells the model to stop and
+//   report.
 
 /// Run one of the project's own checks in your worktree (the commands its CI, README or
 /// Makefile run: `cargo test`, `pnpm test`, `just ci`), in the workspace's environment (a run pod of
-/// the run's own when the deployment runs them), and get its exit code and the tail of
-/// its output. With several repositories in the workspace, say which with `repo`. Only exit code 0 counts as passing. Every failed run uses up one of your limited
-/// check cycles and is reported as a check: never use it to look around (use run_command) or to make a file or change the worktree (use run). A
-/// failed check asked again on exactly the same unchanged code is answered from the earlier run
-/// (no cycle, no new `checks` artifact, still a failure). A
-/// command the shell cannot find means the workspace lacks that tool: that is reported, costs no
-/// cycle, and is for the person to decide. By default (output "on_error") a check that passes is
-/// one line with an output id that read_output reads.
+/// the run's own when the deployment runs them), and get each one's exit code and the tail of its
+/// output. Give one command with `command`, or several independent ones with `commands`: they run at
+/// the same time, at most as many as the run runs tool calls, and the call passes only when every
+/// one of them passed. With several repositories in the workspace, say which with `repo`. Only exit
+/// code 0 counts as passing. Every failed call uses up one of your limited check cycles and is
+/// reported as a check: never use it to look around (use run_command) or to make a file or change
+/// the worktree (use run). A call that failed, asked again on exactly the same unchanged code, is
+/// answered from the earlier run (no cycle, no new `checks` artifact, still a failure). A command
+/// the shell cannot find means the workspace lacks that tool: that is reported, costs no cycle, and
+/// is for the person to decide. By default (output "on_error") a command that passes is one line
+/// with an output id that read_output reads.
 #[tool(label = "Run the checks", icon = "execute", parallel = "exclusive")]
+#[allow(clippy::too_many_arguments)] // the model's arguments, one each
 pub async fn run_checks(
     env: State<ToolEnv>,
     ctx: &ToolCtx,
-    /// Shell command, run with `bash -lc` (`sh -lc` without bash) in the worktree, in the workspace's environment
-    command: String,
+    /// One shell command, run with `bash -lc` (`sh -lc` without bash) in the worktree, in the workspace's environment. Give it or `commands`, not both
+    command: Option<String>,
+    /// Several independent shell commands, each run with `bash -lc` (`sh -lc` without bash) in the worktree: they run at the same time, at most as many as the run runs tool calls, and the call passes only when every one of them passed. Give it or `command`, not both. Example: {"commands":["cargo fmt --check","cargo test"]}
+    commands: Option<Vec<String>>,
     /// Optional sub-directory of the worktree to run in (relative, inside the worktree)
     cwd: Option<String>,
     /// The slot to run in: its name, or the repository's address. Leave out when the workspace has one.
     repo: Option<String>,
-    /// Seconds before the command is killed; at most the deployment's limit, which is also the default. Example: {"command":"npm test","timeout":120}
+    /// Seconds before each command is killed; at most the deployment's limit, which is also the default. Example: {"commands":["npm test"],"timeout":120}
     timeout: Option<i64>,
     /// What you see of the output: "on_error" (a command that succeeds is one line with an output id that read_output reads) or "full". Default "on_error". Example: {"command":"cargo test","output":"full"}
     output: Option<String>,
 ) -> Outcome {
-    let Some(command) = non_empty(&command) else {
-        return Ok(ToolOutput::error("command is required"));
+    let commands = match commands_of(command, commands) {
+        Ok(commands) => commands,
+        Err(said) => return Ok(ToolOutput::error(said)),
     };
     let run = ctx.root_run_id().to_string();
     // `run_checks` runs alone (ADR 0049): no other call of its turn changes the notes while it holds
@@ -658,25 +950,29 @@ pub async fn run_checks(
         Err(reason) => return Ok(ToolOutput::error(reason)),
     };
 
-    // What the command printed is not ours to publish: scrub the process's
-    // secrets before the tail reaches the model, the notes, an event or a
-    // failed run's findings. The command line is shown scrubbed too.
+    // What the commands print is not ours to publish: scrub the process's
+    // secrets before the tails reach the model, the notes, an event or a
+    // failed run's findings. The command lines are shown scrubbed too.
     let redactor = &env.redactor;
-    let shown = redactor.scrub(command).into_owned();
+    let shown: Vec<String> = commands
+        .iter()
+        .map(|command| redactor.scrub(command).into_owned())
+        .collect();
+    let named = joined(&shown);
 
-    // The code the command is about to run on, computed before it runs: it says whether a failure
-    // already seen on exactly this code can be answered instead of running the command again. The
-    // report below is bound to the tree the command leaves (it may write a file), as it always was.
+    // The code the commands are about to run on, computed before they run: it says whether a
+    // failure already seen on exactly this code can be answered instead of running them again. The
+    // report below is bound to the tree they leave (a check may write a file), as it always was.
     let at = super::gitcli::GitAt::slot(&slot);
     let tree_before = super::gitcli::working_tree_id(&at).await;
     let dir_key = cwd_key(cwd.as_deref());
-    // The identity of the command is its raw text, not what the redactor shows: two commands that
-    // differ only in a secret are two checks.
-    let command_sha = sha256_hex(command.as_bytes());
+    // The identity of a call is its commands' raw text, in order, not what the redactor shows: two
+    // calls that differ only in a secret are two checks.
+    let command_sha = call_sha(&commands);
 
-    // A failure on this exact tree, from this exact command (raw text, directory, slot, timeout) in
+    // A failure on this exact tree, from this exact call (raw commands, directory, slot, timeout) in
     // this kind of work, with the run's files and environment unchanged since
-    // (`ChecksNotes::epoch`): the command would fail the same way, so it is not run again. It
+    // (`ChecksNotes::epoch`): the commands would fail the same way, so they are not run again. It
     // spends no cycle and emits no `checks` artifact (the earlier run's is the verdict on this
     // tree); the gate still refuses the pull request.
     let epoch = notes.checks.epoch;
@@ -694,10 +990,10 @@ pub async fn run_checks(
     };
     if let Some(earlier) = earlier {
         let failures = notes.failures_in(scratch);
-        ctx.emit_progress(format!("checks not run again (unchanged tree): {shown}"))
+        ctx.emit_progress(format!("checks not run again (unchanged tree): {named}"))
             .await;
         return Ok(
-            ToolOutput::error(unchanged_failure_text(earlier, &shown, failures, max))
+            ToolOutput::error(unchanged_failure_text(earlier, &named, failures, max))
                 .with_repeat_key(format!(
                     "unchanged:{}",
                     earlier.start_tree.as_deref().unwrap_or_default()
@@ -705,66 +1001,84 @@ pub async fn run_checks(
         );
     }
 
-    ctx.emit_progress(format!("running checks: {shown}")).await;
+    ctx.emit_progress(format!("running checks: {named}")).await;
     let environment = env.session(ctx).await?;
-    let mut outcome = env
-        .run(
-            ctx,
-            &*environment,
-            shell_spec(&dir, command),
-            timeout,
-            env.settings.check_output_tail,
-            true,
-        )
-        .await
-        .map_err(|e| run_error(redactor, &e))?;
-
-    super::output::settle_as(&env, ctx, &mut outcome, mode).await;
+    // At most the run's own bound on the tool calls of a turn at once: a deployment that sets it to
+    // 1 runs the commands one after another, and each takes a seat of the process pool
+    // (`MAX_PROCESSES`, ADR 0065) as it runs.
+    let bound = env.settings.max_parallel_tool_calls.max(1);
+    let outcomes = run_all(
+        &env,
+        ctx,
+        &*environment,
+        &dir,
+        &commands,
+        timeout,
+        mode,
+        bound,
+    )
+    .await?;
 
     // A command the shell could not find is a missing toolchain, not a failing check: the
-    // workspace lacks the tool, and no change to the code would make the check pass. So it is not
-    // recorded (no cycle used, no `checks` artifact, nothing for the gate to see), and the model
-    // is told to report it and wait, which is all it can do: nothing is installed here.
-    if let Some(missing) = missing_tool(&outcome, command) {
-        ctx.emit_progress(format!("the workspace lacks a tool: {shown}"))
+    // workspace lacks the tool, and no change to the code would make the check pass. So the call is
+    // not recorded (no cycle used, no `checks` artifact, nothing for the gate to see), and the
+    // model is told to report it and wait, which is all it can do: nothing is installed here. The
+    // other commands of the call did run; their output is shown so that none of it is lost.
+    let missing = missing_of(&commands, &outcomes);
+    if !missing.is_empty() {
+        ctx.emit_progress(format!("the workspace lacks a tool: {named}"))
             .await;
-        let said = missing_tool_answer(
-            &env,
-            ctx,
-            &missing,
-            &[dir.as_path(), slot.path()],
-            &environment.describe().kind,
-        )
-        .await?;
+        let kind = environment.describe().kind;
+        let mut said = String::new();
+        for (n, (_, tool)) in missing.iter().enumerate() {
+            if n > 0 {
+                said.push('\n');
+            }
+            said.push_str(
+                &missing_tool_answer(&env, ctx, tool, &[dir.as_path(), slot.path()], &kind).await?,
+            );
+        }
+        let ran: Vec<usize> = (0..outcomes.len())
+            .filter(|n| !missing.iter().any(|(missing, _)| missing == n))
+            .collect();
+        if !ran.is_empty() {
+            said.push_str("\nThe other commands of this call ran:\n");
+            for n in ran {
+                said.push_str(&render(&shown[n], &outcomes[n], timeout, mode));
+            }
+        }
         return Ok(ToolOutput::error(said));
     }
 
-    // A failure in a repository that is there on the base too is not the run's (ADR 0026).
-    let on_base = match slot.worktree() {
-        Some(wt) if !outcome.passed() && !outcome.timed_out && outcome.exit_code.is_some() => {
-            preexisting::on_base(
-                preexisting::Failing {
-                    env: &env,
-                    ctx,
-                    session: &*environment,
-                    run: &run,
-                    wt,
-                    shown: &shown,
-                    command,
-                    cwd: cwd.as_deref(),
-                },
-                &mut notes,
-            )
-            .await?
+    // A failure in a repository that is there on the base too is not the run's (ADR 0026). The
+    // commands ran at the same time; the base is asked one command at a time, after them, because
+    // the answer is kept in the run's notes.
+    let mut on_base: Vec<Option<OnBase>> = vec![None; outcomes.len()];
+    for (n, outcome) in outcomes.iter().enumerate() {
+        let Some(wt) = slot.worktree() else {
+            break;
+        };
+        if !outcome.passed() && !outcome.timed_out && outcome.exit_code.is_some() {
+            on_base[n] = Some(
+                preexisting::on_base(
+                    preexisting::Failing {
+                        env: &env,
+                        ctx,
+                        session: &*environment,
+                        run: &run,
+                        wt,
+                        shown: shown[n].as_str(),
+                        command: commands[n].as_str(),
+                        cwd: cwd.as_deref(),
+                    },
+                    &mut notes,
+                )
+                .await?,
+            );
         }
-        _ => OnBase::Unknown,
-    };
-    let base_commit = match &on_base {
-        OnBase::Fails(result) => Some(result.commit.clone()),
-        _ => None,
-    };
+    }
 
-    // The code the command just ran on, so a pull request can be tied to
+    // The code the commands just ran on, so a pull request can be tied to
     // the exact tree that was verified. (A check may write a file: the report is bound to the tree
     // it leaves, which is what `commit_and_push` will commit.)
     let at = super::gitcli::GitAt::slot(&slot);
@@ -774,28 +1088,42 @@ pub async fn run_checks(
         (Some(tree), Some(head_tree)) => *tree != head_tree,
         _ => false,
     };
-    let passed = outcome.passed();
-    let report = ChecksReport::of(&Run {
-        command: &shown,
-        outcome: &outcome,
-        timeout,
+    let runs: Vec<Run<'_>> = (0..outcomes.len())
+        .map(|n| Run {
+            command: shown[n].as_str(),
+            outcome: &outcomes[n],
+            timeout,
+            preexisting: match &on_base[n] {
+                Some(OnBase::Fails(result)) => Some(result.commit.as_str()),
+                _ => None,
+            },
+        })
+        .collect();
+    let report = ChecksReport::of(&Batch {
+        runs: &runs,
         head: head.as_deref(),
         dirty,
         tree: tree.as_deref(),
         // A scratch project has no repository (yet).
         repository: slot.worktree().map(|wt| wt.repo().url.as_str()),
         environment: EnvironmentReport::of(&environment.describe()),
-        preexisting: base_commit.as_deref(),
     })
     .scrubbed(redactor);
+    let passed = outcomes.iter().all(ShellOutcome::passed);
+    let preexisting = report.preexisting;
+    let base_commit = report.base_commit.clone();
     let artifact = report.clone().into_artifact(redactor);
-    let text = render(&shown, &outcome, timeout, mode);
+    let mut text = String::new();
+    for (n, outcome) in outcomes.iter().enumerate() {
+        text.push_str(&render(&shown[n], outcome, timeout, mode));
+    }
     let failures = notes.record_check(CheckRecord {
         call_id: call,
-        command: shown.clone(),
+        command: named.clone(),
         passed,
-        exit_code: outcome.exit_code,
-        tail: outcome.tail.clone(),
+        commands: u32::try_from(outcomes.len()).unwrap_or(u32::MAX),
+        exit_code: first_failing_exit(&outcomes),
+        tail: recorded_tail(&outcomes, &shown),
         tree,
         start_tree: tree_before,
         cwd: dir_key,
@@ -805,56 +1133,61 @@ pub async fn run_checks(
         report: Some(report),
         slot: Some(slot.dir().to_owned()),
         scratch,
-        preexisting: base_commit.is_some(),
-        base_commit: base_commit.clone(),
+        preexisting,
+        base_commit,
     });
     env.notes
         .save(&run, &notes)
         .await
         .map_err(|e| notes_error(&e))?;
     ctx.emit_progress(if passed {
-        format!("checks passed: {shown}")
-    } else if base_commit.is_some() {
-        format!("checks failed, and fail on the base too (no cycle used): {shown}")
+        format!("checks passed: {named}")
+    } else if preexisting {
+        format!("checks failed, and fail on the base too (no cycle used): {named}")
     } else {
-        format!("checks failed ({failures} of {max} cycles used): {shown}")
+        format!("checks failed ({failures} of {max} cycles used): {named}")
     })
     .await;
 
     if passed {
         return Ok(ToolOutput::text(text).with_artifact(artifact));
     }
-    let key = outcome.repeat_key().unwrap_or_default();
-    let mut text = text;
-    if let OnBase::Fails(result) = &on_base {
-        let branch = slot
-            .worktree()
-            .map_or("", |wt| wt.repo().base_branch.as_str());
-        text.push_str(&preexisting::fails_text(
-            result,
-            branch,
-            &outcome.tail,
-            failures,
-            max,
-        ));
-        return Ok(ToolOutput::error(text)
-            .with_artifact(artifact)
-            .with_repeat_key(key));
+    let key = batch_repeat_key(&outcomes);
+    let branch = slot
+        .worktree()
+        .map_or("", |wt| wt.repo().base_branch.as_str());
+    for (n, on_base) in on_base.iter().enumerate() {
+        match on_base {
+            Some(OnBase::Fails(result)) => {
+                text.push_str(&preexisting::fails_text(
+                    result,
+                    branch,
+                    &outcomes[n].tail,
+                    failures,
+                    max,
+                ));
+            }
+            Some(OnBase::Passes(result)) => {
+                text.push_str(&preexisting::passes_text(result, branch));
+            }
+            _ => {}
+        }
     }
-    if let (OnBase::Passes(result), Some(wt)) = (&on_base, slot.worktree()) {
-        text.push_str(&preexisting::passes_text(result, &wt.repo().base_branch));
-    }
-    if failures >= max {
-        text.push_str(&format!(
-            "\nCheck-cycle limit reached ({failures} of {max}). Do not run checks, commit, \
-             push or open a pull request any more. Stop now and report what you did, which \
-             check still fails, and the output above.\n"
-        ));
-    } else {
-        text.push_str(&format!(
-            "\nThis was failed check run {failures} of {max}. Fix the cause (not the check), \
-             then run it again.\n"
-        ));
+    // The call as a whole spent no cycle only when every failure is the repository's; one that is
+    // the run's spends one, however many commands failed, and the model is told how many are left.
+    if !preexisting {
+        if failures >= max {
+            text.push_str(&format!(
+                "\nCheck-cycle limit reached ({failures} of {max}). Do not run checks, commit, \
+                 push or open a pull request any more. Stop now and report what you did, which \
+                 check still fails, and the output above.\n"
+            ));
+        } else {
+            text.push_str(&format!(
+                "\nThis was failed check run {failures} of {max}. Fix the cause (not the check), \
+                 then run it again.\n"
+            ));
+        }
     }
     Ok(ToolOutput::error(text)
         .with_artifact(artifact)
@@ -884,16 +1217,40 @@ mod tests {
     }
 
     fn report(o: &ShellOutcome, head: Option<&str>, dirty: bool) -> ChecksReport {
-        ChecksReport::of(&Run {
+        let run = Run {
             command: "cargo test",
             outcome: o,
             timeout: Duration::from_secs(900),
+            preexisting: None,
+        };
+        ChecksReport::of(&Batch {
+            runs: std::slice::from_ref(&run),
             head,
             dirty,
             tree: Some(TREE),
             repository: None,
             environment: None,
-            preexisting: None,
+        })
+    }
+
+    /// The report of several commands, each given by its text and its outcome, in that order.
+    fn batch(runs: &[(&str, ShellOutcome)]) -> ChecksReport {
+        let runs: Vec<Run<'_>> = runs
+            .iter()
+            .map(|(command, outcome)| Run {
+                command,
+                outcome,
+                timeout: Duration::from_secs(900),
+                preexisting: None,
+            })
+            .collect();
+        ChecksReport::of(&Batch {
+            runs: &runs,
+            head: Some(SHA),
+            dirty: false,
+            tree: Some(TREE),
+            repository: None,
+            environment: None,
         })
     }
 
@@ -988,16 +1345,19 @@ mod tests {
     fn the_summary_is_one_short_line() {
         let o = outcome(Some(1), "");
         let long = format!("echo a\n{}", "x".repeat(1000));
-        let r = ChecksReport::of(&Run {
+        let run = Run {
             command: &long,
             outcome: &o,
             timeout: Duration::from_secs(1),
+            preexisting: None,
+        };
+        let r = ChecksReport::of(&Batch {
+            runs: std::slice::from_ref(&run),
             head: Some(SHA),
             dirty: false,
             tree: None,
             repository: None,
             environment: None,
-            preexisting: None,
         });
         let summary = r.summary.unwrap();
         assert!(!summary.contains('\n'));
@@ -1068,16 +1428,19 @@ mod tests {
 
     fn report_named(command: &str) -> ChecksReport {
         let o = outcome(Some(1), "x");
-        ChecksReport::of(&Run {
+        let run = Run {
             command,
             outcome: &o,
             timeout: Duration::from_secs(1),
+            preexisting: None,
+        };
+        ChecksReport::of(&Batch {
+            runs: std::slice::from_ref(&run),
             head: Some(SHA),
             dirty: false,
             tree: None,
             repository: None,
             environment: None,
-            preexisting: None,
         })
     }
 
@@ -1185,6 +1548,208 @@ mod tests {
         assert!(
             text.contains("[redacted: secret removed, do not reuse]"),
             "{text}"
+        );
+    }
+
+    #[test]
+    fn a_call_names_one_command_or_a_list_never_both() {
+        assert_eq!(
+            commands_of(Some("cargo test".into()), None).unwrap(),
+            ["cargo test"]
+        );
+        assert_eq!(
+            commands_of(None, Some(vec!["a".into(), " b ".into()])).unwrap(),
+            ["a", "b"]
+        );
+        for (command, commands) in [(None, None), (Some("a".into()), Some(vec!["b".into()]))] {
+            let said = commands_of(command, commands).unwrap_err();
+            assert!(
+                said.contains("`command`") && said.contains("`commands`"),
+                "{said}"
+            );
+        }
+        assert!(commands_of(Some("  ".into()), None).is_err());
+        assert!(commands_of(None, Some(vec![])).is_err());
+        let said = commands_of(None, Some(vec!["a".into(), " ".into()])).unwrap_err();
+        assert!(said.contains("commands[1]"), "{said}");
+        // A blank `command` beside a list is both given, not one.
+        let said = commands_of(Some("  ".into()), Some(vec!["a".into()])).unwrap_err();
+        assert!(
+            said.contains("`command`") && said.contains("`commands`"),
+            "{said}"
+        );
+        // A NUL is refused in either form: it is what a length prefix has to tell from a boundary.
+        let said = commands_of(Some("echo a\0b".into()), None).unwrap_err();
+        assert!(said.contains("`command`") && said.contains("NUL"), "{said}");
+        let said = commands_of(None, Some(vec!["a".into(), "b\0c".into()])).unwrap_err();
+        assert!(
+            said.contains("`commands[1]`") && said.contains("NUL"),
+            "{said}"
+        );
+    }
+
+    #[test]
+    fn one_command_hashes_as_it_always_did() {
+        // The literal digest a note written before `commands` existed holds: the reuse must still
+        // find it, so the single-command branch may not change (a restatement of the branch would
+        // pass whatever the branch computed).
+        let one = vec!["cargo test".to_owned()];
+        assert_eq!(
+            call_sha(&one),
+            "0031fd18feb55b6b493544de1976b438eeac0b2d1278821b9e4e8eb07e8cf503"
+        );
+        // A list is its commands in order, each behind its length: where one ends and the next
+        // begins is part of the key.
+        assert_ne!(
+            call_sha(&["a".to_owned(), "b".to_owned()]),
+            call_sha(&["ab".to_owned(), String::new()])
+        );
+        assert_ne!(
+            call_sha(&["a".to_owned(), "b".to_owned()]),
+            call_sha(&["a\0b".to_owned()])
+        );
+        assert_ne!(
+            call_sha(&["a".to_owned(), "b".to_owned()]),
+            call_sha(&["b".to_owned(), "a".to_owned()])
+        );
+    }
+
+    #[test]
+    fn a_batch_passes_only_when_every_command_passed_and_says_how_many() {
+        let r = batch(&[
+            ("a", outcome(Some(0), "ok")),
+            ("b", outcome(Some(0), "")),
+            ("c", outcome(Some(0), "")),
+        ]);
+        assert!(r.passed);
+        assert!(r.findings.is_empty());
+        assert_eq!(r.summary.as_deref(), Some("3 of 3 checks passed"));
+
+        let r = batch(&[
+            ("a", outcome(Some(0), "ok")),
+            ("b", outcome(Some(1), "boom")),
+            ("c", outcome(Some(0), "")),
+        ]);
+        assert!(!r.passed);
+        assert_eq!(r.summary.as_deref(), Some("1 of 3 checks failed"));
+        assert_eq!(
+            r.findings,
+            [Finding {
+                check: "b".to_owned(),
+                message: "exit code 1\nboom".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn the_failing_checks_are_listed_in_the_order_the_caller_gave_them() {
+        let r = batch(&[
+            ("a", outcome(Some(2), "a-failed")),
+            ("b", outcome(Some(0), "b-ok")),
+            ("c", outcome(Some(3), "c-failed")),
+        ]);
+        let checks: Vec<&str> = r.findings.iter().map(|f| f.check.as_str()).collect();
+        assert_eq!(checks, ["a", "c"]);
+        assert_eq!(r.findings[0].message, "exit code 2\na-failed");
+        assert_eq!(r.findings[1].message, "exit code 3\nc-failed");
+    }
+
+    #[test]
+    fn a_batch_is_preexisting_only_when_every_failure_is() {
+        let o = outcome(Some(1), "boom");
+        let base = "aaaaaaaaaabbbbbbbbbbccccccccccdddddddddd";
+        let commands = ["a", "b"];
+        let report_of = |preexisting: [Option<&'static str>; 2]| {
+            let runs: Vec<Run<'_>> = commands
+                .iter()
+                .zip(preexisting)
+                .map(|(command, preexisting)| Run {
+                    command,
+                    outcome: &o,
+                    timeout: Duration::from_secs(1),
+                    preexisting,
+                })
+                .collect();
+            ChecksReport::of(&Batch {
+                runs: &runs,
+                head: Some(SHA),
+                dirty: false,
+                tree: Some(TREE),
+                repository: None,
+                environment: None,
+            })
+        };
+        let all = report_of([Some(base), Some(base)]);
+        assert!(all.preexisting);
+        assert_eq!(all.base_commit.as_deref(), Some(base));
+        assert!(
+            all.summary
+                .as_deref()
+                .unwrap()
+                .contains("pre-existing failure")
+        );
+        let one = report_of([Some(base), None]);
+        assert!(!one.preexisting);
+        assert!(one.base_commit.is_none());
+        assert!(
+            !one.summary
+                .as_deref()
+                .unwrap()
+                .contains("pre-existing failure")
+        );
+    }
+
+    /// Three checks that each sleep finish in about one check's time when they run at the same
+    /// time, and in three times that with a bound of 1: the clock is tokio's, paused, so the sleeps
+    /// cost no real time.
+    #[tokio::test(start_paused = true)]
+    async fn independent_checks_run_at_the_same_time_up_to_the_bound() {
+        let jobs = || {
+            (0..3)
+                .map(|n| async move {
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    n
+                })
+                .collect::<Vec<_>>()
+        };
+
+        let started = tokio::time::Instant::now();
+        let out = at_most(jobs(), 3).await;
+        let took = started.elapsed();
+        assert_eq!(out, [0, 1, 2], "the results keep the order they were given");
+        assert!(
+            (Duration::from_secs(1)..Duration::from_secs(2)).contains(&took),
+            "three checks at once took {took:?}"
+        );
+
+        let started = tokio::time::Instant::now();
+        let out = at_most(jobs(), 1).await;
+        let took = started.elapsed();
+        assert_eq!(out, [0, 1, 2]);
+        assert!(
+            (Duration::from_secs(3)..Duration::from_secs(4)).contains(&took),
+            "three checks one after another took {took:?}"
+        );
+    }
+
+    /// A quick check that starts later does not overtake a slow one that started first: the results
+    /// come back in the caller's order, however they finish.
+    #[tokio::test(start_paused = true)]
+    async fn a_quick_check_does_not_overtake_a_slow_one() {
+        let started = tokio::time::Instant::now();
+        let jobs: Vec<_> = [(3_u64, "a"), (1, "b"), (2, "c")]
+            .into_iter()
+            .map(|(seconds, name)| async move {
+                tokio::time::sleep(Duration::from_secs(seconds)).await;
+                name
+            })
+            .collect();
+        let out = at_most(jobs, 3).await;
+        assert_eq!(out, ["a", "b", "c"]);
+        assert!(
+            (Duration::from_secs(3)..Duration::from_secs(4)).contains(&started.elapsed()),
+            "the batch took {:?}",
+            started.elapsed()
         );
     }
 }

@@ -89,6 +89,13 @@ const WORKSPACE_PAGE: usize = 64;
 /// decision 9). A request to a child context writes no key: the round it starts is shown already.
 pub const CONTEXT_CHILD_SESSIONS: &str = "vymalo.childSessions";
 
+/// The context key under which a round carries the tools its session's `config` narrows (ADR 0054
+/// slice 3): `{"tools": [..], "denyTools": [..]}`. It is the loop's
+/// `adam_llm_agent::SESSION_TOOLS_CONTEXT_KEY` (a test keeps the two equal), written from the
+/// header's config by `put_header` on every round a person starts, **over** whatever the
+/// message's own context said: a person's request never sets it.
+pub const CONTEXT_SESSION_TOOLS: &str = "vymalo.session.tools";
+
 /// Put into `inbound` whether this request activated `child-sessions/v1`
 /// ([`CONTEXT_CHILD_SESSIONS`]): `true` or `null`, so that a message that did not activate the
 /// extension takes an earlier yes away.
@@ -387,7 +394,7 @@ pub(crate) struct Start {
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Asked {
     Nothing,
-    Start(Start),
+    Start(Box<Start>),
     Close { cancel: bool },
 }
 
@@ -417,7 +424,9 @@ pub(crate) fn asked(message: &Message, sessions: &ChildSessions) -> Result<Asked
     match (start, close) {
         (None, None) => Ok(Asked::Nothing),
         (Some(_), Some(_)) => Err("a message starts a session or closes one, not both".into()),
-        (Some(start), None) => parse_start(start, sessions).map(Asked::Start),
+        (Some(start), None) => {
+            parse_start(start, sessions).map(|start| Asked::Start(Box::new(start)))
+        }
         (None, Some(close)) => parse_close(close).map(|cancel| Asked::Close { cancel }),
     }
 }
@@ -542,7 +551,7 @@ fn refused_to_the_person(view: &SessionView) -> Option<BackendError> {
 
 /// The options of `start.config`, as the wire spells them, and as the model's tool and the
 /// refusals of [`SessionBounds::admit`] spell them.
-const CONFIG_OPTIONS: [(&str, &str); 7] = [
+const CONFIG_OPTIONS: [(&str, &str); 10] = [
     ("maxTurns", "max_turns"),
     ("maxToolCalls", "max_tool_calls"),
     ("maxOutputTokens", "max_output_tokens"),
@@ -550,16 +559,25 @@ const CONFIG_OPTIONS: [(&str, &str); 7] = [
     ("maxParallelToolCalls", "max_parallel_tool_calls"),
     ("timeLimit", "time_limit"),
     ("maxRounds", "max_rounds"),
+    ("tokenBudget", "token_budget"),
+    ("tools", "tools"),
+    ("denyTools", "deny_tools"),
 ];
+
+/// The members of `start.config` that are lists of tool names rather than numbers.
+const CONFIG_LISTS: [&str; 2] = ["tools", "denyTools"];
 
 /// The options a remote helper refuses: every one but `timeLimit` and `maxRounds` (ADR 0054
 /// decision 4), the rule `subagent_start` applies to a remote subagent.
-const REMOTE_REFUSED: [&str; 5] = [
+const REMOTE_REFUSED: [&str; 8] = [
     "maxTurns",
     "maxToolCalls",
     "maxOutputTokens",
     "contextWindow",
     "maxParallelToolCalls",
+    "tokenBudget",
+    "tools",
+    "denyTools",
 ];
 
 /// `start.config`, read and admitted ([ADR 0054], decisions 1 and 2): **an unknown member is
@@ -585,14 +603,43 @@ fn parse_config(
                 options.join(", ")
             ));
         }
+        if CONFIG_LISTS.contains(&key.as_str()) {
+            if value.is_null() {
+                continue;
+            }
+            let named = value.as_array().is_some_and(|entries| {
+                entries
+                    .iter()
+                    .all(|entry| entry.as_str().is_some_and(|name| !name.trim().is_empty()))
+            });
+            if !named {
+                return Err(format!(
+                    "`start.config.{key}` is a list of tool names or patterns, none blank"
+                ));
+            }
+            wire.insert(key.clone(), value.clone());
+            continue;
+        }
         match value {
             Value::Null => continue,
-            // A whole number of 32 bits; a `0` goes on to `admit`, which says it by option.
-            Value::Number(n) if n.as_u64().is_some_and(|n| u32::try_from(n).is_ok()) => {}
+            // A whole number: 32 bits, but `tokenBudget`, which counts tokens and goes to 2^53 − 1.
+            // A `0` goes on to `admit`, which says it by option.
+            Value::Number(n)
+                if n.as_u64().is_some_and(|n| {
+                    if key == "tokenBudget" {
+                        n <= adam_runtime::MAX_SESSION_TOKEN_BUDGET
+                    } else {
+                        u32::try_from(n).is_ok()
+                    }
+                }) => {}
             _ => {
+                let most = if key == "tokenBudget" {
+                    adam_runtime::MAX_SESSION_TOKEN_BUDGET
+                } else {
+                    u64::from(u32::MAX)
+                };
                 return Err(format!(
-                    "`start.config.{key}` is a whole number, at most {}",
-                    u32::MAX
+                    "`start.config.{key}` is a whole number, at most {most}"
                 ));
             }
         }
@@ -1251,7 +1298,7 @@ impl RuntimeTaskBackend {
                         caller,
                         message,
                         inbound,
-                        start,
+                        *start,
                         context_id.map(str::to_owned),
                     )
                     .await?;
@@ -1370,6 +1417,7 @@ impl RuntimeTaskBackend {
             mode: start.mode,
             closed: false,
             closing: false,
+            deleted: false,
             round: 1,
             // A person's session is its own parent: no run opened it, so each round's model calls
             // name the round's own task, which the orchestrator binds as any task it creates
@@ -1385,6 +1433,7 @@ impl RuntimeTaskBackend {
             // What the person asked, admitted by the helper's bounds when the message was read:
             // a replay reads it from here and never recomputes it (ADR 0054 decision 3).
             config: start.config,
+            spent: 0,
         };
         put_header(&mut inbound, &header).map_err(BackendError::InvalidParams)?;
         self.runtime
@@ -1475,6 +1524,16 @@ impl RuntimeTaskBackend {
             }
             if let Some(refusal) = refused_to_the_person(&view) {
                 return Err(refusal);
+            }
+            // A session that spent its token budget takes no more messages (ADR 0054, decision 6),
+            // and the header the view already carries says so: no second store read.
+            if let Some(header) = view.header.as_ref().filter(|h| h.is_spent()) {
+                return Err(BackendError::UnsupportedOperation(format!(
+                    "session {session} has spent its token budget ({} of {} tokens) and takes no \
+                     more messages",
+                    header.spent,
+                    header.token_budget().unwrap_or_default()
+                )));
             }
             let mut inbound = inbound
                 .clone()
@@ -1703,11 +1762,13 @@ fn next_header(view: &SessionView, session: RunId) -> SessionHeader {
         mode: SessionMode::OneShot,
         closed: false,
         closing: false,
+        deleted: false,
         round: 0,
         root: None,
         workspace: None,
         visible: false,
         config: None,
+        spent: 0,
     });
     header.round = view.round + 1;
     // The round before may have been one that only cleaned up after a cancel.
@@ -1732,6 +1793,23 @@ fn put_header(inbound: &mut Inbound, header: &SessionHeader) -> Result<(), Strin
         SESSION_STATE_KEY.to_owned(),
         serde_json::to_value(header).map_err(|e| e.to_string())?,
     );
+    // The tools the config narrows, for the round's agent to hold back (ADR 0054 slice 3): from the
+    // header, never from the message, so a round carries `{}` when the config sets none.
+    let context = payload
+        .entry("context")
+        .or_insert_with(|| Value::Object(Map::new()));
+    if !context.is_object() {
+        *context = Value::Object(Map::new());
+    }
+    if let Some(context) = context.as_object_mut() {
+        context.insert(
+            CONTEXT_SESSION_TOOLS.to_owned(),
+            header
+                .config
+                .as_ref()
+                .map_or_else(|| json!({}), SessionConfig::tools_context),
+        );
+    }
     Ok(())
 }
 
@@ -1906,12 +1984,12 @@ mod tests {
         .unwrap();
         assert_eq!(
             ok,
-            Asked::Start(Start {
+            Asked::Start(Box::new(Start {
                 agent: "planner".into(),
                 description: "Plan it".into(),
                 mode: SessionMode::Open,
                 config: None,
-            })
+            }))
         );
         let default_close = asked(
             &message(Some(
@@ -1922,10 +2000,7 @@ mod tests {
         .unwrap();
         assert!(matches!(
             default_close,
-            Asked::Start(Start {
-                mode: SessionMode::OneShot,
-                ..
-            })
+            Asked::Start(start) if start.mode == SessionMode::OneShot
         ));
         let long = "x".repeat(81);
         for entry in [
@@ -1984,7 +2059,8 @@ mod tests {
     fn a_start_carries_its_config_in_camel_case_admitted_by_the_bounds() {
         let Ok(Asked::Start(start)) = start_with(json!({
             "maxTurns": 20, "maxToolCalls": 100, "maxOutputTokens": 2048,
-            "contextWindow": 60000, "maxParallelToolCalls": 4, "timeLimit": 10, "maxRounds": 5
+            "contextWindow": 60000, "maxParallelToolCalls": 4, "timeLimit": 10, "maxRounds": 5,
+            "tokenBudget": 50000
         })) else {
             panic!("a config within the bounds is admitted");
         };
@@ -1996,6 +2072,7 @@ mod tests {
         assert_eq!(config.max_parallel_tool_calls, Some(4));
         assert_eq!(config.time_limit, Some(10));
         assert_eq!(config.max_rounds, Some(5));
+        assert_eq!(config.token_budget, Some(50_000));
         // No config, a null one and an empty one all mean the folder's settings.
         for entry in [json!(null), json!({})] {
             let Ok(Asked::Start(start)) = start_with(entry) else {
@@ -2027,11 +2104,16 @@ mod tests {
             ("timeLimit", json!(31)),
             ("maxRounds", json!(21)),
             ("maxTurns", json!(0)),
+            // `token_budget` is held to the ADR's own floor and ceiling (1,000 to 2^53 − 1).
+            ("tokenBudget", json!(999)),
+            ("tokenBudget", json!(9_007_199_254_740_992_u64)),
         ] {
             let why = start_with(json!({ member: value })).unwrap_err();
             assert!(why.contains(&format!("start.config.{member}")), "{why}");
             assert!(!why.contains("config.max_"), "no snake_case name: {why}");
         }
+        // 2^53 − 1 itself is admitted: the refusal above is the ceiling, not the type.
+        assert!(start_with(json!({"tokenBudget": 9_007_199_254_740_991_u64})).is_ok());
         for value in [json!(-1), json!("5"), json!(1.5), json!(5_000_000_000_u64)] {
             let why = start_with(json!({"maxTurns": value})).unwrap_err();
             assert!(why.contains("start.config.maxTurns"), "{why}");
@@ -2068,6 +2150,8 @@ mod tests {
         let why = ask(&remote, json!({"maxTurns": 3})).unwrap_err();
         assert!(why.contains("start.config.maxTurns"), "{why}");
         assert!(why.contains("remote"), "{why}");
+        let why = ask(&remote, json!({"tokenBudget": 5_000})).unwrap_err();
+        assert!(why.contains("start.config.tokenBudget"), "{why}");
         let Ok(Asked::Start(start)) = ask(&remote, json!({"timeLimit": 5, "maxRounds": 3})) else {
             panic!("a remote helper takes timeLimit and maxRounds");
         };
@@ -2082,6 +2166,110 @@ mod tests {
             Some(json!({"maxTurns": 3, "timeLimit": 2}))
         );
         assert_eq!(config_value(&SessionConfig::default()), None);
+    }
+
+    #[test]
+    fn a_start_takes_tools_and_deny_tools_as_lists_of_names() {
+        let Ok(Asked::Start(start)) = start_with(json!({
+            "tools": ["read_file", "linear__*"], "denyTools": ["write_file"]
+        })) else {
+            panic!("lists of names are admitted when the bounds know no tools");
+        };
+        let config = start.config.expect("the config is read");
+        assert_eq!(
+            config.tools,
+            Some(vec!["read_file".to_owned(), "linear__*".to_owned()])
+        );
+        assert_eq!(config.deny_tools, Some(vec!["write_file".to_owned()]));
+        assert_eq!(
+            config_value(&config),
+            Some(json!({"tools": ["read_file", "linear__*"], "denyTools": ["write_file"]}))
+        );
+        // The model's snake_case spelling is not the wire's.
+        let why = start_with(json!({"deny_tools": ["x"]})).unwrap_err();
+        assert!(why.contains("start.config.deny_tools"), "{why}");
+        assert!(why.contains("denyTools"), "{why}");
+        for (member, value) in [
+            ("tools", json!("read_file")),
+            ("tools", json!([1])),
+            ("denyTools", json!([" "])),
+            ("denyTools", json!({"a": 1})),
+        ] {
+            let why = start_with(json!({ member: value })).unwrap_err();
+            assert!(why.contains(&format!("start.config.{member}")), "{why}");
+        }
+        let many: Vec<String> = (0..33).map(|n| format!("t{n}")).collect();
+        let why = start_with(json!({"tools": many})).unwrap_err();
+        assert!(
+            why.contains("start.config.tools has 33 entries; at most 32"),
+            "{why}"
+        );
+    }
+
+    #[test]
+    fn a_remote_helper_refuses_tools_and_deny_tools() {
+        let remote = ChildSessions::new(
+            [ChildSessionAgent::new("planner", "root/planner", "Plans").remote()],
+            16,
+        )
+        .unwrap()
+        .with_bounds([("planner".to_owned(), SessionBounds::default())]);
+        for member in ["tools", "denyTools"] {
+            let why = asked(
+                &message(Some(json!({"start": {
+                    "agent": "planner", "description": "d", "config": { member: ["a"] }
+                }}))),
+                &remote,
+            )
+            .unwrap_err();
+            assert!(why.contains(&format!("start.config.{member}")), "{why}");
+            assert!(why.contains("remote"), "{why}");
+        }
+    }
+
+    #[test]
+    fn a_round_carries_the_tools_its_header_narrows_over_what_the_message_said() {
+        assert_eq!(
+            CONTEXT_SESSION_TOOLS,
+            adam_llm_agent::SESSION_TOOLS_CONTEXT_KEY
+        );
+        let header = |config| SessionHeader {
+            id: RunId::new(),
+            agent: "root/planner".into(),
+            description: String::new(),
+            mode: SessionMode::Open,
+            closed: false,
+            closing: false,
+            deleted: false,
+            round: 1,
+            root: None,
+            workspace: None,
+            visible: true,
+            config,
+            spent: 0,
+        };
+        let narrowed = SessionConfig::from_value(json!({"tools": ["a"], "denyTools": ["b"]}))
+            .expect("a config");
+        // The message's own context never sets it: the header's config does.
+        let mut inbound = Inbound::new(
+            "message",
+            json!({"text": "hi", "context": {CONTEXT_SESSION_TOOLS: {"tools": ["*"]}, "x": 1}}),
+        );
+        put_header(&mut inbound, &header(Some(narrowed))).unwrap();
+        assert_eq!(
+            inbound.payload["context"],
+            json!({CONTEXT_SESSION_TOOLS: {"tools": ["a"], "denyTools": ["b"]}, "x": 1})
+        );
+        // A config that sets neither, and no config, write an empty object: a round never
+        // inherits another round's value.
+        for config in [None, Some(SessionConfig::default())] {
+            let mut inbound = Inbound::new("message", json!("hi"));
+            put_header(&mut inbound, &header(config)).unwrap();
+            assert_eq!(
+                inbound.payload["context"],
+                json!({CONTEXT_SESSION_TOOLS: {}})
+            );
+        }
     }
 
     #[test]
@@ -2176,6 +2364,7 @@ mod tests {
                 updated_at: adam_core::store::now(),
             },
             config: None,
+            spent: 0,
         }
     }
 
@@ -2227,11 +2416,13 @@ mod tests {
             mode: SessionMode::Open,
             closed: false,
             closing: false,
+            deleted: false,
             round: 1,
             root: None,
             workspace: None,
             visible: false,
             config: None,
+            spent: 0,
         };
         let mut text = Inbound::new("message", json!("hi"));
         put_header(&mut text, &header).unwrap();

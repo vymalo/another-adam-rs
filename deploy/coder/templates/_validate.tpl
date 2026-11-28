@@ -341,6 +341,18 @@ from service.yaml, which every render contains, so they always run.
 {{- if and .Values.externalSecrets.properties.turnVerifyKeys (not .Values.externalSecrets.properties.turnSigningKey) -}}
 {{- fail "externalSecrets.properties.turnVerifyKeys is set and externalSecrets.properties.turnSigningKey is empty: a verify set without a signing key is never read. Set the key's property, or empty the verify set's" -}}
 {{- end -}}
+{{- /* turnSigning.generate: the key is made in the cluster and pushed, so it is not also pulled. */ -}}
+{{- if .Values.turnSigning.generate.enabled -}}
+{{- if not .Values.externalSecrets.enabled -}}
+{{- fail "turnSigning.generate is on and externalSecrets.enabled=false: a generated key is pushed through the ExternalSecret's store, and there is none" -}}
+{{- end -}}
+{{- if .Values.externalSecrets.properties.turnSigningKey -}}
+{{- fail "turnSigning.generate is on and externalSecrets.properties.turnSigningKey is set: the chart would pull a key and generate one. Empty the property, or turn generate off" -}}
+{{- end -}}
+{{- if not .Values.externalSecrets.key -}}
+{{- fail "turnSigning.generate is on and externalSecrets.key is empty: a generated key is pushed to that AWS secret" -}}
+{{- end -}}
+{{- end -}}
 {{- /* config.modelAuth: MODEL_AUTH, a string, one of key, device or injector (the binary folds case but not whitespace; the chart normalises before rendering). */ -}}
 {{- if not (kindIs "string" .Values.config.modelAuth) -}}
 {{- fail (printf "config.modelAuth must be a string: key, device or injector, or empty for the binary's default (key); got %q" (toString .Values.config.modelAuth)) -}}

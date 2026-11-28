@@ -157,7 +157,9 @@ mod request;
 mod schedule;
 #[cfg(feature = "schema")]
 mod schema;
+mod session_tools;
 mod sessions;
+mod si_memory;
 mod signing;
 mod source;
 mod state;
@@ -206,7 +208,7 @@ pub use conversation::{
     ModelSwitch, OMITTED_MARKER_PREFIX, PER_MESSAGE_CONTEXT_KEYS, PROMPT_STATEMENT_KEY,
     PROTECTED_CONTEXT_KEYS, PendingQuestion, PendingRemote, PendingRun, PendingSession,
     PendingWait, REASONING_EFFORT_CONTEXT_KEY, RENDERER_OFFER_CONTEXT_KEY, Repeats,
-    STOPPED_BY_THE_PERSON, loaded_note, user_message,
+    SESSION_TOOLS_CONTEXT_KEY, STOPPED_BY_THE_PERSON, loaded_note, user_message,
 };
 pub use events::{EmitError, RecordedEvent};
 pub use fn_tool::FnTool;
@@ -243,8 +245,9 @@ pub use sessions::{
     MAX_WORKING_ROUNDS, SESSION_TOOL_TIME_LIMIT, SESSION_TOOLS, SUBAGENT_CLOSE, SUBAGENT_LIST,
     SUBAGENT_READ, SUBAGENT_SEND, SUBAGENT_START, SessionAgent, SessionDefaults, SessionTools,
 };
+pub use si_memory::{SI_MEMORY_GROUP, SI_RECALL, SI_RECORD, SiMemoryHandle, SiRecall, SiRecord};
 pub use source::{
-    DynToolSource, Listing, MAX_SOURCE_TOOLS, SourceCtx, ToolNote, ToolSource, Withheld,
+    Declared, DynToolSource, Listing, MAX_SOURCE_TOOLS, SourceCtx, ToolNote, ToolSource, Withheld,
 };
 pub use state::{Extensions, State, StateKey};
 pub use step_io::StepIo;

@@ -1114,6 +1114,36 @@ async fn on_error_shows_a_failure_says_no_output_and_another_value_is_refused() 
     );
 }
 
+/// Two long outputs of one call are kept under two ids: one must not overwrite the other, and each
+/// reads back as the command that made it (`ToolCtx::with_call_id` gives every part of a call its
+/// own output id).
+#[tokio::test]
+async fn a_batch_keeps_each_long_output_under_its_own_id() {
+    let rig = Rig::new().await;
+    let out = RunChecks
+        .call(
+            &rig.ctx,
+            json!({"commands": ["seq 1 30000", "seq 30001 60000"]}),
+        )
+        .await
+        .unwrap();
+    assert!(!out.is_error, "{}", out.content);
+    let mut ids: Vec<String> = Vec::new();
+    for (at, _) in out.content.match_indices("kept as o-") {
+        let start = at + "kept as ".len();
+        let id: String = out.content[start..].chars().take(18).collect();
+        if !ids.contains(&id) {
+            ids.push(id);
+        }
+    }
+    assert_eq!(ids.len(), 2, "two outputs, two ids: {}", out.content);
+    assert_ne!(ids[0], ids[1], "{}", out.content);
+    let first = rig.read(&ids[0], 1).await.content;
+    let second = rig.read(&ids[1], 1).await.content;
+    assert!(first.starts_with("1\n2\n"), "{first}");
+    assert!(second.starts_with("30001\n30002\n"), "{second}");
+}
+
 #[test]
 fn the_kept_output_of_a_command_is_in_the_value_only_as_text() {
     // The result is plain text: no kept copy rides in the journal.

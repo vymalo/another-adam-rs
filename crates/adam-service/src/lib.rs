@@ -8,6 +8,7 @@ pub mod exit;
 #[cfg(feature = "export")]
 pub mod export;
 pub mod harden;
+pub mod hooks;
 pub mod logging;
 pub mod metrics;
 #[cfg(feature = "mcp")]
@@ -27,6 +28,7 @@ pub use config::{
 pub use exit::{
     EX_CONFIG, EX_GENERAL, EX_OSERR, EX_SOFTWARE, EX_UNAVAILABLE, exit_code, exit_code_with,
 };
+pub use hooks::{HOOKS_ALLOW, HOOKS_FILE, HooksSettings, Program};
 #[cfg(feature = "mcp")]
 pub use prompt_commands::{card_with_commands, refuse_prompt_commands, with_prompt_commands};
 pub use serve::{

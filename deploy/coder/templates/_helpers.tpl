@@ -198,8 +198,64 @@ it, so it is not under coder.runsWorkers. On when the ExternalSecret is enabled 
 property; the chart never carries the key itself.
 */}}
 {{- define "coder.turnSigning" -}}
-{{- if and .Values.externalSecrets.enabled .Values.externalSecrets.properties.turnSigningKey -}}true{{- end -}}
+{{- if include "coder.turnKeyGenerated" . -}}true
+{{- else if and .Values.externalSecrets.enabled .Values.externalSecrets.properties.turnSigningKey -}}true{{- end -}}
 {{- end -}}
+{{/* Whether the turn key is generated in the cluster and pushed, rather than pulled. */}}
+{{- define "coder.turnKeyGenerated" -}}
+{{- if and .Values.externalSecrets.enabled .Values.turnSigning.generate.enabled -}}true{{- end -}}
+{{- end -}}
+{{/*
+The Secret and the PushSecret that hold the key, and the Job that writes it. The first two must keep their name for
+the life of the release (the Secret is what the pods mount); the Job's carries a hash of its pod template (see
+`coder.turnKeyJobHash`). Every one of them stays within 63 characters, the limit a Job's name meets through the
+`job-name` label its pods carry, so the fullname is shortened before the suffix is added rather than after.
+*/}}
+{{- define "coder.turnKeyJobName" -}}{{ printf "%s-turn-key" (include "coder.fullname" . | trunc 54 | trimSuffix "-") }}{{- end -}}
+{{/* The Job's own name: the fullname shortened to 45 so that `-turn-key-<8 hex>` fits in 63. */}}
+{{- define "coder.turnKeyJobResourceName" -}}{{ printf "%s-turn-key-%s" (include "coder.fullname" . | trunc 45 | trimSuffix "-") (include "coder.turnKeyJobHash" .) }}{{- end -}}
+{{/*
+The script the generating Job runs: idempotent, it writes the key only when the Secret holds none.
+It is a helper so that the Job's name can hash it (`coder.turnKeyJobHash`).
+*/}}
+{{- define "coder.turnKeyScript" -}}
+set -eu
+name={{ include "coder.turnKeySecretName" . }}
+if kubectl -n "$NAMESPACE" get secret "$name" -o jsonpath='{.data.private-key\.pem}' 2>/dev/null | grep -q .; then
+  echo "the turn key already exists in $name; nothing to do"
+  exit 0
+fi
+openssl genpkey -algorithm ed25519 -out /tmp/private-key.pem
+kubectl -n "$NAMESPACE" create secret generic "$name" --from-file=private-key.pem=/tmp/private-key.pem --dry-run=client -o yaml \
+  | kubectl -n "$NAMESPACE" apply -f -
+rm -f /tmp/private-key.pem
+{{- end -}}
+{{/*
+The ServiceAccount the generating Job runs as. Its own, not the namespace's `default` and not the coder's: the coder's
+Role deliberately holds no Secret verb (run-pods-rbac.yaml), and the default account is granted nothing.
+*/}}
+{{- define "coder.turnKeyServiceAccountName" -}}{{ printf "%s-turn-key" (include "coder.fullname" . | trunc 54 | trimSuffix "-") }}{{- end -}}
+{{/*
+The Job's name carries a hash of what its pod template holds (the image, the account and the script): a Job's template
+is immutable, so a change makes a **new** Job instead of failing `helm upgrade` with "field is immutable" for as long
+as `ttlSecondsAfterFinished` keeps the finished one. The Secret and the PushSecret keep the stable name above.
+*/}}
+{{- define "coder.turnKeyJobHash" -}}
+{{- printf "%s|%s|%s" .Values.turnSigning.generate.image (include "coder.turnKeyServiceAccountName" .) (include "coder.turnKeyScript" .) | sha256sum | trunc 8 }}
+{{- end -}}
+{{/* The Secret the key lives in: the generated one, or the ExternalSecret's. */}}
+{{- define "coder.turnKeySecretName" -}}
+{{- if include "coder.turnKeyGenerated" . -}}
+{{ include "coder.turnKeyJobName" . }}
+{{- else -}}
+{{ include "coder.secretName" . }}
+{{- end -}}
+{{- end -}}
+{{/* The Secret's key that holds the PEM: `private-key.pem` when generated, `TURN_SIGNING_KEY.pem` when pulled. */}}
+{{- define "coder.turnKeyItemKey" -}}
+{{- if include "coder.turnKeyGenerated" . -}}private-key.pem{{- else -}}TURN_SIGNING_KEY.pem{{- end -}}
+{{- end -}}
+
 {{/* Where the turn key's Secret is mounted. */}}
 {{- define "coder.turnSigningDir" -}}/var/run/secrets/turn-signing{{- end -}}
 {{/* The verify set, when the ExternalSecret also copies one. */}}

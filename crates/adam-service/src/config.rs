@@ -22,6 +22,8 @@
 //! | `MAX_PARALLEL_TOOL_CALLS` | the most tool calls of one model turn that run at the same time, 1 to 32 (`1` is one at a time); an agent file's `limits.max_parallel` may lower it for that agent; read by the roles that run workers ([`WorkerSettings::max_parallel_tool_calls`]), which refuse a bad value; **every role also reads it, leniently** (a bad value is the default and no problem), because a control plane holds a person's `start.config` to the same bound ([`SessionSettings::max_parallel_tool_calls`]) | `10` |
 //! | `MAX_TOOL_CALLS_IN_FLIGHT` | the most tool calls of the whole process that run at the same time, 1 to 256: the process's pool, inside which `MAX_PARALLEL_TOOL_CALLS` still bounds one turn (ADR 0065) | `4` |
 //! | `MAX_RUN_CONTINUATIONS` | the most times `run.ending` hooks may keep one run going, 0 to 20 (ADR 0050); anything else is exit 78 | `3` |
+//! | `ADAM_HOOKS_FILE` | the deployment's hook programs (ADR 0050, slice P2a): a JSON file with `programs`, each `{name, command, args?, env?, agents?, points?, deadlineMs?}`; refused unless `HOOKS_ALLOW_PROGRAMS=true`, and a file under a directory the agent works on is refused ([`HooksSettings`](crate::HooksSettings)) | unset (no program) |
+//! | `HOOKS_ALLOW_PROGRAMS` | `true` lets this process run hook programs at all; a file that names one without it is exit 78 | `false` |
 //! | `MAX_MODEL_CALLS` | the most model calls in flight in the process, 1 to 64 (ADR 0065) | `2` |
 //! | `MAX_PROCESSES` | the most commands (`run`, `run_command`, checks, background commands, language servers) of the whole process at once, 1 to 256; a command waits for a seat, then the tool says so and the run retries (ADR 0065) | `4` |
 //! | `MAX_GIT_PROCESSES` | the most git processes at once, 1 to 64 (ADR 0065) | `2` |
@@ -38,6 +40,7 @@
 //! | `MODEL_AUTH` | `key` (the token of `MODEL_API_KEY`), `device`: the process signs in to an OAuth 2.0 issuer with the device grant and renews its token (ADR 0058, [`ModelConfig::device_grant`]); the code and the link are a `WARN` log line at startup; or `injector`: no key, every model call carries `X-Run-Id: <root run id>` and no `Authorization`, for an injector in front of the model that adds the run's credential (ADR 0067, [`ModelConfig::injected_run`]). With `device` or `injector`, `MODEL_API_KEY` must be unset or empty | `key` |
 //! | `MODEL_PARK_LIMIT` | how long parks on a timer in a row may last, from the first, before the run fails with the last reason: a model call the gateway refused (or could not be reached, with `MODEL_AUTH=injector`) parks the run and is made again (ADR 0067, [`ModelConfig::park_limit`]). Whole seconds, or a number with `s`, `m`, `h` or `d` (`24h`), from 60 s to 30 d; anything else is a startup error | `24h` |
 //! | `MODEL_CA_FILE` | a PEM file of certificates trusted for the model endpoint, beside the default roots (ADR 0067, [`ModelConfig::ca_roots`]); not for the device grant's issuer. A file that cannot be read or holds no certificate is a startup error | unset (the default roots) |
+//! | `RUN_CERT_ISSUER`, `RUN_CERT_ISSUER_URL`, `RUN_CERT_TOKEN_FILE`, `RUN_CERT_CA_FILE`, `RUN_CERT_RENEW_FRACTION` | a run's certificate from the broker ([`RunCertSettings`], ADR 0086): off when all are unset; a half-set configuration is a startup error naming the variable; `broker` is built, `openbao` is refused until A6; the token file is re-read on every call and never logged | off |
 //! | `TURN_SIGNING_KEY_FILE` | a PKCS#8 PEM Ed25519 private key: every model call carries `Turn-Signature`, adam's signature of that request, and `X-Run-Id` (ADR 0068 amended 2026-11-25, [`ModelConfig::turn_keys`]). A file that cannot be read or is not an Ed25519 private key is a startup error | unset (no model call is signed) |
 //! | `TURN_SIGNING_KEY_ID` | the `kid` of those signatures (printable ASCII, at most 256 bytes); needs the key file | the key's RFC 7638 thumbprint |
 //! | `TURN_VERIFY_KEYS_FILE` | a JWKS of earlier public keys and `revoked` ids, read and checked with the key; needs the key file | the key's own public key |
@@ -91,6 +94,7 @@ use std::str::FromStr;
 
 use adam_a2a::CardSigner;
 use adam_a2a::push::PushPolicy;
+use adam_core::turn::{DynRunCertIssuer, RenewFraction, RunKeyring, RunSubject};
 use adam_error::{Classify, ErrorClass};
 use adam_host::Role;
 use adam_model::{
@@ -100,6 +104,7 @@ use adam_model_openai::{
     ExtraRoots, OpenAiCompatible, OpenAiConfig, OpenAiConfigError, ReasoningField,
     endpoint_for_logs,
 };
+use adam_run_cert_broker::{BrokerError, BrokerIssuer};
 use secrecy::SecretString;
 use std::collections::BTreeSet;
 use url::Url;
@@ -262,6 +267,10 @@ pub struct ServiceConfig {
     /// [`DEFAULT_UPLOADS_INLINE_MAX_BYTES`](adam_a2a::DEFAULT_UPLOADS_INLINE_MAX_BYTES). The agent folder's
     /// `limits.max_inline_upload_bytes` wins over it ([`Agents::uploads_inline_max_bytes`](crate::Agents)).
     pub uploads_inline_max_bytes: Option<u64>,
+    /// `ADAM_HOOKS_FILE` and `HOOKS_ALLOW_PROGRAMS`: the deployment's hook programs (ADR 0050, slice
+    /// P2a). Empty unless the file is named and the switch is on. Read by every role; a program is
+    /// started per worker, not here.
+    pub hooks: crate::hooks::HooksSettings,
     /// `MODEL_AUTH=injector` or `TURN_SIGNING_KEY_FILE` set, read by every role (the word only): the
     /// process's model calls carry a message's prompt statement and the person's envelope, so the
     /// card lists `prompt-statement/v1` (ADR 0077; with a turn key the calls are signed and the
@@ -290,6 +299,7 @@ impl std::fmt::Debug for ServiceConfig {
             .field("a2a", &self.a2a)
             .field("sessions", &self.sessions)
             .field("prompt_statement", &self.prompt_statement)
+            .field("hooks", &self.hooks.programs().len())
             .finish()
     }
 }
@@ -412,6 +422,7 @@ impl ServiceConfig {
             retention: crate::retention::RetentionSettings::parse(lookup, problems),
             default_locale,
             uploads_inline_max_bytes,
+            hooks: crate::hooks::HooksSettings::parse(&get, problems),
             prompt_statement: is_injector(lookup)
                 || not_blank(lookup, "TURN_SIGNING_KEY_FILE").is_some(),
         }
@@ -1094,6 +1105,239 @@ impl WorkerSettings {
     }
 }
 
+/// `RUN_CERT_ISSUER`: which adapter of `RunCertIssuer` a run's certificate comes from. A closed
+/// set: `broker` is built; `openbao` is reserved for A6 and refused until then; anything else is a
+/// startup problem naming the variable (exit 78).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RunCertIssuerKind {
+    /// The credential broker's internal route, contract v1 (`adam-run-cert-broker`).
+    Broker,
+    /// The OpenBao issuer (A6): parsed, not built.
+    OpenBao,
+}
+
+impl RunCertIssuerKind {
+    fn parse(raw: &str) -> Option<Self> {
+        match raw.trim() {
+            "broker" => Some(Self::Broker),
+            "openbao" => Some(Self::OpenBao),
+            _ => None,
+        }
+    }
+
+    /// The value `RUN_CERT_ISSUER` holds.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Broker => "broker",
+            Self::OpenBao => "openbao",
+        }
+    }
+}
+
+/// `RUN_CERT_*`: a run's certificate comes from `RUN_CERT_ISSUER_URL`, presenting the projected
+/// token in `RUN_CERT_TOKEN_FILE`, trusting the anchors of `RUN_CERT_CA_FILE` beside the system
+/// roots, and renewing at `RUN_CERT_RENEW_FRACTION` of the leaf's life (ADR 0086, A3).
+///
+/// **Nothing is on unless every required variable is set.** All of them unset is off; any of them
+/// set without `RUN_CERT_ISSUER`, `RUN_CERT_ISSUER_URL` and `RUN_CERT_TOKEN_FILE` is a startup
+/// problem naming the variable (exit 78), because a half-set run certificate would silently sign
+/// with the process turn key instead. `RUN_CERT_CA_FILE` and `RUN_CERT_RENEW_FRACTION` are
+/// optional, but they too are refused without the three required ones.
+///
+/// The token itself is never read here: only its file's path. [`issuer`](Self::issuer) builds one
+/// issuer per run, and [`keyring`](Self::keyring) the run's keyring over it.
+#[derive(Clone)]
+pub struct RunCertSettings {
+    /// `RUN_CERT_ISSUER`: the adapter.
+    pub issuer: RunCertIssuerKind,
+    /// `RUN_CERT_ISSUER_URL`: the broker's base URL, without the route.
+    pub url: String,
+    /// `RUN_CERT_TOKEN_FILE`: the projected token, re-read on every call.
+    pub token_file: std::path::PathBuf,
+    /// `RUN_CERT_CA_FILE`: PEM anchors trusted beside the system roots, read at startup.
+    pub ca_file: Option<std::path::PathBuf>,
+    /// `RUN_CERT_RENEW_FRACTION`: when the run key is replaced, two thirds by default.
+    pub renew_fraction: RenewFraction,
+    http: adam_run_cert_broker::HttpClient,
+}
+
+impl RunCertSettings {
+    /// Read the `RUN_CERT_*` variables. `None` when none is set (run certificates off); a problem
+    /// naming the variable for every missing or malformed one, and `None` too.
+    pub fn parse(
+        lookup: &impl Fn(&str) -> Option<String>,
+        problems: &mut Vec<String>,
+    ) -> Option<Self> {
+        let get = |name: &str| not_blank(lookup, name);
+        let issuer_raw = get("RUN_CERT_ISSUER");
+        let url_raw = get("RUN_CERT_ISSUER_URL");
+        let token_raw = get("RUN_CERT_TOKEN_FILE");
+        let ca_raw = get("RUN_CERT_CA_FILE");
+        let fraction_raw = get("RUN_CERT_RENEW_FRACTION");
+        if [&issuer_raw, &url_raw, &token_raw, &ca_raw, &fraction_raw]
+            .iter()
+            .all(|value| value.is_none())
+        {
+            return None;
+        }
+        let off = "unset every RUN_CERT_* variable to turn run certificates off";
+        let mut complete = true;
+        for (name, value) in [
+            ("RUN_CERT_ISSUER", &issuer_raw),
+            ("RUN_CERT_ISSUER_URL", &url_raw),
+            ("RUN_CERT_TOKEN_FILE", &token_raw),
+        ] {
+            if value.is_none() {
+                problems.push(format!(
+                    "{name} is required when any RUN_CERT_* variable is set ({off})"
+                ));
+                complete = false;
+            }
+        }
+
+        let issuer = issuer_raw
+            .as_deref()
+            .and_then(|raw| match RunCertIssuerKind::parse(raw) {
+                Some(RunCertIssuerKind::Broker) => Some(RunCertIssuerKind::Broker),
+                Some(RunCertIssuerKind::OpenBao) => {
+                    problems
+                        .push("RUN_CERT_ISSUER=openbao is not built yet (A6): set broker".into());
+                    None
+                }
+                None => {
+                    problems.push(format!(
+                        "RUN_CERT_ISSUER is invalid: {raw:?} (broker, or openbao once built)"
+                    ));
+                    None
+                }
+            });
+        let url = url_raw.as_deref().and_then(|raw| {
+            match Url::parse(raw.trim()) {
+                Ok(url)
+                    if matches!(url.scheme(), "http" | "https")
+                        && url.host_str().is_some()
+                        && url.query().is_none()
+                        && url.fragment().is_none() =>
+                {
+                    Some(raw.trim().to_owned())
+                }
+                _ => {
+                    problems.push(
+                        "RUN_CERT_ISSUER_URL must be an absolute http(s) URL with a host, no query and no fragment"
+                            .into(),
+                    );
+                    None
+                }
+            }
+        });
+        let token_file = parse_file(&get, "RUN_CERT_TOKEN_FILE", problems);
+        let ca_file = parse_file(&get, "RUN_CERT_CA_FILE", problems);
+        let mut fraction_ok = true;
+        let renew_fraction = fraction_raw.as_deref().map_or(
+            RenewFraction::TWO_THIRDS,
+            |raw| match parse_renew_fraction(raw.trim()) {
+                Some(fraction) => fraction,
+                None => {
+                    problems.push(format!(
+                        "RUN_CERT_RENEW_FRACTION is invalid: {raw:?} (n/d with 0 < n/d < 1, e.g. 2/3)"
+                    ));
+                    fraction_ok = false;
+                    RenewFraction::TWO_THIRDS
+                }
+            },
+        );
+
+        let (Some(issuer), Some(url), Some(token_file)) = (issuer, url, token_file) else {
+            return None;
+        };
+        if !complete || !fraction_ok || (ca_raw.is_some() && ca_file.is_none()) {
+            return None;
+        }
+        let ca_pem = match ca_file.as_deref() {
+            Some(path) => match read_ca_file(path) {
+                Ok(pem) => Some(pem),
+                Err(why) => {
+                    problems.push(format!("RUN_CERT_CA_FILE is unusable: {why}"));
+                    return None;
+                }
+            },
+            None => None,
+        };
+        let http = match adam_run_cert_broker::http_client(ca_pem.as_deref()) {
+            Ok(http) => http,
+            Err(why) => {
+                problems.push(format!("RUN_CERT_CA_FILE is unusable: {why}"));
+                return None;
+            }
+        };
+        Some(Self {
+            issuer,
+            url,
+            token_file,
+            ca_file,
+            renew_fraction,
+            http,
+        })
+    }
+
+    /// The issuer of `run`: one broker issuer, at the URL and with the token file this
+    /// configuration names.
+    ///
+    /// # Errors
+    ///
+    /// [`BrokerError`] when the URL the configuration accepted cannot make a route.
+    pub fn issuer(&self, run: adam_core::RunId) -> Result<DynRunCertIssuer, BrokerError> {
+        let issuer =
+            BrokerIssuer::with_client(&self.url, &self.token_file, run, self.http.clone())?;
+        Ok(std::sync::Arc::new(issuer))
+    }
+
+    /// The keyring of `subject`'s run: an issuer per run, and the configured renewal fraction.
+    ///
+    /// # Errors
+    ///
+    /// [`BrokerError`] when the URL the configuration accepted cannot make a route.
+    pub fn keyring(&self, subject: RunSubject) -> Result<RunKeyring, BrokerError> {
+        Ok(RunKeyring::new(self.issuer(subject.run())?, subject)
+            .with_renew_fraction(self.renew_fraction))
+    }
+}
+
+impl std::fmt::Debug for RunCertSettings {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RunCertSettings")
+            .field("issuer", &self.issuer)
+            // The broker's address is a deployment secret: scheme and host only, as the model's.
+            .field("url", &endpoint_for_logs(&self.url))
+            .field("token_file", &self.token_file)
+            .field("ca_file", &self.ca_file)
+            .field("renew_fraction", &self.renew_fraction)
+            .finish_non_exhaustive()
+    }
+}
+
+/// `n/d`, both integers, strictly between 0 and 1.
+fn parse_renew_fraction(raw: &str) -> Option<RenewFraction> {
+    let (numerator, denominator) = raw.split_once('/')?;
+    let numerator: u32 = numerator.trim().parse().ok()?;
+    let denominator: u32 = denominator.trim().parse().ok()?;
+    RenewFraction::new(numerator, denominator).ok()
+}
+
+/// The PEM of `path`, capped like the broker's client caps it.
+fn read_ca_file(path: &std::path::Path) -> Result<Vec<u8>, String> {
+    let size = std::fs::metadata(path)
+        .map_err(|e| format!("it cannot be read: {e}"))?
+        .len();
+    if size > adam_run_cert_broker::MAX_CA_PEM_BYTES as u64 {
+        return Err(format!(
+            "it is longer than {} bytes",
+            adam_run_cert_broker::MAX_CA_PEM_BYTES
+        ));
+    }
+    std::fs::read(path).map_err(|e| format!("it cannot be read: {e}"))
+}
+
 /// The model of an LLM agent: an OpenAI-compatible gateway, its key and the alias of the model
 /// (`MODEL_BASE_URL`, `MODEL_API_KEY`, `MODEL`). Read by the roles that run workers.
 #[derive(Clone)]
@@ -1112,6 +1356,10 @@ pub struct ModelConfig {
     /// `MODEL_CA_FILE`: certificates trusted for the model endpoint beside the default roots, read
     /// and checked at startup. `None` when unset.
     pub ca_roots: Option<ExtraRoots>,
+    /// `RUN_CERT_*`: the run's certificate comes from a broker ([`RunCertSettings`], ADR 0086,
+    /// A3). `None` when none of the variables is set: no run certificate, and the process turn
+    /// keys sign every request. A half-set configuration is a startup problem (exit 78).
+    pub run_cert: Option<RunCertSettings>,
     /// `TURN_SIGNING_KEY_FILE` (with `TURN_SIGNING_KEY_ID` and `TURN_VERIFY_KEYS_FILE`): the keys
     /// every model call is signed with ([`adam_model::SignedRequests`], ADR 0068 amended
     /// 2026-11-25), read and checked at startup. `None` when unset: no call is signed.
@@ -1193,6 +1441,7 @@ impl std::fmt::Debug for ModelConfig {
             .field("injected_run", &self.injected_run)
             .field("ca_roots", &self.ca_roots)
             .field("turn_keys", &self.turn_keys)
+            .field("run_cert", &self.run_cert)
             .field("park_limit", &self.park_limit)
             // The members, not their values.
             .field(
@@ -1294,6 +1543,7 @@ impl ModelConfig {
             injected_run,
             ca_roots: parse_ca_file(&get, problems),
             turn_keys: parse_turn_keys(&get, problems),
+            run_cert: RunCertSettings::parse(lookup, problems),
             park_limit: parse_park_limit(&get("MODEL_PARK_LIMIT"), problems),
             alias,
             model_aliases_file,
@@ -3698,6 +3948,187 @@ mod tests {
             "TURN_SIGNING_KEY_ID needs TURN_SIGNING_KEY_FILE"
         ));
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A token file for the `RUN_CERT_*` tests: the path, leaked because `Vars` holds `&'static str`,
+    /// and the directory to remove.
+    fn run_cert_token(name: &str) -> (&'static str, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "adam-service-run-cert-{name}-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let token = dir.join("token");
+        std::fs::write(&token, "a-projected-token\n").unwrap();
+        let path: &'static str = Box::leak(token.display().to_string().into_boxed_str());
+        (path, dir)
+    }
+
+    fn run_cert_complete(token: &'static str) -> Vars {
+        let mut vars = model_vars();
+        vars.insert("RUN_CERT_ISSUER", "broker");
+        vars.insert("RUN_CERT_ISSUER_URL", "https://broker.internal:8443");
+        vars.insert("RUN_CERT_TOKEN_FILE", token);
+        vars
+    }
+
+    #[test]
+    fn run_certificates_are_off_until_every_required_variable_is_set() {
+        let (model, problems) = model_problems(&model_vars());
+        assert!(problems.is_empty(), "{problems:?}");
+        assert!(model.run_cert.is_none(), "off when none is set");
+    }
+
+    #[test]
+    fn a_half_set_run_certificate_names_the_variable_and_is_78() {
+        let (token, dir) = run_cert_token("half-set");
+        for missing in [
+            "RUN_CERT_ISSUER",
+            "RUN_CERT_ISSUER_URL",
+            "RUN_CERT_TOKEN_FILE",
+        ] {
+            let mut vars = run_cert_complete(token);
+            vars.remove(missing);
+            let (model, problems) = model_problems(&vars);
+            assert!(
+                mentions(&problems, missing),
+                "{missing} is not named: {problems:?}"
+            );
+            assert!(model.run_cert.is_none(), "{missing}");
+            let error = ConfigError::check(problems).unwrap_err();
+            assert_eq!(crate::exit_code(&error), 78, "{missing}");
+        }
+        // The optional two alone are half a configuration too, and the three required are named.
+        for (name, value) in [
+            ("RUN_CERT_CA_FILE", token),
+            ("RUN_CERT_RENEW_FRACTION", "2/3"),
+        ] {
+            let mut vars = model_vars();
+            vars.insert(name, value);
+            let (model, problems) = model_problems(&vars);
+            for required in [
+                "RUN_CERT_ISSUER",
+                "RUN_CERT_ISSUER_URL",
+                "RUN_CERT_TOKEN_FILE",
+            ] {
+                assert!(
+                    mentions(&problems, required),
+                    "{name}: {required} is not named: {problems:?}"
+                );
+            }
+            assert!(model.run_cert.is_none(), "{name}");
+            assert_eq!(
+                crate::exit_code(&ConfigError::check(problems).unwrap_err()),
+                78,
+                "{name}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_complete_run_certificate_builds_an_issuer_and_a_keyring_and_hides_the_token() {
+        let (token, dir) = run_cert_token("complete");
+        let vars = run_cert_complete(token);
+        let (model, problems) = model_problems(&vars);
+        assert!(problems.is_empty(), "{problems:?}");
+        let settings = model.run_cert.as_ref().expect("run certificates are on");
+        assert_eq!(settings.issuer, RunCertIssuerKind::Broker);
+        assert_eq!(settings.renew_fraction, RenewFraction::TWO_THIRDS);
+        assert_eq!(settings.token_file, std::path::PathBuf::from(token));
+
+        let run = adam_core::RunId::new();
+        let issuer = settings.issuer(run).expect("the broker issuer");
+        assert_eq!(issuer.kind(), "broker");
+        assert_eq!(format!("{issuer:?}"), "RunCertIssuer(broker)");
+        let keyring = settings
+            .keyring(adam_core::turn::RunSubject::new("st-abc", run).unwrap())
+            .expect("the run's keyring");
+        assert_eq!(keyring.renew_fraction(), RenewFraction::TWO_THIRDS);
+
+        // The token is in the file and in none of the renderings.
+        assert!(
+            std::fs::read_to_string(token)
+                .unwrap()
+                .contains("a-projected-token")
+        );
+        for shown in [format!("{settings:?}"), format!("{model:?}")] {
+            assert!(shown.contains("broker.internal"), "{shown}");
+            assert!(!shown.contains("a-projected-token"), "{shown}");
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn the_run_certificate_issuer_is_a_closed_set() {
+        let (token, dir) = run_cert_token("closed-set");
+        for (value, problem) in [
+            ("openbao", "RUN_CERT_ISSUER=openbao is not built yet"),
+            ("vault", "RUN_CERT_ISSUER is invalid"),
+        ] {
+            let mut vars = run_cert_complete(token);
+            vars.insert("RUN_CERT_ISSUER", value);
+            let (model, problems) = model_problems(&vars);
+            assert!(
+                problems.iter().any(|p| p.starts_with(problem)),
+                "{value}: {problems:?}"
+            );
+            assert!(model.run_cert.is_none(), "{value}");
+            assert_eq!(
+                crate::exit_code(&ConfigError::check(problems).unwrap_err()),
+                78,
+                "{value}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_bad_run_certificate_setting_names_its_variable() {
+        let (token, dir) = run_cert_token("bad-settings");
+        let ca = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../adam-model-openai/tests/fixtures/test-ca.pem");
+        let ca: &'static str = Box::leak(ca.display().to_string().into_boxed_str());
+        let missing = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../adam-model-openai/tests/fixtures/not-here.pem");
+        let missing: &'static str = Box::leak(missing.display().to_string().into_boxed_str());
+
+        for (name, value) in [
+            ("RUN_CERT_ISSUER_URL", "ftp://broker.internal"),
+            ("RUN_CERT_ISSUER_URL", "broker.internal"),
+            ("RUN_CERT_ISSUER_URL", "https://broker.internal/?tenant=1"),
+            ("RUN_CERT_TOKEN_FILE", missing),
+            ("RUN_CERT_CA_FILE", missing),
+            ("RUN_CERT_CA_FILE", token),
+            ("RUN_CERT_RENEW_FRACTION", "0/1"),
+            ("RUN_CERT_RENEW_FRACTION", "1/1"),
+            ("RUN_CERT_RENEW_FRACTION", "2/1"),
+            ("RUN_CERT_RENEW_FRACTION", "2/0"),
+            ("RUN_CERT_RENEW_FRACTION", "2"),
+            ("RUN_CERT_RENEW_FRACTION", "-1/2"),
+        ] {
+            let mut vars = run_cert_complete(token);
+            vars.insert(name, value);
+            let (model, problems) = model_problems(&vars);
+            assert!(mentions(&problems, name), "{name}={value}: {problems:?}");
+            assert!(model.run_cert.is_none(), "{name}={value}");
+            assert_eq!(
+                crate::exit_code(&ConfigError::check(problems).unwrap_err()),
+                78,
+                "{name}={value}"
+            );
+        }
+
+        // A good CA and fraction are read, and the fraction reaches the keyring.
+        let mut vars = run_cert_complete(token);
+        vars.insert("RUN_CERT_CA_FILE", ca);
+        vars.insert("RUN_CERT_RENEW_FRACTION", " 1 / 2 ");
+        let (model, problems) = model_problems(&vars);
+        assert!(problems.is_empty(), "{problems:?}");
+        let settings = model.run_cert.expect("on");
+        assert_eq!(settings.ca_file.as_deref(), Some(std::path::Path::new(ca)));
+        assert_eq!(settings.renew_fraction, RenewFraction::new(1, 2).unwrap());
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

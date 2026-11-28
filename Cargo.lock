@@ -89,7 +89,7 @@ dependencies = [
 
 [[package]]
 name = "adam"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "adam-agent-fs",
  "adam-assembly",
@@ -112,7 +112,7 @@ dependencies = [
 
 [[package]]
 name = "adam-a2a"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "a2a-client-lf",
  "a2a-lf",
@@ -149,7 +149,7 @@ dependencies = [
 
 [[package]]
 name = "adam-a2a-runtime"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "a2a-client-lf",
  "a2a-lf",
@@ -184,7 +184,7 @@ dependencies = [
 
 [[package]]
 name = "adam-acp"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "adam-error",
  "agent-client-protocol",
@@ -201,7 +201,7 @@ dependencies = [
 
 [[package]]
 name = "adam-admission-local"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "adam-admission-testkit",
  "adam-budget",
@@ -213,7 +213,7 @@ dependencies = [
 
 [[package]]
 name = "adam-admission-testkit"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "adam-budget",
  "adam-error",
@@ -222,7 +222,7 @@ dependencies = [
 
 [[package]]
 name = "adam-agent"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "a2a-client-lf",
  "a2a-lf",
@@ -262,7 +262,7 @@ dependencies = [
 
 [[package]]
 name = "adam-agent-fixture"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "adam",
  "adam-agent-fs",
@@ -271,7 +271,7 @@ dependencies = [
 
 [[package]]
 name = "adam-agent-fs"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "adam-budget",
  "adam-error",
@@ -289,7 +289,7 @@ dependencies = [
 
 [[package]]
 name = "adam-assembly"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "a2a-client-lf",
  "a2a-lf",
@@ -329,7 +329,7 @@ dependencies = [
 
 [[package]]
 name = "adam-budget"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "adam-device-state",
  "adam-error",
@@ -340,7 +340,7 @@ dependencies = [
 
 [[package]]
 name = "adam-code-tools"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "adam-admission-local",
  "adam-budget",
@@ -365,7 +365,7 @@ dependencies = [
 
 [[package]]
 name = "adam-code-tools-testkit"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "adam-code-tools",
  "adam-llm-agent",
@@ -378,7 +378,7 @@ dependencies = [
 
 [[package]]
 name = "adam-coder"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "a2a-client-lf",
  "a2a-lf",
@@ -437,7 +437,7 @@ dependencies = [
 
 [[package]]
 name = "adam-confine"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "adam-confine-testkit",
  "adam-workspace",
@@ -451,7 +451,7 @@ dependencies = [
 
 [[package]]
 name = "adam-confine-testkit"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "adam-workspace",
  "tempfile",
@@ -460,7 +460,7 @@ dependencies = [
 
 [[package]]
 name = "adam-core"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "adam-error",
  "async-trait",
@@ -476,25 +476,26 @@ dependencies = [
  "thiserror",
  "tokio",
  "uuid",
+ "x509-cert 0.3.1",
 ]
 
 [[package]]
 name = "adam-device-state"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "adam-device-state-testkit",
 ]
 
 [[package]]
 name = "adam-device-state-testkit"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "adam-device-state",
 ]
 
 [[package]]
 name = "adam-egress"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "adam-error",
  "async-trait",
@@ -510,7 +511,7 @@ dependencies = [
 
 [[package]]
 name = "adam-engine"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "a2a-lf",
  "adam-a2a",
@@ -543,7 +544,7 @@ dependencies = [
 
 [[package]]
 name = "adam-env-kubernetes"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "adam-error",
  "adam-workspace",
@@ -568,14 +569,14 @@ dependencies = [
 
 [[package]]
 name = "adam-error"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "thiserror",
 ]
 
 [[package]]
 name = "adam-export"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "adam-core",
  "adam-error",
@@ -595,7 +596,7 @@ dependencies = [
 
 [[package]]
 name = "adam-export-testkit"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "adam-core",
  "adam-error",
@@ -610,7 +611,7 @@ dependencies = [
 
 [[package]]
 name = "adam-git-sandbox"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "adam-error",
  "base64 0.22.1",
@@ -627,8 +628,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "adam-hook-exec"
+version = "0.7.0"
+dependencies = [
+ "adam-core",
+ "adam-error",
+ "adam-llm-agent",
+ "adam-model",
+ "adam-plugin",
+ "adam-runtime",
+ "async-trait",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "adam-host"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "adam-error",
  "clap",
@@ -642,11 +662,12 @@ dependencies = [
 
 [[package]]
 name = "adam-llm-agent"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "adam-budget",
  "adam-core",
  "adam-error",
+ "adam-memory",
  "adam-model",
  "adam-model-openai",
  "adam-plugin",
@@ -658,6 +679,7 @@ dependencies = [
  "base64 0.22.1",
  "futures",
  "jiff",
+ "jsonschema",
  "proptest",
  "schemars 1.2.2",
  "secrecy",
@@ -667,13 +689,14 @@ dependencies = [
  "thiserror",
  "tokio",
  "tracing",
+ "tracing-subscriber",
  "uuid",
  "wiremock",
 ]
 
 [[package]]
 name = "adam-macros"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -682,7 +705,7 @@ dependencies = [
 
 [[package]]
 name = "adam-mcp"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "adam-agent-fs",
  "adam-core",
@@ -707,7 +730,7 @@ dependencies = [
 
 [[package]]
 name = "adam-mcp-testkit"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "adam-agent-fs",
  "adam-error",
@@ -727,8 +750,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "adam-memory"
+version = "0.7.0"
+dependencies = [
+ "adam-core",
+ "adam-error",
+ "adam-memory-testkit",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "thiserror",
+]
+
+[[package]]
+name = "adam-memory-testkit"
+version = "0.7.0"
+dependencies = [
+ "adam-core",
+ "adam-memory",
+]
+
+[[package]]
 name = "adam-model"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "adam-core",
  "adam-error",
@@ -745,7 +790,7 @@ dependencies = [
 
 [[package]]
 name = "adam-model-oauth"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "adam-model",
  "adam-model-openai",
@@ -762,7 +807,7 @@ dependencies = [
 
 [[package]]
 name = "adam-model-openai"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "adam-core",
  "adam-error",
@@ -789,7 +834,7 @@ dependencies = [
 
 [[package]]
 name = "adam-notify-postgres"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "adam-core",
  "adam-error",
@@ -811,7 +856,7 @@ dependencies = [
 
 [[package]]
 name = "adam-notify-testkit"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "adam-core",
  "adam-runtime",
@@ -820,8 +865,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "adam-otel"
+version = "0.7.0"
+dependencies = [
+ "adam-error",
+ "opentelemetry",
+ "opentelemetry-otlp",
+ "opentelemetry_sdk",
+ "reqwest",
+ "rustls",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "tracing-opentelemetry",
+ "tracing-subscriber",
+ "url",
+]
+
+[[package]]
 name = "adam-plugin"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "adam-error",
  "adam-plugin-testkit",
@@ -831,7 +894,7 @@ dependencies = [
 
 [[package]]
 name = "adam-plugin-testkit"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "adam-error",
  "adam-plugin",
@@ -840,7 +903,7 @@ dependencies = [
 
 [[package]]
 name = "adam-postgres"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "adam-core",
  "adam-error",
@@ -858,8 +921,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "adam-run-cert-broker"
+version = "0.7.0"
+dependencies = [
+ "adam-core",
+ "adam-error",
+ "async-trait",
+ "base64 0.22.1",
+ "futures",
+ "reqwest",
+ "rustls",
+ "secrecy",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "url",
+ "wiremock",
+]
+
+[[package]]
 name = "adam-runtime"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "adam-core",
  "adam-error",
@@ -872,6 +957,7 @@ dependencies = [
  "base64 0.22.1",
  "futures",
  "jiff",
+ "jsonschema",
  "proptest",
  "serde",
  "serde_json",
@@ -879,12 +965,13 @@ dependencies = [
  "thiserror",
  "tokio",
  "tracing",
+ "tracing-subscriber",
  "uuid",
 ]
 
 [[package]]
 name = "adam-schedule"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "adam-agent-fs",
  "adam-core",
@@ -904,7 +991,7 @@ dependencies = [
 
 [[package]]
 name = "adam-service"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "a2a-client-lf",
  "a2a-lf",
@@ -915,6 +1002,7 @@ dependencies = [
  "adam-core",
  "adam-error",
  "adam-export",
+ "adam-hook-exec",
  "adam-host",
  "adam-llm-agent",
  "adam-mcp",
@@ -923,6 +1011,7 @@ dependencies = [
  "adam-model-openai",
  "adam-notify-postgres",
  "adam-postgres",
+ "adam-run-cert-broker",
  "adam-runtime",
  "adam-store-mongodb",
  "adam-store-postgres",
@@ -933,6 +1022,7 @@ dependencies = [
  "rustix",
  "rustls",
  "secrecy",
+ "serde",
  "serde_json",
  "tempfile",
  "thiserror",
@@ -945,10 +1035,12 @@ dependencies = [
 
 [[package]]
 name = "adam-store-mongodb"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "adam-core",
  "adam-error",
+ "adam-memory",
+ "adam-memory-testkit",
  "adam-store-testkit",
  "async-trait",
  "futures",
@@ -962,7 +1054,7 @@ dependencies = [
 
 [[package]]
 name = "adam-store-postgres"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "adam-core",
  "adam-error",
@@ -982,7 +1074,7 @@ dependencies = [
 
 [[package]]
 name = "adam-store-sqlite"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "adam-core",
  "adam-error",
@@ -998,7 +1090,7 @@ dependencies = [
 
 [[package]]
 name = "adam-store-testkit"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "adam-core",
  "async-trait",
@@ -1012,7 +1104,7 @@ dependencies = [
 
 [[package]]
 name = "adam-ui"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "a2a-lf",
  "adam-a2a",
@@ -1039,7 +1131,7 @@ dependencies = [
 
 [[package]]
 name = "adam-workspace"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "adam-admission-local",
  "adam-budget",
@@ -2041,7 +2133,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e7c1832837b905bbfb5101e07cc24c8deddf52f93225eee6ead5f4d63d53ddcb"
 dependencies = [
  "const-oid 0.9.6",
- "der_derive",
+ "der_derive 0.7.3",
+ "flagset",
+ "zeroize",
+]
+
+[[package]]
+name = "der"
+version = "0.8.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6a996a108feb8b427a6e12fcf6af4aa83409b79d72c15337d7741368131ee004"
+dependencies = [
+ "const-oid 0.10.2",
+ "der_derive 0.8.0",
  "flagset",
  "zeroize",
 ]
@@ -2051,6 +2155,17 @@ name = "der_derive"
 version = "0.7.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8034092389675178f570469e6c3b0465d3d30b4505c294a6550db47f3c17ad18"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
+
+[[package]]
+name = "der_derive"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "59600e2c2d636fde9b65e99cc6445ac770c63d3628195ff39932b8d6d7409903"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -2162,6 +2277,7 @@ version = "3.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "29fcf32e6c73d1079f83ab4d782de2d81620346a5f38c6237a86a22f8368980a"
 dependencies = [
+ "pkcs8",
  "signature",
 ]
 
@@ -2173,7 +2289,9 @@ checksum = "6ebaa1a2bf1290ab3bfe5a7b771d050ebffab2711c19a81691c683a5144a25de"
 dependencies = [
  "curve25519-dalek",
  "ed25519",
+ "serde",
  "sha2 0.11.0",
+ "signature",
  "subtle",
  "zeroize",
 ]
@@ -3867,6 +3985,80 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7c87def4c32ab89d880effc9e097653c8da5d6ef28e6b539d313baaacfbafcbe"
 
 [[package]]
+name = "opentelemetry"
+version = "0.33.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8c1f1a6ac9c875a4941e4c7c085b61e8f4daa326de03b4701768c3491a6ad9ee"
+dependencies = [
+ "futures-core",
+ "futures-sink",
+ "js-sys",
+ "pin-project-lite",
+ "thiserror",
+ "tracing",
+]
+
+[[package]]
+name = "opentelemetry-http"
+version = "0.33.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "302249bd8ee804789faaa7b5b2cbf79bc61cb864714079c644e3828af5b7e811"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "http",
+ "opentelemetry",
+ "reqwest",
+]
+
+[[package]]
+name = "opentelemetry-otlp"
+version = "0.33.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0756af24841e367128ef31c831999937b8b5c5197d47914590d8f4e2e88c2e1a"
+dependencies = [
+ "http",
+ "httpdate",
+ "opentelemetry",
+ "opentelemetry-http",
+ "opentelemetry-proto",
+ "opentelemetry_sdk",
+ "prost",
+ "reqwest",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
+name = "opentelemetry-proto"
+version = "0.33.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d576f5dddc3299341bcd85a04be17b2564844c0c9563214f02d85f2524d1afae"
+dependencies = [
+ "opentelemetry",
+ "opentelemetry_sdk",
+ "prost",
+]
+
+[[package]]
+name = "opentelemetry_sdk"
+version = "0.33.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "372a912db2974d1990207006fd0e3aa0ef3fd4ad3be43c65cfaadf2206866061"
+dependencies = [
+ "futures-channel",
+ "futures-executor",
+ "futures-util",
+ "opentelemetry",
+ "percent-encoding",
+ "portable-atomic",
+ "rand 0.9.5",
+ "thiserror",
+ "tokio",
+ "tokio-stream",
+]
+
+[[package]]
 name = "ordered-float"
 version = "2.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4085,6 +4277,16 @@ dependencies = [
  "atomic-waker",
  "fastrand",
  "futures-io",
+]
+
+[[package]]
+name = "pkcs8"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "451913da69c775a56034ea8d9003d27ee8948e12443eae7c038ba100a4f21cb7"
+dependencies = [
+ "der 0.8.3",
+ "spki 0.8.1",
 ]
 
 [[package]]
@@ -5218,6 +5420,9 @@ name = "signature"
 version = "3.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "28d567dcbaf0049cb8ac2608a76cd95ff9e4412e1899d389ee400918ca7537f5"
+dependencies = [
+ "rand_core 0.10.1",
+]
 
 [[package]]
 name = "simd-adler32"
@@ -5276,7 +5481,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d91ed6c858b01f942cd56b37a94b3e0a1798290327d1236e4d9cf4eaca44d29d"
 dependencies = [
  "base64ct",
- "der",
+ "der 0.7.10",
+]
+
+[[package]]
+name = "spki"
+version = "0.8.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7ef958a98b9d5da290cfc78946e9f3e61e1e62a18db0d92cac0b83cc161491a9"
+dependencies = [
+ "base64ct",
+ "der 0.8.3",
 ]
 
 [[package]]
@@ -5621,7 +5836,7 @@ dependencies = [
  "tokio",
  "tokio-postgres",
  "tokio-rustls",
- "x509-cert",
+ "x509-cert 0.2.5",
 ]
 
 [[package]]
@@ -5903,6 +6118,33 @@ checksum = "db97caf9d906fbde555dd62fa95ddba9eecfd14cb388e4f491a66d74cd5fb79a"
 dependencies = [
  "once_cell",
  "valuable",
+]
+
+[[package]]
+name = "tracing-log"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ee855f1f400bd0e5c02d150ae5de3840039a3f54b025156404e34c23c03f47c3"
+dependencies = [
+ "log",
+ "once_cell",
+ "tracing-core",
+]
+
+[[package]]
+name = "tracing-opentelemetry"
+version = "0.34.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0a904802a1b902f43638b677ff2a650847e3b4404101b6c586d648e8c1e3e8fe"
+dependencies = [
+ "js-sys",
+ "opentelemetry",
+ "smallvec",
+ "tracing",
+ "tracing-core",
+ "tracing-log",
+ "tracing-subscriber",
+ "web-time",
 ]
 
 [[package]]
@@ -6716,8 +6958,22 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1301e935010a701ae5f8655edc0ad17c44bad3ac5ce8c39185f75453b720ae94"
 dependencies = [
  "const-oid 0.9.6",
- "der",
- "spki",
+ "der 0.7.10",
+ "spki 0.7.3",
+ "tls_codec",
+]
+
+[[package]]
+name = "x509-cert"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e9f58ad685a2945c7c063f5d69b5c27105d75bb85c740380d8fc64e79a098417"
+dependencies = [
+ "const-oid 0.10.2",
+ "der 0.8.3",
+ "sha1 0.11.0",
+ "signature",
+ "spki 0.8.1",
  "tls_codec",
 ]
 

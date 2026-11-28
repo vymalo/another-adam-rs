@@ -291,6 +291,59 @@ async fn an_undeclared_tool_gets_300_s() {
     assert!(started.elapsed() >= Duration::from_secs(599));
 }
 
+/// A tool whose limit depends on the call's arguments: one second for the tool itself, a minute for
+/// the call this test sends. It takes five seconds, so only the second is a limit it survives.
+struct LimitForArgs;
+
+#[async_trait]
+impl Tool for LimitForArgs {
+    fn spec(&self) -> ToolSpec {
+        spec("slow")
+    }
+
+    fn time_limit(&self) -> Option<Duration> {
+        Some(Duration::from_secs(1))
+    }
+
+    fn time_limit_for(&self, _args: &Value) -> Option<Duration> {
+        Some(Duration::from_secs(60))
+    }
+
+    async fn call(&self, _ctx: &ToolCtx, _args: Value) -> Result<ToolOutput, ToolError> {
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        Ok(ToolOutput::text("woke up"))
+    }
+}
+
+/// The loop asks the limit of the call's arguments, not the tool's own: a tool that gives itself a
+/// second and this call a minute is not cut, and its answer is the result. Red with
+/// `tool.time_limit()` in the loop, where the call is stopped at a second.
+#[tokio::test(start_paused = true)]
+async fn the_loop_asks_the_limit_for_the_calls_arguments() {
+    let mock = Arc::new(MockModel::new());
+    let agent = agent_with(&mock, vec![Arc::new(LimitForArgs)]);
+    mock.push_tool_calls(vec![call("c1", "slow")])
+        .push_text("done");
+    let rt = runtime(
+        &agent,
+        &store(),
+        "w",
+        CollectingSinkOrHold::Collect(CollectingSink::new()),
+    );
+    let run = rt
+        .start("llm", user_message("go"), None)
+        .await
+        .expect("start");
+    let view = finish(&rt, run).await;
+
+    assert_eq!(view.status, RunStatus::Done, "the run goes on");
+    assert_eq!(
+        conversation(&rt, &view).await.messages[2],
+        Message::tool_result("c1", "woke up"),
+        "the call's limit applied, not the tool's own"
+    );
+}
+
 /// Hangs the worker that emits the end of a failed step: the call is journaled, and its result is
 /// not committed yet.
 struct HoldAtStepEnd {

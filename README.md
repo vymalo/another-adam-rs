@@ -64,14 +64,38 @@ library's own plan is [the roadmap](docs/roadmap.md); every setting by surface i
 | | A repository's own environment, as a run pod of its image | ⚠️ | partly: lifecycle commands, `containerEnv` and the pulled digest are not built ([ADR 0052](docs/decisions/0052-no-podman-a-repositorys-own-environment-is-a-run-pod-of-its-image.md)) |
 | | Editing workers, rules per agent, approvals, a check of who the person is, kept repository slots | 📋 | [ADR 0037](docs/decisions/0037-parallel-subagent-calls-and-an-editing-worker.md), [0039](docs/decisions/0039-the-agent-loop-takes-opencodes-structure-and-agents-get-plugins.md), [0072](docs/decisions/0072-the-coder-verifies-who-the-person-is-and-asks-github-before-it-touches-a-repository.md), [0073](docs/decisions/0073-a-conversation-keeps-its-repository-slots.md) |
 | **Deploy** | The image: every binary, static, smoke-tested, pushed | ✅ | [Deploy the coder](docs/guides/deploy-the-coder.md) |
-| | Releases: `X.Y.Z` images and an OCI chart, signed, cut by release-please | ⚠️ | built; no tag has been pushed, and the GitHub App it needs is not set up yet ([Releases](docs/guides/releases.md), [ADR 0084](docs/decisions/0084-releases-are-cut-by-release-please-and-production-pins-a-version.md)) |
+| | Releases: `X.Y.Z` images and an OCI chart, signed, cut by release-please | ⚠️ | built; `v0.6.0` was never published and `v0.7.0`'s release run is queued, so no signed image or chart exists yet ([Releases](docs/guides/releases.md), [ADR 0084](docs/decisions/0084-releases-are-cut-by-release-please-and-production-pins-a-version.md)) |
 | | The Helm chart `deploy/coder` | ⚠️ | renders and goldens in CI; never applied with more than one worker ([chart README](deploy/coder/README.md)) |
 | | Resource governance: admission pools, the OS's limits on a command | ⚠️ | the OS limits are Linux only, and no listener serves the pools' metrics ([ADR 0065](docs/decisions/0065-resource-governance-admission-pools-and-os-limits.md)) |
-| | The activity route for scaling (`GET /internal/activity`) | 🚧 | the route is built, on the main listener behind the A2A tokens; a listener and tokens of its own are being built (ADR 0083, not merged) |
+| | The activity route for scaling (`GET /internal/activity`) | 🚧 | built, with a listener and tokens of its own; no scaler has used it on a cluster (ADR 0083) |
 | | Metrics and traces, off by default | 📋 | proposed ([ADR 0075](docs/decisions/0075-metrics-and-traces-are-off-by-default-and-say-nothing-about-a-person.md)) |
 | | A secret replaced wherever it is a value | ✅ | [ADR 0070](docs/decisions/0070-a-secret-is-replaced-where-it-is-a-value.md) |
 | **Embedded** | `adam-engine`: adam inside an application, on a desktop or a phone | ⚠️ | a chat agent on SQLite, resumed after a kill, with the host's hooks and approvals (a yes runs the call once); phones are type-checked only; a local coding agent, Windows and macOS, and adam as an ACP agent are not built ([ADR 0047](docs/decisions/0047-adam-rs-can-be-embedded-in-an-application.md), [embed in an app](docs/guides/embed-in-an-app.md)) |
 | **Bench** | adam-coder against OpenCode on the same tasks and model | ⚠️ | the dry run passed on Docker; never run against a real model ([ADR 0048](docs/decisions/0048-a-benchmark-harness-for-adam-coder-and-opencode.md), [bench](bench/README.md)) |
+
+## Install `adam-agent`
+
+`adam-agent` is one binary that serves an agent folder over A2A. On macOS or Linux (arm64 or x86_64):
+
+```sh
+brew install vymalo/tap/adam-agent
+adam-agent --version
+```
+
+It needs, to run on a laptop: **an agent folder** (a directory with `agent/instructions.md`, nothing else is
+required: [the smallest agent](docs/guides/write-an-agent.md#the-smallest-agent)), **an OpenAI-compatible model
+endpoint** with its key, and **a bearer token** your client will present. No database server: `DATABASE_URL=sqlite://<file>`
+keeps the runs in one file. Nothing else is read from disk, and nothing is installed beside the binary.
+
+```sh
+mkdir -p my-agent/agent && printf -- '---\nname: chat\ndescription: A chat assistant.\n---\nYou are a helpful assistant.\n' > my-agent/agent/instructions.md
+ADAM_AGENT_DIR=my-agent DATABASE_URL="sqlite://$PWD/adam.db" MODEL_BASE_URL=https://your-gateway.example/v1 MODEL=your-model MODEL_API_KEY=... \
+  A2A_BEARER_TOKENS=dev-token PUBLIC_URL=http://127.0.0.1:8080/ adam-agent    # the card: curl http://127.0.0.1:8080/.well-known/agent-card.json
+```
+
+Every variable: [`adam-agent`'s README](bin/adam-agent/README.md#configuration). The archives, their signed checksums and
+how to verify them are on each [GitHub release](https://github.com/vymalo/another-adam-rs/releases) and in
+[Releases](docs/guides/releases.md#the-adam-agent-binary-and-homebrew). The macOS binaries are not notarized.
 
 ## Try it in five minutes
 
@@ -151,7 +175,7 @@ each step. Any worker can resume a run another one left: [the architecture](docs
 
 - **Roadmap:** the product roadmap to launch, with every open piece of work as an issue, is
   [`ROADMAP.md` in another-agentic-system](https://github.com/vymalo/another-agentic-system/blob/main/ROADMAP.md).
-  The library's own table is [`docs/roadmap.md`](docs/roadmap.md).
+  The library's own roadmap, with what is missing, incomplete and long, is [`docs/roadmap.md`](docs/roadmap.md).
 - **Contributing:** [`CONTRIBUTING.md`](CONTRIBUTING.md). Work on a branch and open a pull request against `main`;
   commits are Conventional Commits; the checks CI runs are in [Testing](docs/guides/testing.md#the-commands-ci-runs).
   Update the matching guide, reference or crate README in the same change as any change to behaviour.

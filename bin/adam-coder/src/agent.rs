@@ -774,6 +774,12 @@ fn limited_ending(
             "repeated call",
             "the same call with the same result, three times in a row".to_owned(),
         ),
+        // The budget is the session's, in its header, not in the run's `Limits`: say what stopped
+        // the run without a number it does not have here (ADR 0054, decision 6).
+        Some(adam_llm_agent::LimitKind::TokenBudget) => (
+            "token budget",
+            "the session spent its token budget".to_owned(),
+        ),
         None => (
             "run",
             format!(
@@ -1830,6 +1836,15 @@ mod tests {
         let repeated = json!({"text": "stuck", "limited": true, "limit": "repeated_call"});
         let error = limited_ending(&repeated, true, &limits).expect("fails");
         assert!(error.starts_with("repeated call limit reached"), "{error}");
+        // The session's own cap (ADR 0054, decision 6): no number, because it is not in the run's
+        // `Limits`.
+        let budget = json!({"text": "half", "limited": true, "limit": "token_budget"});
+        let error = limited_ending(&budget, true, &limits).expect("fails");
+        assert!(error.starts_with("token budget limit reached"), "{error}");
+        assert!(
+            error.contains("the session spent its token budget"),
+            "{error}"
+        );
         let unknown = json!({"text": "half", "limited": true, "limit": "max_budget"});
         let error = limited_ending(&unknown, true, &limits).expect("fails");
         assert!(error.contains("limit: max_budget"), "{error}");
@@ -3718,6 +3733,7 @@ mod tests {
                 call_id: call.to_owned(),
                 command: "cargo test".into(),
                 passed: false,
+                commands: 1,
                 exit_code: Some(101),
                 tail: "test a ... FAILED".into(),
                 tree: None,
@@ -3755,6 +3771,7 @@ mod tests {
                 call_id: call.to_owned(),
                 command: "sleep 9".into(),
                 passed: false,
+                commands: 1,
                 exit_code: None,
                 tail: String::new(),
                 tree: None,
@@ -3822,6 +3839,7 @@ mod tests {
                 call_id: call.to_owned(),
                 command: if scratch { "sh check.sh" } else { "cargo test" }.into(),
                 passed: false,
+                commands: 1,
                 exit_code: Some(1),
                 tail: "boom".into(),
                 tree: None,

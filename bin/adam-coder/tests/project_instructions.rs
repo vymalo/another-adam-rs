@@ -976,7 +976,9 @@ async fn the_prepare_result_survives_a_compaction() {
     // tools, the task and the newest read: a compaction that left the request over it would not be
     // made) and under what it holds after the second read, each by about 3,000 tokens. The fixed part
     // counts the `after_previous` property of every schema (ADR 0049), about 1,500 tokens here.
-    let coder = coder_with_history_and_summaries(&fx, &mock, Arc::new(MemoryStore::new()), 32_500);
+    // Re-measured 2026-11-28 when main's session guide and the `output`, `commands`, `mode` and
+    // `wait` arguments grew the fixed part: the test passes from about 33,500 to about 43,000.
+    let coder = coder_with_history_and_summaries(&fx, &mock, Arc::new(MemoryStore::new()), 36_500);
     let task_text = format!("look at {}", fx.remote_url());
     let (_, run) = submit(&coder, &task_text).await;
     let worker = spawn_worker(&coder);

@@ -126,6 +126,10 @@ impl Tool for Scrubbed {
         self.inner.time_limit()
     }
 
+    fn time_limit_for(&self, args: &Value) -> Option<Duration> {
+        self.inner.time_limit_for(args)
+    }
+
     fn retry_policy(&self) -> Option<adam_runtime::RetryPolicy> {
         self.inner.retry_policy()
     }

@@ -64,7 +64,9 @@ checks that cover it.
 ## 4. Choose the commands
 
 * Prefer **exactly the commands CI runs**, in CI's order (format, lint, types, tests, build).
-  One command per `run_checks` call.
+  Give the independent ones to one `run_checks` call with `commands`: they run at the same time,
+  and the call passes only when all of them do. A check that needs another's output, or writes
+  what another reads, goes in a call of its own, after it.
 * Run only what the repository requires. Not an extra linter you like, not a broader test run
   than CI's.
 * **While you iterate, run the narrowest check that covers the change** (one test file, one test,

@@ -811,11 +811,13 @@ mod tests {
             mode: adam_runtime::SessionMode::Open,
             closed: false,
             closing: false,
+            deleted: false,
             round: 1,
             root: None,
             workspace: None,
             visible: false,
             config: None,
+            spent: 0,
         };
         a_session_with(
             store,

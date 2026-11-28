@@ -61,6 +61,25 @@ fn bound_of(assembly: &Assembly) -> SessionBounds {
     all[0].1.clone()
 }
 
+/// The bounds with the one fact only a worker has taken out: the names of the tools the subagent is
+/// bound with (`tools` and `tools_complete`, ADR 0054 slice 3), which a control plane that binds no
+/// agent does not know. Every number is equal; the tool names are the one thing that is not.
+fn without_tools(bounds: &[(String, SessionBounds)]) -> Vec<(String, SessionBounds)> {
+    bounds
+        .iter()
+        .map(|(name, bound)| {
+            (
+                name.clone(),
+                SessionBounds {
+                    tools: Vec::new(),
+                    tools_complete: false,
+                    ..bound.clone()
+                },
+            )
+        })
+        .collect()
+}
+
 /// Every field, in the order of `SessionBounds`: turns, tool calls, output tokens, window, calls
 /// at once, minutes and rounds.
 fn fields(bound: &SessionBounds) -> (u32, u32, u32, Option<u32>, u32, u32, u32) {
@@ -313,7 +332,7 @@ fn a_definition_computes_the_bounds_a_worker_binds_without_binding() {
             let control_plane = control_plane.session_bounds();
             assert_eq!(
                 control_plane,
-                worker.session_bounds(),
+                without_tools(worker.session_bounds()),
                 "folder {folder:?}, {limits:?}, MAX_PARALLEL_TOOL_CALLS {parallel:?}"
             );
         }
@@ -350,7 +369,10 @@ fn the_roster_of_the_bounds_is_the_workers() {
         .model(Arc::new(MockModel::new()), "m")
         .unwrap();
     let root = root.session_max_parallel(6);
-    assert_eq!(root.session_bounds(), worker.session_bounds());
+    assert_eq!(
+        root.session_bounds(),
+        without_tools(worker.session_bounds())
+    );
     assert_eq!(root.session_bounds().len(), 2);
 
     let alone = def(&[(
@@ -405,7 +427,10 @@ fn the_definitions_parallel_limit_is_the_workers_unless_it_says_another() {
         .model(Arc::new(MockModel::new()), "m")
         .unwrap();
     assert_eq!(bound_of(&worker).max_parallel_tool_calls, 4);
-    assert_eq!(definition.session_bounds(), worker.session_bounds());
+    assert_eq!(
+        definition.session_bounds(),
+        without_tools(worker.session_bounds())
+    );
     let override_ = definition
         .bind(tools(&[]))
         .unwrap()
@@ -413,4 +438,294 @@ fn the_definitions_parallel_limit_is_the_workers_unless_it_says_another() {
         .model(Arc::new(MockModel::new()), "m")
         .unwrap();
     assert_eq!(bound_of(&override_).max_parallel_tool_calls, 7);
+}
+
+/// ADR 0054 slice 3: a worker knows the names of the tools its subagent is bound with, and
+/// `admit` holds `tools` and `deny_tools` to them; a control plane, which binds no agent, knows
+/// none and checks the shape alone.
+#[test]
+fn a_worker_bounds_hold_the_names_of_the_subagents_tools_and_a_definitions_do_not() {
+    let definition = def(&[
+        (
+            "agent/instructions.md",
+            &instructions("name: coder", "You are the root."),
+        ),
+        (
+            "agent/subagents/reviewer.md",
+            &instructions(
+                "description: Reviews a change.\ntools: [read_file, write_file]",
+                "You review.",
+            ),
+        ),
+    ]);
+    let worker = definition
+        .clone()
+        .bind(tools(&["read_file", "write_file", "delete_repository"]))
+        .unwrap()
+        .model(Arc::new(MockModel::new()), "m")
+        .unwrap();
+    let bound = bound_of(&worker);
+    assert_eq!(
+        bound.tools,
+        ["read_file", "write_file"],
+        "only the subagent's own tools, not the root's"
+    );
+    assert!(bound.tools_complete, "no source adds a tool at run time");
+    let asked = |value| SessionConfig::from_value(value).expect("a config");
+    assert!(bound.admit(asked(json!({"tools": ["read_*"]}))).is_ok());
+    let why = bound
+        .admit(asked(json!({"denyTools": ["delete_repository"]})))
+        .expect_err("a tool the subagent has not got");
+    assert_eq!(why.option(), Some("deny_tools"));
+    assert!(
+        why.message()
+            .contains("matches none of the names this agent declares: read_file, write_file"),
+        "{why}"
+    );
+
+    let control_plane = definition.session_bounds().remove(0).1;
+    assert!(control_plane.tools.is_empty() && !control_plane.tools_complete);
+    assert!(
+        control_plane
+            .admit(asked(json!({"denyTools": ["delete_repository"]})))
+            .is_ok(),
+        "a control plane checks the shape only"
+    );
+}
+
+/// A source that offers nothing: what matters is that the agent has one, as both shipped agents do.
+/// It does **not** declare its tools, so it answers the default, [`Declared::Unknown`]
+/// ([`adam_llm_agent::Declared::Unknown`]): a source written before the method existed compiles
+/// untouched (ADR 0054 decision 4).
+struct Quiet;
+
+#[async_trait::async_trait]
+impl adam_llm_agent::ToolSource for Quiet {
+    async fn specs(&self, _ctx: &adam_llm_agent::SourceCtx) -> Vec<adam_model::ToolSpec> {
+        Vec::new()
+    }
+
+    async fn call(
+        &self,
+        _ctx: &adam_llm_agent::ToolCtx,
+        _name: &str,
+        _args: serde_json::Value,
+    ) -> Option<Result<adam_llm_agent::ToolOutput, adam_llm_agent::ToolError>> {
+        None
+    }
+}
+
+/// ADR 0054 slice 3: an agent a source adds tools to at run time has a **known but incomplete** set
+/// of names. A concrete `deny_tools` entry no tool has is refused (a typo is far likelier than a
+/// tool a source adds), and a pattern or a `tools` entry is not checked: a source may add what it
+/// selects, and an allow entry that selects nothing offers nothing.
+#[test]
+fn an_agent_with_a_source_has_an_incomplete_set_that_still_catches_a_deny_typo() {
+    let definition = def(&[
+        (
+            "agent/instructions.md",
+            &instructions("name: coder", "You are the root."),
+        ),
+        (
+            "agent/subagents/reviewer.md",
+            &instructions(
+                "description: Reviews a change.\ntools: [read_file, write_file]",
+                "You review.",
+            ),
+        ),
+    ]);
+    let worker = definition
+        .bind(tools(&["read_file", "write_file"]))
+        .unwrap()
+        .tool_source(Quiet)
+        .model(Arc::new(MockModel::new()), "m")
+        .unwrap();
+    let bound = bound_of(&worker);
+    assert_eq!(bound.tools, ["read_file", "write_file"]);
+    assert!(!bound.tools_complete, "a source adds tools at run time");
+    let asked = |value| SessionConfig::from_value(value).expect("a config");
+    let why = bound
+        .admit(asked(json!({"denyTools": ["write_fil"]})))
+        .expect_err("a typo of a concrete name");
+    assert_eq!(why.option(), Some("deny_tools"));
+    assert!(
+        why.message().contains("matches none of the names this agent declares: read_file, write_file; the agent may get more tools while it runs"),
+        "{why}"
+    );
+    assert!(
+        bound
+            .admit(asked(
+                json!({"tools": ["github__*", "later"], "denyTools": ["later_*", "write_file"]})
+            ))
+            .is_ok(),
+        "a pattern and an allow entry are not checked on an incomplete set"
+    );
+}
+
+/// A source that names every tool it can offer, each once.
+struct Declares(&'static [&'static str]);
+
+#[async_trait::async_trait]
+impl adam_llm_agent::ToolSource for Declares {
+    fn declared(&self) -> adam_llm_agent::Declared {
+        adam_llm_agent::Declared::All(self.0.iter().map(|name| (*name).to_owned()).collect())
+    }
+
+    async fn specs(&self, _ctx: &adam_llm_agent::SourceCtx) -> Vec<adam_model::ToolSpec> {
+        Vec::new()
+    }
+
+    async fn call(
+        &self,
+        _ctx: &adam_llm_agent::ToolCtx,
+        _name: &str,
+        _args: serde_json::Value,
+    ) -> Option<Result<adam_llm_agent::ToolOutput, adam_llm_agent::ToolError>> {
+        None
+    }
+}
+
+/// ADR 0054 decision 4: a source that declares its tools makes the subagent's set **complete**, so a
+/// `tools` entry that matches no tool — a typo, or a pattern nothing has — is refused with the list,
+/// and an entry naming a declared tool is admitted. The declaration joins the bound node's names,
+/// each once.
+///
+/// **This test is red before ANR-1319**, first at the names assertion below (the old
+/// `BoundDef::bound_tool_names` returned the node's own names and never joined a source's
+/// declaration), and then at the completeness line it ended with,
+/// `self.sources.is_empty() && node.sources.is_empty()`: any source at all made the set incomplete,
+/// whatever it declared, so `tools_complete` was `false` here and `a_typo` was admitted.
+#[test]
+fn a_source_that_declares_its_tools_makes_the_set_complete_and_catches_an_allow_typo() {
+    let definition = def(&[
+        (
+            "agent/instructions.md",
+            &instructions("name: coder", "You are the root."),
+        ),
+        (
+            "agent/subagents/reviewer.md",
+            &instructions(
+                "description: Reviews a change.\ntools: [read_file, write_file]",
+                "You review.",
+            ),
+        ),
+    ]);
+    let worker = definition
+        .bind(tools(&["read_file", "write_file"]))
+        .unwrap()
+        // `read_file` again: a declaration that names a tool the node already has adds it once.
+        .tool_source(Declares(&["thread_tool", "read_file"]))
+        .model(Arc::new(MockModel::new()), "m")
+        .unwrap();
+    let bound = bound_of(&worker);
+    assert_eq!(
+        bound.tools,
+        ["read_file", "write_file", "thread_tool"],
+        "the node's names, then what the source declares, each once"
+    );
+    assert!(bound.tools_complete, "every source names its tools");
+
+    let asked = |value| SessionConfig::from_value(value).expect("a config");
+    let why = bound
+        .admit(asked(json!({"tools": ["a_typo"]})))
+        .expect_err("an allow entry matching none of a complete set");
+    assert_eq!(why.option(), Some("tools"));
+    assert!(
+        why.message().contains(
+            "matches none of the names this agent declares: read_file, write_file, thread_tool"
+        ),
+        "{why}"
+    );
+    assert!(
+        !why.message().contains("may get more tools"),
+        "a complete set has no hint about tools a source may add: {why}"
+    );
+    // A pattern is checked too, now that the set is complete.
+    let why = bound
+        .admit(asked(json!({"tools": ["github__*"]})))
+        .expect_err("a pattern matching none of a complete set");
+    assert_eq!(why.option(), Some("tools"));
+    // An entry that names a declared tool is admitted, and one that names only some of them too.
+    assert!(bound.admit(asked(json!({"tools": ["thread_*"]}))).is_ok());
+    assert!(
+        bound
+            .admit(asked(
+                json!({"tools": ["read_file"], "denyTools": ["write_file"]})
+            ))
+            .is_ok()
+    );
+}
+
+/// ADR 0054 decision 4, amended 2026-11-28 (ANR-1390, the owner's answer to ANR-Q155): a
+/// declaration may name a **shape**, and `*__*` is the shape of the tools the thread-tools source
+/// relays from a server a person attached (`<server>__<tool>`). Both shipped agents add that
+/// source, so their helpers' sets are complete: a `tools` entry that selects nothing is refused
+/// with the list (the shape among the names), and one naming a relayed server's tools is admitted.
+/// The shape is joined as a name, once, like a concrete one.
+#[test]
+fn a_source_that_declares_a_shape_makes_the_set_complete_and_admits_a_servers_tools() {
+    let definition = def(&[
+        (
+            "agent/instructions.md",
+            &instructions("name: coder", "You are the root."),
+        ),
+        (
+            "agent/subagents/reviewer.md",
+            &instructions(
+                "description: Reviews a change.\ntools: [read_file, write_file]",
+                "You review.",
+            ),
+        ),
+    ]);
+    let worker = definition
+        .bind(tools(&["read_file", "write_file"]))
+        .unwrap()
+        // `read_file` again: a declaration that names a tool the node already has adds it once, and
+        // a shape is joined the same way.
+        .tool_source(Declares(&["turn_output", "*__*", "read_file"]))
+        .model(Arc::new(MockModel::new()), "m")
+        .unwrap();
+    let bound = bound_of(&worker);
+    assert_eq!(
+        bound.tools,
+        ["read_file", "write_file", "turn_output", "*__*"],
+        "the node's names, then what the source declares, each once"
+    );
+    assert!(bound.tools_complete, "every source names what it can offer");
+
+    let asked = |value| SessionConfig::from_value(value).expect("a config");
+    for entry in ["github__*", "github__search", "*"] {
+        assert!(
+            bound.admit(asked(json!({"tools": [entry]}))).is_ok(),
+            "{entry} selects a declared name or the shape"
+        );
+    }
+    let why = bound
+        .admit(asked(json!({"tools": ["a_typo"]})))
+        .expect_err("an allow entry selecting no name and no shape");
+    assert_eq!(why.option(), Some("tools"));
+    assert!(
+        why.message()
+            .contains("matches none of the names this agent declares: read_file, write_file, turn_output, *__*"),
+        "{why}"
+    );
+    assert!(
+        !why.message().contains("may get more tools"),
+        "a complete set has no hint about tools a source may add: {why}"
+    );
+    // A deny entry is held to the same rule: a relayed server's pattern is admitted, a typo is not.
+    assert!(
+        bound
+            .admit(asked(json!({"denyTools": ["github__*"]})))
+            .is_ok()
+    );
+    let why = bound
+        .admit(asked(json!({"denyTools": ["write_fil"]})))
+        .expect_err("a typo of a concrete deny name");
+    assert_eq!(why.option(), Some("deny_tools"));
+    assert!(
+        why.message()
+            .contains("matches none of the names this agent declares: read_file, write_file, turn_output, *__*"),
+        "{why}"
+    );
 }
