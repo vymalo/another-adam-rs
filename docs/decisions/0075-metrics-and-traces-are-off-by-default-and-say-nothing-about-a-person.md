@@ -130,7 +130,8 @@ half:
 - **Metrics ride the same switch.** `OTEL_EXPORTER_OTLP_ENDPOINT` unset still means nothing is built; set, the same
   `Otel` carries an `SdkMeterProvider` whose periodic reader posts to `{endpoint}/v1/metrics`, on the same runtime.
 - **Recording never blocks a run.** The SDK aggregates in the process, so a measurement cannot wait on an exporter; a
-  failed export is the SDK's internal log line, and shutdown flushes both providers for the same deadline.
+  failed export is the SDK's internal log line, and shutdown flushes both providers, each bounded by
+  `SHUTDOWN_TIMEOUT`.
 - **A label is a type, not a string.** `adam_otel::labels` holds the closed sets — `RunState`, held to
   `adam_core::store::RunStatus` by a test, and a shape-checked `Name` for the names a deployment declares. The shape
   check is **not** a secret filter (a token can have a name's shape: `ghp_0123…` is lower-case, digits and `_`), so

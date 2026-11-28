@@ -120,6 +120,8 @@ The same `Otel` carries the metrics half (ANR-1448). `Otel::meter()` gives the m
 from; a periodic reader on the process's runtime posts to `{endpoint}/v1/metrics` every [`METRICS_INTERVAL`] (15 s),
 with [`EXPORT_TIMEOUT`] for one export. Recording a measurement is the SDK's own aggregation in the process, so it
 never blocks a run, and a failed export is the SDK's internal log line. With no endpoint nothing is built at all.
+A dropped `Otel` without `shutdown()` leaves the reader's interval task on the runtime; `shutdown()` is what
+stops it, and every adam binary calls it before exit.
 
 **Labels are types.** [`labels`] holds the closed sets the instruments use: `RunState` (the four states of
 `adam_core::store::RunStatus`, held to them by a test) and a `Name` for the names a deployment declares (a tool, a

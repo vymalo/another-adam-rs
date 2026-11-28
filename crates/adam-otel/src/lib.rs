@@ -368,7 +368,8 @@ impl Otel {
         self.metrics.meter(SCOPE_NAME)
     }
 
-    /// Flushes the queues and stops the exporters, waiting at most [`SHUTDOWN_TIMEOUT`].
+    /// Flushes the queues and stops the exporters; each provider is bounded by [`SHUTDOWN_TIMEOUT`], so
+    /// the call can wait up to twice it.
     pub fn shutdown(self) {
         let _ = self.metrics.shutdown_with_timeout(SHUTDOWN_TIMEOUT);
         let _ = self.provider.shutdown_with_timeout(SHUTDOWN_TIMEOUT);
@@ -501,6 +502,18 @@ mod tests {
         assert_eq!(
             traces_endpoint("http://collector:4318/v1/traces"),
             "http://collector:4318/v1/traces"
+        );
+        assert_eq!(
+            metrics_endpoint("http://collector:4318/"),
+            "http://collector:4318/v1/metrics"
+        );
+        assert_eq!(
+            metrics_endpoint("http://collector:4318/otlp"),
+            "http://collector:4318/otlp/v1/metrics"
+        );
+        assert_eq!(
+            metrics_endpoint("http://collector:4318/v1/metrics"),
+            "http://collector:4318/v1/metrics"
         );
     }
 
