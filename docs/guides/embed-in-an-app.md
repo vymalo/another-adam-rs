@@ -191,12 +191,16 @@ let engine = Engine::builder(store, agent, model, alias)
     .await?;
 ```
 
-[`EngineBuilder::local_agent`](../../crates/adam-engine/README.md#the-api) opens the directory at `start` and refuses
-an unreadable one with `EngineError::Invalid`. The directory is **never owned, cleaned or restored**: a write stays,
-a command's changes stay, and the run's listing tells the model what a command changed (the listing is the same one
-`PersonDir` keeps for every command; nothing is undone). Reads pass without asking; writes (`write_file`,
-`edit_file`, `apply_patch`) and commands (`run_command`, `run`) park the run in `RunState::AwaitingApproval`. The
-hook's question names the tool, the path (or the patch's paths) or the shell line.
+[`EngineBuilder::local_agent`](../../crates/adam-engine/README.md#the-api) opens the directory at `start` (with
+`PersonDir::new(&path, std::iter::empty::<&str>())`, no `&[]`) and refuses an unreadable one with
+`EngineError::Invalid` (a missing path, a file or a symlink). The directory is **never owned, cleaned or restored**:
+a write stays, a command's changes stay, and the run's listing tells the model what a command changed (the listing is
+the same one `PersonDir` keeps for every command; nothing is undone). Reads pass without asking; writes
+(`write_file`, `edit_file`, `apply_patch`) and commands (`run_command`, `run`) park the run in
+`RunState::AwaitingApproval` always — a missing or empty argument still asks, so the run never bypasses the
+approval. The hook's question names the tool, the path (or the patch's paths — `+++ <component>/<path>` or
+`+++ <path>`, the first component dropped as `git apply -p1` does — up to 8 then "and N more"), or the shell line
+(and, when set, the `cwd`).
 
 The seven tools are the same `adam-code-tools` bodies the coder uses (`read_file`, `read_files`, `write_file`,
 `edit_file`, `apply_patch`, `run_command`, `run`), with the coder's `repo` (slot/repo) argument dropped: a
@@ -210,7 +214,9 @@ the builder the same way you would any host tool or hook.
 
 The example (`crates/adam-engine/examples/chat`) takes the directory as `--dir <path>`. With it, `remember to buy
 milk` writes `notes.txt` (after the host's `/approve`), and `ls` runs (after the host's `/approve`); without it,
-the example is the chat-only one.
+the example is the chat-only one. The embedded tree now carries `adam-code-tools`, `adam-macros` and
+`adam-llm-agent`'s `schema` feature; `tools/embedded-deps/check.sh` is the gate (no binary refers to
+`adam_llm_agent::__private::schemars`).
 
 ## Not there yet
 

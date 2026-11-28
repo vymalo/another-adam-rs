@@ -281,7 +281,8 @@ impl EngineBuilder {
     }
 
     /// A local agent over the person's directory `dir` (ADR 0047 slice 7): adds the file and
-    /// command tools of [`adam-code-tools`] to the catalog (every read, write, edit, patch,
+    /// command tools of [`adam-code-tools`](https://github.com/vymalo/another-adam-rs/blob/main/crates/adam-code-tools)
+    /// to the catalog (every read, write, edit, patch,
     /// `run_command` and `run` over a [`PersonDir`]), and a hook that asks the person before every
     /// write or command — reads are never asked. The host answers with the existing
     /// [`Engine::approve`](crate::Engine::approve); the call's tool and the arguments the request

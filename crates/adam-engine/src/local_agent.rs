@@ -1,5 +1,6 @@
 //! The local agent over a person's directory (ADR 0047 slice 7, part 2): the file and command
-//! tools of [`adam-code-tools`] over a [`PersonDir`], with a host-side hook that asks before every
+//! tools of [`adam-code-tools`](https://github.com/vymalo/another-adam-rs/blob/main/crates/adam-code-tools)
+//! over a [`PersonDir`], with a host-side hook that asks before every
 //! write or command.
 //!
 //! The builder option [`EngineBuilder::local_agent`](crate::EngineBuilder::local_agent) adds this
@@ -27,10 +28,18 @@ use adam_macros::tool;
 /// What the local agent's hook asks: writes (file tools that change a file, `apply_patch` included)
 /// and commands (`run_command`, `run`). Reads never ask.
 ///
+/// The hook is fail-closed: every one of the five mutating tools returns `Verdict::Ask` always — even
+/// when its argument is missing or empty, so a script the model writes without a path cannot write
+/// to whatever path the tool would pick on its own. The question names what it can and degrades
+/// gracefully, so the person reads the surface and the run never bypasses the approval.
+///
 /// A yes runs the call once, with the existing [`Engine::approve`](crate::Engine::approve); a no
 /// refuses it. The call's `tool` and the arguments the host reads are shown through
 /// [`EngineBuilder::step_io`](crate::EngineBuilder::step_io), never the raw arguments.
 pub struct AsksBeforeWritingOrCommand;
+
+/// The longest list of patch paths the question names before saying "and N more".
+const PATHS_IN_QUESTION: usize = 8;
 
 impl Plugin for AsksBeforeWritingOrCommand {
     fn name(&self) -> &str {
@@ -40,75 +49,72 @@ impl Plugin for AsksBeforeWritingOrCommand {
     fn before_tool(&self, call: &mut HookedCall<'_>) -> HookResult {
         let question = match call.tool {
             // File writes — every path that changes, named, so the person reads what the run
-            // would touch.
-            "write_file" => {
-                let path = call
-                    .arguments
-                    .get("path")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("");
-                if path.is_empty() {
-                    return Ok(Verdict::Continue);
+            // would touch. A missing or empty path still asks: the tool would write somewhere, and
+            // the person reads the question before approving a name the model did not name.
+            "write_file" => match call
+                .arguments
+                .get("path")
+                .and_then(serde_json::Value::as_str)
+                .filter(|p| !p.is_empty())
+            {
+                Some(path) => format!("Write the file `{path}` in the person's directory?"),
+                None => format!(
+                    "Write a file in the person's directory? The model did not name a path."
+                ),
+            },
+            "edit_file" => match call
+                .arguments
+                .get("path")
+                .and_then(serde_json::Value::as_str)
+                .filter(|p| !p.is_empty())
+            {
+                Some(path) => format!("Edit the file `{path}` in the person's directory?"),
+                None => {
+                    format!("Edit a file in the person's directory? The model did not name a path.")
                 }
-                format!("Write the file `{path}` in the person's directory?")
-            }
-            "edit_file" => {
-                let path = call
-                    .arguments
-                    .get("path")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("");
-                if path.is_empty() {
-                    return Ok(Verdict::Continue);
-                }
-                format!("Edit the file `{path}` in the person's directory?")
-            }
+            },
             "apply_patch" => {
+                // A patch may touch several paths; name the ones it names, the path after `+++`,
+                // whatever the first component is. `git apply` defaults to `-p1`, so the first
+                // component is dropped — keep it the same way.
                 let patch = call
                     .arguments
                     .get("patch")
                     .and_then(serde_json::Value::as_str)
                     .unwrap_or("");
-                // A patch may touch several paths; name the ones it names (the first line of each
-                // hunk header), so the person reads the surface, not the diff.
-                let paths: Vec<&str> = patch
-                    .lines()
-                    .filter_map(|line| line.strip_prefix("+++ b/"))
-                    .take(8)
-                    .collect();
-                if paths.is_empty() {
-                    return Ok(Verdict::Continue);
+                let names = patch_paths(patch);
+                if let Some(named) = listed_paths(&names) {
+                    named
+                } else {
+                    format!("Apply a patch in the person's directory? The patch names no file.")
                 }
-                format!(
-                    "Apply a patch to {} file(s) in the person's directory ({})?",
-                    paths.len(),
-                    paths.join(", ")
-                )
             }
-            // Commands — the shell line, so the person reads what the run would run.
-            "run_command" => {
+            // Commands — the shell line, so the person reads what the run would run, and the cwd
+            // when one is set.
+            "run_command" | "run" => {
+                let tool = call.tool;
                 let command = call
                     .arguments
                     .get("command")
                     .and_then(serde_json::Value::as_str)
                     .unwrap_or("");
-                if command.is_empty() {
-                    return Ok(Verdict::Continue);
-                }
-                format!("Run a command in the person's directory: `{command}`?")
-            }
-            "run" => {
-                let command = call
+                let cwd = call
                     .arguments
-                    .get("command")
+                    .get("cwd")
                     .and_then(serde_json::Value::as_str)
-                    .unwrap_or("");
+                    .filter(|c| !c.is_empty());
+                let in_dir = match cwd {
+                    Some(cwd) => format!("in `{cwd}` of the person's directory"),
+                    None => "in the person's directory".to_owned(),
+                };
                 if command.is_empty() {
-                    return Ok(Verdict::Continue);
+                    format!(
+                        "Run a command {in_dir} with `{}`? The model did not name a command.",
+                        tool
+                    )
+                } else {
+                    format!("Run a command {in_dir} with `{tool}`: `{command}`?")
                 }
-                format!(
-                    "Run a command in the person's directory (it may change files): `{command}`?"
-                )
             }
             // Reads — `read_file`, `read_files`, and any future read-only tool the host adds.
             _ => return Ok(Verdict::Continue),
@@ -117,8 +123,61 @@ impl Plugin for AsksBeforeWritingOrCommand {
     }
 }
 
-/// The local agent's tools, over `State<PersonDir>`. The bodies are [`adam-code-tools`]', with the
-/// coder's `repo` argument dropped (`PersonDir` has one place).
+/// The paths a patch names, one per `+++ <path>` line, with `git apply`'s `-p1` already applied
+/// (the first `/`-separated component dropped when there is one).
+///
+/// The lines are read as the model's bytes are read: a `+++ b/<path>` line is parsed the same way
+/// `git apply` parses it, so the names in the question match the names git applies. A path
+/// component the model wrote without a leading directory (an exact `+++ <path>`) is left alone.
+fn patch_paths(patch: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for line in patch.lines() {
+        let Some(rest) = line.strip_prefix("+++ ") else {
+            continue;
+        };
+        // `git diff` writes `+++ b/<path>`; a model may also write `+++ x/<path>`. The leading
+        // `b/` (or whatever) is a label, not part of the path, and `git apply -p1` drops the first
+        // component. Strip it when the rest has one, keep the rest otherwise.
+        let path = rest.trim();
+        let stripped = match path.split_once('/') {
+            Some((_label, rest)) => rest,
+            None => path,
+        };
+        if stripped.is_empty() {
+            continue;
+        }
+        if !out.iter().any(|p| p == stripped) {
+            out.push(stripped.to_owned());
+        }
+    }
+    out
+}
+
+/// The names of the paths the question names, with "and N more" past [`PATHS_IN_QUESTION`].
+fn listed_paths(names: &[String]) -> Option<String> {
+    if names.is_empty() {
+        return None;
+    }
+    let shown = names
+        .iter()
+        .take(PATHS_IN_QUESTION)
+        .cloned()
+        .collect::<Vec<_>>();
+    let rest = names.len().saturating_sub(shown.len());
+    let mut line = format!(
+        "Apply a patch to {} file(s) in the person's directory ({})?",
+        names.len(),
+        shown.join(", ")
+    );
+    if rest > 0 {
+        line.push_str(&format!(" and {rest} more"));
+    }
+    Some(line)
+}
+
+/// The local agent's tools, over `State<PersonDir>`. The bodies are
+/// [`adam-code-tools`](https://github.com/vymalo/another-adam-rs/blob/main/crates/adam-code-tools)',
+/// with the coder's `repo` argument dropped (`PersonDir` has one place).
 ///
 /// A tool that names `State<PersonDir>` declares the type in its generated `required_state`, so
 /// [`crate::EngineBuilder::local_agent`] failing to register the directory is a build error, not a
@@ -139,7 +198,6 @@ impl Plugin for AsksBeforeWritingOrCommand {
     path = "path",
     crate = ::adam_llm_agent
 )]
-#[allow(clippy::too_many_arguments)] // the model's arguments, one each
 pub async fn read_file(
     person: State<PersonDir>,
     ctx: &ToolCtx,
@@ -325,4 +383,243 @@ pub fn tool_set() -> adam_llm_agent::ToolSet {
 /// The hook the local agent installs: asks before every write or command, lets reads through.
 pub fn plugin() -> Arc<dyn Plugin> {
     Arc::new(AsksBeforeWritingOrCommand)
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    /// Build a `HookedCall` with `tool` and `arguments` JSON for the hook to inspect.
+    fn build_call<'a>(tool: &'a str, arguments: &'a mut serde_json::Value) -> HookedCall<'a> {
+        HookedCall { tool, arguments }
+    }
+
+    /// Drive the hook with `tool` and `arguments` and unwrap the `Verdict::Ask(question)`.
+    fn ask(tool: &str, arguments: &mut serde_json::Value) -> String {
+        let plugin = AsksBeforeWritingOrCommand;
+        let mut call = build_call(tool, arguments);
+        let verdict = plugin.before_tool(&mut call).expect("the hook returns Ok");
+        match verdict {
+            Verdict::Ask(q) => q,
+            other => panic!("expected Ask, got {other:?}"),
+        }
+    }
+
+    /// `write_file` parks with the path when one is given; still parks (with a graceful
+    /// question) when the path is missing or empty.
+    #[test]
+    fn write_file_asks_when_path_is_present_missing_or_empty() {
+        let mut args = json!({ "path": "notes.txt", "content": "hi\n" });
+        let q = ask("write_file", &mut args);
+        assert!(
+            q.contains("`notes.txt`") && q.contains("Write"),
+            "the question names the path: {q}"
+        );
+
+        let mut args = json!({ "content": "hi\n" });
+        let q = ask("write_file", &mut args);
+        assert!(
+            q.contains("Write") && q.contains("did not name a path"),
+            "a missing path still asks, gracefully: {q}"
+        );
+
+        let mut args = json!({ "path": "", "content": "hi\n" });
+        let q = ask("write_file", &mut args);
+        assert!(
+            q.contains("Write") && q.contains("did not name a path"),
+            "an empty path still asks, gracefully: {q}"
+        );
+    }
+
+    /// `edit_file` parks with the path when one is given; still parks when the path is missing or
+    /// empty.
+    #[test]
+    fn edit_file_asks_when_path_is_present_missing_or_empty() {
+        let mut args = json!({ "path": "notes.txt", "old": "a", "new": "b" });
+        let q = ask("edit_file", &mut args);
+        assert!(
+            q.contains("`notes.txt`") && q.contains("Edit"),
+            "the question names the path: {q}"
+        );
+
+        let mut args = json!({ "old": "a", "new": "b" });
+        let q = ask("edit_file", &mut args);
+        assert!(
+            q.contains("Edit") && q.contains("did not name a path"),
+            "a missing path still asks: {q}"
+        );
+
+        let mut args = json!({ "path": "", "old": "a", "new": "b" });
+        let q = ask("edit_file", &mut args);
+        assert!(
+            q.contains("Edit") && q.contains("did not name a path"),
+            "an empty path still asks: {q}"
+        );
+    }
+
+    /// `apply_patch` parks with the patch's paths; the first component is stripped (the way
+    /// `git apply -p1` strips it). Still parks when no path parses or the patch is missing.
+    #[test]
+    fn apply_patch_asks_with_paths_stripped_like_git_apply_p1() {
+        let patch = "--- a/notes.txt\n\
+                     +++ a/notes.txt\n\
+                     @@ -1 +1 @@\n\
+                     -old\n\
+                     +new\n";
+        let mut args = json!({ "patch": patch });
+        let q = ask("apply_patch", &mut args);
+        assert!(
+            q.contains("notes.txt"),
+            "the question names the path with the first component stripped: {q}"
+        );
+
+        // An arbitrary first component (the bug the test for BLOCKING 1.1 catches).
+        let patch = "--- x/notes.txt\n\
+                     +++ x/notes.txt\n\
+                     @@ -1 +1 @@\n\
+                     -old\n\
+                     +new\n";
+        let mut args = json!({ "patch": patch });
+        let q = ask("apply_patch", &mut args);
+        assert!(
+            q.contains("notes.txt") && !q.contains("x/notes.txt"),
+            "the arbitrary `x/` is stripped: {q}"
+        );
+
+        // A patch without `+++ ` lines.
+        let patch = "@@ -1 +1 @@\n-old\n+new\n";
+        let mut args = json!({ "patch": patch });
+        let q = ask("apply_patch", &mut args);
+        assert!(
+            q.contains("patch") && q.contains("did not name"),
+            "a patch without `+++ ` still asks, gracefully: {q}"
+        );
+
+        // A patch the model did not send.
+        let mut args = json!({});
+        let q = ask("apply_patch", &mut args);
+        assert!(
+            q.contains("patch") && q.contains("did not name"),
+            "a missing patch still asks: {q}"
+        );
+    }
+
+    /// `run_command` parks with the command and (when set) the cwd; still parks when the command
+    /// is missing or empty.
+    #[test]
+    fn run_command_asks_with_command_and_optional_cwd() {
+        let mut args = json!({ "command": "ls -la" });
+        let q = ask("run_command", &mut args);
+        assert!(
+            q.contains("`ls -la`") && q.contains("run_command"),
+            "the question names the command: {q}"
+        );
+
+        let mut args = json!({ "command": "ls -la", "cwd": "sub" });
+        let q = ask("run_command", &mut args);
+        assert!(
+            q.contains("`sub`") && q.contains("`ls -la`"),
+            "the cwd and command are both named: {q}"
+        );
+
+        let mut args = json!({ "cwd": "sub" });
+        let q = ask("run_command", &mut args);
+        assert!(
+            q.contains("`sub`") && q.contains("did not name a command"),
+            "a missing command still asks: {q}"
+        );
+
+        let mut args = json!({ "command": "" });
+        let q = ask("run_command", &mut args);
+        assert!(
+            q.contains("did not name a command"),
+            "an empty command still asks: {q}"
+        );
+    }
+
+    /// `run` parks with the command and the tool's own name; still parks when the command is
+    /// missing or empty.
+    #[test]
+    fn run_asks_with_command_and_optional_cwd() {
+        let mut args = json!({ "command": "npm install" });
+        let q = ask("run", &mut args);
+        assert!(
+            q.contains("`npm install`") && q.contains("`run`"),
+            "the question names the command and the tool: {q}"
+        );
+
+        let mut args = json!({ "command": "npm install", "cwd": "ui" });
+        let q = ask("run", &mut args);
+        assert!(
+            q.contains("`ui`") && q.contains("`npm install`"),
+            "the cwd and command are both named: {q}"
+        );
+
+        let mut args = json!({ "cwd": "ui" });
+        let q = ask("run", &mut args);
+        assert!(
+            q.contains("`ui`") && q.contains("did not name a command"),
+            "a missing command still asks: {q}"
+        );
+    }
+
+    /// `read_file` and `read_files` never park: a read passes without asking.
+    #[test]
+    fn reads_never_ask() {
+        let plugin = AsksBeforeWritingOrCommand;
+
+        let mut args = json!({ "path": "notes.txt" });
+        let mut call = build_call("read_file", &mut args);
+        let verdict = plugin.before_tool(&mut call).expect("the hook returns Ok");
+        assert!(
+            matches!(verdict, Verdict::Continue),
+            "read_file is Continue: got {verdict:?}"
+        );
+
+        let mut args = json!({ "paths": ["a.txt", "b.txt"] });
+        let mut call = build_call("read_files", &mut args);
+        let verdict = plugin.before_tool(&mut call).expect("the hook returns Ok");
+        assert!(
+            matches!(verdict, Verdict::Continue),
+            "read_files is Continue: got {verdict:?}"
+        );
+    }
+
+    /// A patch with more than `PATHS_IN_QUESTION` paths names the first eight and says "and N more".
+    #[test]
+    fn apply_patch_truncates_the_paths_list_with_an_and_n_more() {
+        let mut patch = String::new();
+        for i in 0..(PATHS_IN_QUESTION + 3) {
+            patch.push_str(&format!("--- a/file_{i}.txt\n+++ a/file_{i}.txt\n"));
+        }
+        let mut args = json!({ "patch": patch });
+        let q = ask("apply_patch", &mut args);
+        let expected_total = PATHS_IN_QUESTION + 3;
+        assert!(
+            q.contains(&format!("{expected_total} file(s)")),
+            "the question names the total: {q}"
+        );
+        assert!(q.contains("and 3 more"), "the question names the rest: {q}");
+        // The first eight are listed in order, not the rest.
+        assert!(
+            q.contains("file_0.txt") && q.contains("file_7.txt"),
+            "the first eight are listed: {q}"
+        );
+        assert!(
+            !q.contains("file_8.txt"),
+            "the rest are summarised, not listed: {q}"
+        );
+    }
+
+    /// The hook's `name` is the plugin's own identifier.
+    #[test]
+    fn the_hook_has_a_name() {
+        assert_eq!(
+            AsksBeforeWritingOrCommand.name(),
+            "asks-before-writing-or-command"
+        );
+    }
 }

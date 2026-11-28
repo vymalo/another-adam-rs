@@ -13,8 +13,10 @@
 //! [`CommandGuard::settle`] consumes the guard and
 //! `after_run` is given no guard: the guard writes what it saw into a map keyed by the place, and
 //! `after_run` reads that entry once and **clears** it, so a command that never reaches its report
-//! cannot leak into the next one. One command is taken per place at a time (the tools run one per
-//! turn), and two places have two keys.
+//! cannot leak into the next one. The invariant — **one command at a time per place** — is
+//! enforced, not described: [`guard`](CommandWorkspace::guard) refuses with the message the tool
+//! appends to its error result when a second guard is taken for a place that already has one open,
+//! and the first guard's entry is left untouched so its report settles as it would have.
 //!
 //! Paths stay confined to the place by the crate's rule: the place is opened once
 //! ([`SlotDir::open`]) and every path a tool uses is checked against it by the tools themselves.
@@ -213,6 +215,14 @@ impl CommandWorkspace for PersonDir {
 
     /// A guard that watches the place **to report it, never to undo it**: a person's directory is
     /// never restored ([ADR 0047], decision 8).
+    ///
+    /// The guard is **exclusive**: when another guard for the same place is still open, this
+    /// returns the refusal the model reads (the tool appends `refusal_note`) and leaves the first
+    /// guard's entry untouched, so its report settles as it would have. The first guard is taken
+    /// until [`Recorded::settle`] (its drop) runs, which is exactly one command's life — two guards
+    /// for the same place would race over the listing's `Seen` and corrupt the report.
+    ///
+    /// [ADR 0047]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0047-adam-rs-can-be-embedded-in-an-application.md
     async fn guard(
         &self,
         _ctx: &ToolCtx,
@@ -226,6 +236,12 @@ impl CommandWorkspace for PersonDir {
         };
         {
             let mut seen = self.seen.lock().unwrap_or_else(|e| e.into_inner());
+            if seen.contains_key(&key) {
+                return Err(format!(
+                    "a command is already running in `{}`; wait for it to finish",
+                    place.name()
+                ));
+            }
             seen.insert(
                 key.clone(),
                 Seen {
@@ -396,4 +412,98 @@ fn report(before: &Listing, after: &Listing, cut: bool) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use std::sync::Arc;
+
+    use adam_llm_agent::ToolCtx;
+    use adam_runtime::NoopSink;
+
+    use super::*;
+    use crate::commands::Guarding;
+
+    /// A person's directory on disk, the one place it owns, returned as the [`Place`] the tools get.
+    fn rig() -> (tempfile::TempDir, Place) {
+        let dir = tempfile::tempdir().unwrap();
+        let place = Place::new(PLACE, GitAt::directory(dir.path()).unwrap());
+        (dir, place)
+    }
+
+    fn ctx() -> ToolCtx {
+        ToolCtx::detached("guard-test", "c1", Arc::new(NoopSink))
+    }
+
+    /// Two guards for the same place: the first settles `Unchanged`, the second is refused.
+    /// The first guard's report is not lost — `after_run` settles it `Unchanged`.
+    #[tokio::test]
+    async fn a_second_guard_for_the_same_place_is_refused() {
+        let (_dir, place) = rig();
+        let person = PersonDir::new(place.path(), std::iter::empty::<&str>()).unwrap();
+
+        let first = person
+            .guard(&ctx(), &place, Guarding::Look)
+            .await
+            .expect("the first guard is taken");
+        let second = match person.guard(&ctx(), &place, Guarding::Look).await {
+            Ok(_) => panic!("the second guard is refused"),
+            Err(reason) => reason,
+        };
+        assert!(
+            second.contains("already running"),
+            "the refusal names the reason: {second}"
+        );
+
+        // The first guard settles `Unchanged`: nothing changed in the directory between guard and
+        // settle, so the listing it took still matches.
+        let settled = first.settle().await;
+        assert_eq!(settled, Settled::Unchanged);
+
+        // The refusal left the entry untouched, so `after_run` reads it once, settles the report,
+        // and clears it.
+        let report = person.after_run(&ctx(), &place).await.unwrap();
+        assert!(
+            report.is_empty(),
+            "the report is empty: nothing changed: {report:?}"
+        );
+
+        // A fresh guard is taken now: the entry was cleared, so a second command can start.
+        let third = person
+            .guard(&ctx(), &place, Guarding::Look)
+            .await
+            .expect("a guard after `after_run` is taken");
+        let settled = third.settle().await;
+        assert_eq!(settled, Settled::Unchanged);
+    }
+
+    /// A change between guard and settle settles `FilesChanged`; the report names the file the
+    /// command added, the entry is cleared, and a second guard after that is taken.
+    #[tokio::test]
+    async fn a_changing_command_settles_files_changed_and_a_second_guard_is_taken() {
+        let (dir, place) = rig();
+        let person = PersonDir::new(place.path(), std::iter::empty::<&str>()).unwrap();
+
+        let guard = person
+            .guard(&ctx(), &place, Guarding::Make)
+            .await
+            .expect("the guard is taken");
+        // The command runs and adds a file.
+        std::fs::write(dir.path().join("by_test.txt"), "hello\n").unwrap();
+        let settled = guard.settle().await;
+        assert_eq!(settled, Settled::FilesChanged);
+        let report = person.after_run(&ctx(), &place).await.unwrap();
+        assert!(
+            report.contains("added 1") && report.contains("by_test.txt"),
+            "the report names the file the command added: {report:?}"
+        );
+
+        let again = person
+            .guard(&ctx(), &place, Guarding::Look)
+            .await
+            .expect("after the report, a new guard is taken");
+        let settled = again.settle().await;
+        assert_eq!(settled, Settled::Unchanged);
+    }
 }

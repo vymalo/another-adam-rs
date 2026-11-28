@@ -4,7 +4,7 @@ For people: [Embed adam in an application](../../../docs/guides/embed-in-an-app.
 the code each claim stands on, the invariants to check and the proofs. It covers the approvals of ADR 0047 slice 5
 and the local agent of slice 7 part 2; the rest of the engine's evidence is in `crates/adam-engine/README.md` (*Tests*).
 Checked on 2026-11-27 on the branch that built slice 5, over ADR 0050 slice H8, and on 2026-11-28 on the branch that
-built the local agent.
+built the local agent (re-cited after the asking hook became fail-closed and the guard became exclusive).
 
 ## Approvals: where the code is
 
@@ -60,10 +60,10 @@ class), and `crates/adam-engine/tests/example.rs` `the_example_asks_before_savin
 
 | Claim | Code |
 |---|---|
-| the builder option `EngineBuilder::local_agent(dir)` adds file and command tools on top of the screen's tools | `EngineBuilder::local_agent` (`crates/adam-engine/src/engine.rs:286`); the path is opened at `start` (`:423`) and shared with the tools as `State<PersonDir>` (`:450`); the `ToolSet` of the local agent's seven tools (`crates/adam-engine/src/local_agent.rs:319`) is appended to the host's (`:602`) |
-| reads pass without asking; writes and commands ask | `AsksBeforeWritingOrCommand::before_tool` (`crates/adam-engine/src/local_agent.rs:48`); reads (`read_file`, `read_files`) fall through to `Verdict::Continue`, the five mutating tools return `Verdict::Ask` with the path or command as the question |
-| the directory is never owned, cleaned or restored | `PersonDir`'s `CodeWorkspace::after_write` returns empty (`crates/adam-code-tools/src/person.rs:186`) and its guard settles `FilesChanged` or `Unchanged`, never `Undone` (`crates/adam-code-tools/src/person.rs:269`) |
-| the same `Engine::approve` answers the ask | the hook is appended to the host's `HookSet` (`crates/adam-engine/src/engine.rs:603`); the run parks as `RunState::AwaitingApproval` and is answered as any other hook (the approvals of slice 5) |
+| the builder option `EngineBuilder::local_agent(dir)` adds file and command tools on top of the screen's tools | `EngineBuilder::local_agent` (`crates/adam-engine/src/engine.rs:300`); the path is opened at `start` (`:368`) and shared with the tools as `State<PersonDir>` (`:452`); the `ToolSet` of the local agent's seven tools (`crates/adam-engine/src/local_agent.rs:377`) is appended to the host's (`:441`) |
+| reads pass without asking; writes and commands ask | `AsksBeforeWritingOrCommand::before_tool` (`crates/adam-engine/src/local_agent.rs:49`); reads (`read_file`, `read_files`) fall through to `Verdict::Continue`, the five mutating tools return `Verdict::Ask` always (a missing or empty argument still asks, so the run never bypasses the approval); the question names the path or command, with `cwd` for the command tools, and the patch's paths (`+++ <component>/<path>` or `+++ <path>`, the first component dropped as `git apply -p1` does) up to 8 then "and N more" |
+| the directory is never owned, cleaned or restored | `PersonDir`'s `CodeWorkspace::after_write` returns empty (`crates/adam-code-tools/src/person.rs:188`) and its guard settles `FilesChanged` or `Unchanged`, never `Undone` (`crates/adam-code-tools/src/person.rs:287`); the guard is exclusive — a second guard for the same place is refused with the message the tool appends to its error, leaving the first guard's entry untouched |
+| the same `Engine::approve` answers the ask | the hook is appended to the host's `HookSet` (`crates/adam-engine/src/engine.rs:442`); the run parks as `RunState::AwaitingApproval` and is answered as any other hook (the approvals of slice 5) |
 
 ## Local agent: the proofs
 
@@ -71,9 +71,28 @@ class), and `crates/adam-engine/tests/example.rs` `the_example_asks_before_savin
 
 | Test | Holds | Red against |
 |---|---|---|
-| `a_yes_writes_the_file_and_nothing_restores_it` (`:81`) | a yes on a scripted `write_file` writes the file, the file is on disk with the content, and after `shutdown` (engine dropped) the file is still there | a `restore` that puts the file back; a snapshot undo |
-| `a_refusal_does_not_write_the_file` (`:135`) | a no on the same scripted `write_file` does not create the file | the hook returning `Continue` (the red proof, see `without_the_asking_hook_a_write_runs_without_approval`) |
-| `a_read_does_not_ask` (`:180`) | a scripted `read_file` runs to `Done` with no `RunInfo::approval`; no `ApprovalAsked` is asked | the hook returning `Ask` for reads |
-| `a_yes_runs_the_command_and_a_refusal_does_not` (`:206`) | a `run_command` parks on an ask; a yes runs the command and the file appears; a refusal leaves it absent | a `restore` that puts the file back; the hook returning `Continue` |
-| `an_approval_for_a_run_that_awaits_none_is_refused` (`:281`) | `approve` of a finished run is `Rejected` (`ErrorClass::Rejected`) | no check that the run awaits |
-| `without_the_asking_hook_a_write_runs_without_approval` (`:334`) | with `AlwaysContinue` as the only hook (the local agent's asking hook is not installed), the same `write_file` runs without ever parking: the run goes straight to `Done`, the file exists | `Verdict::Continue` refused |
+| `a_yes_writes_the_file_and_nothing_restores_it` (`:155`) | a yes on a scripted `write_file` writes the file, the file is on disk with the content, and after `shutdown` (engine dropped) the file is still there | a `restore` that puts the file back; a snapshot undo |
+| `a_refusal_does_not_write_the_file` (`:203`) | a no on the same scripted `write_file` does not create the file | the hook returning `Continue` (the red proof, see `without_the_asking_hook_a_write_runs_without_approval`) |
+| `a_read_does_not_ask` (`:238`) | a scripted `read_file` runs to `Done` with no `RunInfo::approval`; no `ApprovalAsked` is asked | the hook returning `Ask` for reads |
+| `a_yes_runs_the_command_and_a_refusal_does_not` (`:262`) | a `run_command` parks on an ask; a yes runs the command and the file appears; a refusal leaves it absent | a `restore` that puts the file back; the hook returning `Continue` |
+| `an_approval_for_a_run_that_awaits_none_is_refused` (`:318`) | `approve` of a finished run is `Rejected` (`ErrorClass::Rejected`) | no check that the run awaits |
+| `without_the_asking_hook_a_write_runs_without_approval` (`:722`) | with `AlwaysContinue` as the only hook (the local agent's asking hook is not installed), the same `write_file` runs without ever parking: the run goes straight to `Done`, the file exists | `Verdict::Continue` refused |
+
+The hook's fail-closed behaviour, the patch's `-p1` paths, and the `read_files` non-ask: covered by the
+integration tests `an_apply_patch_with_an_arbitrary_first_component_still_asks`,
+`an_edit_file_asks_and_a_refusal_does_not_edit`, `an_apply_patch_asks_and_a_refusal_does_not_apply`,
+`a_run_asks_and_a_refusal_does_not_run`, `a_read_files_does_not_ask` and the bogus-directory checks for
+a file and a symlink (`a_bogus_directory_is_refused_at_start`). Unit tests for the hook itself (a
+`HookedCall` is built with `tool` and `arguments` JSON) live in `crates/adam-engine/src/local_agent.rs`'s
+test module: each of the five mutating tools parks with the path or command named, even when its
+argument is missing or empty; `read_file` and `read_files` never park; a patch of more than eight
+paths names the first eight and says "and N more".
+
+## Local agent: PersonDir's guard
+
+`crates/adam-code-tools/src/person.rs`:
+
+| Test | Holds | Red against |
+|---|---|---|
+| `a_second_guard_for_the_same_place_is_refused` (`:442`) | a second guard for the same place is refused with the message the tool appends to its error result, leaving the first guard's entry untouched: it settles `Unchanged`, `after_run` reads it once and clears it, and a fresh guard is taken | `guard` overwriting the entry instead of refusing |
+| `a_changing_command_settles_files_changed_and_a_second_guard_is_taken` (`:484`) | a command that adds a file settles `FilesChanged`, the report names the file, the entry is cleared, and a second guard is taken | the report leaking into the next command; `Unchanged` for a real change |

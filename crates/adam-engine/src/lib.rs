@@ -71,9 +71,6 @@ pub use types::{
     SessionState, StartSession, Turn,
 };
 
-#[doc(hidden)]
-pub use adam_code_tools::PersonDir;
-
 use std::sync::Arc;
 
 use adam_core::{DynSecretSource, NoSecrets};

@@ -102,6 +102,42 @@ fn run_command_call(id: &str, command: &str) -> ToolCall {
     }
 }
 
+fn edit_file_call(id: &str, path: &str, old: &str, new: &str) -> ToolCall {
+    ToolCall {
+        id: id.into(),
+        name: "edit_file".into(),
+        arguments: json!({ "path": path, "old": old, "new": new }),
+        ..Default::default()
+    }
+}
+
+fn apply_patch_call(id: &str, patch: &str) -> ToolCall {
+    ToolCall {
+        id: id.into(),
+        name: "apply_patch".into(),
+        arguments: json!({ "patch": patch }),
+        ..Default::default()
+    }
+}
+
+fn run_call(id: &str, command: &str) -> ToolCall {
+    ToolCall {
+        id: id.into(),
+        name: "run".into(),
+        arguments: json!({ "command": command }),
+        ..Default::default()
+    }
+}
+
+fn read_files_call(id: &str, paths: &[&str]) -> ToolCall {
+    ToolCall {
+        id: id.into(),
+        name: "read_files".into(),
+        arguments: json!({ "paths": paths }),
+        ..Default::default()
+    }
+}
+
 async fn shutdown(engine: Engine) {
     timeout(WAIT, engine.shutdown())
         .await
@@ -295,6 +331,295 @@ async fn an_approval_for_a_run_that_awaits_none_is_refused() {
 }
 
 // ---------------------------------------------------------------------------
+// 5b. Decisive for BLOCKING 1: apply_patch with an arbitrary first component
+// still parks; a refusal leaves the file absent.
+// ---------------------------------------------------------------------------
+
+/// `git apply` defaults to `-p1`, so a patch spelled `--- x/<path>` / `+++ x/<path>` applies and
+/// writes `<path>`. Without the asking hook's failure-closed behaviour, that patch would land
+/// without the person ever being asked. With it, the run parks on `AwaitingApproval`, and a
+/// refusal leaves the file absent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_apply_patch_with_an_arbitrary_first_component_still_asks() {
+    let dir = tempfile::tempdir().unwrap();
+    // The patch uses an arbitrary first component (`x/`): `git apply -p1` strips it and writes
+    // `arbitrary.txt`.
+    let patch = "--- x/arbitrary.txt\n\
+                 +++ x/arbitrary.txt\n\
+                 @@ -1 +1 @@\n\
+                 -old\n\
+                 +new\n";
+    let mock = MockModel::new();
+    mock.push_tool_calls(vec![apply_patch_call("c1", patch)])
+        .push_text("I patched it.");
+    let engine = rig(dir.path(), mock).await;
+
+    let turn = engine.send(None, Say::new("patch it")).await.unwrap();
+    let parked = wait_for(&engine, turn.run, RunState::AwaitingApproval).await;
+    let approval = parked
+        .approval
+        .as_ref()
+        .expect("the run is parked on the asking hook");
+    assert_eq!(approval.tool, "apply_patch");
+    // The question names the path the patch would write (`arbitrary.txt`), with the leading `x/`
+    // stripped — the same way `git apply` would strip it.
+    assert!(
+        approval.question.contains("arbitrary.txt"),
+        "the question names the patch's path: {}",
+        approval.question
+    );
+    let call_id = approval.call_id.clone();
+    engine
+        .approve(turn.run, &call_id, Decision::refuse_because("not now"))
+        .await
+        .expect("the no is taken");
+    wait_for(&engine, turn.run, RunState::Done).await;
+
+    // The file the patch would have created is absent: a refused call never ran.
+    let on_disk = dir.path().join("arbitrary.txt");
+    assert!(
+        !on_disk.exists(),
+        "the patch's file should not exist: {}",
+        on_disk.display()
+    );
+    shutdown(engine).await;
+}
+
+// ---------------------------------------------------------------------------
+// 5c. The hook asks for `edit_file` and a refusal does not edit
+// ---------------------------------------------------------------------------
+
+/// `edit_file` parks the run on an ask; a yes edits the file in place; a refusal leaves the
+/// file unchanged (the new text is absent).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_edit_file_asks_and_a_refusal_does_not_edit() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = "notes.txt";
+    std::fs::write(dir.path().join(path), "old line\n").unwrap();
+
+    // Yes
+    let mock_yes = MockModel::new();
+    mock_yes
+        .push_tool_calls(vec![edit_file_call("c1", path, "old line\n", "new line\n")])
+        .push_text("edited it");
+    let engine_yes = rig(dir.path(), mock_yes).await;
+    let turn_yes = engine_yes.send(None, Say::new("edit it")).await.unwrap();
+    let parked_yes = wait_for(&engine_yes, turn_yes.run, RunState::AwaitingApproval).await;
+    let approval_yes = parked_yes.approval.as_ref().unwrap();
+    assert_eq!(approval_yes.tool, "edit_file");
+    assert!(
+        approval_yes.question.contains(path),
+        "the question names the file: {}",
+        approval_yes.question
+    );
+    engine_yes
+        .approve(
+            turn_yes.run,
+            &approval_yes.call_id.clone(),
+            Decision::Approve,
+        )
+        .await
+        .unwrap();
+    wait_for(&engine_yes, turn_yes.run, RunState::Done).await;
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join(path)).unwrap(),
+        "new line\n",
+        "the edit landed"
+    );
+    shutdown(engine_yes).await;
+
+    // Refusal
+    let dir_no = tempfile::tempdir().unwrap();
+    std::fs::write(dir_no.path().join(path), "old line\n").unwrap();
+    let mock_no = MockModel::new();
+    mock_no
+        .push_tool_calls(vec![edit_file_call("c1", path, "old line\n", "new line\n")])
+        .push_text("I did not edit it.");
+    let engine_no = rig(dir_no.path(), mock_no).await;
+    let turn_no = engine_no.send(None, Say::new("edit it")).await.unwrap();
+    let parked_no = wait_for(&engine_no, turn_no.run, RunState::AwaitingApproval).await;
+    let approval_no = parked_no.approval.as_ref().unwrap();
+    engine_no
+        .approve(
+            turn_no.run,
+            &approval_no.call_id.clone(),
+            Decision::refuse_because("no"),
+        )
+        .await
+        .unwrap();
+    wait_for(&engine_no, turn_no.run, RunState::Done).await;
+    assert_eq!(
+        std::fs::read_to_string(dir_no.path().join(path)).unwrap(),
+        "old line\n",
+        "the file is unchanged after a refusal"
+    );
+    shutdown(engine_no).await;
+}
+
+// ---------------------------------------------------------------------------
+// 5d. The hook asks for `apply_patch` and a refusal does not apply
+// ---------------------------------------------------------------------------
+
+/// `apply_patch` parks the run on an ask; a yes applies the patch; a refusal leaves the file
+/// unchanged.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_apply_patch_asks_and_a_refusal_does_not_apply() {
+    let patch = "--- a/notes.txt\n\
+                 +++ b/notes.txt\n\
+                 @@ -1 +1 @@\n\
+                 -old\n\
+                 +new\n";
+
+    // Yes
+    let dir_yes = tempfile::tempdir().unwrap();
+    std::fs::write(dir_yes.path().join("notes.txt"), "old\n").unwrap();
+    let mock_yes = MockModel::new();
+    mock_yes
+        .push_tool_calls(vec![apply_patch_call("c1", patch)])
+        .push_text("patched it");
+    let engine_yes = rig(dir_yes.path(), mock_yes).await;
+    let turn_yes = engine_yes.send(None, Say::new("patch it")).await.unwrap();
+    let parked_yes = wait_for(&engine_yes, turn_yes.run, RunState::AwaitingApproval).await;
+    let approval_yes = parked_yes.approval.as_ref().unwrap();
+    assert_eq!(approval_yes.tool, "apply_patch");
+    assert!(
+        approval_yes.question.contains("notes.txt"),
+        "the question names the file: {}",
+        approval_yes.question
+    );
+    engine_yes
+        .approve(
+            turn_yes.run,
+            &approval_yes.call_id.clone(),
+            Decision::Approve,
+        )
+        .await
+        .unwrap();
+    wait_for(&engine_yes, turn_yes.run, RunState::Done).await;
+    assert_eq!(
+        std::fs::read_to_string(dir_yes.path().join("notes.txt")).unwrap(),
+        "new\n",
+        "the patch landed"
+    );
+    shutdown(engine_yes).await;
+
+    // Refusal
+    let dir_no = tempfile::tempdir().unwrap();
+    std::fs::write(dir_no.path().join("notes.txt"), "old\n").unwrap();
+    let mock_no = MockModel::new();
+    mock_no
+        .push_tool_calls(vec![apply_patch_call("c1", patch)])
+        .push_text("I did not patch it.");
+    let engine_no = rig(dir_no.path(), mock_no).await;
+    let turn_no = engine_no.send(None, Say::new("patch it")).await.unwrap();
+    let parked_no = wait_for(&engine_no, turn_no.run, RunState::AwaitingApproval).await;
+    let approval_no = parked_no.approval.as_ref().unwrap();
+    engine_no
+        .approve(
+            turn_no.run,
+            &approval_no.call_id.clone(),
+            Decision::refuse_because("no"),
+        )
+        .await
+        .unwrap();
+    wait_for(&engine_no, turn_no.run, RunState::Done).await;
+    assert_eq!(
+        std::fs::read_to_string(dir_no.path().join("notes.txt")).unwrap(),
+        "old\n",
+        "the file is unchanged after a refusal"
+    );
+    shutdown(engine_no).await;
+}
+
+// ---------------------------------------------------------------------------
+// 5e. The hook asks for `run` and a refusal does not run
+// ---------------------------------------------------------------------------
+
+/// `run` parks the run on an ask; a yes runs the command and the file appears; a refusal leaves
+/// the directory unchanged.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_run_asks_and_a_refusal_does_not_run() {
+    // Yes
+    let dir_yes = tempfile::tempdir().unwrap();
+    let mock_yes = MockModel::new();
+    mock_yes
+        .push_tool_calls(vec![run_call("c1", "touch by_run_yes.txt")])
+        .push_text("ran it");
+    let engine_yes = rig(dir_yes.path(), mock_yes).await;
+    let turn_yes = engine_yes.send(None, Say::new("run it")).await.unwrap();
+    let parked_yes = wait_for(&engine_yes, turn_yes.run, RunState::AwaitingApproval).await;
+    let approval_yes = parked_yes.approval.as_ref().unwrap();
+    assert_eq!(approval_yes.tool, "run");
+    assert!(
+        approval_yes.question.contains("touch by_run_yes.txt"),
+        "the question names the command: {}",
+        approval_yes.question
+    );
+    engine_yes
+        .approve(
+            turn_yes.run,
+            &approval_yes.call_id.clone(),
+            Decision::Approve,
+        )
+        .await
+        .unwrap();
+    wait_for(&engine_yes, turn_yes.run, RunState::Done).await;
+    assert!(
+        dir_yes.path().join("by_run_yes.txt").exists(),
+        "the command's file should exist"
+    );
+    shutdown(engine_yes).await;
+
+    // Refusal
+    let dir_no = tempfile::tempdir().unwrap();
+    let mock_no = MockModel::new();
+    mock_no
+        .push_tool_calls(vec![run_call("c1", "touch by_run_no.txt")])
+        .push_text("I did not run it.");
+    let engine_no = rig(dir_no.path(), mock_no).await;
+    let turn_no = engine_no.send(None, Say::new("run it")).await.unwrap();
+    let parked_no = wait_for(&engine_no, turn_no.run, RunState::AwaitingApproval).await;
+    let approval_no = parked_no.approval.as_ref().unwrap();
+    engine_no
+        .approve(
+            turn_no.run,
+            &approval_no.call_id.clone(),
+            Decision::refuse_because("no"),
+        )
+        .await
+        .unwrap();
+    wait_for(&engine_no, turn_no.run, RunState::Done).await;
+    assert!(
+        !dir_no.path().join("by_run_no.txt").exists(),
+        "the command's file should not exist"
+    );
+    shutdown(engine_no).await;
+}
+
+// ---------------------------------------------------------------------------
+// 5f. `read_files` does not ask
+// ---------------------------------------------------------------------------
+
+/// A scripted `read_files` runs to completion with no approval: the run ends `Done`, the host
+/// never saw an `ApprovalAsked` for the call.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_read_files_does_not_ask() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.txt"), "a\n").unwrap();
+    std::fs::write(dir.path().join("b.txt"), "b\n").unwrap();
+    let mock = MockModel::new();
+    mock.push_tool_calls(vec![read_files_call("c1", &["a.txt", "b.txt"])])
+        .push_text("read them");
+    let engine = rig(dir.path(), mock).await;
+
+    let turn = engine.send(None, Say::new("read them")).await.unwrap();
+    let done = wait_for(&engine, turn.run, RunState::Done).await;
+    assert_eq!(done.approval, None);
+    assert_eq!(done.output.as_deref(), Some("read them"));
+    shutdown(engine).await;
+}
+
+// ---------------------------------------------------------------------------
 // 6. Exposed pieces
 // ---------------------------------------------------------------------------
 
@@ -319,22 +644,58 @@ fn tool_set_and_plugin_are_exposed() {
     assert_eq!(plugin.name(), "asks-before-writing-or-command");
 }
 
-/// A bogus directory is refused at `start` with `Invalid`.
+/// A bogus directory — a missing path, a file, a symlink — is refused at `start` with `Invalid`.
 #[tokio::test]
 async fn a_bogus_directory_is_refused_at_start() {
     let mock = MockModel::new();
     let model: DynModel = Arc::new(mock);
     let store: DynStore = Arc::new(MemoryStore::new());
-    let bogus = std::path::PathBuf::from("/this/path/does/not/exist/anywhere");
-    let err = Engine::builder(store, agent(), model, "m")
-        .local_agent(&bogus)
+
+    // A missing path.
+    let missing = std::path::PathBuf::from("/this/path/does/not/exist/anywhere");
+    let err = Engine::builder(store.clone(), agent(), model.clone(), "m")
+        .local_agent(&missing)
         .start()
         .await
         .expect_err("start refuses a missing directory");
     assert!(
         matches!(err, EngineError::Invalid(_)),
-        "expected Invalid, got {err:?}"
+        "expected Invalid for missing path, got {err:?}"
     );
+
+    // A file (not a directory).
+    let file_dir = tempfile::tempdir().unwrap();
+    let file_path = file_dir.path().join("not_a_dir.txt");
+    std::fs::write(&file_path, "x").unwrap();
+    let err = Engine::builder(store.clone(), agent(), model.clone(), "m")
+        .local_agent(&file_path)
+        .start()
+        .await
+        .expect_err("start refuses a file as a directory");
+    assert!(
+        matches!(err, EngineError::Invalid(_)),
+        "expected Invalid for file path, got {err:?}"
+    );
+
+    // A symlink, on Unix. The directory is opened once with `SlotDir::open`, which follows the
+    // link to its target: a target that is a file (or a missing path) is refused.
+    #[cfg(unix)]
+    {
+        let link_dir = tempfile::tempdir().unwrap();
+        let target_file = link_dir.path().join("target.txt");
+        std::fs::write(&target_file, "x").unwrap();
+        let link = link_dir.path().join("link_to_file");
+        std::os::unix::fs::symlink(&target_file, &link).unwrap();
+        let err = Engine::builder(store, agent(), model, "m")
+            .local_agent(&link)
+            .start()
+            .await
+            .expect_err("start refuses a symlink to a file");
+        assert!(
+            matches!(err, EngineError::Invalid(_)),
+            "expected Invalid for symlink to file, got {err:?}"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
