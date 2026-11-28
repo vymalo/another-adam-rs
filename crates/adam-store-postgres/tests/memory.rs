@@ -81,7 +81,13 @@ fn migrate_once() {
 
 /// The scope the kit hands `make`, with this process's suffix, so a re-run is clean and the kit's
 /// two scopes still differ from each other.
+///
+/// An **empty** scope is handed on empty: the suffix would turn it into a valid one, and the kit's
+/// `an_empty_configured_scope_is_refused` case exists precisely to see the adapter refuse it.
 fn scoped(scope: &MemoryScope) -> MemoryScope {
+    if scope.as_str().is_empty() {
+        return scope.clone();
+    }
     MemoryScope::new(format!("{}-{}", scope.as_str(), identity()))
 }
 
