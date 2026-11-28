@@ -26,6 +26,7 @@
 //! * a lesson refuses a repository, a path, a URL, a host and an e-mail address whatever its
 //!   audience;
 //! * a retired lesson is kept and not served, and `retire` takes the stored, scrubbed root cause;
+//! * an empty audience is refused by `recall` and `retire` before anything is read;
 //! * sixteen writers on one audience leave sixteen lessons.
 //!
 //! Each case is a function here, so each suite is compiled once and the macro only names it.
@@ -1103,6 +1104,30 @@ pub mod lesson_cases {
             .expect("the stored root cause finds the lesson");
     }
 
+    /// An empty audience is refused before anything is read: `recall` and `retire` answer
+    /// `EmptyField` for it, whatever the adapter would store behind the key it would build.
+    ///
+    /// # Panics
+    ///
+    /// When an empty audience is served instead of refused.
+    pub fn an_empty_key_is_refused(memory: DynMemory, _plan: LessonPlan) {
+        let empty = Audience::new("");
+        let error = memory
+            .recall(&empty)
+            .expect_err("an empty audience is refused");
+        assert!(
+            matches!(error, MemoryError::EmptyField { field: "audience" }),
+            "{error}"
+        );
+        let error = memory
+            .retire(&empty, "anything")
+            .expect_err("an empty audience is refused");
+        assert!(
+            matches!(error, MemoryError::EmptyField { field: "audience" }),
+            "{error}"
+        );
+    }
+
     /// Sixteen writers on one audience leave sixteen lessons: the port is `Send + Sync`.
     ///
     /// # Panics
@@ -1453,6 +1478,16 @@ macro_rules! memory_conformance {
                 let plan = LessonPlan::default();
                 $crate::lesson_cases::retire_takes_the_stored_root_cause(
                     make(&plan, &$crate::memory_scope("stored-root-cause")),
+                    plan,
+                );
+            }
+
+            #[test]
+            fn an_empty_key_is_refused() {
+                $(if !$available() { return; })?
+                let plan = LessonPlan::default();
+                $crate::lesson_cases::an_empty_key_is_refused(
+                    make(&plan, &$crate::memory_scope("empty-key")),
                     plan,
                 );
             }

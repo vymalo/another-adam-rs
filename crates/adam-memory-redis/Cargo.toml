@@ -11,7 +11,6 @@ rust-version.workspace = true
 [dependencies]
 adam-core.workspace = true
 adam-memory.workspace = true
-serde.workspace = true
 serde_json.workspace = true
 redis.workspace = true
 

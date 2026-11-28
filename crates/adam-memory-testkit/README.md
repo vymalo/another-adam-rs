@@ -130,6 +130,7 @@ with a remedy, a rationale and two sources.
 | `a_retired_lesson_is_kept_and_not_served` | a retired lesson is kept and not served, retiring twice is one retirement, an unknown lesson is `NotFound`, and a fresh record serves it again |
 | `a_full_audience_refuses_a_revived_lesson` | the bound counts what is served: reviving needs a free slot, and a full audience refuses it |
 | `retire_takes_the_stored_root_cause` | `retire` finds a lesson only by the stored, scrubbed root cause; the raw text is `NotFound` |
+| `an_empty_key_is_refused` | an empty audience is refused by `recall` and `retire` before anything is read |
 | `sixteen_writers_share_one_audience` | the port is `Send + Sync` and one audience keeps every writer's lesson |
 
 ## The doubles

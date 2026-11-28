@@ -36,7 +36,15 @@ impl MemoryScope {
         &self.0
     }
 
-    pub(crate) fn validate(&self) -> MemoryResult<()> {
+    /// Refuse an empty scope: no key or query may be built on one.
+    ///
+    /// Public for an L2 adapter, which validates its configured scope and the audience of every
+    /// `recall` and `retire` before it builds a key or opens a connection.
+    ///
+    /// # Errors
+    ///
+    /// [`MemoryError::EmptyField`] with `field: "memory scope"`.
+    pub fn validate(&self) -> MemoryResult<()> {
         if self.0.trim().is_empty() {
             return Err(MemoryError::EmptyField {
                 field: "memory scope",
@@ -74,7 +82,15 @@ impl Audience {
         &self.0
     }
 
-    pub(crate) fn validate(&self) -> MemoryResult<()> {
+    /// Refuse an empty audience: no key or query may be built on one.
+    ///
+    /// Public for an L2 adapter, which validates the audience of every `recall` and `retire`
+    /// before it builds a key or opens a connection.
+    ///
+    /// # Errors
+    ///
+    /// [`MemoryError::EmptyField`] with `field: "audience"`.
+    pub fn validate(&self) -> MemoryResult<()> {
         if self.0.trim().is_empty() {
             return Err(MemoryError::EmptyField { field: "audience" });
         }

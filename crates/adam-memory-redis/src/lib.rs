@@ -27,7 +27,7 @@
 //!
 //! A write reads the audience's lessons, checks the bound that counts what is served, and writes
 //! one field, under WATCH/MULTI/EXEC: `redis::transaction` watches the key, retries when it
-//! changed under the write, and the loop gives up after 32 attempts. Retirement is the same
+//! changed under the write, and the loop gives up after 128 attempts. Retirement is the same
 //! transaction, so a retried step lands once and nothing is deleted (decision 10: a retired
 //! lesson is kept and no longer served).
 //!
@@ -59,7 +59,11 @@ use redis::{Client, Connection, RedisError};
 const DEFAULT_KEY_PREFIX: &str = "adam-memory:v1";
 
 /// How often a write retries the WATCH/MULTI/EXEC loop before it gives up as a backend failure.
-const WRITE_ATTEMPTS: u32 = 32;
+///
+/// The sixteen-writer conformance case contends on one audience's key, and each writer expects on
+/// the order of sixteen retries (one per competing writer), so 128 keeps a wide margin and removes
+/// a flake class; the loop is still bounded and gives up as a `Transient` failure.
+const WRITE_ATTEMPTS: u32 = 128;
 
 /// The L2 [`Memory`] port on Redis: one configured scope, one hash per audience.
 ///
@@ -204,6 +208,8 @@ impl Memory for RedisMemory {
     }
 
     fn recall(&self, audience: &Audience) -> MemoryResult<Vec<Lesson>> {
+        self.scope.validate()?;
+        audience.validate()?;
         let key = self.key(audience);
         let mut conn = self.connection(&key)?;
         let all: HashMap<String, String> = redis::cmd("HGETALL")
@@ -226,6 +232,8 @@ impl Memory for RedisMemory {
     }
 
     fn retire(&self, audience: &Audience, root_cause: &str) -> MemoryResult<Lesson> {
+        self.scope.validate()?;
+        audience.validate()?;
         let key = self.key(audience);
         let mut conn = self.connection(&key)?;
         let mut attempts = 0;

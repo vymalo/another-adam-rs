@@ -28,8 +28,8 @@ decisions 2 to 5 and 10; slices M1 and M2a (the L2 port and its kit; the L2 adap
 | `InProcessSiMemory` | The in-process reference the suite and a test use. |
 | `Memory` | The L2 port: `record`, `recall`, `retire`. `Send + Sync + 'static`; no driver type, no URL, no client in a signature. |
 | `DynMemory` | `Arc<dyn Memory>`, what a host or a tool is given. |
-| `MemoryScope` | The scope an L2 adapter is configured with; every key and query carries it. Two scopes on one store never see each other's lessons. |
-| `Audience` | Who a lesson is served to inside its scope; the promotion pass computes it, the port keeps it opaque. |
+| `MemoryScope` | The scope an L2 adapter is configured with; every key and query carries it. Two scopes on one store never see each other's lessons. `validate` refuses an empty one before an adapter builds a key or opens a connection. |
+| `Audience` | Who a lesson is served to inside its scope; the promotion pass computes it, the port keeps it opaque. `validate` refuses an empty one, for an adapter's `recall` and `retire`. |
 | `Lesson` | A root cause, its remedy and rationale, anchors as text, provenance, `state`, `created`, `updated` and `retired_at`. |
 | `LessonDraft` | What a caller writes; the adapter scrubs it, checks it and stamps it. |
 | `LessonProvenance` | The L1 scopes (opaque labels) whose evidence made the lesson, and the review that approved it. |

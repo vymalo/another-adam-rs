@@ -1,8 +1,9 @@
 # 0081. An agent keeps a self-improvement memory near it, and what holds becomes the deployment's memory
 
 Status: **Accepted** (2026-11-27), the owner's decision; the points under [Still open](#still-open) wait for an answer.
-Nothing is built. The evidence behind this page (the paper, the code it was checked against, the code index, the
-proposals for a memory protocol) is in [the agent page](../../.agents/docs/decisions/0081-an-agent-keeps-a-self-improvement-memory-near-it-and-what-holds-becomes-the-deployments-memory.md).
+Nothing was built when this was accepted; M2a and the Redis adapter are built since (see the
+amendments below). The evidence behind this page (the paper, the code it was checked against, the
+code index, the proposals for a memory protocol) is in [the agent page](../../.agents/docs/decisions/0081-an-agent-keeps-a-self-improvement-memory-near-it-and-what-holds-becomes-the-deployments-memory.md).
 
 The owner said (2026-11-27):
 

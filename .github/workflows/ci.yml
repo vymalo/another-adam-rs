@@ -356,7 +356,7 @@ jobs:
         ports: ["27017:27017"]
       redis:
         # Redis 8.2, by tag and digest (the OCI index of docker.io/library/redis:8.2, *verified
-        # 2026-11-28* against the registry). Keep ci.yml, coder.yml and compose.yaml in step.
+        # 2026-11-28* against the registry). Keep ci.yml and compose.yaml in step.
         image: redis:8.2@sha256:bb302517211721bf85ae3152b663c848a7cb36e79b02d69239ce20b5ddce95be
         ports: ["6379:6379"]
         options: >-
@@ -428,7 +428,7 @@ jobs:
         ports: ["27017:27017"]
       redis:
         # Redis 8.2, by tag and digest (the OCI index of docker.io/library/redis:8.2, *verified
-        # 2026-11-28* against the registry). Keep ci.yml, coder.yml and compose.yaml in step.
+        # 2026-11-28* against the registry). Keep ci.yml and compose.yaml in step.
         image: redis:8.2@sha256:bb302517211721bf85ae3152b663c848a7cb36e79b02d69239ce20b5ddce95be
         ports: ["6379:6379"]
         options: >-

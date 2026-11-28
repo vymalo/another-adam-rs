@@ -1,5 +1,6 @@
-//! The adapter's own two cases: a stored value that is not a lesson is `Corrupt`, and a dead
-//! port is a `Transient` backend failure. Both need no Redis unless they run.
+//! The adapter's own three cases: a stored value that is not a lesson is `Corrupt`, a dead port
+//! is a `Transient` backend failure, and an empty scope is refused before any connection. The
+//! last needs no Redis; the first two need no Redis unless they run.
 #![allow(clippy::unwrap_used, clippy::expect_used)] // integration tests assert by unwrapping
 
 use adam_core::testing::test_env;
@@ -57,6 +58,40 @@ fn a_value_that_is_not_a_lesson_is_corrupt() {
         .recall(&audience)
         .expect_err("a stored value that is not a lesson is corrupt");
     assert!(matches!(error, MemoryError::Corrupt { .. }), "{error}");
+}
+
+/// An adapter configured with an empty scope refuses `recall` and `retire` before any
+/// connection: the case needs no server and runs with no URL configured.
+#[test]
+fn an_empty_scope_is_refused_before_any_connection() {
+    // The address is never reached: the refusal comes before any connection is opened.
+    let memory = RedisMemory::open("redis://127.0.0.1:1/", settings(), MemoryScope::new(""))
+        .expect("the URL parses");
+    let audience = Audience::new("x");
+    let error = memory
+        .recall(&audience)
+        .expect_err("an empty scope is refused");
+    assert!(
+        matches!(
+            error,
+            MemoryError::EmptyField {
+                field: "memory scope"
+            }
+        ),
+        "{error}"
+    );
+    let error = memory
+        .retire(&audience, "anything")
+        .expect_err("an empty scope is refused");
+    assert!(
+        matches!(
+            error,
+            MemoryError::EmptyField {
+                field: "memory scope"
+            }
+        ),
+        "{error}"
+    );
 }
 
 /// A URL pointing at a closed port answers a backend failure whose class is `Transient`.

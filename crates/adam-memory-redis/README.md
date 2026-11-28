@@ -12,8 +12,9 @@ lessons (decision 4).
 The rules that decide what a lesson may hold — the scope validation, the scrub, the redaction
 marker, the address check, the bounds — are `adam-memory`'s own, through
 `LessonSettings::prepare`, so this adapter and the in-process reference enforce the same rules and
-the same suite proves both. A retired lesson is kept and no longer served (decision 10): nothing
-is deleted.
+the same suite proves both. Every call validates the configured scope and the audience first,
+before a key is built or a connection opened: an empty one is refused, not read. A retired lesson
+is kept and no longer served (decision 10): nothing is deleted.
 
 ## Keys
 
@@ -32,7 +33,7 @@ prefix with `with_key_prefix` when one Redis is shared with other applications.
 
 A write reads the audience's lessons, checks the bound that counts what is served, and writes one
 field, under WATCH/MULTI/EXEC: `redis::transaction` watches the key, retries when it changed under
-the write, and the loop gives up after 32 attempts. Retirement is the same transaction, so a
+the write, and the loop gives up after 128 attempts. Retirement is the same transaction, so a
 retried step lands once.
 
 The port is `Send + Sync`, and `redis::Connection` is not `Sync`, so the adapter opens **one
@@ -83,8 +84,10 @@ The suite is [`memory_conformance!`](../adam-memory-testkit/README.md), against 
 configured scopes over one server for the decisive two-scope case. It is skipped when
 `ADAM_TEST_REDIS_URL` is unset, unless `ADAM_TEST_REQUIRE_DB=1` (then it fails); CI sets the flag.
 Every test process writes under its own key prefix, so a run never reads a previous run's lessons.
-`tests/redis.rs` adds the adapter's own two cases: a stored value that is not a lesson is
-`Corrupt`, and a dead port is a `Transient` backend failure.
+`tests/redis.rs` adds the adapter's own three cases: a stored value that is not a lesson is
+`Corrupt`, a dead port is a `Transient` backend failure, and an empty configured scope is refused
+by `recall` and `retire` before any connection (that case needs no Redis and runs with no URL
+configured).
 
 ## A new required method
 
