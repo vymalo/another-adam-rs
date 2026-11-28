@@ -20,6 +20,8 @@ path = "src/main.rs"
 [dependencies]
 # The L1 self-improvement memory's folder adapter (ADR 0081 decision 2).
 adam-memory.workspace = true
+# L2's MongoDB adapter, chosen by `MEMORY_URL` (ADR 0081 decisions 4 and 11).
+adam-store-mongodb = { workspace = true, features = ["memory"] }
 adam = { workspace = true, features = ["a2a", "mcp"] }
 adam-a2a.workspace = true
 adam-a2a-runtime.workspace = true

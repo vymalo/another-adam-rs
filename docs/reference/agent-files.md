@@ -714,7 +714,8 @@ si_memory:                # on, tuned
   scopes: [agent, repository]
 ```
 
-* **What `on` gives a run.** `si_recall` and `si_record`, as one lazy group (`load__group__memory`), over the folder
+* **What `on` gives a run.** `si_recall` and `si_record`, as one lazy group (`load__group__memory`): `si_recall` returns the L1 problems, then the
+  audience's approved L2 lessons when `MEMORY_URL` names a store, and `si_record` writes the attempt, over the folder
   `SI_MEMORY_DIR` names ([environment](environment.md#environment-variables)). With no folder, L1 is absent: the tools
   are still offered and answer that nothing is recorded, and the run goes on (ADR 0081 decision 12).
 * **The deployment's ceiling wins downwards.** `SI_MEMORY=off` ([environment](environment.md#environment-variables))
