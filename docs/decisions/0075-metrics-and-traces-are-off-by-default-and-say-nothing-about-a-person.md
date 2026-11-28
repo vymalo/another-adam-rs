@@ -118,3 +118,21 @@ needs both repositories to agree.
   field become an attribute, which is the leak the closed API prevents.
 - **Labels from run data (agent, model alias, tool name).** One user's string becomes a time series; unbounded and, for a tool
   name, a way to put content in a label.
+
+## Amended 2026-11-28: the `opentelemetry` crates, and the metrics half (ANR-1350, ANR-1448)
+
+Decision 6's "OTLP over HTTP JSON by hand on the workspace's `reqwest`, no SDK and no new third-party package", and the
+first alternative below, are superseded by the owner (2026-11-27, pantry `otel-conventions`): the exporters are the
+`opentelemetry`, `opentelemetry_sdk`, `opentelemetry-otlp` and `tracing-opentelemetry` crates, over the workspace's
+`reqwest` on rustls, OTLP over HTTP with no gRPC/tonic. ANR-1350 built the traces half that way and ANR-1448 the metrics
+half:
+
+- **Metrics ride the same switch.** `OTEL_EXPORTER_OTLP_ENDPOINT` unset still means nothing is built; set, the same
+  `Otel` carries an `SdkMeterProvider` whose periodic reader posts to `{endpoint}/v1/metrics`, on the same runtime.
+- **Recording never blocks a run.** The SDK aggregates in the process, so a measurement cannot wait on an exporter; a
+  failed export is the SDK's internal log line, and shutdown flushes both providers, each bounded by
+  `SHUTDOWN_TIMEOUT`.
+- **A label is a type, not a string.** `adam_otel::labels` holds the closed sets — `RunState`, held to
+  `adam_core::store::RunStatus` by a test, and a shape-checked `Name` for the names a deployment declares. The shape
+  check is **not** a secret filter (a token can have a name's shape: `ghp_0123…` is lower-case, digits and `_`), so
+  what keeps a secret out of a metric is the closed set, never a value at hand.
