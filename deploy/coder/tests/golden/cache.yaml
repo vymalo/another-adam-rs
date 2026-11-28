@@ -10,9 +10,9 @@ metadata:
   labels:
     app.kubernetes.io/name: coder
     app.kubernetes.io/instance: coder
-    app.kubernetes.io/version: "0.7.0"
+    app.kubernetes.io/version: "0.8.0"
     app.kubernetes.io/managed-by: Helm
-    helm.sh/chart: coder-0.7.0
+    helm.sh/chart: coder-0.8.0
 value: 0
 preemptionPolicy: Never
 globalDefault: false
@@ -29,9 +29,9 @@ metadata:
   labels:
     app.kubernetes.io/name: coder
     app.kubernetes.io/instance: coder
-    app.kubernetes.io/version: "0.7.0"
+    app.kubernetes.io/version: "0.8.0"
     app.kubernetes.io/managed-by: Helm
-    helm.sh/chart: coder-0.7.0
+    helm.sh/chart: coder-0.8.0
 spec:
   podSelector:
     matchLabels:
@@ -64,9 +64,9 @@ metadata:
     app.kubernetes.io/name: coder-egress
     app.kubernetes.io/instance: coder
     app.kubernetes.io/component: egress-proxy
-    app.kubernetes.io/version: "0.7.0"
+    app.kubernetes.io/version: "0.8.0"
     app.kubernetes.io/managed-by: Helm
-    helm.sh/chart: coder-0.7.0
+    helm.sh/chart: coder-0.8.0
 spec:
   podSelector:
     matchLabels:
@@ -129,9 +129,9 @@ metadata:
   labels:
     app.kubernetes.io/name: coder
     app.kubernetes.io/instance: coder
-    app.kubernetes.io/version: "0.7.0"
+    app.kubernetes.io/version: "0.8.0"
     app.kubernetes.io/managed-by: Helm
-    helm.sh/chart: coder-0.7.0
+    helm.sh/chart: coder-0.8.0
 spec:
   podSelector:
     matchLabels:
@@ -177,9 +177,9 @@ metadata:
   labels:
     app.kubernetes.io/name: coder
     app.kubernetes.io/instance: coder
-    app.kubernetes.io/version: "0.7.0"
+    app.kubernetes.io/version: "0.8.0"
     app.kubernetes.io/managed-by: Helm
-    helm.sh/chart: coder-0.7.0
+    helm.sh/chart: coder-0.8.0
 spec:
   hard:
     limits.memory: "8Gi"
@@ -202,9 +202,9 @@ metadata:
     app.kubernetes.io/name: coder-egress
     app.kubernetes.io/instance: coder
     app.kubernetes.io/component: egress-proxy
-    app.kubernetes.io/version: "0.7.0"
+    app.kubernetes.io/version: "0.8.0"
     app.kubernetes.io/managed-by: Helm
-    helm.sh/chart: coder-0.7.0
+    helm.sh/chart: coder-0.8.0
 spec:
   minAvailable: 1
   selector:
@@ -228,9 +228,9 @@ metadata:
     app.kubernetes.io/name: coder-egress
     app.kubernetes.io/instance: coder
     app.kubernetes.io/component: egress-proxy
-    app.kubernetes.io/version: "0.7.0"
+    app.kubernetes.io/version: "0.8.0"
     app.kubernetes.io/managed-by: Helm
-    helm.sh/chart: coder-0.7.0
+    helm.sh/chart: coder-0.8.0
 automountServiceAccountToken: false
 
 ---
@@ -244,9 +244,9 @@ metadata:
   labels:
     app.kubernetes.io/name: coder
     app.kubernetes.io/instance: coder
-    app.kubernetes.io/version: "0.7.0"
+    app.kubernetes.io/version: "0.8.0"
     app.kubernetes.io/managed-by: Helm
-    helm.sh/chart: coder-0.7.0
+    helm.sh/chart: coder-0.8.0
 automountServiceAccountToken: false
 
 ---
@@ -260,9 +260,9 @@ metadata:
   labels:
     app.kubernetes.io/name: coder
     app.kubernetes.io/instance: coder
-    app.kubernetes.io/version: "0.7.0"
+    app.kubernetes.io/version: "0.8.0"
     app.kubernetes.io/managed-by: Helm
-    helm.sh/chart: coder-0.7.0
+    helm.sh/chart: coder-0.8.0
 data:
   pod.yaml: |
     apiVersion: v1
@@ -372,9 +372,9 @@ metadata:
     app.kubernetes.io/name: coder-egress
     app.kubernetes.io/instance: coder
     app.kubernetes.io/component: egress-proxy
-    app.kubernetes.io/version: "0.7.0"
+    app.kubernetes.io/version: "0.8.0"
     app.kubernetes.io/managed-by: Helm
-    helm.sh/chart: coder-0.7.0
+    helm.sh/chart: coder-0.8.0
 data:
   allow.txt: |
     # The hosts a run pod may reach through the egress proxy: runPods.egressProxy.allow and extraAllow.
@@ -404,9 +404,9 @@ metadata:
   labels:
     app.kubernetes.io/name: coder
     app.kubernetes.io/instance: coder
-    app.kubernetes.io/version: "0.7.0"
+    app.kubernetes.io/version: "0.8.0"
     app.kubernetes.io/managed-by: Helm
-    helm.sh/chart: coder-0.7.0
+    helm.sh/chart: coder-0.8.0
 rules:
   - apiGroups: [""]
     resources: ["pods"]
@@ -424,9 +424,9 @@ metadata:
   labels:
     app.kubernetes.io/name: coder
     app.kubernetes.io/instance: coder
-    app.kubernetes.io/version: "0.7.0"
+    app.kubernetes.io/version: "0.8.0"
     app.kubernetes.io/managed-by: Helm
-    helm.sh/chart: coder-0.7.0
+    helm.sh/chart: coder-0.8.0
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: Role
@@ -448,9 +448,9 @@ metadata:
     app.kubernetes.io/name: coder-egress
     app.kubernetes.io/instance: coder
     app.kubernetes.io/component: egress-proxy
-    app.kubernetes.io/version: "0.7.0"
+    app.kubernetes.io/version: "0.8.0"
     app.kubernetes.io/managed-by: Helm
-    helm.sh/chart: coder-0.7.0
+    helm.sh/chart: coder-0.8.0
 spec:
   type: ClusterIP
   selector:
@@ -474,9 +474,9 @@ metadata:
   labels:
     app.kubernetes.io/name: coder
     app.kubernetes.io/instance: coder
-    app.kubernetes.io/version: "0.7.0"
+    app.kubernetes.io/version: "0.8.0"
     app.kubernetes.io/managed-by: Helm
-    helm.sh/chart: coder-0.7.0
+    helm.sh/chart: coder-0.8.0
 spec:
   type: ClusterIP
   selector:
@@ -498,9 +498,9 @@ metadata:
     app.kubernetes.io/name: coder-egress
     app.kubernetes.io/instance: coder
     app.kubernetes.io/component: egress-proxy
-    app.kubernetes.io/version: "0.7.0"
+    app.kubernetes.io/version: "0.8.0"
     app.kubernetes.io/managed-by: Helm
-    helm.sh/chart: coder-0.7.0
+    helm.sh/chart: coder-0.8.0
 spec:
   replicas: 2
   strategy:
@@ -520,7 +520,7 @@ spec:
         app.kubernetes.io/instance: coder
         app.kubernetes.io/component: egress-proxy
       annotations:
-        checksum/egress-allow: c2c5609f67ff012dafcba331e84dac402bd73ef26423fbc50a533dee1d68ade6
+        checksum/egress-allow: 6521018ce5aa4f262d735822d8ce25c9904f71300ff8a4809b674a07b90d3573
     spec:
       serviceAccountName: coder-egress
       automountServiceAccountToken: false
@@ -598,9 +598,9 @@ metadata:
   labels:
     app.kubernetes.io/name: coder
     app.kubernetes.io/instance: coder
-    app.kubernetes.io/version: "0.7.0"
+    app.kubernetes.io/version: "0.8.0"
     app.kubernetes.io/managed-by: Helm
-    helm.sh/chart: coder-0.7.0
+    helm.sh/chart: coder-0.8.0
 spec:
   replicas: 1
   serviceName: coder
@@ -617,7 +617,7 @@ spec:
         app.kubernetes.io/name: coder
         app.kubernetes.io/instance: coder
       annotations:
-        checksum/run-pod: efac5e000e06225536fb90edae8e9cf4282fe4a79836d731c5a3746c4f7453e8
+        checksum/run-pod: ecfdd0d9e8d2a3ef989ec612234479ebdcb9c651bfa52dc1005a9f01746f2a14
     spec:
       serviceAccountName: coder
       automountServiceAccountToken: false
@@ -890,9 +890,9 @@ metadata:
   labels:
     app.kubernetes.io/name: coder
     app.kubernetes.io/instance: coder
-    app.kubernetes.io/version: "0.7.0"
+    app.kubernetes.io/version: "0.8.0"
     app.kubernetes.io/managed-by: Helm
-    helm.sh/chart: coder-0.7.0
+    helm.sh/chart: coder-0.8.0
 spec:
   instances: 1
   imageName: "ghcr.io/cloudnative-pg/postgresql:18.7-system-trixie@sha256:c437b7c6c00aa7e66f5d6de1dd83602391fdebd4ff776ffb1ab7aaba5e7351ad"
@@ -915,9 +915,9 @@ metadata:
   labels:
     app.kubernetes.io/name: coder
     app.kubernetes.io/instance: coder
-    app.kubernetes.io/version: "0.7.0"
+    app.kubernetes.io/version: "0.8.0"
     app.kubernetes.io/managed-by: Helm
-    helm.sh/chart: coder-0.7.0
+    helm.sh/chart: coder-0.8.0
 spec:
   refreshInterval: 1h
   secretStoreRef:
@@ -956,9 +956,9 @@ metadata:
   labels:
     app.kubernetes.io/name: coder
     app.kubernetes.io/instance: coder
-    app.kubernetes.io/version: "0.7.0"
+    app.kubernetes.io/version: "0.8.0"
     app.kubernetes.io/managed-by: Helm
-    helm.sh/chart: coder-0.7.0
+    helm.sh/chart: coder-0.8.0
 spec:
   failurePolicy: Fail
   matchConstraints:
@@ -1004,9 +1004,9 @@ metadata:
   labels:
     app.kubernetes.io/name: coder
     app.kubernetes.io/instance: coder
-    app.kubernetes.io/version: "0.7.0"
+    app.kubernetes.io/version: "0.8.0"
     app.kubernetes.io/managed-by: Helm
-    helm.sh/chart: coder-0.7.0
+    helm.sh/chart: coder-0.8.0
 spec:
   policyName: coder-coder-ns-run-pods
   validationActions: ["Deny"]
