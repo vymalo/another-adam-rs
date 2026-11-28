@@ -109,6 +109,7 @@ check_ref() {
   ref=$(printf '%s\n' "$line" | sed -nE 's/^[[:space:]]*(-[[:space:]]+)?uses:[[:space:]]+([^[:space:]]+).*/\2/p')
   [ -n "$ref" ] || return 0
   refs_seen=$((refs_seen + 1))
+  raw_ref=$ref
   case $ref in
     \"*\") ref=${ref#\"}; ref=${ref%\"} ;;
     \'*\') ref=${ref#\'}; ref=${ref%\'} ;;
@@ -138,8 +139,9 @@ check_ref() {
   esac
   if [ "$major" = sha ]; then
     # Only the comment that follows this very ref: a later `# vX.` on the same
-    # line must not answer for it.
-    rest=${line#*"$ref"}
+    # line must not answer for it. `raw_ref` keeps the quotes, so a quoted SHA
+    # still finds its own comment.
+    rest=${line#*"$raw_ref"}
     major=$(printf '%s\n' "$rest" | sed -nE 's/^[[:space:]]*# *v([0-9]+)\..*/\1/p')
     if [ -z "$major" ]; then
       echo "$where: $ref is pinned by SHA with no '# vX.Y.Z' comment right after it" >&2
