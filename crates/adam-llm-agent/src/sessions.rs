@@ -2192,11 +2192,11 @@ mod tests {
             vec!["maxTurns", "maxOutputTokens"],
             "a member returned to the folder's is named too"
         );
-        let base = SessionConfig {
-            max_turns: Some(20),
-            max_output_tokens: Some(2048),
-            ..SessionConfig::default()
-        };
+        // `SessionConfig` is `#[non_exhaustive]`: another crate sets its fields one by one.
+        #[allow(clippy::field_reassign_with_default)]
+        let mut base = SessionConfig::default();
+        base.max_turns = Some(20);
+        base.max_output_tokens = Some(2048);
         let merged = patch.apply(Some(&base));
         assert_eq!(
             merged.max_turns,

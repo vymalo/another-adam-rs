@@ -235,6 +235,7 @@ dependencies = [
  "adam-llm-agent",
  "adam-mcp-testkit",
  "adam-model",
+ "adam-otel",
  "adam-postgres",
  "adam-runtime",
  "adam-schedule",
@@ -398,6 +399,7 @@ dependencies = [
  "adam-mcp-testkit",
  "adam-model",
  "adam-model-openai",
+ "adam-otel",
  "adam-postgres",
  "adam-runtime",
  "adam-schedule",
@@ -496,6 +498,7 @@ name = "adam-egress"
 version = "0.7.0"
 dependencies = [
  "adam-error",
+ "adam-otel",
  "async-trait",
  "httparse",
  "mimalloc",
@@ -577,6 +580,7 @@ name = "adam-git-sandbox"
 version = "0.7.0"
 dependencies = [
  "adam-error",
+ "adam-otel",
  "base64 0.22.1",
  "mimalloc",
  "rustix",
@@ -843,6 +847,7 @@ dependencies = [
 name = "adam-otel"
 version = "0.7.0"
 dependencies = [
+ "adam-core",
  "adam-error",
  "opentelemetry",
  "opentelemetry-otlp",

@@ -25,10 +25,12 @@ thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-opentelemetry.workspace = true
-tracing-subscriber = { workspace = true, features = ["registry"] }
+tracing-subscriber = { workspace = true, features = ["registry", "fmt", "json", "env-filter"] }
 url.workspace = true
 
 [dev-dependencies]
+# The drift test in `labels`: the label set must be the store's run states.
+adam-core = { path = "../adam-core" }
 opentelemetry_sdk = { workspace = true, features = ["testing"] }
 tracing-subscriber = { workspace = true, features = ["fmt"] }
 

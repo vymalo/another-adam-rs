@@ -244,7 +244,8 @@ impl EngineBuilder {
     /// [`LlmAgentBuilder::hooks`](adam_llm_agent::LlmAgentBuilder::hooks) takes them: every agent
     /// the engine runs, the root and each subagent, runs them first, in their order and under the
     /// set's limits, then the plugins its file names in `plugins:`. A `before_tool` hook that
-    /// answers `Verdict::Ask` parks the run for the person's approval
+    /// answers the plugin's `Decision::Ask` (`adam_llm_agent::Decision`, not this crate's approval
+    /// [`Decision`]) parks the run for the person's approval
     /// ([`RunState::AwaitingApproval`], [`Engine::approve`]). Default none; a later call replaces
     /// the set, and [`plugin`](Self::plugin) appends to it.
     ///

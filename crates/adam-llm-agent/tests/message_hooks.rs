@@ -14,8 +14,8 @@ use std::time::Duration;
 
 use adam_core::{DynStore, MemoryStore, RunId, RunStatus};
 use adam_llm_agent::{
-    HookDecision, HookResult, HookSet, HookedMessage, LlmAgent, MessageDecision, MessageFile,
-    Plugin, Tool, ToolCtx, ToolError, ToolOutput, Verdict, user_message,
+    Decision, HookDecision, HookResult, HookSet, HookedMessage, LlmAgent, MessageDecision,
+    MessageFile, Plugin, Tool, ToolCtx, ToolError, ToolOutput, user_message,
 };
 use adam_model::{MockModel, ToolCall, ToolSpec};
 use adam_runtime::{CollectingSink, Inbound, RunEvent, RunView, Runtime, RuntimeBuilder};
@@ -174,9 +174,9 @@ impl Plugin for RefusesText {
 
     fn message_received(&self, message: &mut HookedMessage<'_>) -> HookResult {
         if message.text.contains(self.needle) {
-            return Ok(Verdict::Deny(self.reason.to_owned()));
+            return Ok(Decision::Deny(self.reason.to_owned()));
         }
-        Ok(Verdict::Continue)
+        Ok(Decision::Continue)
     }
 }
 
@@ -193,7 +193,7 @@ impl Plugin for Rewrites {
 
     fn message_received(&self, message: &mut HookedMessage<'_>) -> HookResult {
         *message.text = message.text.replace(self.from, self.to);
-        Ok(Verdict::Continue)
+        Ok(Decision::Continue)
     }
 }
 
@@ -214,7 +214,7 @@ impl Plugin for Watches {
         self.decisions.fetch_add(1, SeqCst);
         self.texts.lock().unwrap().push(message.text.clone());
         self.files.lock().unwrap().extend_from_slice(message.files);
-        Ok(Verdict::Continue)
+        Ok(Decision::Continue)
     }
 }
 

@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 use adam_assembly::Error;
 use adam_core::{MemoryStore, RunId, RunStatus};
 use adam_error::{Classify, ErrorClass};
-use adam_llm_agent::{Conversation, Verdict, user_message};
+use adam_llm_agent::{Conversation, Decision, user_message};
 use adam_model::{Message, MockModel, ToolCall};
 use adam_plugin::HookSet;
 use adam_plugin_testkit::{Allows, Answers};
@@ -130,7 +130,7 @@ async fn the_hosts_hooks_run_in_every_agent_before_the_files_plugins() {
     ])
     .plugin(
         "deny",
-        Arc::new(Answers(Verdict::Deny("the file says no".into()))),
+        Arc::new(Answers(Decision::Deny("the file says no".into()))),
     )
     .bind(tools(&["stub"]))
     .unwrap()

@@ -23,6 +23,9 @@ path = "src/bin/adam-git.rs"
 
 [dependencies]
 adam-error.workspace = true
+# The OTel layer (ADR 0075, ANR-1412). No TLS provider: this server is small and the collector of a
+# cluster is plain `http`; add the `aws-lc` feature here to export over `https`.
+adam-otel = { workspace = true, default-features = false }
 base64.workspace = true
 mimalloc.workspace = true
 # `kill_process_group`, `umask` and `openat` as safe functions, so the crate stays `forbid(unsafe_code)`.
