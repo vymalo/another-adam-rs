@@ -43,9 +43,9 @@ use crate::compaction::{
 use crate::conversation::{
     ArtifactRef, Conversation, LOCALE_CONTEXT_KEY, LimitHit, LimitKind, Loaded, Loader,
     MODEL_CONTEXT_KEY, ModelSwitch, PendingQuestion, PendingRemote, PendingRun, PendingSession,
-    PendingWait, REASONING_EFFORT_CONTEXT_KEY, Repeats, asks_to_close, asks_to_edit, parse_context,
-    parse_model_run, parse_prompt_statement, parse_root_run, parse_root_step, parse_session,
-    parse_user_text,
+    PendingWait, REASONING_EFFORT_CONTEXT_KEY, Repeats, SESSION_ACCESS_TIER_CONTEXT_KEY,
+    asks_to_close, asks_to_edit, parse_context, parse_model_run, parse_prompt_statement,
+    parse_root_run, parse_root_step, parse_session, parse_user_text,
 };
 use crate::events::EventRegistry;
 use crate::history::{RunChars, record_shortenings_from};
@@ -2806,9 +2806,16 @@ impl LlmAgent {
         header.apply_edit(request);
         let pending = request.config.clone().unwrap_or_default();
         let adopted = current.adopted_mid_round(&pending);
+        // The ceiling the round's context carries follows the edit, so a source or tool that reads
+        // it from the context applies the new tier from the next model call (ADR 0054, slice 8);
+        // `{}` when the edit reset it, so the round never keeps the ceiling it had.
+        let ceiling = adopted.access_tier_context();
         // Written only when the round's config is not the header's: `None` means "the header's",
         // which is what a round that read no edit, and state written before this existed, reads.
         state.round_config = (adopted != pending).then_some(adopted);
+        state
+            .context
+            .insert(SESSION_ACCESS_TIER_CONTEXT_KEY.to_owned(), ceiling);
     }
 
     /// The cap on the tokens of this run's session ([ADR 0054], decision 6), `None` for a run that

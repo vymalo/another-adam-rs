@@ -345,6 +345,11 @@ impl CoderAgent {
         };
         let bound = def
             .var("max_check_cycles", env.settings.max_check_cycles)
+            // The access tiers this deployment lists, so a session's `access_tier` is held to them
+            // (ADR 0054, slice 8): the same set the card declares, from `MAX_ACCESS_TIER`.
+            .session_access_tiers(Some(crate::tier::honoured_up_to(
+                env.settings.max_access_tier,
+            )))
             .bind(tools.into_iter().collect::<ToolSet>())?;
         // The references the agent and the deployment declare: static for the process, so their
         // names and descriptions are the same words on every turn, before any source whose words

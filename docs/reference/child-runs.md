@@ -295,15 +295,17 @@ this conversation's is "no session"). At most 16 sessions that are not closed an
 `max_open` and `max_rounds` as constants for now).
 
 **A session's own limits** ([ADR 0054](../decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md),
-slice 1). `subagent_start` takes an optional `config` of eleven options: eight numbers, `max_turns`, `max_tool_calls`,
+slice 1). `subagent_start` takes an optional `config` of thirteen options: eight numbers, `max_turns`, `max_tool_calls`,
 `max_output_tokens`, `context_window`, `max_parallel_tool_calls`, `time_limit` (minutes), `max_rounds` and `token_budget`
-(below), two lists of tool names, `tools` and `deny_tools` (below), and `report_schema` (below). An option chooses within what the
+(below), two lists of tool names, `tools` and `deny_tools` (below), `report_schema` (below), `instructions` (text appended to
+the helper's own, slice 7) and `access_tier` (below). An option chooses within what the
 subagent's folder allows and **never widens it**: a value above its bound is refused, in words that name the option
-(`config.max_turns is 51; at most 50`), and nothing starts; an option that is not one of the eleven is refused too. What was
-admitted is kept in the session's header, and the round reads its limits from it. Five of them apply at the next model call
-(`max_turns`, `max_tool_calls`, `max_output_tokens`, `context_window`, `max_parallel_tool_calls`, and `token_budget`, below); `time_limit` and
-`max_rounds` apply to the next round. A later round copies the config and **clamps it to the bounds of that moment**, so a
-deployment that lowered a limit is obeyed and nothing is raised back. `max_output_tokens` is never `0` (that would leave the cap
+(`config.max_turns is 51; at most 50`), and nothing starts; an option that is not one of the thirteen is refused too. What was
+admitted is kept in the session's header, and the round reads its limits from it. Seven of them apply at the next model call
+(`max_turns`, `max_tool_calls`, `max_output_tokens`, `context_window`, `max_parallel_tool_calls`, `token_budget` and
+`access_tier`, below); `time_limit`, `max_rounds` and `instructions` apply from the next round. A later round copies the config
+and **clamps it to the bounds of that moment**, so a deployment that lowered a limit is obeyed and nothing is raised back.
+`max_output_tokens` is never `0` (that would leave the cap
 to the model) and a `context_window` is never so small that no history fits: it is held to the least that leaves room.
 
 **The token budget** (slice 6). `token_budget` caps the whole session's tokens, input and output as `usage/v1` counts them:
@@ -359,6 +361,17 @@ fails it, so describe the shape in `prompt` too. An answer that is not one JSON 
 model with the first three problems, twice at most, and each of those turns counts in `max_turns`; after that the round fails
 with `report does not match report_schema`. It applies to every round of the session, the first included; a `format`
 is only an annotation under draft 2020-12 and is not enforced.
+
+**The access tier** (slice 8). `access_tier` is a ceiling on the access tier of every round of the session (`access-tier/v1`,
+ADR 0036): at most the tier of the run that starts it — the parent's, or the tier of the person's message — and the
+deployment's `MAX_ACCESS_TIER`. It may **lower** the tier and never raise it: a value above the parent's is refused where the
+other options are, in words (`config.access_tier is bypass; at most auto, the tier of the session's parent`), and nothing
+starts. **A deployment that lists no access tiers refuses the option** rather than ignore it: a folder agent has neither a
+`TierSource` nor the `access-tier/v1` extension, so it has no tier to narrow. The ceiling rides the round's context under
+`vymalo.session.accessTier` (`{"ceiling": "plan"}`, or `{}` when the session set none), beside the tier the message names, and
+the coder's `TierSource` and `Gated` take the lower of the two: a `plan` session of an `auto` parent is offered no write tool,
+and a **named** write tool is refused at the tool. It applies from the next model call, and an edit may lower or reset it. Not
+for a remote subagent.
 
 ```mermaid
 sequenceDiagram

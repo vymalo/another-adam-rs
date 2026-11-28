@@ -1119,7 +1119,10 @@ impl Tool for Gated {
                 .load_shared(&run)
                 .await
                 .map_err(|e| notes_error(&e))?
-                .map_or(AccessTier::Plan, |notes| self.env.tier_of(&notes));
+                .map_or(AccessTier::Plan, |notes| self.env.tier_of(&notes))
+                // The ceiling a session put on the round (ADR 0054, slice 8): a `plan` session of an
+                // `auto` parent refuses a write tool here, whatever the model named.
+                .min(ctx.session_ceiling().unwrap_or(AccessTier::Bypass));
             if self.needs > tier {
                 return Ok(ToolOutput::error(crate::tier::refusal(
                     &self.name, self.needs, tier,
@@ -1924,6 +1927,87 @@ mod access_forwarding_tests {
         async fn call(&self, _ctx: &ToolCtx, _args: Value) -> Result<ToolOutput, ToolError> {
             Ok(ToolOutput::text("x"))
         }
+    }
+
+    /// A tool that writes a file, for the tier check at the call.
+    struct Writer;
+
+    #[async_trait::async_trait]
+    impl Tool for Writer {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "write_file".into(),
+                description: "x".into(),
+                parameters: serde_json::json!({"type": "object"}),
+            }
+        }
+
+        async fn call(&self, _ctx: &ToolCtx, _args: Value) -> Result<ToolOutput, ToolError> {
+            Ok(ToolOutput::text("written"))
+        }
+    }
+
+    /// A `plan` session of an `auto` parent: a **named** write tool is refused at the tool, not
+    /// merely hidden from the turn (ADR 0054, slice 8). The same call without the ceiling runs.
+    #[tokio::test]
+    async fn gated_refuses_a_write_tool_under_a_session_ceiling() {
+        let root = tempfile::tempdir().unwrap();
+        let workspaces = Workspaces::new(
+            root.path().join("work"),
+            Arc::new(ScopedToken::new("github.com", "t")),
+        );
+        let env = Arc::new(ToolEnv::new(
+            workspaces,
+            Arc::new(MemoryCodeHost::new()),
+            CoderSettings::new(),
+        ));
+        let run = adam_core::RunId::new();
+        env.notes
+            .save(
+                &run.to_string(),
+                &crate::tools::notes::RunNotes {
+                    tier: Some(AccessTier::Auto),
+                    ..crate::tools::notes::RunNotes::default()
+                },
+            )
+            .await
+            .unwrap();
+        let tool = Gated::layer(env)(Arc::new(Writer));
+        let call = |ceiling: Option<&str>| {
+            let mut context = serde_json::Map::new();
+            context.insert(
+                adam_a2a_runtime::CONTEXT_ACCESS_TIER.to_owned(),
+                serde_json::json!({"tier": "auto"}),
+            );
+            context.insert(
+                adam_runtime::SESSION_ACCESS_TIER_CONTEXT_KEY.to_owned(),
+                ceiling.map_or_else(
+                    || serde_json::json!({}),
+                    |ceiling| serde_json::json!({"ceiling": ceiling}),
+                ),
+            );
+            let ctx = ToolCtx::detached(
+                "write_file",
+                "call-1",
+                Arc::new(adam_runtime::CollectingSink::new()),
+            )
+            .with_root_run(run)
+            .with_context(context);
+            let tool = tool.clone();
+            async move { tool.call(&ctx, serde_json::json!({})).await.unwrap() }
+        };
+        // The parent works at `auto`: the call runs.
+        assert!(!call(None).await.is_error);
+        // The `plan` session refuses it, in the words of the tier.
+        let out = call(Some("plan")).await;
+        assert!(out.is_error, "{}", out.content);
+        assert!(
+            out.content
+                .contains("`write_file` needs the edits access tier")
+                && out.content.contains("this message is under plan"),
+            "{}",
+            out.content
+        );
     }
 
     #[test]

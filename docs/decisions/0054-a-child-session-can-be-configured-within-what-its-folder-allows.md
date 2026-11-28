@@ -553,3 +553,34 @@ Slice 4 is built as decision 11 reads, with these decisions where it left a choi
    helper's *working* round does not read an edit mid-round — the options it takes (`timeLimit`, `maxRounds`) are next-round
    ones, so the edit waits in its inbox and the next round carries it; the A2A front still starts every round with the helper's
    `within` and does not read the session's own `timeLimit` (a gap that predates this slice).
+
+## Amended 2026-11-28 (slice 8, `access_tier`)
+
+Slice 8 is built as decision 4's row reads, with these decisions where it left a choice.
+
+1. **The tier vocabulary moved to `adam-model`.** `AccessTier`, `AccessTiers` and their errors live in
+   `crates/adam-model/src/tier.rs`, beside `ReasoningEffort` (slice 12's option, the same argument), and `adam-a2a` re-exports them
+   at the same paths. `SessionConfig::access_tier` is in `adam-runtime`, which cannot depend on the protocol crate, and a second
+   closed enum for the same four words would drift.
+2. **The ceiling rides the round's context, beside the tier and the mode.** `vymalo.session.accessTier`
+   (`{"ceiling": "plan"}`, `{}` when the session set none) is written from the header's clamped config by `round_message` and the
+   A2A front's `put_header`, exactly as slice 3's `vymalo.session.tools` is, and read by `SourceCtx::session_ceiling` and
+   `ToolCtx::session_ceiling`. It is **one of `PROTECTED_CONTEXT_KEYS`**, unlike the tools key: a child run of a session must stay
+   under the ceiling, and a ceiling a large context could drop would lift the limit. The header's config stays the truth, and an
+   edit refreshes the key in the state it commits, so a mid-round edit applies at the next model call.
+3. **The starter's grant is added at the call.** `SessionBounds::access_tiers` is the set the deployment lists (`None` when it
+   lists none); `for_starter(context)` / `narrowed_to(tier)` lower it to the tier of the run that starts the session — the lower of
+   the tier the context names and any ceiling a parent session put there, else the deployment's default — and `admit` then refuses
+   a tier the narrowed set does not honour, with `config.access_tier is <v>; at most <ceiling>, the tier of the session's parent`.
+   A tier above the parent's is therefore refused in the same words by the tool and the front, and a later round clamps the same
+   way, so a message that lowered the tier lowers the session with it. **A deployment that lists no tiers refuses the option**
+   (`this deployment lists no access tiers`); the coder gives `honoured_up_to(MAX_ACCESS_TIER)` on both its worker and control-plane
+   definitions, and `adam-agent` gives none. A remote subagent refuses the option by name, as it refuses every other.
+4. **The enforcement is the coder's, twice.** `TierSource` withholds the tools above `min(deployment cap, session ceiling, tier of
+   the run)` and says that tier in its words; `Gated` applies the same minimum at the call, so a named write tool is refused in a
+   `plan` session of an `auto` parent even though the model was not shown it.
+5. **The prompt grows once.** `subagent_start`'s and `subagent_edit`'s `config` schemas gain an `access_tier` property, so the
+   stable prefix and the prompt cache of every agent with subagents change once at the deploy, and the coder's tool-size golden
+   (`tests/fixtures/tool-tokens.txt`) and the `BASELINE_TOOLS_BYTES` pin in `tests/first_request.rs` need a reviewed bump — which
+   slice 3's note already said the next slice to grow `subagent_start` would need. `SessionBounds` gains the public field
+   `access_tiers`, so a literal of it outside this crate must name it.

@@ -16,7 +16,7 @@ use adam_llm_agent::{
     DynTool, DynToolSource, Limits, LlmStarter, SESSION_TOOLS, SessionTools, SiMemoryHandle,
     ToolSet,
 };
-use adam_model::ReasoningEffort;
+use adam_model::{AccessTiers, ReasoningEffort};
 use adam_runtime::{RuntimeBuilder, SessionLimits, glob};
 use secrecy::SecretString;
 
@@ -206,6 +206,10 @@ pub struct AgentDef {
     /// The deployment's `MAX_PARALLEL_TOOL_CALLS`, as the sessions' bounds need it on a process that
     /// binds no agent ([`session_max_parallel`](Self::session_max_parallel)).
     max_parallel: Option<usize>,
+    /// The access tiers the deployment lists, for the sessions' bounds
+    /// ([`session_access_tiers`](Self::session_access_tiers)): `None` when it lists none, and then a
+    /// session may not set one (ADR 0054, slice 8).
+    session_access_tiers: Option<AccessTiers>,
     /// The root's reasoning level when its file sets none
     /// ([`reasoning_effort`](Self::reasoning_effort)).
     reasoning_effort: Option<ReasoningEffort>,
@@ -252,6 +256,7 @@ impl AgentDef {
             run_skills: None,
             session_limits: SessionLimits::default(),
             max_parallel: None,
+            session_access_tiers: None,
             reasoning_effort: None,
             plugins: BTreeMap::new(),
             si_memory_ceiling: SiMemoryCeiling::default(),
@@ -468,6 +473,18 @@ impl AgentDef {
         self
     }
 
+    /// The access tiers this deployment lists for a session's `access_tier` (`access-tier/v1`,
+    /// ADR 0054 slice 8): what [`session_bounds`](Self::session_bounds) holds the option to, on
+    /// every role, and the tiers a worker's session tools admit. `None` (the default) means the
+    /// deployment lists none, and then a session may not set a tier at all: the option is refused
+    /// rather than ignored. The coder gives `tier::honoured_up_to(MAX_ACCESS_TIER)`; a folder agent
+    /// that enforces no tier gives nothing.
+    #[must_use]
+    pub fn session_access_tiers(mut self, tiers: Option<AccessTiers>) -> Self {
+        self.session_access_tiers = tiers;
+        self
+    }
+
     /// The root's reasoning level when its file sets none (ADR 0063 decision 8): an embedded
     /// engine's host gives the level its folder would, and the root's own `reasoning_effort` wins
     /// over it. It is the **root's only**: it never applies to a subagent, which has its own file.
@@ -575,6 +592,7 @@ impl AgentDef {
                     &target,
                     self.max_parallel,
                     max_rounds,
+                    self.session_access_tiers.clone(),
                     Vec::new(),
                     false,
                 );
@@ -893,7 +911,8 @@ impl AgentDef {
         }
         let root = self.manifest.name.clone();
         let bound = BoundDef::new(self.manifest, nodes, remotes, session_limits)
-            .with_default_max_parallel(self.max_parallel);
+            .with_default_max_parallel(self.max_parallel)
+            .with_session_access_tiers(self.session_access_tiers);
         #[cfg(feature = "sessions")]
         let bound = bound.with_child_sessions(child_sessions);
         #[cfg(feature = "mcp")]

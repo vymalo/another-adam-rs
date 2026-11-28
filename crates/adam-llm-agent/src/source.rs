@@ -220,6 +220,14 @@ impl SourceCtx {
         &self.context
     }
 
+    /// The ceiling a session put on the access tier of this round
+    /// ([`SESSION_ACCESS_TIER_CONTEXT_KEY`](crate::SESSION_ACCESS_TIER_CONTEXT_KEY)), `None` when
+    /// it set none. A source that enforces a tier takes the lower of it and the tier of the run, so
+    /// a `plan` session of an `auto` parent is held to `plan` (ADR 0054, slice 8).
+    pub fn session_ceiling(&self) -> Option<adam_model::AccessTier> {
+        adam_runtime::access_tier_ceiling(&self.context)
+    }
+
     /// The words the run was started with: the first part of its first message
     /// ([`Conversation::task`](crate::Conversation::task)), the same text at every turn and at every
     /// call of the run, and in a run that continues it. `None` when the first message has no words.

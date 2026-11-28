@@ -10,7 +10,9 @@ use adam_llm_agent::{
     DynTool, DynToolSource, Limits, LlmAgent, LlmAgentBuilder, ModelBinding, ModelParking,
     SESSION_TOOLS, SessionAgent, SessionTools, StepIo, ToolSource, WINDOW_MARGIN_TOKENS,
 };
-use adam_model::{DEFAULT_MAX_OUTPUT_TOKENS, DynModel, ModelProfiles, Preset, ReasoningEffort};
+use adam_model::{
+    AccessTiers, DEFAULT_MAX_OUTPUT_TOKENS, DynModel, ModelProfiles, Preset, ReasoningEffort,
+};
 use adam_runtime::{RuntimeBuilder, SessionBounds, SessionLimits};
 
 use crate::bounds::parallel_limit;
@@ -44,6 +46,9 @@ pub struct BoundDef {
     model_parking: Option<ModelParking>,
     admission: Option<DynAdmission>,
     session_limits: SessionLimits,
+    /// The access tiers the deployment lists, for the sessions' bounds
+    /// ([`with_session_access_tiers`](Self::with_session_access_tiers)).
+    session_access_tiers: Option<AccessTiers>,
     #[cfg(feature = "sessions")]
     child_sessions: Option<adam_a2a_runtime::ChildSessions>,
     step_io: Option<StepIo>,
@@ -119,6 +124,7 @@ impl BoundDef {
             model_parking: None,
             admission: None,
             session_limits,
+            session_access_tiers: None,
             #[cfg(feature = "sessions")]
             child_sessions: None,
             step_io: None,
@@ -255,6 +261,14 @@ impl BoundDef {
     /// [`max_parallel`](Self::max_parallel) already says another.
     pub(crate) fn with_default_max_parallel(mut self, n: Option<usize>) -> Self {
         self.max_parallel = self.max_parallel.or(n);
+        self
+    }
+
+    /// The access tiers the deployment lists
+    /// ([`AgentDef::session_access_tiers`](crate::AgentDef::session_access_tiers)), for the bounds
+    /// of the sessions (ADR 0054, slice 8).
+    pub(crate) fn with_session_access_tiers(mut self, tiers: Option<AccessTiers>) -> Self {
+        self.session_access_tiers = tiers;
         self
     }
 
@@ -836,6 +850,7 @@ impl BoundDef {
             target,
             self.max_parallel,
             self.session_limits.max_rounds(),
+            self.session_access_tiers.clone(),
             names,
             complete,
         )

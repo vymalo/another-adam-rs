@@ -1878,6 +1878,15 @@ impl ToolCtx {
         &self.context
     }
 
+    /// The ceiling a session put on the access tier of this round
+    /// ([`SESSION_ACCESS_TIER_CONTEXT_KEY`](crate::SESSION_ACCESS_TIER_CONTEXT_KEY)), `None` when
+    /// it set none. A tool that checks the tier at the call takes the lower of it and the tier of
+    /// the run, so a named write tool is refused in a `plan` session of an `auto` parent (ADR 0054,
+    /// slice 8).
+    pub fn session_ceiling(&self) -> Option<adam_model::AccessTier> {
+        adam_runtime::access_tier_ceiling(&self.context)
+    }
+
     /// The shared value of type `T` the agent was given, if any.
     pub fn state<T: Send + Sync + 'static>(&self) -> Option<State<T>> {
         self.extensions.get::<T>().map(State::from)

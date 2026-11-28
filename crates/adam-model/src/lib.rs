@@ -91,6 +91,7 @@ mod mock;
 mod profiles;
 mod prompt;
 mod signed;
+mod tier;
 mod types;
 
 pub use adam_error::{Classify, ErrorClass};
@@ -111,6 +112,7 @@ pub use prompt::{
     PROMPT_USER_SIGNATURE_HEADER, PromptStatement,
 };
 pub use signed::{KeySource, SignedRequests, TURN_SIGNATURE_HEADER, request_target};
+pub use tier::{AccessTier, AccessTiers, AccessTiersError, NotATier};
 pub use types::{
     ADAM_MAKER, ContentPart, FinishReason, INVALID_ARGUMENTS_MARKER, ImageData, ImageLimits,
     ImageOrigin, ImageRef, InputModalities, Message, ModelDelta, ModelRequest, ModelResponse,

@@ -31,7 +31,9 @@ use async_trait::async_trait;
 use serde_json::{Value, json};
 
 use crate::agent::render_output;
-use crate::conversation::{MESSAGE_KIND, SESSION_TOOLS_CONTEXT_KEY};
+use crate::conversation::{
+    MESSAGE_KIND, SESSION_ACCESS_TIER_CONTEXT_KEY, SESSION_TOOLS_CONTEXT_KEY,
+};
 use crate::paging::{
     PAGE_LINES, PageError, clip_item, end_line, escape_text, more_line, page_lines, window,
     window_args,
@@ -368,7 +370,7 @@ fn required_of(tool: &str) -> Vec<&'static str> {
 
 /// The options of `config` as the model writes them (snake_case, like the other arguments), and
 /// the camelCase the wire and the header use for the same names.
-const CONFIG_OPTIONS: [(&str, &str); 11] = [
+const CONFIG_OPTIONS: [(&str, &str); 12] = [
     ("max_turns", "maxTurns"),
     ("max_tool_calls", "maxToolCalls"),
     ("max_output_tokens", "maxOutputTokens"),
@@ -380,6 +382,7 @@ const CONFIG_OPTIONS: [(&str, &str); 11] = [
     ("tools", "tools"),
     ("deny_tools", "denyTools"),
     ("report_schema", "reportSchema"),
+    ("access_tier", "accessTier"),
 ];
 
 /// The options of `config` that are lists of tool names rather than numbers.
@@ -400,6 +403,7 @@ fn config_words(config: &SessionConfig) -> Option<String> {
             }
             match value {
                 Value::Number(n) => Some(format!("{own} {n}")),
+                Value::String(word) => Some(format!("{own} {word}")),
                 Value::Array(names) => Some(format!(
                     "{own} {}",
                     names
@@ -417,7 +421,7 @@ fn config_words(config: &SessionConfig) -> Option<String> {
 
 /// The options a remote subagent refuses: every one but `time_limit` and `max_rounds` (ADR 0054
 /// decision 4).
-const REMOTE_REFUSED: [&str; 9] = [
+const REMOTE_REFUSED: [&str; 10] = [
     "max_turns",
     "max_tool_calls",
     "max_output_tokens",
@@ -427,6 +431,7 @@ const REMOTE_REFUSED: [&str; 9] = [
     "tools",
     "deny_tools",
     "report_schema",
+    "access_tier",
 ];
 
 /// The [`SessionPatch`] a `config` object of `subagent_start` or `subagent_edit` asked for, or the
@@ -470,6 +475,19 @@ fn config_of(value: &Value) -> Result<SessionPatch, String> {
         if *name == "reportSchema" {
             if !value.is_null() && !value.is_object() {
                 return Err("config.report_schema must be a JSON Schema, an object".to_owned());
+            }
+            wire.insert((*name).to_owned(), value.clone());
+            continue;
+        }
+        // The access tier is one of the four words: a near spelling is refused here, and `admit`
+        // holds the value to the tier of the run that starts the session (ADR 0054, slice 8).
+        if *name == "accessTier" {
+            if !value.is_null() {
+                let tier = value.as_str().ok_or_else(|| {
+                    "config.access_tier must be one of plan, edits, auto or bypass".to_owned()
+                })?;
+                tier.parse::<adam_model::AccessTier>()
+                    .map_err(|e| format!("config.access_tier: {e}"))?;
             }
             wire.insert((*name).to_owned(), value.clone());
             continue;
@@ -795,6 +813,16 @@ fn round_message(ctx: &ToolCtx, text: &str, header: &SessionHeader) -> Inbound {
                     .as_ref()
                     .map_or_else(|| json!({}), SessionConfig::tools_context),
             );
+            // The ceiling the config puts on the access tier, beside the tier the message names
+            // (ADR 0054, slice 8): from the header, never from the message, so a round carries `{}`
+            // when the config sets none.
+            context.insert(
+                SESSION_ACCESS_TIER_CONTEXT_KEY.to_owned(),
+                header
+                    .config
+                    .as_ref()
+                    .map_or_else(|| json!({}), SessionConfig::access_tier_context),
+            );
         }
     }
     message
@@ -1000,6 +1028,14 @@ impl Tool for Start {
                                                 first answer fails it: describe the shape in \
                                                 `prompt` too. Not for a remote subagent.",
                             },
+                            "access_tier": {
+                                "type": "string",
+                                "enum": ["plan", "edits", "auto", "bypass"],
+                                "description": "A ceiling on the access tier of every round of \
+                                                this session: at most the tier of the run that \
+                                                starts it, and it may only lower it. Not for a \
+                                                remote subagent.",
+                            },
                         },
                         "additionalProperties": false,
                     },
@@ -1085,6 +1121,7 @@ impl Tool for Start {
                 }
                 agent
                     .bounds
+                    .for_starter(ctx.context_map())
                     .admit(patch.apply(None))
                     .map_err(|why| why.message().to_owned())
             }) {
@@ -1301,7 +1338,7 @@ impl Tool for Send {
                 .as_ref()
                 .and_then(|h| h.config.as_ref())
                 .map(|asked| match agent {
-                    Some(a) => a.bounds.clamp(asked),
+                    Some(a) => a.bounds.for_starter(ctx.context_map()).clamp(asked),
                     // The agent left the roster: clamp to the loop's own defaults, which never
                     // raise what the session asked for beyond what any folder would allow.
                     None => SessionBounds::default().clamp(asked),
@@ -1598,6 +1635,13 @@ impl Tool for Edit {
                                                 with no reference outside itself) that the \
                                                 subagent's final answer must match.",
                             },
+                            "access_tier": {
+                                "type": ["string", "null"],
+                                "enum": ["plan", "edits", "auto", "bypass", null],
+                                "description": "A ceiling on the access tier of every round: at \
+                                                most the tier of the run that starts it, and it \
+                                                may only lower it.",
+                            },
                         },
                         "additionalProperties": false,
                     },
@@ -1686,12 +1730,13 @@ impl Tool for Edit {
                      time_limit and max_rounds"
                 ));
             }
+            let bounds = agent.bounds.for_starter(ctx.context_map());
             let base = view
                 .header
                 .as_ref()
                 .and_then(|h| h.config.as_ref())
-                .map(|asked| agent.bounds.clamp(asked));
-            let admitted = match agent.bounds.admit(patch.apply(base.as_ref())) {
+                .map(|asked| bounds.clamp(asked));
+            let admitted = match bounds.admit(patch.apply(base.as_ref())) {
                 Ok(config) => config,
                 Err(why) => return refuse(why.message().to_owned()),
             };

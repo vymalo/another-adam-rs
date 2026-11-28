@@ -2934,3 +2934,145 @@ async fn a_repository_skill_that_allows_a_tool_does_not_lift_the_tier() {
     assert_eq!(adam_coder::tier::needs("load_skill"), AccessTier::Plan);
     assert_eq!(adam_coder::tier::needs("read_skill_file"), AccessTier::Plan);
 }
+
+// ------------------------------------------------- a session's access tier (ADR 0054, slice 8)
+
+/// The coder's whole app, its subagents registered, with a worker: a run that starts a session
+/// really starts it. What the model was sent, and the app (to read the session's run from).
+async fn drive_app(
+    fx: &Fixture,
+    tier: Option<AccessTier>,
+    script: impl FnOnce(&MockModel),
+) -> (Arc<MockModel>, Coder) {
+    let mock = Arc::new(MockModel::new());
+    script(&mock);
+    let model: DynModel = mock.clone();
+    let coder = Coder::new(
+        Arc::new(MemoryStore::new()),
+        CoderAgent::new(model, "test-model", fx.env.clone()),
+        &RuntimeOptions {
+            poll_interval: Duration::from_millis(20),
+            ..RuntimeOptions::default()
+        },
+    );
+    let (stop, rx) = tokio::sync::oneshot::channel::<()>();
+    let runtime = coder.runtime.clone();
+    let worker = tokio::spawn(async move {
+        runtime
+            .run_worker(async {
+                let _ = rx.await;
+            })
+            .await
+    });
+    let run = coder
+        .runtime
+        .start(AGENT_NAME, tier_message("hi", tier), None)
+        .await
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let view = coder.runtime.view(run).await.unwrap().expect("run exists");
+        match view.status {
+            RunStatus::Done => break,
+            RunStatus::Failed => panic!("the run failed: {view:#?}"),
+            _ => {}
+        }
+        assert!(Instant::now() < deadline, "timed out: {view:#?}");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let _ = stop.send(());
+    worker.await.unwrap().unwrap();
+    (mock, coder)
+}
+
+/// The result of the tool call `id`, from whichever request of the model carries it.
+fn tool_result(mock: &MockModel, id: &str) -> String {
+    mock.requests()
+        .iter()
+        .find_map(|request| {
+            request.messages.iter().find_map(|message| match message {
+                Message::Tool {
+                    call_id, content, ..
+                } if call_id == id => Some(content.clone()),
+                _ => None,
+            })
+        })
+        .unwrap_or_else(|| panic!("no result for {id}"))
+}
+
+/// A `plan` session of an `auto` parent: the config is admitted, and the ceiling it sets **rides
+/// the round's context**, which is where a source reads it (ADR 0054, slice 8). The model is shown
+/// the tier it works under, not the one the person's message named.
+#[tokio::test]
+async fn a_sessions_access_tier_rides_the_round_context() {
+    let fx = Fixture::new().await;
+    let (mock, coder) = drive_app(&fx, Some(AccessTier::Auto), |m| {
+        m.push_tool_calls(vec![call(
+            "s1",
+            "subagent_start",
+            json!({
+                "agent": "explorer",
+                "description": "look around",
+                "prompt": "where is the access tier read",
+                "config": {"access_tier": "plan"},
+            }),
+        )])
+        // One text for the explorer's round, one for the root's answer: either may arrive first.
+        .push_text("Explored.")
+        .push_text("Started.");
+    })
+    .await;
+    let started: Value = serde_json::from_str(&tool_result(&mock, "s1")).unwrap();
+    assert_eq!(started["state"], json!("working"), "{started}");
+    let session =
+        adam_core::RunId(uuid::Uuid::parse_str(started["session"].as_str().unwrap()).unwrap());
+    let view = coder
+        .runtime
+        .view(session)
+        .await
+        .unwrap()
+        .expect("the session round exists");
+    assert_eq!(
+        view.state
+            .pointer("/context/vymalo.session.accessTier/ceiling"),
+        Some(&json!("plan")),
+        "the header's ceiling rides the round's context: {}",
+        view.state
+    );
+    // And the session's config, as the header records it, is the ceiling asked for.
+    assert_eq!(
+        view.state.pointer("/session/config/accessTier"),
+        Some(&json!("plan")),
+        "{}",
+        view.state
+    );
+}
+
+/// A session may lower the tier of its parent and never raise it (ADR 0054, slice 8): `bypass`
+/// from an `auto` parent is refused where the other options are, in the ADR's words, and nothing
+/// starts.
+#[tokio::test]
+async fn a_session_may_not_be_configured_above_the_tier_of_its_parent() {
+    let fx = Fixture::new().await;
+    let (mock, _coder) = drive_app(&fx, Some(AccessTier::Auto), |m| {
+        m.push_tool_calls(vec![call(
+            "s1",
+            "subagent_start",
+            json!({
+                "agent": "explorer",
+                "description": "look around",
+                "prompt": "do it",
+                "config": {"access_tier": "bypass"},
+            }),
+        )])
+        .push_text("I did not start it.");
+    })
+    .await;
+    let refused = tool_result(&mock, "s1");
+    assert!(
+        refused.contains(
+            "config.access_tier is bypass; at most auto, the tier of the session's parent"
+        ),
+        "{refused}"
+    );
+}

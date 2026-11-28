@@ -22,6 +22,7 @@
 
 use adam_agent_fs::{AgentManifest, Limits as FileLimits, Subagent};
 use adam_llm_agent::{DEFAULT_MAX_PARALLEL, Limits, MAX_PARALLEL_LIMIT};
+use adam_model::AccessTiers;
 use adam_runtime::SessionBounds;
 
 use crate::def::{SessionTarget, limits};
@@ -92,6 +93,7 @@ pub(crate) fn bounds_of(
     target: &SessionTarget,
     deployment_parallel: Option<usize>,
     max_rounds: u32,
+    access_tiers: Option<AccessTiers>,
     tools: Vec<String>,
     tools_complete: bool,
 ) -> SessionBounds {
@@ -133,6 +135,10 @@ pub(crate) fn bounds_of(
         // No folder caps a session's tokens today (ADR 0054, decision 4): any value narrows, and
         // `admit` holds a request to the ADR's own ceiling.
         token_budget: None,
+        // The tiers the deployment lists: `None` refuses a session's `access_tier` rather than
+        // ignore it (ADR 0054, slice 8). A remote target keeps them, so a person's refusal is the
+        // deployment's words, not "no tiers".
+        access_tiers,
         tools: if target.remote { Vec::new() } else { tools },
         tools_complete: tools_complete && !target.remote,
     }

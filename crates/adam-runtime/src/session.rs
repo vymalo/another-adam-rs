@@ -5,6 +5,7 @@
 //! holds the derivation and what a listing reads back from the runs alone.
 
 use adam_core::time::Timestamp;
+use adam_model::{AccessTier, AccessTiers};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 
@@ -886,6 +887,52 @@ const REFUSAL_LIST_NAMES: usize = 50;
 /// [ADR 0054]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md
 pub const MAX_REPORT_SCHEMA_BYTES: usize = 16 * 1024;
 
+/// The context key under which a message names the access tier of its run (`access-tier/v1`):
+/// `{"tier": "plan" | "edits" | "auto" | "bypass"}`, written by the A2A backend from the message and
+/// read by the agent that enforces the tier. Defined here because a session's `access_tier`
+/// ([`SessionConfig`]) is held to the tier of the run that starts it ([ADR 0054], slice 8).
+///
+/// [ADR 0054]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md
+pub const ACCESS_TIER_CONTEXT_KEY: &str = "vymalo.accessTier";
+
+/// The context key under which a session's round carries the ceiling its config puts on the access
+/// tier ([ADR 0054], slice 8): `{"ceiling": "plan"}`, or `{}` when the session set none, so a round
+/// never inherits another round's ceiling. Written by `subagent_start`/`subagent_send` and the A2A
+/// front from the header's clamped config, and refreshed when an edit changes it; a source or tool
+/// that enforces a tier takes the lower of it and the tier of the run
+/// (`SourceCtx::session_ceiling`, `ToolCtx::session_ceiling`).
+///
+/// **A second reading, not the truth**: the truth is the round's config
+/// ([`SessionConfig::access_tier`]), which the agent applies at every model call. The key cannot be
+/// the truth: an oversized context is dropped, and a ceiling must not go with it.
+///
+/// [ADR 0054]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md
+pub const SESSION_ACCESS_TIER_CONTEXT_KEY: &str = "vymalo.session.accessTier";
+
+/// The access tier a context names under [`ACCESS_TIER_CONTEXT_KEY`]: `None` when it names none, or
+/// names something that is not one of the four words (a value is never rounded to a near spelling).
+#[must_use]
+pub fn access_tier_named(context: &serde_json::Map<String, Value>) -> Option<AccessTier> {
+    context
+        .get(ACCESS_TIER_CONTEXT_KEY)?
+        .get("tier")?
+        .as_str()?
+        .parse()
+        .ok()
+}
+
+/// The ceiling a context carries under [`SESSION_ACCESS_TIER_CONTEXT_KEY`], `None` when it carries
+/// none.
+#[must_use]
+pub fn access_tier_ceiling(context: &serde_json::Map<String, Value>) -> Option<AccessTier> {
+    context
+        .get(SESSION_ACCESS_TIER_CONTEXT_KEY)?
+        .get("ceiling")?
+        .as_str()?
+        .parse()
+        .ok()
+}
+
 /// The configuration a session runs with ([ADR 0054]): every option optional, and each one only
 /// ever **narrows** what the subagent's folder and the deployment allow ([`SessionBounds::admit`]).
 ///
@@ -961,6 +1008,15 @@ pub struct SessionConfig {
     /// [ADR 0054]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub instructions: Option<String>,
+    /// A ceiling on the access tier of every round of the session (`access-tier/v1`, ADR 0036): at
+    /// most the tier of the run that starts it (its parent's, or the person's message) and the
+    /// deployment's `MAX_ACCESS_TIER`. It may **lower** the tier and never raise it, and a
+    /// deployment that lists no access tiers refuses it rather than ignore it ([ADR 0054], slice
+    /// 8).
+    ///
+    /// [ADR 0054]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub access_tier: Option<AccessTier>,
 }
 
 /// The most characters a session's `instructions` may hold ([ADR 0054], decision 4).
@@ -981,6 +1037,7 @@ impl SessionConfig {
             && self.deny_tools.is_none()
             && self.report_schema.is_none()
             && self.instructions.is_none()
+            && self.access_tier.is_none()
     }
 
     /// What a round's context carries of this config under `vymalo.session.tools`
@@ -998,6 +1055,21 @@ impl SessionConfig {
         }
         if let Some(deny) = &self.deny_tools {
             entry.insert("denyTools".to_owned(), serde_json::json!(deny));
+        }
+        Value::Object(entry)
+    }
+
+    /// What a round's context carries of this config under
+    /// [`SESSION_ACCESS_TIER_CONTEXT_KEY`] ([ADR 0054] slice 8): `{"ceiling": "plan"}`, or `{}` when
+    /// the config sets none, so a round never inherits another round's ceiling. One function for
+    /// the model's tool, the A2A front and an edit, so the three write the same bytes.
+    ///
+    /// [ADR 0054]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md
+    #[must_use]
+    pub fn access_tier_context(&self) -> Value {
+        let mut entry = serde_json::Map::new();
+        if let Some(tier) = self.access_tier {
+            entry.insert("ceiling".to_owned(), serde_json::json!(tier));
         }
         Value::Object(entry)
     }
@@ -1156,6 +1228,13 @@ pub struct SessionPatch {
         skip_serializing_if = "Option::is_none"
     )]
     pub instructions: Option<Option<String>>,
+    /// See [`max_turns`](Self::max_turns).
+    #[serde(
+        default,
+        deserialize_with = "double_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub access_tier: Option<Option<AccessTier>>,
 }
 
 /// Read a **present** member of a patch as `Some(..)` whatever it is, so that a member set to
@@ -1211,6 +1290,7 @@ impl SessionPatch {
         name("denyTools", self.deny_tools.is_some());
         name("reportSchema", self.report_schema.is_some());
         name("instructions", self.instructions.is_some());
+        name("accessTier", self.access_tier.is_some());
         named
     }
 
@@ -1255,6 +1335,9 @@ impl SessionPatch {
         }
         if let Some(v) = &self.instructions {
             config.instructions = v.clone();
+        }
+        if let Some(v) = &self.access_tier {
+            config.access_tier = *v;
         }
         config
     }
@@ -1328,6 +1411,14 @@ pub struct SessionBounds {
     ///
     /// [ADR 0054]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md
     pub token_budget: Option<u64>,
+    /// The tiers the deployment lists for a session's
+    /// [`access_tier`](SessionConfig::access_tier) (`access-tier/v1`), **narrowed at the call** to
+    /// those at or below the tier of the run that starts the session
+    /// ([`for_starter`](Self::for_starter)): `None` when the deployment lists none, and then
+    /// [`admit`](Self::admit) refuses the option rather than ignore it ([ADR 0054], slice 8).
+    ///
+    /// [ADR 0054]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md
+    pub access_tiers: Option<AccessTiers>,
     /// The names of the tools the folder and the deployment can offer the subagent (its own, an MCP
     /// server's as `server__tool`, and what each of its sources declares:
     /// `ToolSource::declared`), **as far as the caller knows them**: a worker fills them from the
@@ -1378,6 +1469,7 @@ impl Default for SessionBounds {
             time_limit: 30,
             max_rounds: 20,
             token_budget: None,
+            access_tiers: None,
             tools: Vec::new(),
             tools_complete: false,
         }
@@ -1385,6 +1477,48 @@ impl Default for SessionBounds {
 }
 
 impl SessionBounds {
+    /// These bounds as the run that starts the session narrows them ([ADR 0054], decision 2 and
+    /// slice 8): the tiers a session's `access_tier` may name are the deployment's at or below the
+    /// **starter's** tier, and a run whose context names none works under the deployment's default.
+    ///
+    /// The starter's tier is the lower of the tier the context names
+    /// ([`access_tier_named`]) and the ceiling a parent session put there
+    /// ([`access_tier_ceiling`]), so a session of a session is held to both. A deployment that lists
+    /// no tiers stays `None`: the option is refused whatever the starter's tier.
+    ///
+    /// The tool and the A2A front both call it before [`admit`](Self::admit), so a tier above the
+    /// parent's is refused in the same words at both. A round of a session and every later round
+    /// clamp with it too, so a message that lowered the tier lowers the session with it.
+    ///
+    /// [ADR 0054]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md
+    #[must_use]
+    pub fn for_starter(&self, context: &serde_json::Map<String, Value>) -> Self {
+        let starter = match (access_tier_named(context), access_tier_ceiling(context)) {
+            (Some(named), Some(ceiling)) => Some(named.min(ceiling)),
+            (named, ceiling) => named.or(ceiling),
+        };
+        self.narrowed_to(starter)
+    }
+
+    /// These bounds with the tiers narrowed to `starter`: [`for_starter`] for a caller that
+    /// resolved the starter's tier itself (the A2A front, whose person's tier comes from the
+    /// message's metadata rather than a context a run carries). `None` means the starter named no
+    /// tier, so it works under the deployment's default, and a session may not be raised above it.
+    ///
+    /// [`for_starter`]: Self::for_starter
+    #[must_use]
+    pub fn narrowed_to(&self, starter: Option<AccessTier>) -> Self {
+        let Some(tiers) = &self.access_tiers else {
+            return self.clone();
+        };
+        let starter = starter.unwrap_or_else(|| tiers.default_tier());
+        let mut narrowed = self.clone();
+        // `None` when the narrowed set honours nothing: fail closed, as if the deployment listed
+        // no tiers, rather than admit a tier the starter cannot grant.
+        narrowed.access_tiers = tiers.narrowed_to(starter);
+        narrowed
+    }
+
     /// Admit `requested` against these bounds ([ADR 0054], decision 2): the same config when every
     /// option is within them, a [`Refusal`] otherwise. **It never raises a bound and it fills
     /// nothing in**: an option the request leaves out stays out and means the folder's.
@@ -1499,6 +1633,27 @@ impl SessionBounds {
                 return Err(Refusal::new(
                     Some("token_budget"),
                     format!("config.token_budget is {v}; at most {ceiling}"),
+                ));
+            }
+        }
+        if let Some(tier) = requested.access_tier {
+            let Some(tiers) = &self.access_tiers else {
+                return Err(Refusal::new(
+                    Some("access_tier"),
+                    format!(
+                        "config.access_tier is {tier}; this deployment lists no access tiers, so \
+                         a session may not set one"
+                    ),
+                ));
+            };
+            if !tiers.honours(tier) {
+                let ceiling = tiers.ceiling().unwrap_or(tier);
+                return Err(Refusal::new(
+                    Some("access_tier"),
+                    format!(
+                        "config.access_tier is {tier}; at most {ceiling}, the tier of the \
+                         session's parent"
+                    ),
                 ));
             }
         }
@@ -1719,6 +1874,15 @@ impl SessionBounds {
             // Text has no bound to clamp to: `admit` already refused one that is too long, and a
             // later round keeps what the session was started with.
             instructions: config.instructions.clone(),
+            // A deployment that lowered the tiers since obeys the highest one it lists now, and a
+            // deployment that lists none keeps the ceiling the session was started under: dropping
+            // it would widen, and the round still carries it in its context.
+            access_tier: config.access_tier.map(|tier| {
+                self.access_tiers
+                    .as_ref()
+                    .and_then(AccessTiers::ceiling)
+                    .map_or(tier, |ceiling| tier.min(ceiling))
+            }),
         }
     }
 }
@@ -3153,6 +3317,7 @@ mod tests {
             time_limit: 30,
             max_rounds: 12,
             token_budget: None,
+            access_tiers: None,
             tools: Vec::new(),
             tools_complete: false,
         }
@@ -3454,6 +3619,170 @@ mod tests {
         }
     }
 
+    /// Bounds of a deployment that lists the tiers up to `bypass`, working under `auto` when a
+    /// message names none: the coder's, with its cap raised.
+    fn tiered() -> SessionBounds {
+        SessionBounds {
+            access_tiers: Some(AccessTiers::up_to(AccessTier::Bypass, AccessTier::Auto)),
+            ..bounds()
+        }
+    }
+
+    /// A context that names `tier`, with `ceiling` when it is set.
+    fn tier_context(tier: Option<&str>, ceiling: Option<&str>) -> serde_json::Map<String, Value> {
+        let mut context = serde_json::Map::new();
+        if let Some(tier) = tier {
+            context.insert(
+                ACCESS_TIER_CONTEXT_KEY.to_owned(),
+                serde_json::json!({ "tier": tier }),
+            );
+        }
+        if let Some(ceiling) = ceiling {
+            context.insert(
+                SESSION_ACCESS_TIER_CONTEXT_KEY.to_owned(),
+                serde_json::json!({ "ceiling": ceiling }),
+            );
+        }
+        context
+    }
+
+    fn asking_tier(tier: AccessTier) -> SessionConfig {
+        SessionConfig {
+            access_tier: Some(tier),
+            ..SessionConfig::default()
+        }
+    }
+
+    #[test]
+    fn a_session_may_lower_the_access_tier_and_never_raise_it() {
+        // The parent works at `auto`: a session may be `plan`, `edits` or `auto`, never `bypass`.
+        let bounds = tiered().for_starter(&tier_context(Some("auto"), None));
+        for lower in [AccessTier::Plan, AccessTier::Edits, AccessTier::Auto] {
+            assert_eq!(
+                bounds
+                    .admit(asking_tier(lower))
+                    .expect("at or below the parent")
+                    .access_tier,
+                Some(lower),
+                "{lower}"
+            );
+        }
+        let why = bounds
+            .admit(asking_tier(AccessTier::Bypass))
+            .expect_err("above the parent's tier");
+        assert_eq!(why.option(), Some("access_tier"));
+        assert!(
+            why.message().contains(
+                "config.access_tier is bypass; at most auto, the tier of the session's parent"
+            ),
+            "{why}"
+        );
+        // A parent that works at `bypass` may hand `bypass` down.
+        let parent = tiered().for_starter(&tier_context(Some("bypass"), None));
+        assert_eq!(
+            parent
+                .admit(asking_tier(AccessTier::Bypass))
+                .expect("at the parent's tier")
+                .access_tier,
+            Some(AccessTier::Bypass)
+        );
+    }
+
+    #[test]
+    fn a_parent_session_ceiling_lowers_the_starter_and_a_nested_session_is_held_to_it() {
+        // A session of an `auto` parent, itself configured `plan`: its own children are `plan`.
+        let nested = tiered().for_starter(&tier_context(Some("auto"), Some("plan")));
+        assert!(nested.admit(asking_tier(AccessTier::Plan)).is_ok());
+        for above in [AccessTier::Edits, AccessTier::Auto, AccessTier::Bypass] {
+            let why = nested
+                .admit(asking_tier(above))
+                .expect_err("above the parent session's ceiling");
+            assert!(why.message().contains("at most plan"), "{above}: {why}");
+        }
+        // A context that names no tier but carries a ceiling still narrows.
+        let ceiling_only = tiered().for_starter(&tier_context(None, Some("edits")));
+        assert!(ceiling_only.admit(asking_tier(AccessTier::Edits)).is_ok());
+        assert!(ceiling_only.admit(asking_tier(AccessTier::Auto)).is_err());
+        // A context that names no tier and carries no ceiling leaves the deployment's default:
+        // `auto`, so `bypass` is still refused.
+        let bare = tiered().for_starter(&serde_json::Map::new());
+        assert!(bare.admit(asking_tier(AccessTier::Auto)).is_ok());
+        assert!(bare.admit(asking_tier(AccessTier::Bypass)).is_err());
+    }
+
+    #[test]
+    fn a_deployment_that_lists_no_tiers_refuses_the_option() {
+        let why = bounds()
+            .for_starter(&tier_context(Some("auto"), None))
+            .admit(asking_tier(AccessTier::Plan))
+            .expect_err("no tiers listed");
+        assert_eq!(why.option(), Some("access_tier"));
+        assert!(
+            why.message()
+                .contains("config.access_tier is plan; this deployment lists no access tiers"),
+            "{why}"
+        );
+        // Even the lowest tier: an ignored option would fail open.
+        assert!(bounds().admit(asking_tier(AccessTier::Plan)).is_err());
+        // And the config still asks for nothing else.
+        assert!(!asking_tier(AccessTier::Plan).is_empty());
+    }
+
+    #[test]
+    fn a_later_round_clamps_the_access_tier_to_the_tiers_of_the_time() {
+        let ask = SessionConfig {
+            access_tier: Some(AccessTier::Bypass),
+            ..SessionConfig::default()
+        };
+        // The deployment lowered its cap to `edits`: the round works at `edits`, never `bypass`.
+        let lowered = SessionBounds {
+            access_tiers: Some(AccessTiers::up_to(AccessTier::Edits, AccessTier::Edits)),
+            ..bounds()
+        };
+        assert_eq!(
+            lowered.clamp(&ask).access_tier,
+            Some(AccessTier::Edits),
+            "nothing is raised back"
+        );
+        // A deployment that lists no tiers keeps what the session was started under: dropping it
+        // would widen, and the round still carries the ceiling in its context.
+        assert_eq!(bounds().clamp(&ask).access_tier, Some(AccessTier::Bypass));
+        // Within the bounds: unchanged; absent: absent.
+        assert_eq!(tiered().clamp(&ask).access_tier, Some(AccessTier::Bypass));
+        assert_eq!(tiered().clamp(&SessionConfig::default()).access_tier, None);
+    }
+
+    #[test]
+    fn the_access_tier_rides_the_round_context_and_only_when_it_is_set() {
+        assert_eq!(
+            asking_tier(AccessTier::Plan).access_tier_context(),
+            serde_json::json!({ "ceiling": "plan" })
+        );
+        // A config that sets none writes `{}`: a round never inherits another round's ceiling.
+        assert_eq!(
+            SessionConfig::default().access_tier_context(),
+            serde_json::json!({})
+        );
+        let context = serde_json::Map::from_iter([(
+            SESSION_ACCESS_TIER_CONTEXT_KEY.to_owned(),
+            asking_tier(AccessTier::Edits).access_tier_context(),
+        )]);
+        assert_eq!(access_tier_ceiling(&context), Some(AccessTier::Edits));
+        assert_eq!(access_tier_named(&context), None);
+        // A value that is not a tier is no ceiling, never a guess.
+        for bad in [
+            serde_json::json!({"ceiling": "root"}),
+            serde_json::json!({"ceiling": 2}),
+            serde_json::json!({}),
+        ] {
+            let context = serde_json::Map::from_iter([(
+                SESSION_ACCESS_TIER_CONTEXT_KEY.to_owned(),
+                bad.clone(),
+            )]);
+            assert_eq!(access_tier_ceiling(&context), None, "{bad}");
+        }
+    }
+
     fn reporting(schema: Value) -> SessionConfig {
         SessionConfig {
             report_schema: Some(schema),
@@ -3578,6 +3907,7 @@ mod tests {
             time_limit: 10,
             max_rounds: 5,
             token_budget: Some(4_000),
+            access_tiers: None,
             tools: Vec::new(),
             tools_complete: false,
         };

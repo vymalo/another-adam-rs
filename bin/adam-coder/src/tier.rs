@@ -21,6 +21,12 @@
 //!    notes ([`Gated`](crate::tools)), which is what keeps a subagent or a tool called from
 //!    elsewhere to the tier of the **root** run.
 //!
+//! **A session may lower the tier** (ADR 0054, slice 8): its `config.access_tier` is a ceiling that
+//! rides the round's context (`vymalo.session.accessTier`), and both `TierSource` and `Gated` take
+//! the lower of it and the tier of the run. So a `plan` session of an `auto` parent is offered no
+//! write tool, and a named one is refused at the tool. A deployment that lists no tiers refuses the
+//! option; the coder always lists `honoured_up_to(MAX_ACCESS_TIER)`.
+//!
 //! Only a message sets the tier: the agent records it in the run notes from the conversation's
 //! context and from the messages waiting in the inbox, before each step (`CoderAgent::step`), and
 //! never from what the model or a tool said. A task starts at [`DEFAULT`], not at the tier of the
@@ -224,7 +230,9 @@ impl TierSource {
         Self { notes, max }
     }
 
-    /// The tier the run `ctx` is for works under now.
+    /// The tier the run `ctx` is for works under now: the tier of the message (the root's notes for a
+    /// subagent), lowered by the deployment's cap and by the ceiling a session put on the round
+    /// (ADR 0054, slice 8).
     async fn tier_of(&self, ctx: &SourceCtx) -> AccessTier {
         let tier = if ctx.root_run_id() == ctx.run_id() {
             in_context(ctx.context_map())
@@ -239,6 +247,7 @@ impl TierSource {
             }
         };
         tier.min(self.max)
+            .min(ctx.session_ceiling().unwrap_or(AccessTier::Bypass))
     }
 }
 
@@ -256,7 +265,14 @@ impl ToolSource for TierSource {
     }
 
     async fn instructions(&self, ctx: &SourceCtx) -> Option<String> {
-        named_in_context(ctx.context_map()).map(|named| words(named.min(self.max)))
+        named_in_context(ctx.context_map()).map(|named| {
+            // The tier the model is told is the one it works under: the message's, lowered by the
+            // deployment's cap and by the session's ceiling.
+            let tier = named
+                .min(self.max)
+                .min(ctx.session_ceiling().unwrap_or(AccessTier::Bypass));
+            words(tier)
+        })
     }
 
     async fn withhold(&self, ctx: &SourceCtx, tools: &[&str]) -> Vec<Withheld> {
@@ -533,6 +549,68 @@ mod tests {
             honoured_up_to(AccessTier::Bypass).honoured(),
             AccessTier::ALL
         );
+    }
+
+    /// A round's context: the tier a message names, and the ceiling its session's config puts on
+    /// it (`vymalo.session.accessTier`, ADR 0054 slice 8).
+    fn session_context(tier: &str, ceiling: Option<&str>) -> Map<String, Value> {
+        let mut context = context(json!({"tier": tier}));
+        context.insert(
+            adam_runtime::SESSION_ACCESS_TIER_CONTEXT_KEY.to_owned(),
+            ceiling.map_or_else(|| json!({}), |ceiling| json!({"ceiling": ceiling})),
+        );
+        context
+    }
+
+    /// A `plan` session of an `auto` parent is offered no write tool (ADR 0054, slice 8): the
+    /// ceiling of the round, not the tier of the message, holds the subagent back.
+    #[tokio::test]
+    async fn a_session_ceiling_holds_a_subagent_to_its_own_tier() {
+        use crate::tools::notes::RunNotes;
+        let dir = tempfile::tempdir().unwrap();
+        let notes = NotesStore::new(dir.path());
+        let root = adam_core::RunId::new();
+        notes
+            .save(
+                &root.to_string(),
+                &RunNotes {
+                    tier: Some(AccessTier::Auto),
+                    ..RunNotes::default()
+                },
+            )
+            .await
+            .unwrap();
+        let source = TierSource::new(notes, AccessTier::Bypass);
+        let tools = [
+            "read_file",
+            "write_file",
+            "open_pull_request",
+            "merge_pull_request",
+        ];
+        let held = |ceiling: Option<&str>| {
+            let ctx = SourceCtx::detached_under(root, session_context("auto", ceiling));
+            let source = source.clone();
+            async move {
+                source
+                    .withhold(&ctx, &tools)
+                    .await
+                    .into_iter()
+                    .map(|h| h.tool)
+                    .collect::<Vec<_>>()
+            }
+        };
+        // The parent works at `auto`: without a ceiling the write tools are offered.
+        assert!(held(None).await.is_empty());
+        // A `plan` session of that parent is offered no write tool.
+        assert_eq!(
+            held(Some("plan")).await,
+            ["write_file", "open_pull_request", "merge_pull_request"]
+        );
+        // And the model is told the tier it works under, not the one the person's message named.
+        let ctx = SourceCtx::detached_under(root, session_context("auto", Some("plan")));
+        let text = source.instructions(&ctx).await.unwrap();
+        assert!(text.contains("**plan**"), "{text}");
+        assert!(!text.contains("**auto**"), "{text}");
     }
 
     #[tokio::test]

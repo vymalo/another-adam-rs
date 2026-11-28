@@ -148,8 +148,27 @@ pub struct ModelSwitch {
 }
 
 /// The context key under which a message carries the access tier the person picked for it
-/// (`access-tier/v1`): `{"tier": "plan" | "edits" | "auto" | "bypass"}`.
-pub const ACCESS_TIER_CONTEXT_KEY: &str = "vymalo.accessTier";
+/// (`access-tier/v1`): `{"tier": "plan" | "edits" | "auto" | "bypass"}`. Defined by
+/// [`adam_runtime::ACCESS_TIER_CONTEXT_KEY`] because a session's `access_tier` is held to it (ADR
+/// 0054, slice 8).
+pub const ACCESS_TIER_CONTEXT_KEY: &str = adam_runtime::ACCESS_TIER_CONTEXT_KEY;
+
+/// The context key under which a session's round carries the ceiling its `config` puts on the
+/// access tier (ADR 0054, slice 8): `{"ceiling": "plan"}`, or `{}` when it set none, so a round
+/// never inherits another round's ceiling. Defined by
+/// [`adam_runtime::SESSION_ACCESS_TIER_CONTEXT_KEY`], written by [`round_message`] and the A2A
+/// front from the header's clamped config, and read by a source or tool that enforces a tier
+/// through [`SourceCtx::session_ceiling`](crate::SourceCtx::session_ceiling) and
+/// [`ToolCtx::session_ceiling`](crate::ToolCtx::session_ceiling).
+///
+/// **Not the truth**: the truth is the round's config (`Conversation::config`), which the agent
+/// applies at every model call. The key cannot be the truth: an oversized context is dropped, and a
+/// ceiling must not go with it.
+///
+/// **One of [`PROTECTED_CONTEXT_KEYS`]**, unlike [`SESSION_TOOLS_CONTEXT_KEY`]: a child run of a
+/// session must stay under the ceiling of the run that started it, and a ceiling that a large
+/// context could drop would lift the limit.
+pub const SESSION_ACCESS_TIER_CONTEXT_KEY: &str = adam_runtime::SESSION_ACCESS_TIER_CONTEXT_KEY;
 
 /// The context key under which a message carries the reasoning effort it activated
 /// (`reasoning/v1`, ADR 0063): `{"effort": "none" | "minimal" | "low" | "medium" | "high" |
@@ -210,8 +229,8 @@ pub const LOCALE_CONTEXT_KEY: &str = "vymalo.locale";
 pub const CHILD_SESSIONS_CONTEXT_KEY: &str = "vymalo.childSessions";
 
 /// The context keys that must survive a context the run drops: the **limits on the agent** (the
-/// access tier the person picked, the mode it works in, who the message was sent for, the reasoning
-/// effort it activated, and that nobody answers the run,
+/// access tier the person picked, the ceiling a session put on it, the mode it works in, who the
+/// message was sent for, the reasoning effort it activated, and that nobody answers the run,
 /// `adam_runtime::UNATTENDED_CONTEXT_KEY`) and the **interface
 /// language** the person is speaking ([`LOCALE_CONTEXT_KEY`]). A message always sets them, even
 /// when the rest of its context is over [`MAX_CONTEXT_BYTES`] and dropped (otherwise a large
@@ -221,6 +240,7 @@ pub const CHILD_SESSIONS_CONTEXT_KEY: &str = "vymalo.childSessions";
 /// [`MAX_PROTECTED_VALUE_BYTES`]; a larger one is ignored.
 pub const PROTECTED_CONTEXT_KEYS: &[&str] = &[
     ACCESS_TIER_CONTEXT_KEY,
+    SESSION_ACCESS_TIER_CONTEXT_KEY,
     MODE_CONTEXT_KEY,
     CALLER_CONTEXT_KEY,
     REASONING_EFFORT_CONTEXT_KEY,

@@ -46,7 +46,9 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use a2a::{Message, Task, TaskState};
-use adam_a2a::{BackendError, CHILD_SESSIONS_EXTENSION, Caller, ChildSessionInfo, ExtensionConfig};
+use adam_a2a::{
+    AccessTier, BackendError, CHILD_SESSIONS_EXTENSION, Caller, ChildSessionInfo, ExtensionConfig,
+};
 use adam_core::{ConversationScope, RunId, RunQuery, RunRecord, Timestamp};
 use adam_runtime::{
     Inbound, MAX_SESSION_PAGE, RoundOutcome, RunView, RuntimeError, SESSION_CLOSE_KIND,
@@ -96,6 +98,13 @@ pub const CONTEXT_CHILD_SESSIONS: &str = "vymalo.childSessions";
 /// header's config by `put_header` on every round a person starts, **over** whatever the
 /// message's own context said: a person's request never sets it.
 pub const CONTEXT_SESSION_TOOLS: &str = "vymalo.session.tools";
+
+/// The context key under which a round carries the ceiling its session's `config` puts on the
+/// access tier (ADR 0054, slice 8): `{"ceiling": "plan"}`, or `{}` when it sets none. It is the
+/// loop's `adam_llm_agent::SESSION_ACCESS_TIER_CONTEXT_KEY` (a test keeps the two equal), written
+/// from the header's config by `put_header` on every round a person starts, **over** whatever the
+/// message's own context said: a person's request never sets it.
+pub const CONTEXT_SESSION_ACCESS_TIER: &str = "vymalo.session.accessTier";
 
 /// Put into `inbound` whether this request activated `child-sessions/v1`
 /// ([`CONTEXT_CHILD_SESSIONS`]): `true` or `null`, so that a message that did not activate the
@@ -426,7 +435,11 @@ fn members(message: &Message) -> Result<Option<&Value>, String> {
 
 /// What `message` asks. Unknown members are ignored; `start`, `close` and `edit` are objects of the
 /// contract's members, and a message asks one of them at most.
-pub(crate) fn asked(message: &Message, sessions: &ChildSessions) -> Result<Asked, String> {
+pub(crate) fn asked(
+    message: &Message,
+    sessions: &ChildSessions,
+    starter: Option<AccessTier>,
+) -> Result<Asked, String> {
     let Some(entry) = members(message)? else {
         return Ok(Asked::Nothing);
     };
@@ -437,7 +450,7 @@ pub(crate) fn asked(message: &Message, sessions: &ChildSessions) -> Result<Asked
     }
     match (start, close, edit) {
         (Some(start), _, _) => {
-            parse_start(start, sessions).map(|start| Asked::Start(Box::new(start)))
+            parse_start(start, sessions, starter).map(|start| Asked::Start(Box::new(start)))
         }
         (_, Some(close), _) => parse_close(close).map(|cancel| Asked::Close { cancel }),
         (_, _, Some(edit)) => parse_edit(edit).map(|patch| Asked::Edit {
@@ -447,7 +460,11 @@ pub(crate) fn asked(message: &Message, sessions: &ChildSessions) -> Result<Asked
     }
 }
 
-fn parse_start(start: &Value, sessions: &ChildSessions) -> Result<Start, String> {
+fn parse_start(
+    start: &Value,
+    sessions: &ChildSessions,
+    starter: Option<AccessTier>,
+) -> Result<Start, String> {
     let object = start
         .as_object()
         .ok_or("`start` is not an object: {agent, description, keepOpen}")?;
@@ -490,7 +507,7 @@ fn parse_start(start: &Value, sessions: &ChildSessions) -> Result<Start, String>
             let helper = sessions
                 .by_name(agent)
                 .ok_or("`start.agent` names no helper")?;
-            parse_config(value, helper)?
+            parse_config(value, helper, starter)?
         }
     };
     Ok(Start {
@@ -503,7 +520,7 @@ fn parse_start(start: &Value, sessions: &ChildSessions) -> Result<Start, String>
 
 /// The options of `start.config`, as the wire spells them, and as the model's tool and the
 /// refusals of [`SessionBounds::admit`] spell them.
-const CONFIG_OPTIONS: [(&str, &str); 10] = [
+const CONFIG_OPTIONS: [(&str, &str); 11] = [
     ("maxTurns", "max_turns"),
     ("maxToolCalls", "max_tool_calls"),
     ("maxOutputTokens", "max_output_tokens"),
@@ -514,10 +531,14 @@ const CONFIG_OPTIONS: [(&str, &str); 10] = [
     ("tokenBudget", "token_budget"),
     ("tools", "tools"),
     ("denyTools", "deny_tools"),
+    ("accessTier", "access_tier"),
 ];
 
 /// The members of `start.config` that are lists of tool names rather than numbers.
 const CONFIG_LISTS: [&str; 2] = ["tools", "denyTools"];
+
+/// The member of `start.config` that is one of the four access-tier words rather than a number.
+const CONFIG_WORDS: [&str; 1] = ["accessTier"];
 
 /// The options a remote helper refuses: every one but `timeLimit` and `maxRounds` (ADR 0054
 /// decision 4), the rule `subagent_start` applies to a remote subagent.
@@ -541,6 +562,7 @@ const REMOTE_REFUSED: [&str; 8] = [
 fn parse_config(
     value: &Value,
     helper: &ChildSessionAgent,
+    starter: Option<AccessTier>,
 ) -> Result<Option<SessionConfig>, String> {
     let object = value
         .as_object()
@@ -568,6 +590,23 @@ fn parse_config(
                 return Err(format!(
                     "`start.config.{key}` is a list of tool names or patterns, none blank"
                 ));
+            }
+            wire.insert(key.clone(), value.clone());
+            continue;
+        }
+        if CONFIG_WORDS.contains(&key.as_str()) {
+            match value {
+                Value::Null => continue,
+                Value::String(word) => {
+                    // Exactly one of the four: a near spelling is refused here, before `admit`.
+                    word.parse::<AccessTier>()
+                        .map_err(|e| format!("`start.config.{key}`: {e}"))?;
+                }
+                _ => {
+                    return Err(format!(
+                        "`start.config.{key}` is one of plan, edits, auto or bypass"
+                    ));
+                }
             }
             wire.insert(key.clone(), value.clone());
             continue;
@@ -617,7 +656,7 @@ fn parse_config(
             "`start.config` is not available for this helper: its bounds are not known here".into(),
         );
     };
-    let admitted = bounds.admit(asked).map_err(|why| {
+    let admitted = bounds.narrowed_to(starter).admit(asked).map_err(|why| {
         // Its words name `config.<snake_name>`; here the member is `start.config.<camelName>`.
         let mut words = why.message().to_owned();
         for (camel, snake) in CONFIG_OPTIONS {
@@ -1177,7 +1216,8 @@ impl RuntimeTaskBackend {
         if !activated {
             return Err(not_activated());
         }
-        let asked = asked(message, sessions).map_err(BackendError::InvalidParams)?;
+        let asked = asked(message, sessions, self.starter_tier(caller, message)?)
+            .map_err(BackendError::InvalidParams)?;
         let task = match (task_id, round, kind) {
             (_, _, Some(ContextKind::TooDeep)) => {
                 return Err(BackendError::InvalidParams(
@@ -1250,7 +1290,13 @@ impl RuntimeTaskBackend {
         if !caller.has_extension(CHILD_SESSIONS_EXTENSION) {
             return Ok(None);
         }
-        match asked(message, self.sessions()?).map_err(BackendError::InvalidParams)? {
+        match asked(
+            message,
+            self.sessions()?,
+            self.starter_tier(caller, message)?,
+        )
+        .map_err(BackendError::InvalidParams)?
+        {
             Asked::Nothing => Ok(None),
             Asked::Close { .. } => Err(BackendError::InvalidParams(
                 "a close goes to the child context of a session".into(),
@@ -1304,6 +1350,29 @@ impl RuntimeTaskBackend {
             return Ok(());
         };
         crate::tier::put(inbound, tier).map_err(BackendError::InvalidParams)
+    }
+
+    /// The tier the run a session is started under works at, for
+    /// [`SessionBounds::narrowed_to`] (ADR 0054, slice 8): the tier the message names when the
+    /// request activated `access-tier/v1`, else the deployment's default — the same value
+    /// [`named_tier`](Self::named_tier) puts in the round's context, so a person's
+    /// `start.config.accessTier` is held to the tier the person's own message works under. `None`
+    /// when the deployment lists no tiers, and then the option is refused.
+    fn starter_tier(
+        &self,
+        caller: &Caller,
+        message: &Message,
+    ) -> Result<Option<AccessTier>, BackendError> {
+        let Some(tiers) = &self.access_tiers else {
+            return Ok(None);
+        };
+        if caller.has_extension(adam_a2a::ACCESS_TIER_EXTENSION) {
+            crate::tier::requested(message, tiers)
+                .map(Some)
+                .map_err(BackendError::InvalidParams)
+        } else {
+            Ok(Some(tiers.default_tier()))
+        }
     }
 
     /// The mode of a message to a child context: a request that activated `agent-mode/v1` names
@@ -1441,6 +1510,9 @@ impl RuntimeTaskBackend {
     ) -> Result<Task, BackendError> {
         let sessions = self.sessions()?;
         let child = session_conversation_id(context, session);
+        // The person's own tier, which an edit's `accessTier` may lower and never raise (ADR 0054,
+        // slice 8).
+        let starter = self.starter_tier(caller, message)?;
         // A message asks one of the three at most (`asked`), and this is the child-context path:
         // a `start` was refused before it got here.
         let close = match asked {
@@ -1550,6 +1622,7 @@ impl RuntimeTaskBackend {
                             .into(),
                     ));
                 };
+                let bounds = bounds.narrowed_to(starter);
                 let base = view
                     .header
                     .as_ref()
@@ -1878,6 +1951,15 @@ fn put_header(inbound: &mut Inbound, header: &SessionHeader) -> Result<(), Strin
                 .as_ref()
                 .map_or_else(|| json!({}), SessionConfig::tools_context),
         );
+        // The ceiling the config puts on the access tier, from the header, never from the message
+        // (ADR 0054, slice 8).
+        context.insert(
+            CONTEXT_SESSION_ACCESS_TIER.to_owned(),
+            header
+                .config
+                .as_ref()
+                .map_or_else(|| json!({}), SessionConfig::access_tier_context),
+        );
     }
     Ok(())
 }
@@ -2049,7 +2131,8 @@ mod tests {
         let ok = asked(
             &message(Some(json!({"start": {"agent": "planner", "description": " Plan it ", "keepOpen": true, "x": 1}}))),
             &s,
-        )
+           None,
+       )
         .unwrap();
         assert_eq!(
             ok,
@@ -2065,6 +2148,7 @@ mod tests {
                 json!({"start": {"agent": "planner", "description": "d"}}),
             )),
             &s,
+            None,
         )
         .unwrap();
         assert!(matches!(
@@ -2086,11 +2170,14 @@ mod tests {
             json!({"start": {"agent": "planner", "description": "d"}, "close": {}}),
             json!("start"),
         ] {
-            assert!(asked(&message(Some(entry.clone())), &s).is_err(), "{entry}");
+            assert!(
+                asked(&message(Some(entry.clone())), &s, None).is_err(),
+                "{entry}"
+            );
         }
-        assert_eq!(asked(&message(None), &s), Ok(Asked::Nothing));
+        assert_eq!(asked(&message(None), &s, None), Ok(Asked::Nothing));
         assert_eq!(
-            asked(&message(Some(json!({"other": 1}))), &s),
+            asked(&message(Some(json!({"other": 1}))), &s, None),
             Ok(Asked::Nothing)
         );
         let exact = "x".repeat(80);
@@ -2099,7 +2186,8 @@ mod tests {
                 &message(Some(
                     json!({"start": {"agent": "planner", "description": exact}})
                 )),
-                &s
+                &s,
+                None,
             )
             .is_ok()
         );
@@ -2119,6 +2207,7 @@ mod tests {
                 "agent": "planner", "description": "d", "config": config
             }}))),
             &bounded(),
+            None,
         )
     }
 
@@ -2204,6 +2293,7 @@ mod tests {
                     "agent": "planner", "description": "d", "config": config
                 }}))),
                 sessions,
+                None,
             )
         };
         assert!(ask(&unbounded, json!({"maxTurns": 3})).is_err());
@@ -2287,6 +2377,7 @@ mod tests {
                     "agent": "planner", "description": "d", "config": { member: ["a"] }
                 }}))),
                 &remote,
+                None,
             )
             .unwrap_err();
             assert!(why.contains(&format!("start.config.{member}")), "{why}");
@@ -2345,15 +2436,15 @@ mod tests {
     fn a_close_is_read_strictly() {
         let s = sessions();
         assert_eq!(
-            asked(&message(Some(json!({"close": {}}))), &s),
+            asked(&message(Some(json!({"close": {}}))), &s, None),
             Ok(Asked::Close { cancel: false })
         );
         assert_eq!(
-            asked(&message(Some(json!({"close": {"cancel": true}}))), &s),
+            asked(&message(Some(json!({"close": {"cancel": true}}))), &s, None),
             Ok(Asked::Close { cancel: true })
         );
         for entry in [json!({"close": true}), json!({"close": {"cancel": "yes"}})] {
-            assert!(asked(&message(Some(entry)), &s).is_err());
+            assert!(asked(&message(Some(entry)), &s, None).is_err());
         }
     }
 

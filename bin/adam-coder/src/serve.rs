@@ -427,7 +427,10 @@ pub async fn serve(
         .context("reading the agent definition")?
         .session_limits(config.service.sessions.limits)
         // The same `MAX_PARALLEL_TOOL_CALLS` every role reads, so the bounds below are a worker's.
-        .session_max_parallel(config.service.sessions.max_parallel_tool_calls);
+        .session_max_parallel(config.service.sessions.max_parallel_tool_calls)
+        // The access tiers every role lists, so a control plane refuses a `start.config.accessTier`
+        // exactly as a worker's session tools do (ADR 0054, slice 8).
+        .session_access_tiers(Some(crate::tier::honoured_up_to(config.max_access_tier)));
     let sessions = helpers.child_sessions();
     // The files' schedules (ADR 0060), run by the roles that run workers.
     let schedules = helpers.manifest().schedules.clone();

@@ -85,6 +85,16 @@
             "report_schema": {
               "type": "object",
               "description": "A JSON Schema (draft 2020-12, at most 16 KiB, with no reference outside itself) that the subagent's final answer must match: one JSON value (a `format` is only an annotation, not enforced). The subagent is not shown it unless a first answer fails it: describe the shape in `prompt` too. Not for a remote subagent."
+            },
+            "access_tier": {
+              "type": "string",
+              "enum": [
+                "plan",
+                "edits",
+                "auto",
+                "bypass"
+              ],
+              "description": "A ceiling on the access tier of every round of this session: at most the tier of the run that starts it, and it may only lower it. Not for a remote subagent."
             }
           },
           "additionalProperties": false
@@ -251,6 +261,20 @@
                 "null"
               ],
               "description": "A JSON Schema (draft 2020-12, at most 16 KiB, with no reference outside itself) that the subagent's final answer must match."
+            },
+            "access_tier": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "enum": [
+                "plan",
+                "edits",
+                "auto",
+                "bypass",
+                null
+              ],
+              "description": "A ceiling on the access tier of every round: at most the tier of the run that starts it, and it may only lower it."
             }
           },
           "additionalProperties": false
