@@ -194,14 +194,14 @@ byte the one without the feature.
 The typed level is applied **after** the extra body (`MODEL_EXTRA_BODY` until ADR 0064 slice 3 replaces it with
 the profile's `extraBody`), and it removes only the members its wire would duplicate: `reasoning_effort` and
 `reasoning.effort` for the first two wires (a `reasoning` object that held the effort and empties is removed;
-one the extra body wrote empty stays), `thinking` for the third. Every other member stays, so a flag the model
+one the extra body wrote empty stays), `thinking.type` and `thinking.budget_tokens` for the third, whose object's
+other members stay (ADR 0063, amended 2026-11-28). Every other member stays, so a flag the model
 needs is not dropped — including, for `thinking_budget`, the extra body's `reasoning_effort` and
 `reasoning.effort`, which the ADR's letter leaves in place. `none` is a real level and is sent as `"none"`; an
 **absent** level sends nothing. A level the profile does not declare is the assembly's to refuse, not the
 client's: the client is not a second validator.
 
-**Limits.** `thinking` is removed wholesale, as the ADR says: an extra body's other `thinking` members
-(`clear_thinking`, a provider's own) are lost, and merging them is a follow-up (adam-rs#330). The wires are
+**Limits.** The wires are
 asymmetric on a non-object `reasoning`: `reasoning_object` replaces it (the member name collides), while
 `reasoning_effort` leaves it (only `reasoning.effort` is its duplicate, and a non-object holds none). A
 hand-built profile with the `thinking_budget` wire and no budget for the level is
@@ -321,7 +321,9 @@ adds roots to it. The crate reads no variable itself: `MODEL_CA_FILE` is read by
   (the ADR's pinned order), `each_wire_writes_its_own_member` (all three wires, each with an extra body carrying all three
   members), `an_emptied_reasoning_object_is_removed_and_its_other_members_stay`,
   `an_empty_reasoning_object_the_extra_body_wrote_stays`, `the_reasoning_object_wire_keeps_the_objects_other_members`,
-  `the_thinking_budget_wire_replaces_thinking_wholesale`, `none_is_a_level_that_is_sent_and_an_absent_one_is_not`,
+  `the_thinking_budget_wire_keeps_a_thinking_objects_other_members`,
+  `the_thinking_budget_wire_replaces_a_thinking_that_is_not_an_object`,
+  `none_is_a_level_that_is_sent_and_an_absent_one_is_not`,
   `without_a_profile_a_wire_or_a_level_the_body_is_byte_identical`,
   `a_thinking_budget_with_no_budget_names_the_model_and_the_level` and
   `a_hand_built_thinking_budget_profile_refuses_none`; `src/lib.rs`'s

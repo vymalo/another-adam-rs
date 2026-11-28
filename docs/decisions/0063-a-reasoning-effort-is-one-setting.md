@@ -133,7 +133,7 @@ recorded outside this repository.
    the profiles and applies the `reasoningWire` of the request's model:
    - the typed level is applied **after** the profile's `extraBody` (or, until ADR 0064 lands,
      `MODEL_EXTRA_BODY`), and it removes only the members the chosen wire would duplicate —
-     `reasoning_effort` and `reasoning.effort` for the first two wires, `thinking` for `thinking_budget` —
+     `reasoning_effort` and `reasoning.effort` for the first two wires, `thinking` for `thinking_budget` (*amended 2026-11-28: the two members it writes, not the object — see below*) —
      so a typed level wins without dropping a flag the model needs; if the extra body's `reasoning`
      object becomes empty, the object is removed;
    - other extra-body members remain;
@@ -273,6 +273,19 @@ choice; absent everywhere sends nothing). The `MODEL_EXTRA_BODY` rule is 0054's 
 typed level removes the members the model's wire would duplicate from the profile's `extraBody` (or
 `MODEL_EXTRA_BODY` until ADR 0064 lands) and writes the model's mapping. `temperature` is unchanged.
 
+## Amended 2026-11-28 (ANR-55, the owner's answer to ANR-Q125)
+
+ under the `thinking_budget` wire, a typed level no longer
+removes the extra body's `thinking` object wholesale. It removes only the two members the wire writes — `thinking.type`
+and `thinking.budget_tokens` — and writes its own into the object, so a sibling the extra body set survives (GLM's
+`clear_thinking: false`, which together with `MODEL_ECHO_REASONING` keeps earlier turns' reasoning — the sibling alone does
+not: the provider also needs the complete `reasoning_content` echoed back). A `thinking` that is not an object cannot hold those members, so
+the typed level replaces it, as the `reasoning` object wire does. Decision 6's "the members its wire would duplicate" is
+therefore read as the members the wire **writes**, not the object that holds them. Proof:
+`crates/adam-model-openai/src/wire.rs` — `the_thinking_budget_wire_keeps_a_thinking_objects_other_members` (red with
+`members.remove("thinking")`), `the_thinking_budget_wire_replaces_a_thinking_that_is_not_an_object`, and the third arm of
+`each_wire_writes_its_own_member`.
+
 ## Amended 2026-11-22
 
 *Amended 2026-11-22:* **a `thinking_budget` profile may not declare `none`.** The shape has no disabled
@@ -312,13 +325,3 @@ lowest first; nothing else in decision 5 changes.
 - The full per-model probe table lives outside this repository; the deployment's profiles are the owner's.
 - Whether a model's `thinking_budget` budgets are per level a fixed table or a formula; the entry carries
   the table, and a formula is a later ADR if a model needs one.
-
-*Amended 2026-11-28 (ANR-55, the owner's answer to ANR-Q125):* under the `thinking_budget` wire, a typed level no longer
-removes the extra body's `thinking` object wholesale. It removes only the two members the wire writes — `thinking.type`
-and `thinking.budget_tokens` — and writes its own into the object, so a sibling the extra body set survives (GLM's
-`clear_thinking: false` keeps earlier turns' reasoning). A `thinking` that is not an object cannot hold those members, so
-the typed level replaces it, as the `reasoning` object wire does. Decision 6's "the members its wire would duplicate" is
-therefore read as the members the wire **writes**, not the object that holds them. Proof:
-`crates/adam-model-openai/src/wire.rs` — `the_thinking_budget_wire_keeps_a_thinking_objects_other_members` (red with
-`members.remove("thinking")`), `the_thinking_budget_wire_replaces_a_thinking_that_is_not_an_object`, and the third arm of
-`each_wire_writes_its_own_member`.

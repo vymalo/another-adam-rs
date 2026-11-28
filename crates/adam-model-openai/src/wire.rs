@@ -358,8 +358,8 @@ impl ReasoningMember {
                     .and_then(Value::as_object)
                     .cloned()
                     .unwrap_or_default();
-                thinking.remove("type");
-                thinking.remove("budget_tokens");
+                // The two `insert`s below are the removal: they overwrite whatever the extra body
+                // wrote of the same two members.
                 thinking.insert("type".to_owned(), json!("enabled"));
                 thinking.insert("budget_tokens".to_owned(), json!(budget));
                 members.insert("thinking".to_owned(), Value::Object(thinking));
@@ -1482,7 +1482,7 @@ mod tests {
                     );
                     assert_eq!(
                         sent["reasoning_effort"], "medium",
-                        "the ADR removes only `thinking`: the extra body's effort stays: {sent}"
+                        "the wire does not write `reasoning_effort`, so the extra body's stays: {sent}"
                     );
                     assert_eq!(
                         sent["reasoning"],
