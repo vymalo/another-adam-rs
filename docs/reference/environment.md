@@ -155,6 +155,10 @@ through `config.extraEnv`. Source: [`adam-otel`](../../crates/adam-otel/README.m
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | the OTLP/HTTP collector, an absolute `http` or `https` URL with no user, password, query or fragment; unset or blank means no exporter and no thread | unset: off |
 | `OTEL_SERVICE_NAME` | `service.name` of every exported span's and metric's resource | `adam` |
 
+Logs ride it too: the process's `tracing` events are exported to `{endpoint}/v1/logs` through an allowlist, so a
+record carries its message, its severity and named classes (an error's class, a state, a count) and never a
+prompt, an argument or a token.
+
 Metrics ride the same variable and the same switch (`adam.runs`, a counter of committed transitions labelled by the run's state): with an endpoint set, the process's meter exports to
 `{endpoint}/v1/metrics` on a periodic reader (15 s); unset, nothing is built. A label is one of the crate's closed
 sets (`adam_otel::labels`), so a metric names a run's state or a declared tool, never a person, an id or an amount.

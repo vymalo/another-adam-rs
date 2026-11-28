@@ -132,6 +132,20 @@ backend's cardinality is what the deployment planned for, and no id, token or am
 accident. The shape check is not a secret filter — a token can have a name's shape — so what keeps a secret out is the
 set, never a value at hand.
 
+## Logs
+
+The process's `tracing` events become OTLP log records on the same switch (ANR-1348): with an endpoint set, a
+batch processor posts them to `{endpoint}/v1/logs`, and with none nothing is built.
+
+**A record is allowlisted.** It carries its target, its severity, the message the macro wrote, and only the fields
+named in [`logs::ALLOWED`] — an error's class, a run's state, a count, a declared tool or model, a worker id, an
+attempt number. Every other field the event carries (a prompt, a tool's arguments, a path, a token) is dropped before
+the record exists, so it cannot reach an exporter even by accident. The test emits an event with a prompt, an
+argument and a token beside a class, and asserts the exporter saw the class and neither of the other three.
+
+The coder's redactor holds per-run secrets this process-level layer cannot see; the allowlist is what makes that
+unnecessary, and it is why the log bridge is adam's own layer rather than a copy-everything appender.
+
 ## Versions
 
 `opentelemetry` 0.33.1, `opentelemetry_sdk` 0.33.1, `opentelemetry-otlp` 0.33.1 and

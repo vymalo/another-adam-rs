@@ -15,6 +15,7 @@ use tracing_subscriber::layer::SubscriberExt as _;
 use tracing_subscriber::registry::LookupSpan;
 use tracing_subscriber::util::SubscriberInitExt as _;
 
+use crate::logs::Logs;
 use crate::{Otel, OtelLayer, Settings};
 
 /// Installs the process's subscriber and starts the exporter the environment names.
@@ -53,6 +54,12 @@ fn compose(filter: EnvFilter, otel: Option<&Otel>) -> impl Subscriber + Send + S
     Registry::default()
         .with(tracing_subscriber::fmt::layer().json().with_filter(filter))
         .with(otel_layer(otel))
+        .with(logs_layer(otel))
+}
+
+/// The logs half of [`compose`]: `None` when tracing is off, so no record is built.
+fn logs_layer(otel: Option<&Otel>) -> Option<Logs> {
+    otel.map(|otel| Logs::new(otel.logger_provider()))
 }
 
 /// The OTel half of [`compose`]: `None` when tracing is off, so no layer is built.
