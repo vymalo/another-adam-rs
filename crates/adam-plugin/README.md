@@ -33,6 +33,11 @@ neither the loop nor the runtime.
 
 ## The rules
 
+- **Not a plugin point: the command environment.** A command's environment is
+  `adam_workspace::ExecHook`, composed by `adam_workspace::HookedEnvironment` (ADR 0050, decision 13,
+  slice H10), and not a `Plugin` method: it sees an `ExecSpec` and needs no `Ctx`, store or secret,
+  and keeping it there means this crate depends on neither the workspace nor the loop. `HidingEnvironment`
+  is one such hook; `exec` stays a reserved event namespace.
 - **Fail closed.** A hook that errors, panics or misses its deadline never lets the call or the message
   through: the set answers a `HookError` and the caller refuses. A panic is `Invalid` (a buggy plugin is
   not unlucky); a deadline is `Transient`.

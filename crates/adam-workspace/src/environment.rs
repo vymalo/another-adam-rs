@@ -26,6 +26,9 @@
 //!   command line, and an environment gives none to its processes.
 //! * [`EnvProgress`] is how a slow `ensure` (building an image) tells the caller what it is doing,
 //!   as [`EnvStep`]s the caller shows.
+//! * [`ExecHook`] adjusts every [`ExecSpec`] of a run before the environment prepares it (a
+//!   deployment's policy on the commands it runs); [`HookedEnvironment`] composes a list of them
+//!   around an inner [`Environment`], and [`HidingEnvironment`] is one such hook.
 //!
 //! [`Local`] is the one implementation here and behaves as the callers always did: the process is
 //! a child of the caller, in the caller's environment, minus the names the caller asked to hide
@@ -34,7 +37,7 @@
 //! The traits are the port; an implementation that runs processes in a container is another crate's
 //! (ADR 0009 of this repository: swappable at build time).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::fmt;
 use std::path::PathBuf;
@@ -455,7 +458,8 @@ pub trait EnvSession: Send + Sync {
     /// sandbox usage (ADR 0043). `None`, the default, is an environment that is not metered (the
     /// caller's own container): the usage says where the run was and not how long,
     /// which is *not measured* and not zero. An implementation that wraps another one must forward
-    /// this ([`HidingEnvironment`] does), or the default hides the shape.
+    /// this ([`HookedEnvironment`] does, and [`HidingEnvironment`] through it), or the default hides the
+    /// shape.
     fn sandbox_shape(&self) -> Option<SandboxShape> {
         None
     }
@@ -503,6 +507,16 @@ pub enum EnvError {
     /// restarted).
     #[error("the environment of the run was lost")]
     Lost,
+    /// An [`ExecHook`] refused or failed on a spec, so the command is not run (ADR 0050,
+    /// decision 13).
+    #[error("the exec hook {hook:?} {source}")]
+    Hook {
+        /// The hook, by its name.
+        hook: String,
+        /// What it said.
+        #[source]
+        source: ExecHookError,
+    },
     /// A local I/O error.
     #[error("the environment could not read or write a file")]
     Io(#[from] std::io::Error),
@@ -513,9 +527,95 @@ impl Classify for EnvError {
         match self {
             Self::Unavailable(_) | Self::Lost | Self::Timeout { .. } => ErrorClass::Transient,
             Self::Config { .. } | Self::Refused(_) | Self::Build { .. } => ErrorClass::Invalid,
+            Self::Hook { source, .. } => source.class(),
             Self::Io(_) => ErrorClass::Internal,
         }
     }
+}
+
+/// A hook that adjusts every command a run prepares, before its environment makes the command
+/// (ADR 0050, decision 13; slice **H10**).
+///
+/// A hook is the **deployment's policy** on the commands of a run: it may set a variable or hide a
+/// name for every [`ExecSpec`], so no caller has to remember it. It gets no `Ctx`, no store and no
+/// secret — it sees the spec and nothing else — and it cannot add a step of the loop.
+///
+/// [`HookedEnvironment`] runs a list of hooks in order and holds two rules at that seam, so a hook
+/// cannot get them wrong:
+///
+/// * A variable a hook **adds** must be a plain upper-case name, and never one that changes how a
+///   program starts ([`DENIED_ENV`]); the command is refused with [`ExecHookError::Variable`],
+///   which names the variable and never its value.
+/// * A **hidden** name always wins: whatever order the hooks ran in, a name in [`ExecSpec::hide`]
+///   is not left in [`ExecSpec::env`] — hiding is the agent's own boundary, a hook is the
+///   deployment's policy, and the boundary does not move.
+///
+/// [`HidingEnvironment`] is the one hook the coder uses today ([`HidingHook`]).
+pub trait ExecHook: Send + Sync {
+    /// The hook's name, as an error names it.
+    fn name(&self) -> &str;
+
+    /// Adjust `spec`: set a variable (never a secret), add a name to hide, or refuse the command.
+    ///
+    /// # Errors
+    ///
+    /// [`ExecHookError`] when the hook cannot or will not adjust this spec. The command is not
+    /// run, and the error never carries a value of a variable.
+    fn prepare(&self, spec: &mut ExecSpec) -> Result<(), ExecHookError>;
+}
+
+/// Why an [`ExecHook`] did not adjust a spec. No variant carries a value of a variable.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum ExecHookError {
+    /// The hook would add a variable that may not be set for a process: it changes how the program
+    /// starts. The variable is named; its value never is.
+    #[error("may not set {name:?}: {reason}")]
+    Variable {
+        /// The variable.
+        name: String,
+        /// Why it may not be set.
+        reason: String,
+    },
+    /// The hook failed for its own reason.
+    #[error("failed: {reason}")]
+    Failed {
+        /// The class of the failure, for the caller that decides whether to try again.
+        class: ErrorClass,
+        /// What happened, as a person reads it. Never a value of a variable.
+        reason: String,
+    },
+}
+
+impl Classify for ExecHookError {
+    fn class(&self) -> ErrorClass {
+        match self {
+            Self::Variable { .. } => ErrorClass::Invalid,
+            Self::Failed { class, .. } => *class,
+        }
+    }
+}
+
+/// The variables an [`ExecHook`] may never add: they change how a program starts (ADR 0050,
+/// decision 13, and the same list `adam-hook-exec` holds for a program's own environment in its
+/// private `check_env_name`, `crates/adam-hook-exec/src/config.rs`; a dependency on that crate
+/// would drag its transport, so the rule is written twice). **Keep the two lists equal.**
+pub const DENIED_ENV: &[&str] = &["PATH", "HOME", "LANG", "TMPDIR", "BASH_ENV", "ENV", "IFS"];
+
+/// Whether `name` is a variable a hook may add, and why not when it may not.
+fn added_env_problem(name: &str) -> Option<&'static str> {
+    let plain = !name.is_empty()
+        && !name.starts_with(|c: char| c.is_ascii_digit())
+        && name
+            .chars()
+            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_');
+    if !plain {
+        return Some("it is not a plain upper-case name (A-Z, 0-9 and _)");
+    }
+    if name.starts_with("LD_") || DENIED_ENV.contains(&name) {
+        return Some("it changes how the program starts");
+    }
+    None
 }
 
 /// The shell commands run in: `bash` when the image has one, else `sh`.
@@ -621,74 +721,81 @@ impl EnvSession for LocalSession {
     async fn kill(&self, _exec: &ExecId) {}
 }
 
-/// An [`Environment`] that hides some variables of the caller's own environment from **every**
-/// process of every run, whatever the spec says: the names are added to each [`ExecSpec::hide`]
-/// before the inner session prepares it.
+/// An [`Environment`] that runs [`ExecHook`]s on **every** [`ExecSpec`] its sessions prepare,
+/// before the inner environment makes the command (ADR 0050, decision 13; slice **H10**).
 ///
-/// This is how a process that holds secrets keeps them from the code it runs for others (a
-/// repository's checks, a command the model asked for, a coding agent): the names are the
-/// deployment's, known at startup, and a caller that builds a spec cannot forget them. Everything
-/// else is the inner environment's: describe, kill, secrets, tool paths, release.
+/// The binary composes it from the hooks it registered; [`HidingEnvironment`] is the one hook the
+/// coder uses today. The hooks run in the order they were given, and the seam holds the two rules
+/// of [`ExecHook`] whatever a hook does: a variable one adds must be a plain upper-case name that
+/// does not change how a program starts, and a hidden name always wins.
+///
+/// Everything else is the inner environment's: `describe`, `kill`, `sandbox_shape`, `release`,
+/// `held_runs`, `seal`, `set_image`, `repository_image_prefixes`.
 ///
 /// ```
-/// use adam_workspace::{ExecSpec, HidingEnvironment, Local, NoProgress};
+/// use std::sync::Arc;
+/// use adam_workspace::{ExecHook, ExecHookError, ExecSpec, HookedEnvironment, Local, NoProgress};
+///
+/// struct Adds;
+///
+/// impl ExecHook for Adds {
+///     fn name(&self) -> &str {
+///         "adds"
+///     }
+///     fn prepare(&self, spec: &mut ExecSpec) -> Result<(), ExecHookError> {
+///         spec.env.insert("CI".to_owned(), "1".to_owned());
+///         Ok(())
+///     }
+/// }
+///
 /// # async fn demo(workspace: &adam_workspace::RunWorkspace) -> Result<(), adam_workspace::EnvError> {
 /// use adam_workspace::Environment as _;
-/// let env = HidingEnvironment::new(std::sync::Arc::new(Local), ["SEARCH_MCP_TOKEN"]);
+/// let env = HookedEnvironment::new(Arc::new(Local), vec![Arc::new(Adds)]);
 /// let session = env.ensure(workspace, &NoProgress).await?;
 /// let command = session.prepare(&ExecSpec::shell("env", "/work"))?;
-/// assert_eq!(command.env_remove, ["SEARCH_MCP_TOKEN"]);
+/// assert_eq!(command.env.get(&std::ffi::OsString::from("CI")), Some(&std::ffi::OsString::from("1")));
 /// # Ok(()) }
 /// ```
-pub struct HidingEnvironment {
+pub struct HookedEnvironment {
     inner: DynEnvironment,
-    hidden: Arc<Vec<String>>,
+    hooks: Arc<Vec<Arc<dyn ExecHook>>>,
 }
 
-impl HidingEnvironment {
-    /// `inner`, with `names` hidden from every process. Duplicates and blanks are dropped.
-    pub fn new<I, S>(inner: DynEnvironment, names: I) -> Self
-    where
-        I: IntoIterator<Item = S>,
-        S: Into<String>,
-    {
-        let mut hidden: Vec<String> = Vec::new();
-        for name in names.into_iter().map(Into::into) {
-            if !name.trim().is_empty() && !hidden.contains(&name) {
-                hidden.push(name);
-            }
-        }
+impl HookedEnvironment {
+    /// `inner`, with `hooks` run in this order on every spec.
+    pub fn new(inner: DynEnvironment, hooks: Vec<Arc<dyn ExecHook>>) -> Self {
         Self {
             inner,
-            hidden: Arc::new(hidden),
+            hooks: Arc::new(hooks),
         }
     }
 
-    /// The names hidden, in the order they were given.
-    pub fn hidden(&self) -> &[String] {
-        &self.hidden
+    /// The hooks, in the order they run.
+    pub fn hooks(&self) -> &[Arc<dyn ExecHook>] {
+        &self.hooks
     }
 }
 
-impl fmt::Debug for HidingEnvironment {
+impl fmt::Debug for HookedEnvironment {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("HidingEnvironment")
-            .field("hidden", &self.hidden)
+        let hooks: Vec<&str> = self.hooks.iter().map(|hook| hook.name()).collect();
+        f.debug_struct("HookedEnvironment")
+            .field("hooks", &hooks)
             .finish_non_exhaustive()
     }
 }
 
 #[async_trait]
-impl Environment for HidingEnvironment {
+impl Environment for HookedEnvironment {
     async fn ensure(
         &self,
         workspace: &RunWorkspace,
         progress: &dyn EnvProgress,
     ) -> Result<Arc<dyn EnvSession>, EnvError> {
         let inner = self.inner.ensure(workspace, progress).await?;
-        Ok(Arc::new(HidingSession {
+        Ok(Arc::new(HookedSession {
             inner,
-            hidden: Arc::clone(&self.hidden),
+            hooks: Arc::clone(&self.hooks),
         }))
     }
 
@@ -713,24 +820,48 @@ impl Environment for HidingEnvironment {
     }
 }
 
-struct HidingSession {
+struct HookedSession {
     inner: Arc<dyn EnvSession>,
-    hidden: Arc<Vec<String>>,
+    hooks: Arc<Vec<Arc<dyn ExecHook>>>,
 }
 
 #[async_trait]
-impl EnvSession for HidingSession {
+impl EnvSession for HookedSession {
     fn describe(&self) -> EnvDescription {
         self.inner.describe()
     }
 
     fn prepare(&self, spec: &ExecSpec) -> Result<PreparedCommand, EnvError> {
         let mut spec = spec.clone();
-        for name in self.hidden.iter() {
-            if !spec.hide.contains(name) {
-                spec.hide.push(name.clone());
+        for hook in self.hooks.iter() {
+            let before: BTreeSet<String> = spec.env.keys().cloned().collect();
+            hook.prepare(&mut spec).map_err(|source| EnvError::Hook {
+                hook: hook.name().to_owned(),
+                source,
+            })?;
+            for name in spec.env.keys() {
+                if before.contains(name) {
+                    // The caller set it: a hook that rewrites the value of a variable of the
+                    // caller's adds no name, and the rule below is about names a hook adds.
+                    continue;
+                }
+                if let Some(reason) = added_env_problem(name) {
+                    return Err(EnvError::Hook {
+                        hook: hook.name().to_owned(),
+                        source: ExecHookError::Variable {
+                            name: name.clone(),
+                            reason: reason.to_owned(),
+                        },
+                    });
+                }
             }
         }
+        // Hidden names always win (ADR 0050, decision 13): a hook is the deployment's policy, and
+        // hiding is the agent's own boundary, so no order of hooks can move it. The addition is
+        // dropped rather than refused, so the command still runs without the variable: a hook's
+        // mistake never leaves a hidden name visible, and never stops the run either.
+        let hide = &spec.hide;
+        spec.env.retain(|name, _| !hide.contains(name));
         self.inner.prepare(&spec)
     }
 
@@ -740,6 +871,144 @@ impl EnvSession for HidingSession {
 
     fn sandbox_shape(&self) -> Option<SandboxShape> {
         self.inner.sandbox_shape()
+    }
+}
+
+/// The [`ExecHook`] behind [`HidingEnvironment`]: it adds its names to every spec's
+/// [`ExecSpec::hide`].
+pub struct HidingHook {
+    hidden: Arc<Vec<String>>,
+}
+
+impl HidingHook {
+    /// A hook that hides `names` from every process. Duplicates and blanks are dropped.
+    pub fn new<I, S>(names: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        let mut hidden: Vec<String> = Vec::new();
+        for name in names.into_iter().map(Into::into) {
+            if !name.trim().is_empty() && !hidden.contains(&name) {
+                hidden.push(name);
+            }
+        }
+        Self {
+            hidden: Arc::new(hidden),
+        }
+    }
+
+    /// The names hidden, in the order they were given.
+    pub fn hidden(&self) -> &[String] {
+        &self.hidden
+    }
+}
+
+impl ExecHook for HidingHook {
+    fn name(&self) -> &str {
+        "hiding"
+    }
+
+    fn prepare(&self, spec: &mut ExecSpec) -> Result<(), ExecHookError> {
+        for name in self.hidden.iter() {
+            if !spec.hide.contains(name) {
+                spec.hide.push(name.clone());
+            }
+        }
+        Ok(())
+    }
+}
+
+impl fmt::Debug for HidingHook {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("HidingHook")
+            .field("hidden", &self.hidden)
+            .finish_non_exhaustive()
+    }
+}
+
+/// An [`Environment`] that hides some variables of the caller's own environment from **every**
+/// process of every run, whatever the spec says: the names are added to each [`ExecSpec::hide`]
+/// before the inner session prepares it.
+///
+/// This is how a process that holds secrets keeps them from the code it runs for others (a
+/// repository's checks, a command the model asked for, a coding agent): the names are the
+/// deployment's, known at startup, and a caller that builds a spec cannot forget them. It is a
+/// [`HookedEnvironment`] over one hook, [`HidingHook`], so a deployment that composes several hooks
+/// gets the same hiding beside them; everything else is the inner environment's: describe, kill,
+/// secrets, tool paths, release.
+///
+/// ```
+/// use adam_workspace::{ExecSpec, HidingEnvironment, Local, NoProgress};
+/// # async fn demo(workspace: &adam_workspace::RunWorkspace) -> Result<(), adam_workspace::EnvError> {
+/// use adam_workspace::Environment as _;
+/// let env = HidingEnvironment::new(std::sync::Arc::new(Local), ["SEARCH_MCP_TOKEN"]);
+/// let session = env.ensure(workspace, &NoProgress).await?;
+/// let command = session.prepare(&ExecSpec::shell("env", "/work"))?;
+/// assert_eq!(command.env_remove, ["SEARCH_MCP_TOKEN"]);
+/// # Ok(()) }
+/// ```
+pub struct HidingEnvironment {
+    hooked: HookedEnvironment,
+    hook: Arc<HidingHook>,
+}
+
+impl HidingEnvironment {
+    /// `inner`, with `names` hidden from every process. Duplicates and blanks are dropped.
+    pub fn new<I, S>(inner: DynEnvironment, names: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        let hook = Arc::new(HidingHook::new(names));
+        Self {
+            hooked: HookedEnvironment::new(inner, vec![hook.clone()]),
+            hook,
+        }
+    }
+
+    /// The names hidden, in the order they were given.
+    pub fn hidden(&self) -> &[String] {
+        self.hook.hidden()
+    }
+}
+
+impl fmt::Debug for HidingEnvironment {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("HidingEnvironment")
+            .field("hidden", &self.hook.hidden())
+            .finish_non_exhaustive()
+    }
+}
+
+#[async_trait]
+impl Environment for HidingEnvironment {
+    async fn ensure(
+        &self,
+        workspace: &RunWorkspace,
+        progress: &dyn EnvProgress,
+    ) -> Result<Arc<dyn EnvSession>, EnvError> {
+        self.hooked.ensure(workspace, progress).await
+    }
+
+    async fn release(&self, run: &str) -> Result<(), EnvError> {
+        self.hooked.release(run).await
+    }
+
+    async fn held_runs(&self) -> Result<Vec<String>, EnvError> {
+        self.hooked.held_runs().await
+    }
+
+    async fn seal(&self, workspace: &RunWorkspace) -> Result<(), EnvError> {
+        self.hooked.seal(workspace).await
+    }
+
+    async fn set_image(&self, run: &str, image: Option<&str>) -> Result<(), EnvError> {
+        self.hooked.set_image(run, image).await
+    }
+
+    fn repository_image_prefixes(&self) -> Option<&[String]> {
+        self.hooked.repository_image_prefixes()
     }
 }
 
@@ -1045,6 +1314,241 @@ mod tests {
         // The rest is the inner environment's.
         assert!(env.held_runs().await.unwrap().is_empty());
         env.release("any").await.unwrap();
+    }
+
+    /// An [`ExecHook`] that sets one variable.
+    struct Adds {
+        name: &'static str,
+        variable: &'static str,
+        value: &'static str,
+    }
+
+    impl ExecHook for Adds {
+        fn name(&self) -> &str {
+            self.name
+        }
+
+        fn prepare(&self, spec: &mut ExecSpec) -> Result<(), ExecHookError> {
+            spec.env
+                .insert(self.variable.to_owned(), self.value.to_owned());
+            Ok(())
+        }
+    }
+
+    /// An [`ExecHook`] that fails with a class of its own.
+    struct Fails(ErrorClass);
+
+    impl ExecHook for Fails {
+        fn name(&self) -> &str {
+            "failing"
+        }
+
+        fn prepare(&self, _spec: &mut ExecSpec) -> Result<(), ExecHookError> {
+            Err(ExecHookError::Failed {
+                class: self.0,
+                reason: "it is down".to_owned(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn a_hook_adds_a_variable_and_the_command_sees_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = HookedEnvironment::new(
+            Arc::new(Local),
+            vec![Arc::new(Adds {
+                name: "adds",
+                variable: "CI",
+                value: "1",
+            })],
+        );
+        assert_eq!(
+            format!("{env:?}"),
+            "HookedEnvironment { hooks: [\"adds\"], .. }"
+        );
+        let session = env.ensure(&a_run(dir.path()), &NoProgress).await.unwrap();
+        let spec = ExecSpec::shell(r#"printf '%s' "${CI-unset}""#, dir.path());
+        let prepared = session.prepare(&spec).unwrap();
+        assert_eq!(
+            prepared.env.get(&OsString::from("CI")),
+            Some(&OsString::from("1"))
+        );
+        let out = prepared.command().output().await.unwrap();
+        assert!(out.status.success(), "{out:?}");
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "1");
+        assert!(spec.env.is_empty(), "the caller's spec is not changed");
+    }
+
+    /// The card's red case (ADR 0050, slice H10): a hook that adds a hidden name, applied **after**
+    /// the hiding hook, still leaves it hidden. With the seam's pass over the spec removed, the
+    /// adding hook's value stays in `ExecSpec::env` and the assertion on `prepared.env` fails
+    /// (`Local` would still remove it from the child, which is why the spec is asserted too).
+    #[tokio::test]
+    async fn a_hook_that_adds_a_hidden_name_after_the_hiding_hook_still_leaves_it_hidden() {
+        let dir = tempfile::tempdir().unwrap();
+        let probe = r#"printf '%s' "${GITHUB_TOKEN-unset}""#;
+        let adds = || -> Arc<dyn ExecHook> {
+            Arc::new(Adds {
+                name: "adds",
+                variable: "GITHUB_TOKEN",
+                value: "set by a hook",
+            })
+        };
+        let hiding = || -> Arc<dyn ExecHook> { Arc::new(HidingHook::new(["GITHUB_TOKEN"])) };
+        for hooks in [
+            // Hiding first, then the hook that adds the hidden name: the card's order.
+            vec![hiding(), adds()],
+            // And the other order, to prove the order does not matter.
+            vec![adds(), hiding()],
+        ] {
+            let env = HookedEnvironment::new(Arc::new(Local), hooks);
+            let session = env.ensure(&a_run(dir.path()), &NoProgress).await.unwrap();
+            let prepared = session
+                .prepare(&ExecSpec::shell(probe, dir.path()))
+                .unwrap();
+            assert!(
+                !prepared.env.contains_key(&OsString::from("GITHUB_TOKEN")),
+                "a hidden name is never left set: {prepared:?}"
+            );
+            assert_eq!(prepared.env_remove, ["GITHUB_TOKEN"]);
+            let out = prepared.command().output().await.unwrap();
+            assert!(out.status.success(), "{out:?}");
+            assert_eq!(String::from_utf8_lossy(&out.stdout), "unset");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_hook_may_not_add_a_variable_that_changes_how_a_program_starts() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in [
+            "PATH",
+            "HOME",
+            "LANG",
+            "TMPDIR",
+            "LD_PRELOAD",
+            "BASH_ENV",
+            "ENV",
+            "IFS",
+            "lower_case",
+            "1NUMBER",
+            "",
+        ] {
+            let env = HookedEnvironment::new(
+                Arc::new(Local),
+                vec![Arc::new(Adds {
+                    name: "adds",
+                    variable: name,
+                    value: "value-of-the-variable",
+                })],
+            );
+            let session = env.ensure(&a_run(dir.path()), &NoProgress).await.unwrap();
+            let error = session
+                .prepare(&ExecSpec::shell("true", dir.path()))
+                .unwrap_err();
+            assert!(matches!(error, EnvError::Hook { .. }), "{name:?}: {error}");
+            assert_eq!(error.class(), ErrorClass::Invalid, "{name:?}: {error}");
+            let said = error.to_string();
+            assert!(said.contains(name), "{name:?} is named: {said}");
+            assert!(
+                !said.contains("value-of-the-variable"),
+                "never the value: {said}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_hook_may_rewrite_a_variable_the_caller_set_though_it_may_not_add_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = HookedEnvironment::new(
+            Arc::new(Local),
+            vec![Arc::new(Adds {
+                name: "adds",
+                variable: "LANG",
+                value: "C",
+            })],
+        );
+        let session = env.ensure(&a_run(dir.path()), &NoProgress).await.unwrap();
+        let prepared = session
+            .prepare(&ExecSpec::shell("true", dir.path()).env("LANG", "fr_FR.UTF-8"))
+            .unwrap();
+        assert_eq!(
+            prepared.env.get(&OsString::from("LANG")),
+            Some(&OsString::from("C"))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_hook_that_fails_refuses_the_command_with_its_class() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = HookedEnvironment::new(
+            Arc::new(Local),
+            vec![Arc::new(Fails(ErrorClass::Transient))],
+        );
+        let session = env.ensure(&a_run(dir.path()), &NoProgress).await.unwrap();
+        let error = session
+            .prepare(&ExecSpec::shell("true", dir.path()))
+            .unwrap_err();
+        assert!(matches!(error, EnvError::Hook { .. }), "{error}");
+        assert_eq!(error.class(), ErrorClass::Transient, "{error}");
+        let said = error.to_string();
+        assert!(said.contains("failing"), "{said}");
+        assert!(said.contains("it is down"), "{said}");
+    }
+
+    #[tokio::test]
+    async fn a_hooked_environment_with_no_hooks_prepares_what_the_inner_one_does() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = HookedEnvironment::new(Arc::new(Local), Vec::new());
+        assert!(env.hooks().is_empty());
+        let session = env.ensure(&a_run(dir.path()), &NoProgress).await.unwrap();
+        let spec = ExecSpec::shell("true", dir.path())
+            .env("CI", "1")
+            .hide(["TOKEN"]);
+        let hooked = session.prepare(&spec).unwrap();
+        let plain = LocalSession.prepare(&spec).unwrap();
+        assert_eq!(hooked.program, plain.program);
+        assert_eq!(hooked.args, plain.args);
+        assert_eq!(hooked.cwd, plain.cwd);
+        assert_eq!(hooked.env, plain.env);
+        assert_eq!(hooked.env_clear, plain.env_clear);
+        assert_eq!(hooked.env_remove, plain.env_remove);
+    }
+
+    #[tokio::test]
+    async fn a_hooked_environment_forwards_what_it_wraps() {
+        let dir = tempfile::tempdir().unwrap();
+        let inner = Arc::new(Sealing {
+            prefixes: vec!["ghcr.io/acme/".to_owned()],
+            ..Sealing::default()
+        });
+        let env = HookedEnvironment::new(
+            inner.clone(),
+            vec![Arc::new(HidingHook::new(["MCP_SECRET"]))],
+        );
+        env.seal(&a_run(dir.path())).await.unwrap();
+        assert_eq!(*inner.sealed.lock().unwrap(), ["run-1"]);
+        assert_eq!(
+            env.repository_image_prefixes(),
+            Some(["ghcr.io/acme/".to_owned()].as_slice())
+        );
+        env.set_image("run-1", None).await.unwrap();
+        assert_eq!(*inner.images.lock().unwrap(), [("run-1".to_owned(), None)]);
+        assert!(env.held_runs().await.unwrap().is_empty());
+        env.release("run-1").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_hooked_environment_keeps_the_shape_of_the_environment_it_wraps() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = HookedEnvironment::new(
+            Arc::new(Metered),
+            vec![Arc::new(HidingHook::new(["MCP_SECRET"]))],
+        );
+        let session = env.ensure(&a_run(dir.path()), &NoProgress).await.unwrap();
+        assert_eq!(
+            session.sandbox_shape(),
+            Some(SandboxShape::new(Some(250), Some(512 * 1024 * 1024)))
+        );
     }
 
     /// An environment whose sessions say they are metered.
