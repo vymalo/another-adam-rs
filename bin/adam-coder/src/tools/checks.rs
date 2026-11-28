@@ -45,12 +45,14 @@
 //! in where one command ends and the next begins, are two checks) — the commands are not run. The
 //! key is the tree id and the call, **never the time**.
 //!
-//! A **passed** record is the tree's verdict and is reused whatever the run's file/environment
-//! epoch is now — never by time or by the epoch. The answer says the checks passed and were not
-//! run again because this call already passed on the same tree, and its `checks` artifact is the
-//! earlier report marked [`reused`](ChecksReport::reused): the report says which results were
-//! reused. No check cycle is spent and no new record is written (the earlier pass is the record
-//! for this tree).
+//! A **passed** record is the tree's verdict and is reused only at the run's file/environment
+//! epoch it ran at — never by time, and never across a write or a kept command that may have
+//! changed a file the project ignores (`ChecksNotes::epoch`), because the tree id does not show
+//! such a file and a check may read it. The answer says the checks passed and were not run again
+//! because this call already passed on the same tree, and its `checks` artifact is the earlier
+//! report marked [`reused`](ChecksReport::reused): the report says which results were reused. No
+//! check cycle is spent and no new record is written (the earlier pass is the record for this
+//! tree).
 //!
 //! A **failed** record is reused only at the `ChecksNotes::epoch` it ran at (`run` and the file
 //! tools bump it; nothing a check reads may have moved since): the result quotes that run's
@@ -710,11 +712,12 @@ fn unchanged_failure_text(record: &CheckRecord, command: &str, failures: u32, ma
 }
 
 /// What the model is told when a passed check is not run again: the same call already passed on
-/// exactly this tree, so its results are the answer. It quotes the earlier report's summary and
-/// any findings (a pass has none, but the report may carry a `commit` finding when the run's
-/// `HEAD` was unknown — kept), names the call that made them, says the key of a check is the tree
-/// id and the call, never the time or the epoch (so any change to the tree runs the checks again),
-/// and that the `checks` result is the earlier report marked reused, not a new run.
+/// exactly this tree and the run's files and environment have not moved since, so its results are
+/// the answer. It quotes the earlier report's summary and any findings (a pass has none, but the
+/// report may carry a `commit` finding when the run's `HEAD` was unknown — kept), names the call
+/// that made them, says the key of a check is the tree id, the call and the epoch, never the time
+/// (so any change to the tree or to a file a check may read runs the checks again), and that the
+/// `checks` result is the earlier report marked reused, not a new run.
 fn unchanged_pass_text(record: &CheckRecord, command: &str) -> String {
     let tree = record.start_tree.as_deref().unwrap_or_default();
     let short = &tree[..tree.len().min(10)];
@@ -724,10 +727,11 @@ fn unchanged_pass_text(record: &CheckRecord, command: &str) -> String {
         .unwrap_or("the checks passed");
     let mut said = format!(
         "The checks passed and were not run again: `{command}` already passed on tree {short} \
-         (call `{}`), and this call starts on exactly that tree again. A check is keyed on the \
-         tree id (tracked changes and untracked files, not what `.gitignore` hides) and the call, \
-         never on when it ran or on the run's epoch: any change to the tree runs the checks \
-         again. The results reused are those of that run: {summary}",
+         (call `{}`), and this call starts on exactly that tree again, with nothing a check may \
+         read changed since. A check is keyed on the tree id (tracked changes and untracked \
+         files, not what `.gitignore` hides), the call and the run's file/environment epoch, \
+         never on when it ran: any change to the tree or to a file a check may read runs the \
+         checks again. The results reused are those of that run: {summary}",
         record.call_id
     );
     if let Some(report) = report {
@@ -1003,8 +1007,8 @@ pub async fn run_checks(
     let named = joined(&shown);
 
     // The code the commands are about to run on, computed before they run: it says whether a
-    // result already seen on exactly this code (a failure at its epoch, or a pass whatever the
-    // epoch) can be answered instead of running them again. The
+    // result already seen on exactly this code, at this epoch (a failure and a pass alike), can be
+    // answered instead of running them again. The
     // report below is bound to the tree they leave (a check may write a file), as it always was.
     let at = super::gitcli::GitAt::slot(&slot);
     let tree_before = super::gitcli::working_tree_id(&at).await;
@@ -1045,9 +1049,10 @@ pub async fn run_checks(
     }
 
     // A pass on this exact tree, from this exact call (raw commands, directory, slot, timeout) in
-    // this kind of work: the tree is the verdict's key (it holds the tracked changes and untracked
-    // files of the worktree), never the time or the run's file/environment epoch
-    // (`RunNotes::passed_check_on`), so the commands are not run again. The earlier report,
+    // this kind of work, with the run's files and environment unchanged since: the tree is the
+    // verdict's key (it holds the tracked changes and untracked files of the worktree) and the
+    // epoch says nothing a check reads moved (`RunNotes::passed_check_on`), so the commands are
+    // not run again. The earlier report,
     // marked reused, is the answer and the `checks` artifact; no check cycle is spent and no
     // record is written (the earlier pass is the record for this tree). A record that keeps no
     // report cannot say what the earlier run found (only notes written before reports did can

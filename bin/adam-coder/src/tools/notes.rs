@@ -197,9 +197,9 @@ fn is_zero_u64(n: &u64) -> bool {
 /// What makes two `run_checks` calls the same check on the same code: the command (by the SHA-256
 /// of its raw text, so that two commands that differ only in a secret are two checks), the
 /// directory, the slot, the timeout, the tree the command is about to run on, the epoch (see
-/// [`ChecksNotes::epoch`]; a pass is reused whatever it is, [`RunNotes::passed_check_on`]) and
-/// whether the command runs in a scratch project. Two calls with the
-/// same key would do the same thing to the same code, in the same environment.
+/// [`ChecksNotes::epoch`]; a pass and a failure are both reused only at the epoch they ran at,
+/// [`RunNotes::passed_check_on`]) and whether the command runs in a scratch project. Two calls
+/// with the same key would do the same thing to the same code, in the same environment.
 #[derive(Debug, Clone, Copy)]
 pub struct CheckKey<'a> {
     /// The tree id of the code the command is about to run on.
@@ -742,15 +742,18 @@ impl RunNotes {
     /// what `run_checks` answers with instead of running the commands again. A pass is the tree's
     /// verdict, so it is keyed on the tree (the worktree as it would be committed: tracked changes
     /// and untracked files, not what `.gitignore` hides) and the call (the raw commands' SHA-256,
-    /// the directory, the slot, the timeout, the kind of work), **never on time or on the run's
-    /// file/environment epoch**. This differs from [`failed_check_on`](Self::failed_check_on): a
-    /// failure is answered as "it would fail the same way", which needs
-    /// [`ChecksNotes::epoch`] to say that nothing a check reads moved since, while a pass is the
-    /// verdict on the tree itself and stands wherever the epoch is now. As there, `key.tree` is
-    /// the code the command is **about to start** on ([`CheckRecord::start_tree`]), and the most
-    /// recent run of the check on the tree decides: a failure after a pass means the command runs
-    /// again, not that the older pass is the answer. Pre-existing failures are never the verdict
-    /// on their own, and records written before `cwd`, `timeout_secs` or `command_sha` existed
+    /// the directory, the slot, the timeout, the kind of work), **never on time**, and on the
+    /// run's file/environment epoch exactly as [`failed_check_on`](Self::failed_check_on) is:
+    /// [`ChecksNotes::epoch`] moves when a write or a kept command may have changed a file the
+    /// project **ignores** (`target/`, a config), which the tree id does not show and a check may
+    /// read. Reusing a pass across an epoch would then be a stale verdict — the one risk the
+    /// slice's epic names — so a pass is reused only while the epoch is the one it ran at. The
+    /// cost is that a write which leaves the tree as it was (a file changed and reverted) runs the
+    /// check again: one run, never a wrong answer. As in `failed_check_on`, `key.tree` is the code
+    /// the command is **about to start** on ([`CheckRecord::start_tree`]), and the most recent run
+    /// of the check on the tree decides: a failure after a pass means the command runs again, not
+    /// that the older pass is the answer. Pre-existing failures are never the verdict on their
+    /// own, and records written before `cwd`, `timeout_secs`, `epoch` or `command_sha` existed
     /// have none of them, and are not reused.
     pub fn passed_check_on(&self, key: &CheckKey<'_>) -> Option<&CheckRecord> {
         self.checks
@@ -765,7 +768,10 @@ impl RunNotes {
                     && record.scratch == key.scratch
             })
             .filter(|record| {
-                record.passed && !record.preexisting && record.timeout_secs == key.timeout_secs
+                record.passed
+                    && !record.preexisting
+                    && record.epoch == key.epoch
+                    && record.timeout_secs == key.timeout_secs
             })
     }
 
@@ -1761,12 +1767,13 @@ mod tests {
         }
     }
 
-    /// A **pass** is reused on the same tree and call whatever the epoch: a pass is the tree's
-    /// verdict, keyed on the tree and the call, never on time or on the run's file/environment
-    /// epoch. The tree, the raw command, the directory, the slot, the timeout and the kind of work
-    /// still have to be the record's, and the most recent run of the check on the tree decides.
+    /// A **pass** is reused on the same tree, call and epoch: a pass is the tree's verdict, keyed
+    /// on the tree and the call, never on time — and on the run's file/environment epoch, because
+    /// a file the project ignores does not change the tree and a check may read it. The tree, the
+    /// raw command, the directory, the slot, the timeout, the epoch and the kind of work still
+    /// have to be the record's, and the most recent run of the check on the tree decides.
     #[test]
-    fn a_passed_record_is_reused_on_its_tree_and_call_whatever_the_epoch() {
+    fn a_passed_record_is_reused_on_its_tree_call_and_epoch() {
         fn key<'a>(tree: &'a str, epoch: u64) -> CheckKey<'a> {
             CheckKey {
                 tree,
@@ -1788,9 +1795,10 @@ mod tests {
         green.epoch = 4;
         notes.record_check(green);
         assert_eq!(find(&notes, &key("t1", 4)), Some("c1"));
-        // The epoch is no part of it: `run` and the file tools moving it does not cost the tree
-        // its verdict.
-        assert_eq!(find(&notes, &key("t1", 9)), Some("c1"));
+        // The epoch is part of it: a write or a kept command may have changed a file the project
+        // ignores, which the tree id does not show and a check may read, so a pass from before it
+        // is not the verdict on the code as it is now.
+        assert_eq!(find(&notes, &key("t1", 9)), None, "another epoch");
         assert_eq!(find(&notes, &key("t2", 9)), None, "another tree");
         assert_eq!(
             find(
