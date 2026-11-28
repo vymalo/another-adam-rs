@@ -19,7 +19,7 @@ use adam_engine::adam_agent_fs::{Dir, Strictness};
 use adam_engine::adam_assembly::AgentDef;
 use adam_engine::adam_core::{DynStore, MemoryStore, RunId};
 use adam_engine::adam_error::{Classify, ErrorClass};
-use adam_engine::adam_llm_agent::{HookResult, HookedCall, Plugin, Verdict};
+use adam_engine::adam_llm_agent::{Decision as HookDecision, HookResult, HookedCall, Plugin};
 use adam_engine::adam_model::{DynModel, MockModel, ToolCall};
 use adam_engine::{Decision, Engine, EngineError, RunInfo, RunState, Say};
 use serde_json::json;
@@ -714,7 +714,7 @@ impl Plugin for AlwaysContinue {
         "always-continue"
     }
     fn before_tool(&self, _call: &mut HookedCall<'_>) -> HookResult {
-        Ok(Verdict::Continue)
+        Ok(HookDecision::Continue)
     }
 }
 

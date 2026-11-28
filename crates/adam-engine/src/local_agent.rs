@@ -21,14 +21,14 @@ use std::sync::Arc;
 
 use adam_code_tools::{PersonDir, files, inspect, make};
 use adam_llm_agent::{
-    HookResult, HookedCall, Plugin, State, ToolCtx, ToolError, ToolOutput, Verdict,
+    Decision, HookResult, HookedCall, Plugin, State, ToolCtx, ToolError, ToolOutput,
 };
 use adam_macros::tool;
 
 /// What the local agent's hook asks: writes (file tools that change a file, `apply_patch` included)
 /// and commands (`run_command`, `run`). Reads never ask.
 ///
-/// The hook is fail-closed: every one of the five mutating tools returns `Verdict::Ask` always — even
+/// The hook is fail-closed: every one of the five mutating tools returns `Decision::Ask` always — even
 /// when its argument is missing or empty, so a script the model writes without a path cannot write
 /// to whatever path the tool would pick on its own. The question names what it can and degrades
 /// gracefully, so the person reads the surface and the run never bypasses the approval.
@@ -120,9 +120,9 @@ impl Plugin for AsksBeforeWritingOrCommand {
                 }
             }
             // Reads — `read_file`, `read_files`, and any future read-only tool the host adds.
-            _ => return Ok(Verdict::Continue),
+            _ => return Ok(Decision::Continue),
         };
-        Ok(Verdict::Ask(question))
+        Ok(Decision::Ask(question))
     }
 }
 
@@ -407,13 +407,13 @@ mod tests {
         HookedCall { tool, arguments }
     }
 
-    /// Drive the hook with `tool` and `arguments` and unwrap the `Verdict::Ask(question)`.
+    /// Drive the hook with `tool` and `arguments` and unwrap the `Decision::Ask(question)`.
     fn ask(tool: &str, arguments: &mut serde_json::Value) -> String {
         let plugin = AsksBeforeWritingOrCommand;
         let mut call = build_call(tool, arguments);
         let verdict = plugin.before_tool(&mut call).expect("the hook returns Ok");
         match verdict {
-            Verdict::Ask(q) => q,
+            Decision::Ask(q) => q,
             other => panic!("expected Ask, got {other:?}"),
         }
     }
@@ -636,7 +636,7 @@ mod tests {
         let mut call = build_call("read_file", &mut args);
         let verdict = plugin.before_tool(&mut call).expect("the hook returns Ok");
         assert!(
-            matches!(verdict, Verdict::Continue),
+            matches!(verdict, Decision::Continue),
             "read_file is Continue: got {verdict:?}"
         );
 
@@ -644,7 +644,7 @@ mod tests {
         let mut call = build_call("read_files", &mut args);
         let verdict = plugin.before_tool(&mut call).expect("the hook returns Ok");
         assert!(
-            matches!(verdict, Verdict::Continue),
+            matches!(verdict, Decision::Continue),
             "read_files is Continue: got {verdict:?}"
         );
     }

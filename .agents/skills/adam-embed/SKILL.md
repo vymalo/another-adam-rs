@@ -164,7 +164,7 @@ https://github.com/vymalo/another-adam-rs/blob/main/docs/guides/embed-in-an-app.
   `dir` once at `start` (a missing path, a file, or a symlink is `EngineError::Invalid`) and gives the agent the file and
   command tools of [`adam-code-tools`] over a `PersonDir` (`read_file`, `read_files`, `write_file`, `edit_file`,
   `apply_patch`, `run_command`, `run`), with a host-side hook that asks before every write or command (reads are never
-  asked; the five mutating tools return `Verdict::Ask` always — a missing or empty argument still asks, fail-closed, so
+  asked; the five mutating tools return `Decision::Ask` always — a missing or empty argument still asks, fail-closed, so
   the run never bypasses the approval). The directory is **never owned, cleaned or restored**: a write stays, a
   command's changes stay, and the run's listing tells the model what changed. `PersonDir::guard` is exclusive: a
   second guard for the same place is refused with the message the tool appends to its error result, leaving the
