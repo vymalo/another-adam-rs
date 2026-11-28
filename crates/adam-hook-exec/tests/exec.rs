@@ -14,7 +14,7 @@ use adam_plugin::{
     Decision, EventHeader, EventKind, HookEvent, HookSet, HookedCall, HookedCompaction, HookedEnd,
     HookedMessage, HookedModelRequest, HookedText, MessageFile, ModelCallKind, Plugin,
 };
-use serde_json::json;
+use serde_json::{Value, json};
 
 /// The protocol's test program, as cargo built it for these tests.
 fn program() -> PathBuf {
@@ -32,12 +32,14 @@ fn only(point: DecidePoint) -> Points {
     }
 }
 
-/// How many requests the program logged.
+/// How many requests the program logged: its `event` lines. The program logs every line it reads,
+/// so the hello and the shutdown are in the file too, and are not requests.
 fn requests(log: &std::path::Path) -> usize {
     std::fs::read_to_string(log)
         .unwrap_or_default()
         .lines()
-        .filter(|line| !line.trim().is_empty())
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|line| line.get("type").and_then(Value::as_str) == Some("event"))
         .count()
 }
 

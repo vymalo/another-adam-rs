@@ -231,10 +231,17 @@ fn read_lines(stdout: ChildStdout, shared: Arc<Shared>) {
     shared.close(Fault::Closed("the program closed its output".to_owned()));
 }
 
-/// Write the lines the adapter queues, and close the program when its stdin refuses one.
+/// Write the lines the adapter queues, each ended by its newline, and close the program when its
+/// stdin refuses one. The queue carries a line's JSON alone (its bound is checked without the
+/// newline); the protocol is one JSON value per line, so without the `\n` a program reading lines
+/// waits for the rest of a request that is already whole.
 fn write_lines(mut stdin: ChildStdin, lines: Receiver<Vec<u8>>, shared: Arc<Shared>) {
     for line in lines {
-        if let Err(e) = stdin.write_all(&line).and_then(|()| stdin.flush()) {
+        let written = stdin
+            .write_all(&line)
+            .and_then(|()| stdin.write_all(b"\n"))
+            .and_then(|()| stdin.flush());
+        if let Err(e) = written {
             shared.close(Fault::Closed(format!(
                 "the program's stdin refused a line: {e}"
             )));

@@ -234,8 +234,11 @@ async fn a_run_fails_when_its_program_never_answers() {
         .tool(a)
         .hooks(HookSet::new().with(Arc::new(exec)))
         .build();
-    mock.push_tool_calls(vec![call("c1", "a", json!({}))])
-        .push_text("done");
+    // Every attempt of the step asks the model again, so each gets the same call: a retry must meet
+    // the dead program too, rather than a scripted answer that ends the run without the call.
+    for _ in 0..4 {
+        mock.push_tool_calls(vec![call("c1", "a", json!({}))]);
+    }
 
     let rt = Runtime::builder(store.clone())
         .agent(agent.clone())
