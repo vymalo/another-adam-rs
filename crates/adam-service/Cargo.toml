@@ -30,6 +30,8 @@ adam-a2a-runtime.workspace = true
 adam-agent-fs = { workspace = true, optional = true }
 adam-core.workspace = true
 adam-error.workspace = true
+adam-otel.workspace = true
+opentelemetry.workspace = true
 adam-export = { workspace = true, optional = true }
 adam-hook-exec.workspace = true
 jiff.workspace = true
@@ -59,6 +61,7 @@ tracing-subscriber.workspace = true
 url.workspace = true
 
 [dev-dependencies]
+opentelemetry_sdk = { workspace = true, features = ["testing"] }
 a2a-client-lf.workspace = true
 # `generate_signing_key_pem`, for the tests of the card-signing settings.
 adam-a2a = { workspace = true, features = ["test-util"] }

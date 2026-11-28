@@ -38,6 +38,13 @@ pub const LLM_TOKENS: &str = "adam.llm.tokens";
 /// The histogram of one model call's latency in seconds, labelled by the model alias (ANR-1462).
 pub const LLM_DURATION: &str = "adam.llm.duration";
 
+/// The gauge of the runs a worker is stepping right now (ANR-1506).
+///
+/// Recorded by `adam-service` where it reads the store's activity: `StoreActivity::busy` is open
+/// runs with a live lease, and the gauge carries **no labels** — it is one number for the service,
+/// never a run id or an agent name.
+pub const STORE_BUSY: &str = "adam.store.busy";
+
 /// The kind of an instrument, the three [ADR 0075] uses.
 ///
 /// [ADR 0075]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0075-metrics-and-traces-are-off-by-default-and-say-nothing-about-a-person.md
@@ -93,6 +100,13 @@ pub const EMITTED: &[Instrument] = &[
         unit: "",
         labels: &["state"],
         emitted_by: "adam-runtime",
+    },
+    Instrument {
+        name: STORE_BUSY,
+        kind: Kind::Gauge,
+        unit: "",
+        labels: &[],
+        emitted_by: "adam-service",
     },
     Instrument {
         name: TOOL_DURATION,
