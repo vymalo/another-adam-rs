@@ -19,6 +19,7 @@ schema = ["dep:schemars", "schemars/derive"]
 adam-budget.workspace = true
 adam-error.workspace = true
 adam-core.workspace = true
+adam-otel.workspace = true
 adam-model.workspace = true
 # The compiled hook set around a tool call (ADR 0050, slice H1): the loop runs it inside the
 # call's journaled step.
@@ -37,6 +38,7 @@ base64.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+opentelemetry.workspace = true
 tracing.workspace = true
 uuid.workspace = true
 # The two self-improvement-memory tools (`si_recall`, `si_record`, ADR 0081 decision 6): the port
@@ -44,6 +46,7 @@ uuid.workspace = true
 adam-memory.workspace = true
 
 [dev-dependencies]
+opentelemetry_sdk = { workspace = true, features = ["testing"] }
 # The call-span tests of `agent` (ANR-1346): a subscriber that captures what a span renders.
 tracing-subscriber.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
