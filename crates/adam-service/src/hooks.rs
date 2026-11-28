@@ -170,7 +170,11 @@ impl HooksSettings {
                 let detail = if e.is_data() {
                     e.to_string()
                 } else {
-                    format!("it does not parse at line {} column {}", e.line(), e.column())
+                    format!(
+                        "it does not parse at line {} column {}",
+                        e.line(),
+                        e.column()
+                    )
                 };
                 problems.push(format!(
                     "{HOOKS_FILE} {:?} is not a valid file ({detail})",

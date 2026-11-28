@@ -29,13 +29,26 @@ fn fixture(name: &str) -> Value {
 }
 
 /// A token file under the target's temp directory (never `/tmp`, which the build host's rules keep
-/// off the big disk): written with a trailing newline, as a projected secret is.
+/// off the big disk): written with a trailing newline, as a projected secret is, and swapped in
+/// atomically like the kubelet swaps a projected secret (a reader never sees a truncated file).
 fn token_file(name: &str, token: &str) -> PathBuf {
     let dir = Path::new(env!("CARGO_TARGET_TMPDIR"));
     std::fs::create_dir_all(dir).unwrap();
     let path = dir.join(format!("run-cert-token-{name}"));
-    std::fs::write(&path, format!("{token}\n")).unwrap();
+    replace_token(&path, token);
     path
+}
+
+fn replace_token(path: &Path, token: &str) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    let temp = path.with_file_name(format!(
+        ".token-{}-{}.tmp",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::write(&temp, format!("{token}\n")).unwrap();
+    std::fs::rename(&temp, path).unwrap();
 }
 
 fn request() -> CertificateRequest {
@@ -250,7 +263,7 @@ async fn the_token_is_read_again_on_every_call() {
     let path = token_file("reread", "first-token");
     let issuer = BrokerIssuer::new(server.uri(), &path, RunId::new()).unwrap();
     issuer.issue(&request()).await.unwrap();
-    std::fs::write(&path, "second-token\n").unwrap();
+    replace_token(&path, "second-token");
     issuer.issue(&request()).await.unwrap();
 
     let received = server.received_requests().await.unwrap();
