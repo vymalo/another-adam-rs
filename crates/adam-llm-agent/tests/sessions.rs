@@ -1951,6 +1951,14 @@ mod cases {
         // journal), so the model is asked again and answers the same call: the edit's second try.
         rig.parent_mock
             .push_tool_calls(vec![start_call("c1", true)])
+            // The edit call twice: a transient tool error re-runs the whole step, and a failed
+            // step is not journaled, so the model is asked again and repeats its call (what a
+            // deterministic model does). The retry's answer is what the run keeps.
+            .push_tool_calls(vec![edit_call(
+                "c2",
+                session,
+                json!({"max_output_tokens": 512}),
+            )])
             .push_tool_calls(vec![edit_call(
                 "c2",
                 session,
