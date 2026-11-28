@@ -40,9 +40,10 @@ decisions 2 to 5 and 10; slices M1 and M2a (the L2 port and its kit; the L2 adap
 | `MemoryError::backend` | What an adapter wraps its storage failures in: class `Transient` (ADR 0081 decision 12). |
 
 The crate is the two ports, the values, L1's in-folder adapter and the two in-process references.
-The PostgreSQL and MongoDB adapters are features of crates of their own (M2b, ANR-1292 and
-ANR-1293); the Redis one is [`adam-memory-redis`](../adam-memory-redis/README.md); a store
-reached over the network is L2 (ADR 0081 decision 2).
+The PostgreSQL adapter is a feature of a crate of its own (M2b, ANR-1292); the MongoDB one is
+`adam-store-mongodb`'s `memory` feature (ANR-1293) and the Redis one is
+[`adam-memory-redis`](../adam-memory-redis/README.md). A store reached over the network is L2
+(ADR 0081 decision 2).
 
 ```rust
 use adam_core::RunId;

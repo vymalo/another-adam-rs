@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use adam_core::Timestamp;
 
-use crate::lesson::sort_lessons_newest_first;
+use crate::lesson::{prepare, sort_newest_first};
 use crate::{
     Audience, Lesson, LessonDraft, LessonSettings, LessonState, Memory, MemoryError, MemoryResult,
     MemoryScope,
@@ -92,7 +92,7 @@ impl Memory for InProcessMemory {
     fn record(&self, draft: LessonDraft) -> MemoryResult<Lesson> {
         self.scope.validate()?;
         let now = Timestamp::now();
-        let prepared = self.settings.prepare(&self.scope, draft, now)?;
+        let prepared = prepare(&self.scope, draft, &self.settings, now)?;
         let mut scopes = self.store.scopes();
         let audiences = scopes.entry(self.scope.as_str().to_owned()).or_default();
         let lessons = audiences
@@ -135,7 +135,7 @@ impl Memory for InProcessMemory {
                     .collect()
             })
             .unwrap_or_default();
-        sort_lessons_newest_first(&mut lessons);
+        sort_newest_first(&mut lessons);
         Ok(lessons)
     }
 
