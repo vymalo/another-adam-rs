@@ -12,7 +12,7 @@ use std::fmt;
 
 /// The lifecycle status of a run, as a label (`adam.run` instruments).
 ///
-/// Closed on purpose: the four states of [`adam_core::store::RunStatus`] and nothing else. The test
+/// Closed on purpose: the four states of `adam_core::store::RunStatus` and nothing else. The test
 /// below holds the two to each other, so a state added there without a line here fails a test rather
 /// than shipping an instrument that can never report it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
