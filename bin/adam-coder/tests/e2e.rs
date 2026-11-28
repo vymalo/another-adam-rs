@@ -505,6 +505,7 @@ async fn add_hello_txt_streams_working_progress_checks_artifact_completed(store:
             "subagent_start",
             "subagent_send",
             "subagent_read",
+            "subagent_edit",
             "subagent_close",
             "subagent_list"
         ]
@@ -4253,7 +4254,7 @@ async fn three_questions_as_one_form_the_answers_come_back_and_the_run_goes_on(s
         .map(|t| t.name.clone())
         .collect();
     assert_eq!(
-        offered[offered.len() - 15..],
+        offered[offered.len() - 16..],
         [
             "ask_user",
             "show",
@@ -4268,6 +4269,7 @@ async fn three_questions_as_one_form_the_answers_come_back_and_the_run_goes_on(s
             "subagent_start",
             "subagent_send",
             "subagent_read",
+            "subagent_edit",
             "subagent_close",
             "subagent_list"
         ],
@@ -4372,13 +4374,14 @@ async fn the_catalog_is_read_again_over_the_thread_tools_and_their_tools_are_off
         .map(|t| t.name.clone())
         .collect();
     assert_eq!(
-        offered[offered.len() - 8..],
+        offered[offered.len() - 9..],
         [
             "explorer",
             "reviewer",
             "subagent_start",
             "subagent_send",
             "subagent_read",
+            "subagent_edit",
             "subagent_close",
             "subagent_list",
             "relay__search"

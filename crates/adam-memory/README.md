@@ -28,19 +28,24 @@ decisions 2 to 5 and 10; slices M1 and M2a (the L2 port and its kit; the L2 adap
 | `InProcessSiMemory` | The in-process reference the suite and a test use. |
 | `Memory` | The L2 port: `record`, `recall`, `retire`. `Send + Sync + 'static`; no driver type, no URL, no client in a signature. |
 | `DynMemory` | `Arc<dyn Memory>`, what a host or a tool is given. |
-| `MemoryScope` | The scope an L2 adapter is configured with; every key and query carries it. Two scopes on one store never see each other's lessons. |
-| `Audience` | Who a lesson is served to inside its scope; the promotion pass computes it, the port keeps it opaque. |
+| `MemoryScope` | The scope an L2 adapter is configured with; every key and query carries it. Two scopes on one store never see each other's lessons. `validate` refuses an empty one before an adapter builds a key or opens a connection. |
+| `Audience` | Who a lesson is served to inside its scope; the promotion pass computes it, the port keeps it opaque. `validate` refuses an empty one, for an adapter's `recall` and `retire`. |
 | `Lesson` | A root cause, its remedy and rationale, anchors as text, provenance, `state`, `created`, `updated` and `retired_at`. |
 | `LessonDraft` | What a caller writes; the adapter scrubs it, checks it and stamps it. |
 | `LessonProvenance` | The L1 scopes (opaque labels) whose evidence made the lesson, and the review that approved it. |
 | `LessonState` | `Proposed`, `Active`, `Retired`. A closed set; a recall serves `Active` only. |
-| `LessonSettings`, `LessonLimits` | The injected scrub and the bounds an L2 adapter is built with. |
+| `LessonSettings`, `LessonLimits` | The injected scrub and the bounds an L2 adapter is built with. `prepare` is the adapter-facing half of `record`: the scope validation, the scrub, the marker, the address check and the bounds, so a database adapter enforces the same rules as the reference. `sort_lessons_newest_first` is the order a recall serves, exported for an adapter too. |
 | `InProcessMemory` | The in-process L2 reference the suite and a test use. |
 | `InProcessLessonStore` | The storage several `InProcessMemory` adapters share, so a test can put two scopes on one store. |
+| `MemoryError::backend` | What an adapter wraps its storage failures in: class `Transient` (ADR 0081 decision 12). |
 
 The crate is the two ports, the values, L1's in-folder adapter and the two in-process references.
-The PostgreSQL, MongoDB and Redis adapters are features of crates of their own (M2b); a store
-reached over the network is L2 (ADR 0081 decision 2).
+The PostgreSQL adapter is `adam-store-postgres`'s `memory` feature (M2b, ANR-1292), the MongoDB
+one is `adam-store-mongodb`'s `memory` feature (ANR-1293) and the Redis one is
+[`adam-memory-redis`](../adam-memory-redis/README.md) (ANR-1294); all three are built. A store
+reached over the network is L2 (ADR 0081 decision 2). Adapters in other crates use this crate's
+public write-path pieces: `prepare`, `sort_lessons_newest_first`, `MemoryScope::validate`,
+`Audience::validate` and `MemoryError::backend`.
 
 ```rust
 use adam_core::RunId;
@@ -161,7 +166,8 @@ so the two cannot drift.
 variant. A refused text, a bound, an empty field or an address is `Invalid`; a full scope, problem or
 audience is `Rejected`; an unknown problem, attempt or lesson is `NotFound`; a file that does not
 parse is `Corrupt`; a storage failure is `Transient` (ADR 0081 decision 12: an unreachable memory is
-a transient tool error).
+a transient tool error). `MemoryError::backend` is public **for adapters**: a driver failure maps to
+`Backend`, whose class is `Transient`.
 
 ## Environment
 
@@ -181,7 +187,9 @@ variable.
 
 `cargo test -p adam-memory --test lesson` runs
 [`memory_conformance!`](../adam-memory-testkit/README.md) against `InProcessMemory`, over one shared
-store so two configured scopes are two scopes on one store.
+store so two configured scopes are two scopes on one store. The same suite runs against the
+PostgreSQL adapter in [`adam-store-postgres`](../adam-store-postgres/README.md) (`tests/memory.rs`,
+feature `memory`).
 
 The unit tests cover the class table, the marker, the address detector, the slug and the digest.
 

@@ -151,7 +151,7 @@ https://github.com/vymalo/another-adam-rs/blob/main/docs/guides/embed-in-an-app.
   `schedules/` fired, which `get`, `events` and `cancel` reach too), `helpers`, `start_session`, `sessions` and
   `close_session` (child sessions of the local subagents, `child-sessions/v1`) and `shutdown`; decide from `EngineError`'s class
   (`adam_error::Classify`), and match `RunState` and `EngineEvent` with a `_` arm (both `#[non_exhaustive]`). `events(run)` is bounded: a slow reader gets `Behind`, then a `Snapshot` read from the store.
-* **Approvals** (ADR 0047 slice 5): install a `Plugin` whose `before_tool` returns `Verdict::Ask(question)` with
+* **Approvals** (ADR 0047 slice 5): install a `Plugin` whose `before_tool` returns `Decision::Ask(question)` with
   `EngineBuilder::plugin` (or a `HookSet` with `.hooks(..)`); it runs in every agent the engine runs. The run then
   waits in `RunState::AwaitingApproval` (not `Waiting`), `RunInfo::approval` is the `ApprovalRequest` (`call_id`, `tool`,
   `question`, `arguments` as the call's step shows them, through `EngineBuilder::step_io`'s redactor), and the stream

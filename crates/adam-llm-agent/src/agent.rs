@@ -16,15 +16,15 @@ use adam_model::{
     PromptStatement, ReasoningEffort, ToolCall, ToolChoice, ToolSpec,
 };
 use adam_plugin::{
-    DeclarationError, EventSpec, HookSet, HookedCall, HookedCompaction, HookedEnd, HookedMessage,
-    HookedModelRequest, HookedText, MessageFile, ModelCallKind, Plugin, Verdict,
+    Decision, DeclarationError, EventSpec, HookSet, HookedCall, HookedCompaction, HookedEnd,
+    HookedMessage, HookedModelRequest, HookedText, MessageFile, ModelCallKind, Plugin,
 };
 use adam_runtime::{
     AGENT_TEXT_KIND, Agent, AgentError, AgentStarter, CHILD_PARKED_KIND, CHILD_REPORTED_KIND,
     CancelToken, ChildLook, ChildStarter, ChildStatus, Ctx, Emitter, Inbound, MAX_RUN_FILE_BYTES,
     MAX_SESSION_PAGE, RUN_FINISHED_KIND, ReservedStep, RetryPolicy, RunEvent, SESSION_CLOSE_KIND,
-    SandboxUsage, SessionState, SessionSummary, StepEvent, StepIcon, StepKind, StepState,
-    Transition, UsageEvent, UsageTotals, child_run_id,
+    SESSION_EDIT_KIND, SandboxUsage, SessionEditRequest, SessionState, SessionSummary, StepEvent,
+    StepIcon, StepKind, StepState, Transition, UsageEvent, UsageTotals, child_run_id,
 };
 use async_trait::async_trait;
 use futures::FutureExt;
@@ -43,7 +43,7 @@ use crate::compaction::{
 use crate::conversation::{
     ArtifactRef, Conversation, LOCALE_CONTEXT_KEY, LimitHit, LimitKind, Loaded, Loader,
     MODEL_CONTEXT_KEY, ModelSwitch, PendingQuestion, PendingRemote, PendingRun, PendingSession,
-    PendingWait, REASONING_EFFORT_CONTEXT_KEY, Repeats, asks_to_close, parse_context,
+    PendingWait, REASONING_EFFORT_CONTEXT_KEY, Repeats, asks_to_close, asks_to_edit, parse_context,
     parse_model_run, parse_prompt_statement, parse_root_run, parse_root_step, parse_session,
     parse_user_text,
 };
@@ -931,9 +931,10 @@ fn ask_end(
         plugin: Some(plugin.into()),
     };
     match hooks.run_ending(&end) {
+        // An action is a decision with nothing to perform yet (slice H1d): the end is allowed.
         Ok(None)
         | Ok(Some(adam_plugin::Decided {
-            verdict: Verdict::Continue,
+            verdict: Decision::Continue | Decision::Act(_),
             ..
         })) => Ok(EndDecision {
             verdict: "allow".into(),
@@ -941,9 +942,9 @@ fn ask_end(
             plugin: None,
         }),
         Ok(Some(d)) => Ok(match d.verdict {
-            Verdict::Deny(reason) if continuations >= cap => one("capped", Some(reason), d.plugin),
-            Verdict::Deny(reason) => one("continue", Some(reason), d.plugin),
-            Verdict::Stop(reason) => one("stop", Some(reason), d.plugin),
+            Decision::Deny(reason) if continuations >= cap => one("capped", Some(reason), d.plugin),
+            Decision::Deny(reason) => one("continue", Some(reason), d.plugin),
+            Decision::Stop(reason) => one("stop", Some(reason), d.plugin),
             _ => one(
                 "failed",
                 Some("the hook gave a verdict run.ending does not have".into()),
@@ -2568,6 +2569,26 @@ impl LlmAgent {
         {
             header.closed = true;
         }
+        // An edit of the session is read here too, and journaled with the state of the step that
+        // takes it (ADR 0054, decision 11): a run parked on its summary call is a working round.
+        let (edits, inbox): (Vec<_>, Vec<_>) =
+            inbox.into_iter().partition(|i| i.kind == SESSION_EDIT_KIND);
+        for edit in &edits {
+            // A message the run has read is not read again: a sender that did not hear the first
+            // delivery sends the same edit again, under the same id.
+            if state.has_read(&edit.id) {
+                continue;
+            }
+            match SessionEditRequest::from_payload(&edit.payload) {
+                Some(request) => {
+                    state.note_read(&edit.id);
+                    Self::apply_edit(state, &request);
+                }
+                None => {
+                    tracing::warn!(inbound = %edit.id, "ignoring an unreadable session edit");
+                }
+            }
+        }
         if inbox.is_empty() {
             return Ok(());
         }
@@ -2764,7 +2785,30 @@ impl LlmAgent {
         &self,
         state: &'a Conversation,
     ) -> Option<&'a adam_runtime::SessionConfig> {
-        state.session.as_ref().and_then(|h| h.config.as_ref())
+        state.config()
+    }
+
+    /// Apply an edit of the session this round belongs to ([ADR 0054], decision 11), at the step
+    /// that read it: the header carries the config the session runs with from then on and the edit
+    /// joins its history at this round, while the round itself adopts the options the ADR marks
+    /// *next model call* and keeps its own of the others, which wait in the header for the next
+    /// round. The whole effect is in the state the step commits, so a replay reads the same header
+    /// and makes no second call.
+    ///
+    /// A run that is no round of a session ignores it: it has no header to change.
+    ///
+    /// [ADR 0054]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md
+    fn apply_edit(state: &mut Conversation, request: &SessionEditRequest) {
+        let current = state.config().cloned().unwrap_or_default();
+        let Some(header) = &mut state.session else {
+            return;
+        };
+        header.apply_edit(request);
+        let pending = request.config.clone().unwrap_or_default();
+        let adopted = current.adopted_mid_round(&pending);
+        // Written only when the round's config is not the header's: `None` means "the header's",
+        // which is what a round that read no edit, and state written before this existed, reads.
+        state.round_config = (adopted != pending).then_some(adopted);
     }
 
     /// The cap on the tokens of this run's session ([ADR 0054], decision 6), `None` for a run that
@@ -3153,10 +3197,7 @@ impl LlmAgent {
         let live = self.live_model(state);
         let live_alias = live.alias.to_owned();
         let mut request = ModelRequest::new(live_alias.clone());
-        request.system = with_session_instructions(
-            self.instructions.clone(),
-            state.session.as_ref().and_then(|h| h.config.as_ref()),
-        );
+        request.system = with_session_instructions(self.instructions.clone(), state.config());
         // What is sent about an image is decided here, from the reference and the deployment's
         // settings now, and recorded nowhere: the same settings give the same lines every turn.
         let image_limits = self.model.input_modalities(&live_alias).images;
@@ -3379,7 +3420,7 @@ impl LlmAgent {
                         metadata: &mut metadata,
                     });
                     match verdict {
-                        Ok(Verdict::Continue) => {
+                        Ok(Decision::Continue | Decision::Act(_)) => {
                             apply_hooked(
                                 &mut request,
                                 temperature,
@@ -3390,13 +3431,13 @@ impl LlmAgent {
                                 metadata,
                             )?;
                         }
-                        Ok(Verdict::Stop(reason)) => {
+                        Ok(Decision::Stop(reason)) => {
                             return Err(ModelFailure::by_hook(
                                 format!("stopped by a plugin: {reason}"),
                                 false,
                             ));
                         }
-                        Ok(Verdict::Deny(_) | Verdict::Ask(_)) => {
+                        Ok(Decision::Deny(_) | Decision::Ask(_)) => {
                             return Err(ModelFailure::by_hook(
                                 "a hook may only continue or stop at model.request".to_owned(),
                                 false,
@@ -4002,10 +4043,7 @@ impl LlmAgent {
         let live = self.live_model(state);
         let live_alias = live.alias.to_owned();
         let mut request = ModelRequest::new(live_alias.clone());
-        request.system = with_session_instructions(
-            self.instructions.clone(),
-            state.session.as_ref().and_then(|h| h.config.as_ref()),
-        );
+        request.system = with_session_instructions(self.instructions.clone(), state.config());
         // The summary request is the request before it and one more message, so a provider's cache
         // serves it: its images are the ones the last request sent. A history that a provider
         // rejected as too long is sent shorter, with each image said in a few words.
@@ -4091,8 +4129,8 @@ impl LlmAgent {
                     match hooks.compaction_before(&mut HookedCompaction {
                         context: &mut context,
                     }) {
-                        Ok(Verdict::Continue) => {}
-                        Ok(Verdict::Deny(reason)) => {
+                        Ok(Decision::Continue | Decision::Act(_)) => {}
+                        Ok(Decision::Deny(reason)) => {
                             return Ok(Summarised {
                                 summary: None,
                                 cut: at,
@@ -4101,13 +4139,13 @@ impl LlmAgent {
                                 vetoed: Some(reason),
                             });
                         }
-                        Ok(Verdict::Stop(reason)) => {
+                        Ok(Decision::Stop(reason)) => {
                             return Err(ModelFailure::by_hook(
                                 format!("stopped by a plugin: {reason}"),
                                 false,
                             ));
                         }
-                        Ok(Verdict::Ask(_)) => {
+                        Ok(Decision::Ask(_)) => {
                             return Err(ModelFailure::by_hook(
                                 "a hook may only continue, deny or stop at compaction.before"
                                     .to_owned(),
@@ -4141,7 +4179,7 @@ impl LlmAgent {
                         max_output_tokens: &mut max_output_tokens,
                         metadata: &mut metadata,
                     }) {
-                        Ok(Verdict::Continue) => {
+                        Ok(Decision::Continue | Decision::Act(_)) => {
                             apply_hooked(
                                 &mut request,
                                 temperature,
@@ -4152,13 +4190,13 @@ impl LlmAgent {
                                 metadata,
                             )?;
                         }
-                        Ok(Verdict::Stop(reason)) => {
+                        Ok(Decision::Stop(reason)) => {
                             return Err(ModelFailure::by_hook(
                                 format!("stopped by a plugin: {reason}"),
                                 false,
                             ));
                         }
-                        Ok(Verdict::Deny(_) | Verdict::Ask(_)) => {
+                        Ok(Decision::Deny(_) | Decision::Ask(_)) => {
                             return Err(ModelFailure::by_hook(
                                 "a hook may only continue or stop at model.request".to_owned(),
                                 false,
@@ -7155,11 +7193,12 @@ fn ask_message(
         Ok(Some(decided)) => {
             let plugin = decided.plugin;
             match decided.verdict {
-                Verdict::Continue => MessageDecision {
+                // An action has nothing to perform yet (slice H1d): the message goes on as allowed.
+                Decision::Continue | Decision::Act(_) => MessageDecision {
                     text: (text != original).then_some(text),
                     hook: None,
                 },
-                Verdict::Deny(reason) => MessageDecision {
+                Decision::Deny(reason) => MessageDecision {
                     text: None,
                     hook: Some(
                         HookDecision::new(
@@ -7170,7 +7209,7 @@ fn ask_message(
                         .by(plugin),
                     ),
                 },
-                Verdict::Stop(reason) => MessageDecision {
+                Decision::Stop(reason) => MessageDecision {
                     text: None,
                     hook: Some(
                         HookDecision::new(
@@ -7183,7 +7222,7 @@ fn ask_message(
                 },
                 // The point allows, rewrites or refuses: an ask is a verdict this point does not
                 // have, so it is a failure of the hook and the message does not go through.
-                Verdict::Ask(reason) => refuse_at_message(
+                Decision::Ask(reason) => refuse_at_message(
                     plugin,
                     &format!(
                         "the hook asked at message.received, which only allows or refuses: {reason}"
@@ -7356,6 +7395,22 @@ fn continue_conversation(
         // The carried answer was signed under the run it came from; this run signs it again.
         crate::signing::unsign_from(&mut conversation.messages, 0);
         return Ok(conversation);
+    }
+    // A round that only edits its session has no message either: it carries the header, which
+    // already says what the session runs with, and nothing else ([ADR 0054], decision 11).
+    //
+    // [ADR 0054]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md
+    if asks_to_edit(&input.payload) {
+        let session = parse_session(&input.payload).or_else(|| prior.session.clone());
+        return Ok(Conversation {
+            continued_from: Some(prior_run),
+            context: prior.context.clone(),
+            plan: prior.plan.clone(),
+            // The editing round calls no model, so it only carries the session's spend.
+            spent: session.as_ref().map_or(0, |h| h.spent),
+            session,
+            ..Conversation::default()
+        });
     }
     let text = start_text(input)?;
     let mut conversation = prior.continued(text, prior_run);
@@ -7542,14 +7597,15 @@ fn decide_before(
         }
     };
     match verdict {
-        Ok(Verdict::Continue) => {
+        // An action has nothing to perform yet (slice H1d): the call runs as if it continued.
+        Ok(Decision::Continue | Decision::Act(_)) => {
             if !changes_access(args) {
                 return Ok(None);
             }
             Ok(Some(refuse(HookDecision::FAILED, changed_access(), None)))
         }
-        Ok(Verdict::Deny(reason)) => Ok(Some(refuse(HookDecision::DENY, reason, None))),
-        Ok(Verdict::Ask(question)) => {
+        Ok(Decision::Deny(reason)) => Ok(Some(refuse(HookDecision::DENY, reason, None))),
+        Ok(Decision::Ask(question)) => {
             if changes_access(args) {
                 return Ok(Some(refuse(HookDecision::FAILED, changed_access(), None)));
             }
@@ -7576,7 +7632,7 @@ fn decide_before(
                 approval: Some(question),
             }))
         }
-        Ok(Verdict::Stop(reason)) => Ok(Some(refuse(HookDecision::STOP, reason, None))),
+        Ok(Decision::Stop(reason)) => Ok(Some(refuse(HookDecision::STOP, reason, None))),
         Err(error) if error.is_retryable() => Err(ToolError::Transient(error.to_string())),
         Err(error) => Ok(Some(refuse(
             HookDecision::FAILED,
@@ -7631,18 +7687,19 @@ fn decide_after(
         refused.sanitized()
     };
     match verdict {
-        Ok(Verdict::Continue) => {
+        // An action has nothing to perform yet (slice H1d): the answer goes on as rewritten.
+        Ok(Decision::Continue | Decision::Act(_)) => {
             output.content = text;
             Ok(output.sanitized())
         }
-        Ok(Verdict::Deny(reason)) => Ok(refuse(output, HookDecision::DENY, reason, None)),
-        Ok(Verdict::Ask(question)) => Ok(refuse(
+        Ok(Decision::Deny(reason)) => Ok(refuse(output, HookDecision::DENY, reason, None)),
+        Ok(Decision::Ask(question)) => Ok(refuse(
             output,
             HookDecision::FAILED,
             format!("a hook may not ask after the call ran: {question}"),
             None,
         )),
-        Ok(Verdict::Stop(reason)) => Ok(refuse(output, HookDecision::STOP, reason, None)),
+        Ok(Decision::Stop(reason)) => Ok(refuse(output, HookDecision::STOP, reason, None)),
         Err(error) if error.is_retryable() => Err(ToolError::Transient(error.to_string())),
         Err(error) => Ok(refuse(
             output,
@@ -8205,6 +8262,17 @@ impl LlmAgent {
         ctx: &mut Ctx,
         mut state: Conversation,
     ) -> Result<Transition<Conversation>, AgentError> {
+        // A round that only edits its session calls no model and has no report: the header it
+        // starts with already carries the edit, so there is nothing left to do ([ADR 0054],
+        // decision 11). It is decided **before** a message that arrived can reopen the run: it
+        // would read nothing, and asking for the reopen again on every commit would not end.
+        //
+        // [ADR 0054]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md
+        if state.session.as_ref().is_some_and(|h| h.editing) {
+            let output = json!({ "text": "", "artifacts": [], "edited": true });
+            self.forget_chars(ctx.run_id());
+            return Ok(Transition::Done { state, output });
+        }
         // A message that arrives while this step finishes the run is read, not dropped: see
         // `Ctx::reopen_on_arrival`.
         ctx.reopen_on_arrival();
@@ -8423,6 +8491,31 @@ impl LlmAgent {
             && let Some(header) = &mut state.session
         {
             header.closed = true;
+        }
+        // An edit of the session this round belongs to ([ADR 0054], decision 11): it is read here,
+        // at this step, and its effect is journaled with this step's state. The options the ADR
+        // marks *next model call* are the ones this round adopts; the others wait in the header for
+        // the next round. A round that ended before reading one leaves it in its inbox, where a
+        // reader of the session finds it.
+        //
+        // [ADR 0054]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md
+        let (edits, inbox): (Vec<_>, Vec<_>) =
+            inbox.into_iter().partition(|i| i.kind == SESSION_EDIT_KIND);
+        for edit in &edits {
+            // A message the run has read is not read again: a sender that did not hear the first
+            // delivery sends the same edit again, under the same id.
+            if state.has_read(&edit.id) {
+                continue;
+            }
+            match SessionEditRequest::from_payload(&edit.payload) {
+                Some(request) => {
+                    state.note_read(&edit.id);
+                    Self::apply_edit(&mut state, &request);
+                }
+                None => {
+                    tracing::warn!(inbound = %edit.id, "ignoring an unreadable session edit");
+                }
+            }
         }
         let notices: Vec<(RunId, ChildStatus)> = finished
             .iter()

@@ -20,7 +20,8 @@ neither the loop nor the runtime.
 | Item | What it is |
 |---|---|
 | `Plugin` | `name`, `message_received`, `model_request` (inside the `model:<turn>` step: it sees `kind` — `Turn` or `Compaction` — and may rewrite `temperature`, `top_p`, `max_output_tokens`, `metadata`, `headers` and an `extra_body` of the call, or `Stop` the run; a header whose name looks like a credential or a body member the client owns fails the run; a replay asks none), `compaction_before` (inside the `compact:` step: it may add `context` to the summary request, or `Deny` it and the history is shortened instead), `run_ending` (`Deny` keeps the run going with the reason), `before_tool` and `after_tool`, each with a do-nothing default, so a plugin that cares about one point implements one method |
-| `Verdict` | `Continue`, `Deny(reason)`, `Ask(reason)`, `Stop(reason)`: the first verdict other than `Continue` is the set's, and a later plugin is not asked; **except `Ask` at `before_tool`** (slice H8): the plugins after it are still asked, a later `Deny`, `Stop` or failure wins, and of two asks the first question stands |
+| `Decision` | `Continue`, `Deny(reason)`, `Ask(reason)`, `Stop(reason)` and `Act(action)`: the first decision other than `Continue` is the set's, and a later plugin is not asked; **except `Ask` at `before_tool`** (slice H8): the plugins after it are still asked, a later `Deny`, `Stop` or failure wins, and of two asks the first question stands. `reason()` is the text a decision carries, `decides()` is false only for `Continue` (an action is a decision) |
+| `HookAction` | the action a `Decision::Act` asks the loop to perform as its own journaled step (ADR 0050, decision 11, slice H1d): `Compact` first. **Open on purpose** (`#[non_exhaustive]`), unlike the closed enums of the workspace: a plugin declares an action of its own and the set gains a variant. Until slice H1d is built the loop performs nothing and reads `Act` as `Continue` |
 | `HookError` | the plugin's name, an `adam-error` class and a reason (never an argument or a tool's answer); `is_retryable` follows the class |
 | `HookLimits` | the deadline of one hook (1 s by default) and how many times a retryable failure is tried again (1) |
 | `HookSet` | the ordered plugins and their limits (`Clone`: a clone shares the plugins, so one set given to every agent of an assembly, `adam_assembly::BoundDef::hooks`, runs the same plugins in each); `message_received`, `before_tool` and `after_tool` run them, `catch_unwind` each call, and stop at the first decision (at `before_tool`, the first `Deny` or `Stop`: an `Ask` lets the rest decide) |
@@ -33,6 +34,11 @@ neither the loop nor the runtime.
 
 ## The rules
 
+- **Not a plugin point: the command environment.** A command's environment is
+  `adam_workspace::ExecHook`, composed by `adam_workspace::HookedEnvironment` (ADR 0050, decision 13,
+  slice H10), and not a `Plugin` method: it sees an `ExecSpec` and needs no `Ctx`, store or secret,
+  and keeping it there means this crate depends on neither the workspace nor the loop. `HidingEnvironment`
+  is one such hook; `exec` stays a reserved event namespace.
 - **Fail closed.** A hook that errors, panics or misses its deadline never lets the call or the message
   through: the set answers a `HookError` and the caller refuses. A panic is `Invalid` (a buggy plugin is
   not unlucky); a deadline is `Transient`.

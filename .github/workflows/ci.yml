@@ -1,14 +1,20 @@
 name: ci
 
-# Push to main and every pull request: not both on every branch push. A newer
-# push to a pull request cancels the run it supersedes; runs on main finish.
+# Push to main and every pull request: not both on every branch push.
 on:
   push:
     branches: [main]
   pull_request:
 
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
+  # A merge on main is a verification, so a push gets a group of its own per
+  # commit: GitHub cancels a *pending* run when a newer one joins its group even
+  # with `cancel-in-progress: false`, so a per-ref group on a busy main meant a
+  # pending run was replaced by the next merge and never reached a verdict
+  # (ANR-1360: d3281289, dfc99a8e and 5178c56c all ended `cancelled`). A pull
+  # request keeps the per-ref group: its next head supersedes the previous run,
+  # which is the cheap behaviour, and `cancel-in-progress` cancels it outright.
+  group: ci-${{ github.workflow }}-${{ github.event_name == 'push' && github.sha || github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
@@ -54,6 +60,10 @@ jobs:
       # one are gone. The scan is what keeps them from coming back by habit; the script says what it reads.
       - name: The dev stack and CI carry no container engine
         run: sh tools/check-dev-stack.sh
+      # ANR-1427: a pin below the major recorded in tools/workflow-pins.txt is how a node20 action comes
+      # back — #495 re-added actions/checkout@v4 after ANR-62 had moved every pin (ANR-1410).
+      - name: Every workflow action pin is at or above its recorded major
+        run: sh tools/check-workflow-pins.sh
       # ADR 0084: every version a release moves is marked for release-please, and the Cargo lines agree.
       - name: The release's version lines are marked and agree
         run: sh tools/release/check-versions.sh
@@ -94,7 +104,7 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy --workspace --all-targets --locked --features adam-llm-agent/schema,adam-assembly/dev,adam/dev,adam-assembly/mcp,adam/mcp -- -D warnings
+      - run: cargo clippy --workspace --all-targets --locked --features adam-llm-agent/schema,adam-assembly/dev,adam/dev,adam-assembly/mcp,adam/mcp,adam-store-postgres/memory -- -D warnings
 
   # nextest does not run doctests; the database suites are not needed here.
   doctest-default:
@@ -115,7 +125,7 @@ jobs:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test --workspace --doc --locked --features adam-llm-agent/schema,adam-assembly/dev,adam/dev,adam-assembly/mcp,adam/mcp
+      - run: cargo test --workspace --doc --locked --features adam-llm-agent/schema,adam-assembly/dev,adam/dev,adam-assembly/mcp,adam/mcp,adam-store-postgres/memory
 
   # Broken or redundant intra-doc links, with every feature on (the documented build; some
   # docs link to items that exist only behind a feature).
@@ -191,11 +201,12 @@ jobs:
           workspaces: tools/sqlite-probe
       - run: cargo test --manifest-path tools/sqlite-probe/Cargo.toml --locked
 
-  # The required check. It compiles nothing: it fails unless every job above passed, so a clippy, doctest or
-  # rustdoc or embedded-set error cannot merge on a green `lint`. The jobs above are extra checks, not required ones.
+  # The required check. It compiles nothing: it fails unless every job above passed, so a clippy, doctest,
+  # rustdoc, embedded-set or TLS-provider error cannot merge on a green `lint`. The jobs below are extra
+  # checks, not required ones.
   lint:
     name: lint
-    needs: [fmt, clippy-default, clippy-features, doctest-default, doctest-features, rustdoc, embedded, sqlite-probe, phone-targets]
+    needs: [fmt, clippy-default, clippy-features, doctest-default, doctest-features, rustdoc, embedded, sqlite-probe, phone-targets, tls-provider]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -212,7 +223,8 @@ jobs:
             "rustdoc=${{ needs.rustdoc.result }}" \
             "embedded=${{ needs.embedded.result }}" \
             "sqlite-probe=${{ needs['sqlite-probe'].result }}" \
-            "phone-targets=${{ needs['phone-targets'].result }}"
+            "phone-targets=${{ needs['phone-targets'].result }}" \
+            "tls-provider=${{ needs['tls-provider'].result }}"
           do
             name=${pair%%=*}
             result=${pair#*=}
@@ -231,7 +243,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.98
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --workspace --all-targets --locked
-      - run: cargo check --workspace --all-targets --locked --features adam-llm-agent/schema,adam-assembly/dev,adam/dev,adam-assembly/mcp,adam/mcp
+      - run: cargo check --workspace --all-targets --locked --features adam-llm-agent/schema,adam-assembly/dev,adam/dev,adam-assembly/mcp,adam/mcp,adam-store-postgres/memory
 
   # ADR 0065 slice 3: the OS limits on a command, proven on a machine with a systemd user manager. The
   # memory hog, the process flood and the file over the size limit run here, and the test binary itself
@@ -303,8 +315,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with:
           node-version: 24
       - run: node --test "tools/release/test/*.test.mjs"
@@ -354,9 +366,17 @@ jobs:
       mongodb:
         image: mongo:${{ matrix.mongodb }}
         ports: ["27017:27017"]
+      redis:
+        # Redis 8.2, by tag and digest (the OCI index of docker.io/library/redis:8.2, *verified
+        # 2026-11-28* against the registry). Keep ci.yml and compose.yaml in step.
+        image: redis:8.2@sha256:bb302517211721bf85ae3152b663c848a7cb36e79b02d69239ce20b5ddce95be
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping" --health-interval 2s --health-retries 30
     env:
       ADAM_TEST_POSTGRES_URL: postgres://postgres:postgres@localhost:5432/adam_test
       ADAM_TEST_MONGODB_URI: mongodb://localhost:27017
+      ADAM_TEST_REDIS_URL: redis://localhost:6379
       # A database suite that would skip (variable unset) fails instead: see
       # adam_core::testing. Without this, a typo here turns the suites green.
       ADAM_TEST_REQUIRE_DB: "1"
@@ -379,12 +399,13 @@ jobs:
           "$RUNNER_TEMP/github-mcp-server" --version
           echo "ADAM_TEST_GITHUB_MCP_SERVER=$RUNNER_TEMP/github-mcp-server" >> "$GITHUB_ENV"
       - name: Tests (memory, Postgres, MongoDB, coder end to end)
-        run: cargo nextest run --workspace --locked --profile ci --features adam-llm-agent/schema,adam-assembly/dev,adam/dev,adam-assembly/mcp,adam/mcp
+        run: cargo nextest run --workspace --locked --profile ci --features adam-llm-agent/schema,adam-assembly/dev,adam/dev,adam-assembly/mcp,adam/mcp,adam-store-mongodb/memory,adam-store-postgres/memory
       # Run the database suites a second time: this pass exercises migrate() on
       # an existing schema. The offline suites (coder end to end) do not repeat.
       - name: Database suites again, on the migrated schema
         run: >-
           cargo nextest run --locked --profile ci
+          --features adam-store-postgres/memory,adam-store-mongodb/memory
           -p adam-store-postgres -p adam-store-mongodb -p adam-runtime -p adam-a2a-runtime
           -p adam-notify-postgres
 
@@ -397,6 +418,15 @@ jobs:
   # and still fails main, so the ratchet cannot silently drift.
   coverage:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    # ANR-1360: one coverage run at a time. Its steps open, comment on and close a
+    # single issue, so two commits' runs must not interleave — an older run
+    # finishing after a newer one would close the issue of a red `main`, or open
+    # one for a green `main`. `queue: max` keeps the waiting runs instead of
+    # replacing one, so each commit's run still reaches a verdict (up to 100 wait).
+    concurrency:
+      group: ci-coverage
+      cancel-in-progress: false
+      queue: max
     runs-on: ubuntu-latest
     timeout-minutes: 60
     # The gate is main-only, so a red main needs a follow-up: the last step opens an issue.
@@ -418,9 +448,17 @@ jobs:
       mongodb:
         image: mongo:8.0
         ports: ["27017:27017"]
+      redis:
+        # Redis 8.2, by tag and digest (the OCI index of docker.io/library/redis:8.2, *verified
+        # 2026-11-28* against the registry). Keep ci.yml and compose.yaml in step.
+        image: redis:8.2@sha256:bb302517211721bf85ae3152b663c848a7cb36e79b02d69239ce20b5ddce95be
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping" --health-interval 2s --health-retries 30
     env:
       ADAM_TEST_POSTGRES_URL: postgres://postgres:postgres@localhost:5432/adam_test
       ADAM_TEST_MONGODB_URI: mongodb://localhost:27017
+      ADAM_TEST_REDIS_URL: redis://localhost:6379
       ADAM_TEST_REQUIRE_DB: "1"
     steps:
       - uses: actions/checkout@v7
@@ -433,7 +471,7 @@ jobs:
           tool: nextest,cargo-llvm-cov
       - name: Run the tests instrumented
         run: >-
-          cargo llvm-cov nextest --workspace --locked --profile ci --features adam-llm-agent/schema,adam-assembly/dev,adam/dev,adam-assembly/mcp,adam/mcp
+          cargo llvm-cov nextest --workspace --locked --profile ci --features adam-llm-agent/schema,adam-assembly/dev,adam/dev,adam-assembly/mcp,adam/mcp,adam-store-postgres/memory
           --ignore-filename-regex "$COVERAGE_IGNORE" --no-report
       - name: lcov report
         run: cargo llvm-cov report --lcov --output-path lcov.info --ignore-filename-regex "$COVERAGE_IGNORE"

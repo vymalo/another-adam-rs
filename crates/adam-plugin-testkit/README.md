@@ -8,7 +8,7 @@ slice H1). Test code, not a product.
 | Double | What it does |
 |---|---|
 | `Allows` | continues, counting the `before_tool` and `after_tool` calls |
-| `Answers(Verdict)` | answers that verdict, again and again |
+| `Answers(Decision)` | answers that decision, again and again |
 | `Fails::new(class, times)` / `Fails::always(class)` | fails with that class that many times, then continues |
 | `Panics` | panics on purpose in `before_tool` |
 | `Rewrites` | sets `arguments["rewritten"] = true` |

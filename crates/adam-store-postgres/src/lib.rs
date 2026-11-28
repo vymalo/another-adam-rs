@@ -2,7 +2,7 @@
 //!
 //! # Schema
 //!
-//! Five tables (names prefixed, `adam_` by default):
+//! Six tables (names prefixed, `adam_` by default):
 //!
 //! * `adam_runs`: one row per run. `state` is `JSONB`, so runs are queryable
 //!   from SQL for dashboards and debugging. `sched_at` is the precomputed "due
@@ -19,6 +19,11 @@
 //!   `adam_blob` is content-addressed (`digest` is the primary key, `size` is checked against the
 //!   bytes) and shared by every run that names a digest; `adam_run_blob` is the append-only set of
 //!   digests one run references, primary key `(run_id, digest)`, deleted with its run.
+//! * `adam_memory_lesson` (schema version 10, [ADR 0081](../../docs/decisions/0081-an-agent-keeps-a-self-improvement-memory-near-it-and-what-holds-becomes-the-deployments-memory.md)'s
+//!   L2): the lessons of an L2 memory, keyed `(scope, audience, root_cause)`. It is created by
+//!   **every** migration, whatever the `memory` feature says, so a binary that stamps version 10
+//!   never leaves a feature-enabled one on a schema with no table. Written and read by `PgMemory`
+//!   (feature `memory`).
 //!
 //! # Concurrency
 //!
@@ -47,6 +52,12 @@
 //! `adam_core::time::Timestamp` directly through `postgres-types`' `with-jiff-0_2`, and the
 //! migration and the notification listener take a connection out of the pool (`Object::take`)
 //! so a session lock or a `LISTEN` never returns to it.
+
+#[cfg(feature = "memory")]
+mod memory;
+
+#[cfg(feature = "memory")]
+pub use memory::PgMemory;
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -101,7 +112,13 @@ use uuid::Uuid;
 /// * 9: the claim is a function, `<prefix>claim_due` (ADR 0082, decision 1, slice P2): due, not
 ///   busy, lease free and the pinned owner, locked with `SKIP LOCKED`, leased and returned in claim
 ///   order, in one `BEGIN ATOMIC` body. Renewal and release stay inline.
-pub const SCHEMA_VERSION: i32 = 9;
+/// * 10: the L2 memory's lessons, `<prefix>memory_lesson` ([ADR
+///   0081](../../docs/decisions/0081-an-agent-keeps-a-self-improvement-memory-near-it-and-what-holds-becomes-the-deployments-memory.md),
+///   decision 4). Created by **every** migration, whatever the `memory` feature says: a binary
+///   built without the feature that stamps version 10 must not leave a feature-enabled binary on a
+///   schema with no table. Indexed by `(scope, audience, updated DESC, root_cause)` where `state =
+///   'active'`, the recall scan; `PgMemory` (feature `memory`) reads and writes it.
+pub const SCHEMA_VERSION: i32 = 10;
 
 /// The oldest server [`Store::migrate`] accepts, as PostgreSQL's `server_version_num`: 18.0, the
 /// floor of [ADR 0082](../../docs/decisions/0082-the-sql-adapters-keep-their-rules-in-the-database.md)
@@ -271,17 +288,7 @@ impl PgStore {
     /// several isolated environments in one database. Only `[a-z0-9_]` is
     /// allowed, starting with a letter or underscore.
     pub fn with_table_prefix(self, prefix: &str) -> StoreResult<Self> {
-        let valid = !prefix.is_empty()
-            && prefix.len() <= 40
-            && prefix
-                .chars()
-                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
-            && !prefix.starts_with(|c: char| c.is_ascii_digit());
-        if !valid {
-            return Err(StoreError::InvalidInput(format!(
-                "invalid table prefix {prefix:?}"
-            )));
-        }
+        check_table_prefix(prefix)?;
         Ok(Self::build(self.pool, prefix.to_owned()))
     }
 
@@ -643,6 +650,67 @@ fn statement_timeout_ms_from_text(raw: &str) -> StoreResult<u64> {
     Ok(millis)
 }
 
+/// The rule of every table-name prefix: only `[a-z0-9_]`, at most 40 characters, not starting
+/// with a digit. Shared by [`PgStore::with_table_prefix`] and `PgMemory::with_table_prefix`.
+pub(crate) fn check_table_prefix(prefix: &str) -> StoreResult<()> {
+    let valid = !prefix.is_empty()
+        && prefix.len() <= 40
+        && prefix
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+        && !prefix.starts_with(|c: char| c.is_ascii_digit());
+    if valid {
+        Ok(())
+    } else {
+        Err(StoreError::InvalidInput(format!(
+            "invalid table prefix {prefix:?}"
+        )))
+    }
+}
+
+/// The advisory-lock key every migrator of this prefix takes: the migration transaction of
+/// [`Store::migrate`] and `PgMemory::migrate`'s memory DDL (feature `memory`) are serialised by it.
+pub(crate) fn migrate_lock_key(p: &str) -> String {
+    format!("adam-rs:migrate:{p}")
+}
+
+/// The DDL of `<prefix>memory_lesson` (schema version 10, ADR 0081's L2): the table of L2 lessons
+/// and the partial index a recall scans. In **every** migration ([`Sql::migrate`]), whatever the
+/// `memory` feature says, and run alone by `PgMemory::migrate` (feature `memory`), under
+/// [`migrate_lock_key`]'s lock. Every constraint and the index carry the table prefix, like the
+/// rest of the schema.
+pub(crate) fn memory_lesson_ddl(p: &str) -> Vec<Arc<str>> {
+    let t = format!("{p}memory_lesson");
+    [
+        format!(
+            "CREATE TABLE IF NOT EXISTS {t} (
+                scope      TEXT        NOT NULL,
+                audience   TEXT        NOT NULL,
+                root_cause TEXT        NOT NULL COLLATE \"C\",
+                remedy     TEXT        NOT NULL,
+                rationale  TEXT        NOT NULL,
+                anchors    JSONB       NOT NULL,
+                sources    JSONB       NOT NULL,
+                review     TEXT        NOT NULL,
+                state      TEXT        NOT NULL,
+                created    TIMESTAMPTZ NOT NULL,
+                updated    TIMESTAMPTZ NOT NULL,
+                retired_at TIMESTAMPTZ,
+                CONSTRAINT {p}memory_lesson_pkey PRIMARY KEY (scope, audience, root_cause),
+                CONSTRAINT {p}memory_lesson_state CHECK (state IN ('proposed', 'active', 'retired'))
+            )"
+        ),
+        // The recall scan: one scope and audience's active lessons, the freshest first.
+        format!(
+            "CREATE INDEX IF NOT EXISTS {p}memory_lesson_active ON {t} (scope, audience, updated DESC, root_cause)
+             WHERE state = 'active'"
+        ),
+    ]
+    .into_iter()
+    .map(Arc::from)
+    .collect()
+}
+
 /// SQL text with table names baked in, built once per store.
 #[derive(Clone, Debug)]
 struct Sql {
@@ -907,6 +975,10 @@ impl Sql {
         // Slices P0 and P1 create none (P1 adds the `served` column, above); P2 adds the claim.
         let migrate_functions: Vec<Arc<str>> = vec![Arc::from(claim_due_function(p, &runs))];
         migrate.extend(migrate_functions);
+        // Schema version 10 (ADR 0081's L2): the memory lesson table, in every migration whatever
+        // the `memory` feature says (see [`memory_lesson_ddl`]), before the version row. A fresh
+        // database and an upgrade end with the same tables.
+        migrate.extend(memory_lesson_ddl(p));
         // Record the version, and raise it from an older one. Never lower it: a process
         // running an older release must not undo a newer one's migration.
         migrate.push(Arc::from(format!(
@@ -920,7 +992,7 @@ impl Sql {
             migrate_body,
             meta_table: meta.clone(),
             runs_table: runs.clone(),
-            migrate_lock: format!("adam-rs:migrate:{p}"),
+            migrate_lock: migrate_lock_key(p),
             listing_index: runs_list.clone(),
             // `to_regclass` resolves the unqualified name through the search path, like every
             // other statement here, so two deployments that share a database with the same prefix
@@ -2576,24 +2648,27 @@ mod tests {
     /// fixture: a start on a current schema runs no DDL, so such a change would never reach a
     /// database (ADR 0082, decision 10).
     #[test]
-    fn the_statements_equal_the_version_9_fixture() {
-        assert_eq!(SCHEMA_VERSION, 9, "a new version gets a fixture of its own");
+    fn the_statements_equal_the_version_10_fixture() {
+        assert_eq!(
+            SCHEMA_VERSION, 10,
+            "a new version gets a fixture of its own"
+        );
         let sql = Sql::new("adam_");
         assert!(
             sql.migrate.len() > 4,
             "the fixture must hold the whole migration"
         );
         let mut generated = String::from(
-            "-- The schema version 9 that adam-store-postgres emits.\n\
-             -- Regenerate with ADAM_WRITE_FIXTURE=1 cargo test -p adam-store-postgres --lib the_statements_equal_the_version_9_fixture\n",
+            "-- The schema version 10 that adam-store-postgres emits.\n\
+             -- Regenerate with ADAM_WRITE_FIXTURE=1 cargo test -p adam-store-postgres --lib the_statements_equal_the_version_10_fixture\n",
         );
         generated.push_str(&sql.migrate.join(";\n\n"));
         generated.push_str(";\n");
-        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/schema-v9.sql");
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/schema-v10.sql");
         if std::env::var_os("ADAM_WRITE_FIXTURE").is_some() {
             std::fs::write(path, &generated).expect("write the fixture");
         }
-        let fixture = include_str!("../tests/fixtures/schema-v9.sql");
+        let fixture = include_str!("../tests/fixtures/schema-v10.sql");
         assert_eq!(
             normalise(&(sql.migrate.join("; ") + ";")),
             normalise(fixture)

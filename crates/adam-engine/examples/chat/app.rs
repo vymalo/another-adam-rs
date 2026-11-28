@@ -20,7 +20,7 @@ use std::time::Duration;
 
 use adam_engine::adam_core::RunId;
 use adam_engine::adam_llm_agent::{
-    FnTool, HookResult, HookedCall, Plugin, ToolError, ToolOutput, Verdict,
+    Decision as PluginDecision, FnTool, HookResult, HookedCall, Plugin, ToolError, ToolOutput,
 };
 use adam_engine::adam_runtime::RunEvent;
 use adam_engine::{
@@ -81,14 +81,14 @@ impl Plugin for AsksBeforeSaving {
 
     fn before_tool(&self, call: &mut HookedCall<'_>) -> HookResult {
         if call.tool != "save_note" {
-            return Ok(Verdict::Continue);
+            return Ok(PluginDecision::Continue);
         }
         let text = call
             .arguments
             .get("text")
             .and_then(serde_json::Value::as_str)
             .unwrap_or_default();
-        Ok(Verdict::Ask(format!("Save the note {text:?}?")))
+        Ok(PluginDecision::Ask(format!("Save the note {text:?}?")))
     }
 }
 

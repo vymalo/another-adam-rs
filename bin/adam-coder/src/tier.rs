@@ -120,11 +120,15 @@ pub fn known(tool: &str) -> Option<AccessTier> {
         | "ask_agent"
         | "explorer"
         | "reviewer"
-        // The tools that run those helpers in the background: they start, read and close the
-        // same read-only subagents, which keep to the tier of the run they serve.
+        // The tools that run those helpers in the background: they start, read, edit and close the
+        // same read-only subagents, which keep to the tier of the run they serve. An edit is `Plan`
+        // with them even though it may raise a session's `token_budget` or `max_turns`: it changes
+        // no file and reaches no repository, and the family is one tier so a session is not edited
+        // under a gate its other tools do not open.
         | "subagent_start"
         | "subagent_send"
         | "subagent_read"
+        | "subagent_edit"
         | "subagent_close"
         | "subagent_list"
         | "load_skill"

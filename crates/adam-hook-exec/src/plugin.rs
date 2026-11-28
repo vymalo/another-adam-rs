@@ -5,8 +5,8 @@ use std::sync::Arc;
 
 use adam_error::{Classify, ErrorClass};
 use adam_plugin::{
-    HookError, HookEvent, HookResult, HookedCall, HookedCompaction, HookedEnd, HookedMessage,
-    HookedModelRequest, HookedText, ModelCallKind, Plugin, Subscriptions, Verdict,
+    Decision, HookError, HookEvent, HookResult, HookedCall, HookedCompaction, HookedEnd,
+    HookedMessage, HookedModelRequest, HookedText, ModelCallKind, Plugin, Subscriptions,
 };
 use serde_json::{Value, json};
 
@@ -143,7 +143,7 @@ impl Plugin for HookExec {
 
     fn message_received(&self, message: &mut HookedMessage<'_>) -> HookResult {
         if !self.points.decides(DecidePoint::MessageReceived) {
-            return Ok(Verdict::Continue);
+            return Ok(Decision::Continue);
         }
         let clean = self.scrub(message.text);
         let reply = self.ask(
@@ -151,8 +151,8 @@ impl Plugin for HookExec {
             json!({"text": clean, "files": Self::files(message.files)}),
         )?;
         match reply.verdict {
-            Word::Continue => Ok(Verdict::Continue),
-            Word::Deny => Ok(Verdict::Deny(self.reason(&reply))),
+            Word::Continue => Ok(Decision::Continue),
+            Word::Deny => Ok(Decision::Deny(self.reason(&reply))),
             Word::Ask => Err(self
                 .refuse("ask at message.received, where only allow, rewrite and deny are allowed")),
             Word::Stop => Err(self.refuse(
@@ -168,23 +168,23 @@ impl Plugin for HookExec {
                     ));
                 }
                 *message.text = text;
-                Ok(Verdict::Continue)
+                Ok(Decision::Continue)
             }
         }
     }
 
     fn run_ending(&self, end: &HookedEnd<'_>) -> HookResult {
         if !self.points.decides(DecidePoint::RunEnding) {
-            return Ok(Verdict::Continue);
+            return Ok(Decision::Continue);
         }
         let reply = self.ask(
             DecidePoint::RunEnding,
             json!({"text": self.scrub(end.text), "continuations": end.continuations}),
         )?;
         match reply.verdict {
-            Word::Continue => Ok(Verdict::Continue),
-            Word::Deny => Ok(Verdict::Deny(self.reason(&reply))),
-            Word::Stop => Ok(Verdict::Stop(self.reason(&reply))),
+            Word::Continue => Ok(Decision::Continue),
+            Word::Deny => Ok(Decision::Deny(self.reason(&reply))),
+            Word::Stop => Ok(Decision::Stop(self.reason(&reply))),
             Word::Ask => Err(self.refuse(
                 "ask at run.ending, where only allow, deny (keep going) and stop are allowed",
             )),
@@ -196,7 +196,7 @@ impl Plugin for HookExec {
 
     fn model_request(&self, request: &mut HookedModelRequest<'_>) -> HookResult {
         if !self.points.decides(DecidePoint::ModelRequest) {
-            return Ok(Verdict::Continue);
+            return Ok(Decision::Continue);
         }
         let metadata = self.scrub_map(request.metadata);
         let headers = self.scrub_map(request.headers);
@@ -224,8 +224,8 @@ impl Plugin for HookExec {
             }),
         )?;
         match reply.verdict {
-            Word::Continue => Ok(Verdict::Continue),
-            Word::Stop => Ok(Verdict::Stop(self.reason(&reply))),
+            Word::Continue => Ok(Decision::Continue),
+            Word::Stop => Ok(Decision::Stop(self.reason(&reply))),
             Word::Deny | Word::Ask => Err(self.refuse(
                 "deny or ask at model.request, where only allow, rewrite and stop are allowed",
             )),
@@ -257,21 +257,21 @@ impl Plugin for HookExec {
                     }
                     *request.extra_body = Some(value);
                 }
-                Ok(Verdict::Continue)
+                Ok(Decision::Continue)
             }
         }
     }
 
     fn compaction_before(&self, compaction: &mut HookedCompaction<'_>) -> HookResult {
         if !self.points.decides(DecidePoint::CompactionBefore) {
-            return Ok(Verdict::Continue);
+            return Ok(Decision::Continue);
         }
         let clean = self.scrub(compaction.context);
         let reply = self.ask(DecidePoint::CompactionBefore, json!({"context": clean}))?;
         match reply.verdict {
-            Word::Continue => Ok(Verdict::Continue),
-            Word::Deny => Ok(Verdict::Deny(self.reason(&reply))),
-            Word::Stop => Ok(Verdict::Stop(self.reason(&reply))),
+            Word::Continue => Ok(Decision::Continue),
+            Word::Deny => Ok(Decision::Deny(self.reason(&reply))),
+            Word::Stop => Ok(Decision::Stop(self.reason(&reply))),
             Word::Ask => Err(self.refuse(
                 "ask at compaction.before, where only allow, rewrite, deny and stop are allowed",
             )),
@@ -285,14 +285,14 @@ impl Plugin for HookExec {
                     ));
                 }
                 *compaction.context = context;
-                Ok(Verdict::Continue)
+                Ok(Decision::Continue)
             }
         }
     }
 
     fn before_tool(&self, call: &mut HookedCall<'_>) -> HookResult {
         if !self.points.decides(DecidePoint::ToolBefore) {
-            return Ok(Verdict::Continue);
+            return Ok(Decision::Continue);
         }
         let clean = self.scrub_value(call.arguments);
         let reply = self.ask(
@@ -300,10 +300,10 @@ impl Plugin for HookExec {
             json!({"tool": call.tool, "arguments": clean}),
         )?;
         match reply.verdict {
-            Word::Continue => Ok(Verdict::Continue),
-            Word::Deny => Ok(Verdict::Deny(self.reason(&reply))),
-            Word::Ask => Ok(Verdict::Ask(self.reason(&reply))),
-            Word::Stop => Ok(Verdict::Stop(self.reason(&reply))),
+            Word::Continue => Ok(Decision::Continue),
+            Word::Deny => Ok(Decision::Deny(self.reason(&reply))),
+            Word::Ask => Ok(Decision::Ask(self.reason(&reply))),
+            Word::Stop => Ok(Decision::Stop(self.reason(&reply))),
             Word::Rewrite => {
                 let Some(arguments) = reply.arguments else {
                     return Err(self.refuse("a rewrite without `arguments`"));
@@ -314,14 +314,14 @@ impl Plugin for HookExec {
                     ));
                 }
                 *call.arguments = arguments;
-                Ok(Verdict::Continue)
+                Ok(Decision::Continue)
             }
         }
     }
 
     fn after_tool(&self, call: &HookedCall<'_>, output: &mut HookedText<'_>) -> HookResult {
         if !self.points.decides(DecidePoint::ToolAfter) {
-            return Ok(Verdict::Continue);
+            return Ok(Decision::Continue);
         }
         let clean = self.scrub(output.text);
         let reply = self.ask(
@@ -329,9 +329,9 @@ impl Plugin for HookExec {
             json!({"tool": call.tool, "text": clean}),
         )?;
         match reply.verdict {
-            Word::Continue => Ok(Verdict::Continue),
-            Word::Deny => Ok(Verdict::Deny(self.reason(&reply))),
-            Word::Stop => Ok(Verdict::Stop(self.reason(&reply))),
+            Word::Continue => Ok(Decision::Continue),
+            Word::Deny => Ok(Decision::Deny(self.reason(&reply))),
+            Word::Stop => Ok(Decision::Stop(self.reason(&reply))),
             Word::Ask => Err(self
                 .refuse("ask at tool.after, where only allow, rewrite, deny and stop are allowed")),
             Word::Rewrite => {
@@ -343,7 +343,7 @@ impl Plugin for HookExec {
                         .refuse("a rewrite over a scrubbed answer is refused: it holds a secret"));
                 }
                 *output.text = text;
-                Ok(Verdict::Continue)
+                Ok(Decision::Continue)
             }
         }
     }

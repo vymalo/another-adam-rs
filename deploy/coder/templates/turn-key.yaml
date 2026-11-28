@@ -7,7 +7,7 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: {{ include "coder.turnKeyJobName" . }}-{{ include "coder.turnKeyJobHash" . }}
+  name: {{ include "coder.turnKeyJobResourceName" . }}
   labels:
     {{- include "coder.labels" . | nindent 4 }}
 spec:

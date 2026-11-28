@@ -30,6 +30,7 @@ tools:
   - subagent_start
   - subagent_send
   - subagent_read
+  - subagent_edit
   - subagent_close
   - subagent_list
   - load_skill

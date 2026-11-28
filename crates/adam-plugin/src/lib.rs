@@ -11,14 +11,22 @@
 //! 2. **A transient failure is retried, once.** [`HookError::is_retryable`] says whether the hook
 //!    may be tried again in the same step (a deadline is `Transient`); past the retries the call or
 //!    the message is refused like any other error.
-//! 3. **Order is the declaration order**, and the first verdict other than [`Verdict::Continue`] is
-//!    the set's: a later plugin is not asked once one has decided.
+//! 3. **Order is the declaration order**, and the first verdict other than [`Decision::Continue`] is
+//!    the set's: a later plugin is not asked once one has decided. An action ([`Decision::Act`]) is
+//!    a decision too: it ends the set, and the loop performs nothing until slice H1d is built.
 //!
 //! The loop runs a set **inside** the journaled step it affects, with `LlmAgentBuilder::hooks` of
 //! `adam-llm-agent`: in the step that takes a message in for `message.received`, inside
 //! `tool:<call id>` for `before_tool` (after a source's `withhold` and before the tool) and
 //! `after_tool` (once the tool answered). The verdict is recorded in that step, so a replay that
 //! finds it recorded asks no hook again. A hook gets no `Ctx` and cannot add a step.
+//!
+//! **The command environment is not a plugin point.** A command's environment has its own seam,
+//! `adam_workspace::ExecHook`, composed by `adam_workspace::HookedEnvironment` (ADR 0050,
+//! decision 13, slice H10): it sees an `ExecSpec` and no `Ctx`, store or secret, and
+//! `HidingEnvironment` is one such hook. It is not a method of [`Plugin`] because this crate
+//! depends on neither the loop, the runtime nor the workspace: an `exec.prepare` point would make
+//! every plugin implementer depend on `adam-workspace`. `exec` stays a reserved event namespace.
 
 #![warn(missing_docs)]
 
@@ -60,12 +68,12 @@ pub struct HookedText<'a> {
 }
 
 /// The point where a person's message is about to reach a model (ADR 0050, decision 9). It may
-/// allow the message, rewrite [`HookedMessage::text`] in place, or refuse it with [`Verdict::Deny`].
+/// allow the message, rewrite [`HookedMessage::text`] in place, or refuse it with [`Decision::Deny`].
 pub const MESSAGE_RECEIVED: &str = "message.received";
 
 /// The point where the run would end with an answer (ADR 0050, decision 10): a plugin may allow the
-/// end ([`Verdict::Continue`]) or keep the run going with [`Verdict::Deny`], whose reason the model is
-/// asked again with. [`Verdict::Stop`] ends the run as it was going to end; [`Verdict::Ask`] is not a
+/// end ([`Decision::Continue`]) or keep the run going with [`Decision::Deny`], whose reason the model is
+/// asked again with. [`Decision::Stop`] ends the run as it was going to end; [`Decision::Ask`] is not a
 /// verdict of this point and is a hook failure.
 pub const RUN_ENDING: &str = "run.ending";
 
@@ -150,9 +158,29 @@ pub struct HookedCompaction<'a> {
     pub context: &'a mut String,
 }
 
-/// What a deciding hook says about the call it runs at.
+/// An action a deciding hook asks the loop to perform, as its own journaled step (ADR 0050,
+/// decision 11, slice H1d).
+///
+/// The set is **open and versioned** on purpose, and this is the one place the workspace's closed
+/// enums rule does not hold: a plugin declares an action of its own (`ActionSpec { name, version,
+/// schema }`, ADR 0050 decision 11), and the loop performs it in `action:<turn>:<i>` with the
+/// declaring plugin's `perform`. A new action is therefore a variant here and no trait change, so
+/// `#[non_exhaustive]` is correct and is not to be "fixed": a host that matches this must carry an
+/// arm for an action it does not know.
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Verdict {
+pub enum HookAction {
+    /// Summarise the history now, as the next `compact:<n>:<turn>` step, within ADR 0044's bound of
+    /// compactions per run.
+    Compact,
+}
+
+/// What a deciding hook says about the call it runs at: a verdict, and the action it asks for.
+///
+/// The variants are the closed set the loop knows how to honour, so a new one must fail to compile
+/// in every host: unlike [`HookAction`], this enum is not `#[non_exhaustive]` (rule 3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Decision {
     /// Go on: the call runs with any rewrite the hook made.
     Continue,
     /// Refuse the call; the text is the reason a person reads.
@@ -161,22 +189,28 @@ pub enum Verdict {
     Ask(String),
     /// Stop the run; the text is the reason the run ends with.
     Stop(String),
+    /// Perform [`HookAction`] as its own journaled step after this one, and otherwise go on.
+    ///
+    /// Until slice H1d is built the loop performs nothing and reads this as [`Decision::Continue`];
+    /// the type carries the shape the journaled step will record.
+    Act(HookAction),
 }
 
-impl Verdict {
-    /// The reason, for a verdict that carries one.
+impl Decision {
+    /// The reason, for a decision that carries one. A [`Decision::Act`] carries none.
     #[must_use]
     pub fn reason(&self) -> Option<&str> {
         match self {
-            Verdict::Continue => None,
-            Verdict::Deny(reason) | Verdict::Ask(reason) | Verdict::Stop(reason) => Some(reason),
+            Decision::Continue | Decision::Act(_) => None,
+            Decision::Deny(reason) | Decision::Ask(reason) | Decision::Stop(reason) => Some(reason),
         }
     }
 
-    /// Whether the verdict ends the set's run of plugins: anything but [`Verdict::Continue`].
+    /// Whether the decision ends the set's run of plugins: anything but [`Decision::Continue`], an
+    /// action included (an action is a decision, even though the loop goes on).
     #[must_use]
     pub fn decides(&self) -> bool {
-        !matches!(self, Verdict::Continue)
+        !matches!(self, Decision::Continue)
     }
 }
 
@@ -218,8 +252,8 @@ impl std::fmt::Display for HookError {
 
 impl std::error::Error for HookError {}
 
-/// What a hook answers: a verdict, or the reason it could not decide.
-pub type HookResult = Result<Verdict, HookError>;
+/// What a hook answers: a decision, or the reason it could not decide.
+pub type HookResult = Result<Decision, HookError>;
 
 /// A compiled hook set around one tool call. Every method has a do-nothing default, so a plugin that
 /// cares about one point implements one method.
@@ -228,41 +262,41 @@ pub trait Plugin: Send + Sync {
     fn name(&self) -> &str;
 
     /// A person's message is about to reach a model: allow it, rewrite its text, or refuse it with
-    /// [`Verdict::Deny`] and the reason the person reads. `Ask` and `Stop` are not verdicts of this
+    /// [`Decision::Deny`] and the reason the person reads. `Ask` and `Stop` are not verdicts of this
     /// point, and the loop treats them as a hook failure (a refusal).
     fn message_received(&self, _message: &mut HookedMessage<'_>) -> HookResult {
-        Ok(Verdict::Continue)
+        Ok(Decision::Continue)
     }
 
-    /// The run would end with an answer: allow it, or return [`Verdict::Deny`] with the reason the
+    /// The run would end with an answer: allow it, or return [`Decision::Deny`] with the reason the
     /// model is asked again with. Called once per such end, in the journaled step `end:<turn>`.
     fn run_ending(&self, _end: &HookedEnd<'_>) -> HookResult {
-        Ok(Verdict::Continue)
+        Ok(Decision::Continue)
     }
 
     /// A model call is about to be made: rewrite its temperature, its bound on output tokens or its
-    /// metadata, or stop the run with [`Verdict::Stop`]. `Deny` and `Ask` are not verdicts of this
+    /// metadata, or stop the run with [`Decision::Stop`]. `Deny` and `Ask` are not verdicts of this
     /// point, and the loop treats them as a hook failure.
     fn model_request(&self, _request: &mut HookedModelRequest<'_>) -> HookResult {
-        Ok(Verdict::Continue)
+        Ok(Decision::Continue)
     }
 
     /// A history is about to be summarised (ADR 0050, slice H9): add context to the summary request,
-    /// or refuse the compaction with [`Verdict::Deny`], and the history is shortened instead.
+    /// or refuse the compaction with [`Decision::Deny`], and the history is shortened instead.
     /// `Stop` fails the run; `Ask` is not a verdict of this point, so it is a failure of class
     /// `Invalid` and the run fails too (decision 8). A hook never writes the summary itself.
     fn compaction_before(&self, _compaction: &mut HookedCompaction<'_>) -> HookResult {
-        Ok(Verdict::Continue)
+        Ok(Decision::Continue)
     }
 
     /// Before the call runs: rewrite its arguments, refuse it, ask, or stop the run.
     fn before_tool(&self, _call: &mut HookedCall<'_>) -> HookResult {
-        Ok(Verdict::Continue)
+        Ok(Decision::Continue)
     }
 
     /// After the tool answered: rewrite what the model will read, or refuse it.
     fn after_tool(&self, _call: &HookedCall<'_>, _output: &mut HookedText<'_>) -> HookResult {
-        Ok(Verdict::Continue)
+        Ok(Decision::Continue)
     }
 
     /// What the plugin is offered by [`observe`](Self::observe). The default is the core catalogue
@@ -296,7 +330,7 @@ pub struct Decided<'a> {
     /// The plugin that decided.
     pub plugin: &'a str,
     /// What it said.
-    pub verdict: Verdict,
+    pub verdict: Decision,
 }
 
 /// How long one hook may take, and how many times a transient failure is tried again.
@@ -370,7 +404,7 @@ impl HookSet {
     }
 
     /// Runs every plugin's `message_received` in order, until one decides. `None` when every plugin
-    /// said [`Verdict::Continue`].
+    /// said [`Decision::Continue`].
     ///
     /// # Errors
     /// As [`HookSet::before_tool`]. The caller refuses the message on an error: a hook that cannot
@@ -401,7 +435,11 @@ impl HookSet {
 
     /// Runs every plugin's `before_tool` in order, until one denies or stops.
     ///
-    /// An [`Verdict::Ask`] does not end the set (ADR 0050, decision 8 and slice H8): the plugins
+    /// A [`Decision::Act`] ends the set like any other decision: the action is the first one asked
+    /// for, and the plugins after it are not asked. The loop performs nothing until slice H1d, and
+    /// reads the action as `Continue`, so the call runs.
+    ///
+    /// A [`Decision::Ask`] does not end the set (ADR 0050, decision 8 and slice H8): the plugins
     /// after it are still asked, each seeing the arguments the ones before it left, because a call a
     /// person approves runs, and a plugin that would have refused it must have had its say. A later
     /// `Deny` or `Stop`, or a later failure, is the set's answer; a later `Ask` adds nothing (the
@@ -412,23 +450,23 @@ impl HookSet {
     /// been tried again [`HookLimits::retries`] times. The caller denies on an error: a hook that
     /// cannot say `Continue` never lets the call through.
     pub fn before_tool(&self, call: &mut HookedCall<'_>) -> HookResult {
-        let mut asked: Option<Verdict> = None;
+        let mut asked: Option<Decision> = None;
         let decided = self.run_decided("before_tool", |plugin| {
             let verdict = guard(plugin.name(), self.limits.deadline, || {
                 plugin.before_tool(call)
             })?;
             match verdict {
                 // The first question stands; the plugins after it are asked all the same.
-                Verdict::Ask(_) => {
+                Decision::Ask(_) => {
                     asked.get_or_insert(verdict);
-                    Ok(Verdict::Continue)
+                    Ok(Decision::Continue)
                 }
                 verdict => Ok(verdict),
             }
         })?;
         Ok(match decided {
             Some(one) => one.verdict,
-            None => asked.unwrap_or(Verdict::Continue),
+            None => asked.unwrap_or(Decision::Continue),
         })
     }
 
@@ -448,7 +486,7 @@ impl HookSet {
     ///
     /// # Errors
     /// As [`HookSet::before_tool`]. The caller does not summarise on an error: the run fails for
-    /// good (decision 8); only a [`Verdict::Deny`] shortens the history instead.
+    /// good (decision 8); only a [`Decision::Deny`] shortens the history instead.
     pub fn compaction_before(&self, compaction: &mut HookedCompaction<'_>) -> HookResult {
         self.run(COMPACTION_BEFORE, |plugin| {
             guard(plugin.name(), self.limits.deadline, || {
@@ -471,7 +509,7 @@ impl HookSet {
 
     fn run(&self, point: &str, one: impl FnMut(&Arc<dyn Plugin>) -> HookResult) -> HookResult {
         self.run_decided(point, one)
-            .map(|decided| decided.map_or(Verdict::Continue, |one| one.verdict))
+            .map(|decided| decided.map_or(Decision::Continue, |one| one.verdict))
     }
 
     /// [`run`](Self::run), naming the plugin whose verdict decided.
@@ -545,16 +583,27 @@ mod tests {
 
         fn before_tool(&self, _call: &mut HookedCall<'_>) -> HookResult {
             self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            Ok(Verdict::Continue)
+            Ok(Decision::Continue)
         }
     }
 
     #[test]
     fn a_verdict_carries_its_reason_and_only_continue_lets_the_set_go_on() {
-        assert_eq!(Verdict::Continue.reason(), None);
-        assert_eq!(Verdict::Deny("no".into()).reason(), Some("no"));
-        assert!(!Verdict::Continue.decides());
-        assert!(Verdict::Stop("done".into()).decides());
+        assert_eq!(Decision::Continue.reason(), None);
+        assert_eq!(Decision::Deny("no".into()).reason(), Some("no"));
+        assert!(!Decision::Continue.decides());
+        assert!(Decision::Stop("done".into()).decides());
+    }
+
+    #[test]
+    fn an_action_is_a_decision_and_carries_no_reason() {
+        let action = Decision::Act(HookAction::Compact);
+        assert_ne!(action, Decision::Continue);
+        assert!(
+            action.decides(),
+            "an action is a decision, not a continuation"
+        );
+        assert_eq!(action.reason(), None, "an action carries no reason");
     }
 
     #[test]
@@ -566,14 +615,14 @@ mod tests {
         };
         assert_eq!(
             HookSet::new().before_tool(&mut call).unwrap(),
-            Verdict::Continue
+            Decision::Continue
         );
 
         let counter = Arc::new(Counter(0.into()));
         let set = HookSet::new().with(counter.clone());
         assert_eq!(set.names(), vec!["counter"]);
         assert!(!set.is_empty());
-        assert_eq!(set.before_tool(&mut call).unwrap(), Verdict::Continue);
+        assert_eq!(set.before_tool(&mut call).unwrap(), Decision::Continue);
         assert_eq!(counter.0.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
@@ -610,10 +659,10 @@ mod tests {
 
         fn message_received(&self, message: &mut HookedMessage<'_>) -> HookResult {
             if message.text.contains("secret") {
-                return Ok(Verdict::Deny("no secrets here".into()));
+                return Ok(Decision::Deny("no secrets here".into()));
             }
             message.text.push_str(" (read)");
-            Ok(Verdict::Continue)
+            Ok(Decision::Continue)
         }
     }
 
@@ -647,7 +696,7 @@ mod tests {
             })
             .expect("a verdict")
             .expect("a refusal");
-        assert_eq!(decided.verdict, Verdict::Deny("no secrets here".into()));
+        assert_eq!(decided.verdict, Decision::Deny("no secrets here".into()));
         assert_eq!(decided.plugin, "refuses-messages");
     }
 

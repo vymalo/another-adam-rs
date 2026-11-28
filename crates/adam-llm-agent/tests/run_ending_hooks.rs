@@ -9,8 +9,8 @@ use std::time::Duration;
 
 use adam_core::{DynStore, MemoryStore, RunId, RunStatus};
 use adam_llm_agent::{
-    HookResult, HookSet, HookedEnd, LlmAgent, Plugin, Tool, ToolCtx, ToolError, ToolOutput,
-    Verdict, user_message,
+    Decision, HookResult, HookSet, HookedEnd, LlmAgent, Plugin, Tool, ToolCtx, ToolError,
+    ToolOutput, user_message,
 };
 use adam_model::{MockModel, ToolCall, ToolSpec};
 use adam_runtime::{CollectingSink, RunView, Runtime};
@@ -121,9 +121,9 @@ impl Plugin for Keeps {
 
     fn run_ending(&self, _end: &HookedEnd<'_>) -> HookResult {
         if self.asked.fetch_add(1, SeqCst) < self.times {
-            Ok(Verdict::Deny(self.reason.into()))
+            Ok(Decision::Deny(self.reason.into()))
         } else {
-            Ok(Verdict::Continue)
+            Ok(Decision::Continue)
         }
     }
 }

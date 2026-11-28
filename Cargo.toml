@@ -42,12 +42,14 @@ adam-macros = { path = "crates/adam-macros", version = "0.7.0" } # x-release-ple
 adam-mcp = { path = "crates/adam-mcp", version = "0.7.0" } # x-release-please-version
 adam-mcp-testkit = { path = "crates/adam-mcp-testkit", version = "0.7.0" } # x-release-please-version
 adam-memory = { path = "crates/adam-memory", version = "0.7.0" } # x-release-please-version
+adam-memory-redis = { path = "crates/adam-memory-redis", version = "0.7.0" } # x-release-please-version
 adam-memory-testkit = { path = "crates/adam-memory-testkit", version = "0.7.0" } # x-release-please-version
 adam-model = { path = "crates/adam-model", version = "0.7.0" } # x-release-please-version
 adam-model-oauth = { path = "crates/adam-model-oauth", version = "0.7.0", default-features = false } # x-release-please-version
 adam-model-openai = { path = "crates/adam-model-openai", version = "0.7.0", default-features = false } # x-release-please-version
 adam-notify-postgres = { path = "crates/adam-notify-postgres", version = "0.7.0" } # x-release-please-version
 adam-notify-testkit = { path = "crates/adam-notify-testkit", version = "0.7.0" } # x-release-please-version
+adam-otel = { path = "crates/adam-otel", version = "0.7.0" } # x-release-please-version
 adam-plugin = { path = "crates/adam-plugin", version = "0.7.0" } # x-release-please-version
 adam-plugin-testkit = { path = "crates/adam-plugin-testkit", version = "0.7.0" } # x-release-please-version
 adam-postgres = { path = "crates/adam-postgres", version = "0.7.0" } # x-release-please-version
@@ -112,9 +114,20 @@ memchr = "2"
 # many threads. The crate compiles mimalloc's C sources with `cc`, so a musl build needs `musl-gcc`.
 mimalloc = "0.1"
 notify = "8"
+# The OTel layer of ADR 0075 (adam-otel): the SDK, the tracing bridge and the OTLP/HTTP exporter.
+# The exporter's HTTP client is the workspace `reqwest` below (`reqwest-client`, never
+# `reqwest-blocking-client`); gRPC/tonic is not compiled in, and the crate picks the TLS provider
+# exactly as adam-model-openai does.
+opentelemetry = { version = "0.33.1", default-features = false, features = ["trace", "metrics", "internal-logs"] }
+opentelemetry_sdk = { version = "0.33.1", default-features = false, features = ["trace", "metrics", "internal-logs", "experimental_trace_batch_span_processor_with_async_runtime", "experimental_metrics_periodicreader_with_async_runtime", "rt-tokio"] }
+opentelemetry-otlp = { version = "0.33.1", default-features = false, features = ["http-proto", "reqwest-client", "trace", "metrics", "internal-logs"] }
 proc-macro2 = "1"
 proptest = "1"
 quote = "1"
+# The Redis L2 memory adapter (adam-memory-redis): client only. `tls-rustls-webpki-roots` lets a
+# deployment reach `rediss://` through bundled roots; the defaults (acl, streams, geospatial,
+# script, num-bigint) are command sets nothing here uses.
+redis = { version = "1.8", default-features = false, features = ["tls-rustls-webpki-roots"] }
 # Client only, and only the transports adam-mcp uses; the crate picks its own features.
 rmcp = { version = "3.9", default-features = false }
 # `search_files` (adam-coder): a linear-time engine, with no backtracking and a size limit.
@@ -147,6 +160,8 @@ tokio-util = { version = "0.7", features = ["compat"] }
 tower-test = "0.4"
 trybuild = "1"
 tracing = "0.1"
+# The bridge from a `tracing` span to an OTel span (adam-otel, ADR 0075).
+tracing-opentelemetry = "0.34.0"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "json", "env-filter"] }
 url = "2"
 # Swagger UI at `/docs` of every A2A server (adam-a2a). `vendored`: the assets come from the

@@ -175,10 +175,10 @@ pub use access::{ToolAccess, Use, UseMode, path_scope};
 ///
 /// [ADR 0050]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0050-hooks-around-the-agent-loop-compiled-first-and-programs-second.md
 pub use adam_plugin::{
-    COMPACTION_BEFORE, EventHeader, EventKind, EventQueue, FlushReport, HookError, HookEvent,
-    HookLimits, HookResult, HookSet, HookedCall, HookedCompaction, HookedEnd, HookedMessage,
-    HookedModelRequest, HookedText, MESSAGE_RECEIVED, MODEL_REQUEST, MessageFile, ModelCallKind,
-    ObserveLimits, Plugin, Verdict,
+    COMPACTION_BEFORE, Decision, EventHeader, EventKind, EventQueue, FlushReport, HookAction,
+    HookError, HookEvent, HookLimits, HookResult, HookSet, HookedCall, HookedCompaction, HookedEnd,
+    HookedMessage, HookedModelRequest, HookedText, MESSAGE_RECEIVED, MODEL_REQUEST, MessageFile,
+    ModelCallKind, ObserveLimits, Plugin,
 };
 /// Custom events (ADR 0050, slice H5): what a tool or an agent declares ([`EventSpec`]), who may see
 /// it ([`Visibility`]), how an observer subscribes ([`Subscriptions`]), and why a declaration is
@@ -240,8 +240,8 @@ pub use redact::{REDACTED_MARKER, is_ordinary_word, is_value_position};
 pub use schema::{ToolSpecExt, spec_for};
 pub use sessions::{
     MAX_DESCRIPTION_CHARS, MAX_OPEN_SESSIONS, MAX_SESSION_ROUNDS, MAX_TEXT_CHARS,
-    MAX_WORKING_ROUNDS, SESSION_TOOL_TIME_LIMIT, SESSION_TOOLS, SUBAGENT_CLOSE, SUBAGENT_LIST,
-    SUBAGENT_READ, SUBAGENT_SEND, SUBAGENT_START, SessionAgent, SessionTools,
+    MAX_WORKING_ROUNDS, SESSION_TOOL_TIME_LIMIT, SESSION_TOOLS, SUBAGENT_CLOSE, SUBAGENT_EDIT,
+    SUBAGENT_LIST, SUBAGENT_READ, SUBAGENT_SEND, SUBAGENT_START, SessionAgent, SessionTools,
 };
 pub use si_memory::{SI_MEMORY_GROUP, SI_RECALL, SI_RECORD, SiMemoryHandle, SiRecall, SiRecord};
 pub use source::{

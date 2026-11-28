@@ -225,6 +225,20 @@ ADR 0052 removed the third one (a repository's devcontainer on a rootless contai
 deployment that still asks for it stops with exit 78, and a repository that brings its own environment
 names an image its run pod runs ([below](#a-repositorys-own-image-adr-0052)).
 
+### Hooks on the command environment
+
+A deployment may adjust every command of a run before the environment makes it, through
+`adam_workspace::ExecHook`: `prepare(&mut ExecSpec)` sets a variable or hides a name, and gets no run
+context, store or secret. `HookedEnvironment` runs a list of them around the environment the binary
+chose, and `HidingEnvironment` (the coder's: the variables its `mcp.json` files read as `${VAR}`) is
+one of them. Two rules hold at that seam, whatever the hooks do:
+
+* a variable a hook **adds** must be a plain upper-case name, never `PATH`, `HOME`, `LANG`, `TMPDIR`,
+  `LD_*`, `BASH_ENV`, `ENV` or `IFS` (they change how a program starts); the refusal names the
+  variable and never its value;
+* a **hidden** name always wins, whatever order the hooks ran in: hiding is the agent's own boundary,
+  a hook is the deployment's policy, so the command runs without the variable.
+
 ### The environment of a run
 
 The coder brings `adam-exec` into a run pod only (through the chart's init container), read-only: no

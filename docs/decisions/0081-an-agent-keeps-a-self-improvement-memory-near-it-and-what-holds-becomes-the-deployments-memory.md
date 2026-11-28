@@ -1,8 +1,14 @@
 # 0081. An agent keeps a self-improvement memory near it, and what holds becomes the deployment's memory
 
 Status: **Accepted** (2026-11-27), the owner's decision; the points under [Still open](#still-open) wait for an answer.
-Nothing is built. The evidence behind this page (the paper, the code it was checked against, the code index, the
-proposals for a memory protocol) is in [the agent page](../../.agents/docs/decisions/0081-an-agent-keeps-a-self-improvement-memory-near-it-and-what-holds-becomes-the-deployments-memory.md).
+Nothing was built when this was accepted; M1, M2a, the M4 memory tools (partly), and the MongoDB
+and Redis adapters are built since (see the amendments below). The evidence behind this page (the paper, the
+code it was checked against, the code index, the proposals for a memory protocol) is in [the agent page](../../.agents/docs/decisions/0081-an-agent-keeps-a-self-improvement-memory-near-it-and-what-holds-becomes-the-deployments-memory.md).
+
+**Amended 2026-11-28 (ANR-1292).** The PostgreSQL L2 adapter is built: `PgMemory`, the `memory`
+feature of `adam-store-postgres`, one configured scope per adapter over one `memory_lesson` table
+(schema version 10 of the run store's database), proved by `memory_conformance!` with two scopes on
+one database. The MongoDB adapter (ANR-1293) is built too; Redis (ANR-1294) remains unbuilt.
 
 The owner said (2026-11-27):
 
@@ -165,7 +171,7 @@ Cards of the board epic; each is one pull request, its proof seen failing first.
 | M0 | this ADR and its pages | docs-check |
 | M1 | the L1 port, its testkit and the in-folder adapter, L1's only one | a double that answers another scope or writes twice for one key fails the suite |
 | M2a | the L2 port, its testkit and the in-process reference | `memory_conformance!`; two configured scopes on one store never see each other's lessons |
-| M2b | the PostgreSQL, MongoDB and Redis adapters (ANR-1292, ANR-1293, ANR-1294, unbuilt) | the suite on each; two scopes on one database never see each other; fails with a URL unset under the CI switch |
+| M2b | the PostgreSQL, MongoDB and Redis adapters (ANR-1292, ANR-1293 and ANR-1294, built) | the suite on each; two scopes on one database never see each other; fails with a URL unset under the CI switch |
 | M3 + M4 | `si_memory:` and the deployment's settings; the `si_recall` and `si_record` tools as a lazy group, over L1 | a folder `off` is off; a replay asks the store nothing; a secret in a field is refused |
 | M5 + M6 | the outcome observer; the defaults in `adam-coder` and `adam-agent`, and the chart | a passing check stamps a success; the first request differs by one loader line; the chart renders unchanged by default |
 | M7 + M8 | the promotion pass and rule; the reviewer agent | the same evidence twice is one lesson; one L1 scope alone is never a candidate; a rejected candidate is never served; one scope never reaches every audience |
@@ -174,8 +180,9 @@ Cards of the board epic; each is one pull request, its proof seen failing first.
 
 The M2 port-and-kit half (M2a) is built (*2026-11-27*): `adam-memory`'s `Memory` trait, its types,
 its in-process reference and `adam-memory-testkit`'s `memory_conformance!`, with the two-scope case.
-The PostgreSQL, MongoDB and Redis adapters remain M2b (ANR-1292, ANR-1293, ANR-1294); this slice
-claims no adapter.
+M2b's three adapters are built (*2026-11-28*): the PostgreSQL one as `adam-store-postgres`'s
+`memory` feature (ANR-1292), the MongoDB one as `adam-store-mongodb`'s (ANR-1293) and the Redis one
+as `adam-memory-redis` (ANR-1294). M2a claimed no adapter.
 
 ## Still open
 
@@ -217,3 +224,20 @@ claims no adapter.
 * **L2's scope fixed by adam.** The owner left it to the adapter: one store for many deployments, or one per adam-coder.
 * **Promotion by a person, or with no review.** The owner chose another agent as reviewer.
 * **Inferring a chat** from its tools or tags. Implicit, and a tag is presentation.
+
+## Amended 2026-11-28: the Redis adapter
+
+The Redis adapter is built (`adam-memory-redis`, ANR-1294), and it settles nothing this decision
+left open: Redis is **L2, a store and not an L1 cache** — decision 2 already makes any database
+reached over the network L2 even when one agent alone uses it — so the adapter implements `Memory`
+and never `SiMemory`.
+
+Its durability is its deployment's to configure, and the adapter documents it rather than enforcing
+it (it cannot reach a server's settings): AOF with `appendfsync everysec` (or `always`, at the cost
+of latency) so a restart does not lose the lessons since the last snapshot, and
+`maxmemory-policy noeviction` so the server refuses a write instead of evicting one. A deployment
+that chooses an eviction policy breaks decision 10's "kept, not deleted" **silently**: lessons go
+with no error the caller ever sees.
+
+The suite runs under `ADAM_TEST_REDIS_URL` with `ADAM_TEST_REQUIRE_DB=1` in CI, and with ANR-1293's
+MongoDB adapter two of the Slices table's M2b three are built.

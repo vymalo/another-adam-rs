@@ -3,8 +3,8 @@
 Configuration of both agents is environment variables only. Problems are reported all at once at startup
 (`invalid configuration`, exit 78). Sources of truth: `crates/adam-service/src/config.rs` (the common ones),
 `bin/adam-coder/src/config.rs`, `bin/adam-agent/src/config.rs`, `crates/adam-env-kubernetes/src/settings.rs`,
-`bin/adam-egress/src/config.rs`, `crates/adam-git-sandbox/src/config.rs`, and for the one row below
-`crates/adam-notify-postgres/src/lib.rs`.
+`bin/adam-egress/src/config.rs`, `bin/run-signer/src/config.rs`, `crates/adam-git-sandbox/src/config.rs`, and for the one
+row below `crates/adam-notify-postgres/src/lib.rs`.
 The chart sets these from its values: [chart README](../../deploy/coder/README.md). Secrets are never in
 files or logs; they are `SecretString`s and absent from `Debug`.
 
@@ -142,6 +142,32 @@ run's calls are still signed by the process turn key. The broker's contract is v
 in, `{"v":1,"chain":["<base64 DER>", …]}` out, and the refusals `400` (`Invalid`), `401`/`403`
 (`Unauthenticated`), `429`/`5xx` (`Transient`). Source: [`adam-run-cert-broker`](../../crates/adam-run-cert-broker/README.md).
 
+## Traces (`adam-otel`)
+
+The OTel layer of [ADR 0075](../decisions/0075-metrics-and-traces-are-off-by-default-and-say-nothing-about-a-person.md):
+OTLP/HTTP spans, **off unless an endpoint is set**. `adam-coder`, `adam-agent`, `adam-egress` and
+`adam-git-sandbox` compose the layer beside their JSON log layer (ANR-1412); `adam-service` does not pass the
+variables and the chart has no `otel.*` value yet (ANR-1386, ADR 0075 decision 7), so a deployment sets them
+through `config.extraEnv`. Source: [`adam-otel`](../../crates/adam-otel/README.md).
+
+| Variable | Meaning | Default |
+|---|---|---|
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | the OTLP/HTTP collector, an absolute `http` or `https` URL with no user, password, query or fragment; unset or blank means no exporter and no thread | unset: off |
+| `OTEL_SERVICE_NAME` | `service.name` of every exported span's and metric's resource | `adam` |
+
+Metrics ride the same variable and the same switch (`adam.runs`, a counter of committed transitions labelled by the run's state): with an endpoint set, the process's meter exports to
+`{endpoint}/v1/metrics` on a periodic reader (15 s); unset, nothing is built. A label is one of the crate's closed
+sets (`adam_otel::labels`), so a metric names a run's state or a declared tool, never a person, an id or an amount.
+
+A value the crate refuses is **one warning line and tracing stays off**, never an exit: a trace is not a reason
+an agent fails. With the endpoint set, the spans the runtime writes (`adam.run`, `adam.child`) are exported; a
+failed export is the SDK's own log line and never a run's failure. `adam-egress` and `adam-git-sandbox` write
+events, not spans, so their log lines stay in the JSON layer.
+
+`adam-egress` and `adam-git-sandbox` link **no TLS provider** (they take `adam-otel` with `default-features = false`),
+so their exporter speaks plain `http` — an in-cluster collector. Exporting to an `https` collector from either
+needs the `aws-lc` feature on its `adam-otel` dependency, which adds `reqwest`/`rustls`/`aws-lc` to a small binary.
+
 ## Cross-process notifications (`adam-notify-postgres`)
 
 `adam-coder`, in every role (`all`, `control-plane`, `worker`): the `notify` component. Both binaries'
@@ -164,7 +190,7 @@ cross-process listener: SQLite's notifier is always in-process, and MongoDB has 
 | `ADAM_EXTRA_MCP_FILE` | a file of extra MCP servers in the shape of `mcp.json`, **added** to the agent's own (a name clash is exit 78) | unset |
 | `ADAM_REFERENCES_FILE` | `adam-coder`, roles that run workers: a file `{"references": [{"name", "url", "branch"?, "description"}]}` of repositories the coder may **read** beside the one it works on and never write, **added** to the `references:` of the agent's files; it must be an existing file of valid references whose addresses the workspaces' policy accepts (an allowed host, an owner a GitHub App acts for), and a name the agent already declares is exit 78. See [References](workspace-and-environments.md#references) | unset |
 | `A2A_ALLOW_INSECURE_REMOTES` | `adam-agent`, roles that run workers: let a remote subagent (`a2a:`) be at plain `http` on another machine, such as a service of the same cluster; without it such a URL is exit 78. **The messages and the bearer then cross the pod network in clear text**: protect it with a NetworkPolicy that admits only the caller, or mesh mTLS. Plain `http` goes only to the card's own host, and never from an `https` card. Its token is the environment's too: `auth: bearer:VAR` names the variable ([remote subagents](agent-files.md#remote-subagents-a2a)) | `false` |
-| `SI_MEMORY` | the deployment's ceiling on the self-improvement memory (ADR 0081 decision 11), `on` or `off`; anything else is exit 78. It only **narrows** a folder's `si_memory:` key: `off` here is off whatever the folder says, and a folder's `off` is off whatever this says ([the key](agent-files.md#the-self-improvement-memory-si_memory)). Read by the roles that run workers | `on` |
+| `SI_MEMORY` | the deployment's ceiling on the self-improvement memory (ADR 0081 decision 11), `on` or `off`; anything else is exit 78. It only **narrows** a folder's `si_memory:` key: `off` here is off whatever the folder says, and a folder's `off` is off whatever this says ([the key](agent-files.md#the-self-improvement-memory-si_memory)). Read by `adam-agent`'s worker roles; **`adam-coder` does not read it yet** — it serves an embedded agent whose `si_memory` key nothing wires, so `on`/`off` there has no effect until that wiring lands (ANR-1370) | `on` |
 
 ## The coder (`adam-coder`)
 
@@ -236,6 +262,32 @@ one, and nothing is less safe without it. For each one that is set, the process 
 | `DEVCONTAINER_PREPULL` | pull the default image at startup |
 | `DEVCONTAINER_CLI`, `DEVCONTAINER_PODMAN`, `DEVCONTAINER_CACHE_DIR` | the devcontainer CLI, the container engine's client, its cache |
 
+## The run signer (`run-signer`)
+
+The sidecar that signs a run's model requests with the run's own certificate
+([ADR 0086](../decisions/0086-a-run-signs-its-model-requests-with-a-certificate.md)): an agent points
+`MODEL_BASE_URL` at it with `MODEL_AUTH=injector`, and it forwards each call to the model gateway with a
+`Turn-Signature` added ([ADR 0068](../decisions/0068-adam-signs-its-own-history.md), *Amended 2026-11-25 (the request
+signature)*). Source: `bin/run-signer/src/config.rs`. Problems are reported all at once (exit 78).
+
+| Variable | Meaning | Default |
+|---|---|---|
+| `RUN_SIGNER_LISTEN` | the address to listen on. **Loopback only**: anything else is exit 78, because the proxy signs a caller's request with the run's key | `127.0.0.1:8443` |
+| `RUN_SIGNER_UPSTREAM` | **required**: the model gateway's base URL, absolute `http` or `https` with a host, no query, no fragment and no credentials. The request's own path and query are appended to it, and it is reached **directly**: the client ignores `HTTP_PROXY`, `HTTPS_PROXY` and `ALL_PROXY`. A target `Url::parse` would rewrite (`..`, `%2e%2e`, `\`, `{}`) is refused `400` rather than signed over one path and sent over another | required |
+| `RUN_SIGNER_UPSTREAM_CA_FILE` | the PEM anchors the upstream client trusts beside the default roots. A file that cannot be read, is empty, is over 1 MiB or holds no certificate is exit 78 | `RUN_CERT_CA_FILE`'s bytes: the broker and the gateway are one trust domain by design today |
+| `RUN_CERT_ISSUER`, `RUN_CERT_ISSUER_URL`, `RUN_CERT_TOKEN_FILE`, `RUN_CERT_CA_FILE`, `RUN_CERT_RENEW_FRACTION` | the first three are **required here**, unlike the agents ([their rows](#turn-signing)): a signer with no issuer cannot sign, so every one of them unset is exit 78 naming the three required ones, and a half-set configuration is exit 78 with the same problems the agents report, beside this binary's own. `RUN_CERT_CA_FILE` is trusted for **both** the broker and the gateway. The token file is re-read on every call, never cached and never logged | the first three required; the two optional ones default as for the agents |
+| `RUST_LOG` | log filter; JSON logs on stdout | `info` |
+
+A request it refuses is an HTTP status, not an exit: `400` for a missing or malformed `X-Run-Id` or `Prompt-Statement`
+(a run certificate names the person, so the statement is required), for one named twice, or for a target it would not
+forward unchanged; `413` for a body over 16 MiB; `503` when the issuer or the gateway cannot be reached, or a renewal
+outlived its one retry; and `502` for any other signing failure. A `503` carries `type: unavailable` so the run parks on
+a timer; the others carry `about:blank`.
+
+Not variables: the body limit (16 MiB), the connect timeout (10 s), the read timeout (300 s: a black-holed gateway
+frees the request, and it stays above the shutdown grace), the number of runs kept in memory (1024, least recently
+used dropped first) and the shutdown grace (25 s) — `Limits` values, so a test can shorten them.
+
 ## Egress proxy (`adam-egress`)
 
 The HTTPS-only proxy of the coder image (`bin/adam-egress`, [its README](../../bin/adam-egress/README.md)). It reads
@@ -288,7 +340,7 @@ Put these in a `.env` next to `compose.yaml`.
 
 | Variable | Meaning |
 |---|---|
-| `ADAM_TEST_POSTGRES_URL`, `ADAM_TEST_MONGODB_URI` | the database suites; skipped when unset |
+| `ADAM_TEST_POSTGRES_URL`, `ADAM_TEST_MONGODB_URI`, `ADAM_TEST_REDIS_URL` | the database suites; skipped when unset |
 | `ADAM_TEST_TABLE_PREFIX`, `ADAM_TEST_MONGO_COLLECTION_PREFIX` | the Postgres table prefix (`adam_test_`) and the MongoDB collection prefix (`adam_`) the store suite and the transcript measurement write to; set the same value on `dev/p2-measure.sh` |
 | `ADAM_TEST_REQUIRE_DB=1` | a suite whose variable is unset **fails** instead of skipping (CI sets it) |
 | `ADAM_TEST_MOCK_OPENAI_URL`, `ADAM_TEST_MOCK_GITHUB_URL`, `ADAM_TEST_MOCK_GITHUB_MCP_URL` | the tests of the real clients against the compose mocks |

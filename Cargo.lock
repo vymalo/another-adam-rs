@@ -235,6 +235,7 @@ dependencies = [
  "adam-llm-agent",
  "adam-mcp-testkit",
  "adam-model",
+ "adam-otel",
  "adam-postgres",
  "adam-runtime",
  "adam-schedule",
@@ -398,6 +399,7 @@ dependencies = [
  "adam-mcp-testkit",
  "adam-model",
  "adam-model-openai",
+ "adam-otel",
  "adam-postgres",
  "adam-runtime",
  "adam-schedule",
@@ -496,6 +498,7 @@ name = "adam-egress"
 version = "0.7.0"
 dependencies = [
  "adam-error",
+ "adam-otel",
  "async-trait",
  "httparse",
  "mimalloc",
@@ -579,6 +582,7 @@ name = "adam-git-sandbox"
 version = "0.7.0"
 dependencies = [
  "adam-error",
+ "adam-otel",
  "base64 0.22.1",
  "mimalloc",
  "rustix",
@@ -729,6 +733,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "adam-memory-redis"
+version = "0.7.0"
+dependencies = [
+ "adam-core",
+ "adam-error",
+ "adam-memory",
+ "adam-memory-testkit",
+ "redis",
+ "serde_json",
+]
+
+[[package]]
 name = "adam-memory-testkit"
 version = "0.7.0"
 dependencies = [
@@ -830,6 +846,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "adam-otel"
+version = "0.7.0"
+dependencies = [
+ "adam-core",
+ "adam-error",
+ "opentelemetry",
+ "opentelemetry-otlp",
+ "opentelemetry_sdk",
+ "reqwest",
+ "rustls",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "tracing-opentelemetry",
+ "tracing-subscriber",
+ "url",
+]
+
+[[package]]
 name = "adam-plugin"
 version = "0.7.0"
 dependencies = [
@@ -890,12 +925,41 @@ dependencies = [
 ]
 
 [[package]]
+name = "adam-run-signer"
+version = "0.7.0"
+dependencies = [
+ "adam-core",
+ "adam-error",
+ "adam-model",
+ "adam-run-cert-broker",
+ "adam-service",
+ "async-trait",
+ "axum",
+ "base64 0.22.1",
+ "bytes",
+ "futures",
+ "mimalloc",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "url",
+ "uuid",
+ "wiremock",
+]
+
+[[package]]
 name = "adam-runtime"
 version = "0.7.0"
 dependencies = [
  "adam-core",
  "adam-error",
  "adam-model",
+ "adam-otel",
  "adam-plugin",
  "adam-store-mongodb",
  "adam-store-postgres",
@@ -905,6 +969,8 @@ dependencies = [
  "futures",
  "jiff",
  "jsonschema",
+ "opentelemetry",
+ "opentelemetry_sdk",
  "proptest",
  "serde",
  "serde_json",
@@ -984,6 +1050,8 @@ version = "0.7.0"
 dependencies = [
  "adam-core",
  "adam-error",
+ "adam-memory",
+ "adam-memory-testkit",
  "adam-store-testkit",
  "async-trait",
  "futures",
@@ -1001,6 +1069,8 @@ version = "0.7.0"
 dependencies = [
  "adam-core",
  "adam-error",
+ "adam-memory",
+ "adam-memory-testkit",
  "adam-postgres",
  "adam-runtime",
  "adam-store-testkit",
@@ -1223,6 +1293,12 @@ checksum = "c049c0be4daef0b145cb3555416b3b8ef5b7888a38aea1a3a155801fe7b0810b"
 dependencies = [
  "rustversion",
 ]
+
+[[package]]
+name = "arcstr"
+version = "1.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "03918c3dbd7701a85c6b9887732e2921175f26c350b4563841d0958c21d57e6d"
 
 [[package]]
 name = "arraydeque"
@@ -3928,6 +4004,80 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7c87def4c32ab89d880effc9e097653c8da5d6ef28e6b539d313baaacfbafcbe"
 
 [[package]]
+name = "opentelemetry"
+version = "0.33.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8c1f1a6ac9c875a4941e4c7c085b61e8f4daa326de03b4701768c3491a6ad9ee"
+dependencies = [
+ "futures-core",
+ "futures-sink",
+ "js-sys",
+ "pin-project-lite",
+ "thiserror",
+ "tracing",
+]
+
+[[package]]
+name = "opentelemetry-http"
+version = "0.33.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "302249bd8ee804789faaa7b5b2cbf79bc61cb864714079c644e3828af5b7e811"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "http",
+ "opentelemetry",
+ "reqwest",
+]
+
+[[package]]
+name = "opentelemetry-otlp"
+version = "0.33.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0756af24841e367128ef31c831999937b8b5c5197d47914590d8f4e2e88c2e1a"
+dependencies = [
+ "http",
+ "httpdate",
+ "opentelemetry",
+ "opentelemetry-http",
+ "opentelemetry-proto",
+ "opentelemetry_sdk",
+ "prost",
+ "reqwest",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
+name = "opentelemetry-proto"
+version = "0.33.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d576f5dddc3299341bcd85a04be17b2564844c0c9563214f02d85f2524d1afae"
+dependencies = [
+ "opentelemetry",
+ "opentelemetry_sdk",
+ "prost",
+]
+
+[[package]]
+name = "opentelemetry_sdk"
+version = "0.33.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "372a912db2974d1990207006fd0e3aa0ef3fd4ad3be43c65cfaadf2206866061"
+dependencies = [
+ "futures-channel",
+ "futures-executor",
+ "futures-util",
+ "opentelemetry",
+ "percent-encoding",
+ "portable-atomic",
+ "rand 0.9.5",
+ "thiserror",
+ "tokio",
+ "tokio-stream",
+]
+
+[[package]]
 name = "ordered-float"
 version = "2.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4602,6 +4752,25 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "513962919efc330f829edb2535844d1b912b0fbe2ca165d613e4e8788bb05a5a"
 dependencies = [
  "rand_core 0.9.5",
+]
+
+[[package]]
+name = "redis"
+version = "1.8.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c85db9332bbc47e826283f0a6058d747c478ed2278976279cefd22154d541b98"
+dependencies = [
+ "arcstr",
+ "combine",
+ "itoa",
+ "percent-encoding",
+ "rustls",
+ "rustls-native-certs",
+ "ryu",
+ "socket2",
+ "url",
+ "webpki-roots",
+ "xxhash-rust",
 ]
 
 [[package]]
@@ -5990,6 +6159,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "tracing-log"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ee855f1f400bd0e5c02d150ae5de3840039a3f54b025156404e34c23c03f47c3"
+dependencies = [
+ "log",
+ "once_cell",
+ "tracing-core",
+]
+
+[[package]]
+name = "tracing-opentelemetry"
+version = "0.34.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0a904802a1b902f43638b677ff2a650847e3b4404101b6c586d648e8c1e3e8fe"
+dependencies = [
+ "js-sys",
+ "opentelemetry",
+ "smallvec",
+ "tracing",
+ "tracing-core",
+ "tracing-log",
+ "tracing-subscriber",
+ "web-time",
+]
+
+[[package]]
 name = "tracing-serde"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6818,6 +7014,12 @@ dependencies = [
  "spki 0.8.1",
  "tls_codec",
 ]
+
+[[package]]
+name = "xxhash-rust"
+version = "0.8.21"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "40de123dbb523ebcc00d61ec01840ad192578afc378d859f3429caa38308fad5"
 
 [[package]]
 name = "yoke"

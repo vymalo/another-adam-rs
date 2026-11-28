@@ -5,9 +5,10 @@ description: "Build, publish and deploy the adam-rs coder image (ghcr.io/vymalo/
 
 # Build, publish and deploy the coder image and chart
 
-One image, `ghcr.io/vymalo/another-adam-rs/coder`, carries six static binaries: `adam-coder` (the
+One image, `ghcr.io/vymalo/another-adam-rs/coder`, carries seven static binaries: `adam-coder` (the
 entrypoint), `adam-agent` (run with `--entrypoint tini ... -- adam-agent`, see `adam-agent-folder`),
-`adam-kube-exec`, `adam-egress`, `adam-git-sandbox` and `adam-git` (run pods and the git sandbox, see
+`adam-kube-exec`, `adam-egress`, `run-signer` (the loopback sidecar that signs a run's model requests with
+the run's own certificate, ADR 0086), `adam-git-sandbox` and `adam-git` (run pods and the git sandbox, see
 `deploy/coder/README.md`). One Helm chart, `deploy/coder`, deploys the coder. There is no second image.
 A release also publishes the chart as an OCI package, `oci://ghcr.io/vymalo/another-adam-rs/charts/coder`.
 
@@ -32,8 +33,8 @@ https://github.com/vymalo/another-adam-rs/blob/main/deploy/coder/README.md.
 ## Procedure
 
 1. **The image.** `docker/coder/Dockerfile` builds from the **repository root**
-   (`docker buildx build -f docker/coder/Dockerfile .`): stage 1 compiles the six binaries for
-   `x86_64-unknown-linux-musl` on a pinned `rust:1.94-trixie` (tag and digest, plus `musl-tools` and the
+   (`docker buildx build -f docker/coder/Dockerfile .`): stage 1 compiles the seven binaries for
+   `x86_64-unknown-linux-musl` on a pinned `rust:1.98-trixie` (tag and digest, plus `musl-tools` and the
    target), statically linked with `mimalloc` as the global allocator, so they start in any x86-64 Linux
    image whatever its C library (ADR 0053 decision 11); stage 2 is the workspace image
    `ghcr.io/vymalo/another-agentic-images/workspace:${WORKSPACE_TAG}` (the `ARG WORKSPACE_TAG` is

@@ -31,15 +31,24 @@ async fn main() -> ExitCode {
     }
 
     // `RUST_LOG` when set, else `info` with the MCP client library quiet (`adam_service::logging`).
-    tracing_subscriber::fmt()
-        .json()
-        .with_env_filter(adam_service::logging::env_filter())
-        .init();
+    // The OTel layer joins it when `OTEL_EXPORTER_OTLP_ENDPOINT` is set, and nothing is built when
+    // it is not.
+    let telemetry = adam_otel::init(adam_service::logging::env_filter());
 
     // Before anything else is read: a same-user child (an MCP server's command) cannot read this
     // process's `/proc/<pid>/environ`, where the model key and the database URL are.
     adam_service::harden::make_non_dumpable();
 
+    let code = run().await;
+    // Flush the batch queue before the process exits, so the spans of the last runs are not lost.
+    if let Some(otel) = telemetry {
+        otel.shutdown();
+    }
+    code
+}
+
+/// The process's work, once the logger and the hardening are in place.
+async fn run() -> ExitCode {
     // Its errors name variables, never their values.
     let config = match Config::from_env().context("reading the configuration") {
         Ok(config) => config,

@@ -222,6 +222,7 @@ async fn a_parent_calls_its_subagent_which_calls_its_own_and_the_parent_goes_on(
                 "subagent_start",
                 "subagent_send",
                 "subagent_read",
+                "subagent_edit",
                 "subagent_close",
                 "subagent_list"
             ]
@@ -363,6 +364,7 @@ async fn a_child_cannot_call_a_tool_only_its_parent_has() {
             "subagent_start",
             "subagent_send",
             "subagent_read",
+            "subagent_edit",
             "subagent_close",
             "subagent_list"
         ]
@@ -384,6 +386,7 @@ async fn a_child_cannot_call_a_tool_only_its_parent_has() {
             "subagent_start",
             "subagent_send",
             "subagent_read",
+            "subagent_edit",
             "subagent_close",
             "subagent_list"
         ]
@@ -419,6 +422,7 @@ fn a_subagent_does_not_inherit_a_tool_unless_it_lists_it() {
             "subagent_start",
             "subagent_send",
             "subagent_read",
+            "subagent_edit",
             "subagent_close",
             "subagent_list"
         ]
@@ -752,6 +756,7 @@ fn a_registered_tool_the_parent_does_not_list_is_no_clash() {
             "subagent_start",
             "subagent_send",
             "subagent_read",
+            "subagent_edit",
             "subagent_close",
             "subagent_list"
         ]
@@ -794,6 +799,7 @@ fn a_subagent_named_like_a_skill_tool_is_refused() {
             "subagent_start",
             "subagent_send",
             "subagent_read",
+            "subagent_edit",
             "subagent_close",
             "subagent_list"
         ]
@@ -934,6 +940,7 @@ fn the_root_may_ask_and_a_subagent_that_does_not_is_fine() {
             "subagent_start",
             "subagent_send",
             "subagent_read",
+            "subagent_edit",
             "subagent_close",
             "subagent_list"
         ]

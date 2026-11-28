@@ -537,8 +537,9 @@ impl AgentDef {
     /// Both roles call one function (`bounds_of`), so a control plane that answers A2A and a worker
     /// that runs the rounds admit the same numbers in a `start.config`. **They do not admit the same
     /// tool names**: a worker knows the names of the tools it binds and refuses a concrete
-    /// `deny_tools` entry no tool has (and, when no source adds tools at run time, any `tools` entry
-    /// that selects none); this control plane knows no name (`SessionBounds::tools` is empty), so it
+    /// `deny_tools` entry no tool has (and, when every source declares what it can offer, any `tools`
+    /// entry that selects none; a declared name may be a shape, `*__*` for a relayed
+    /// `<server>__<tool>`); this control plane knows no name (`SessionBounds::tools` is empty), so it
     /// checks the shape alone and admits what a worker may still refuse. **Give both roles the same
     /// `MAX_PARALLEL_TOOL_CALLS` and `SESSION_MAX_ROUNDS`**: a control plane with a larger value
     /// would admit what a worker then narrows at run time, never the reverse. The model's window is
@@ -1519,7 +1520,7 @@ fn add_subagent_tools(
             });
         }
     }
-    // The five tools themselves are made at `BoundDef::build`, where the deployment's
+    // The six tools themselves are made at `BoundDef::build`, where the deployment's
     // `MAX_PARALLEL_TOOL_CALLS` and the model are known: each subagent's bounds need both (ADR
     // 0054 slice 1 part 2). Their names and order are fixed here, so a clash is still found
     // before a model is needed, and `AgentInfo::tools` names them.
