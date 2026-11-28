@@ -2037,6 +2037,57 @@ mod tests {
         );
     }
 
+    /// ADR 0081 decision 6, the wiring: a run with a memory is offered the two tools and their
+    /// loader; `si_memory: off`, a ceiling of `off`, or no handle leaves the tool list untouched.
+    #[test]
+    fn a_run_with_a_memory_gets_the_two_tools_and_their_group() {
+        use adam_memory::{InProcessSiMemory, Scope, Scrubber, Settings};
+
+        let handle = || {
+            let memory = Arc::new(InProcessSiMemory::new(Settings::new(Scrubber::new(
+                |text: &str| text.to_owned(),
+            ))));
+            SiMemoryHandle::one_caller(memory, Scope::agent("dep", "-", "chat"), "caller")
+        };
+        let tools_of = |def: AgentDef| -> Vec<String> {
+            def.bind(ToolSet::new())
+                .expect("a bindable folder")
+                .tool_names()
+        };
+
+        let on = tools_of(def_with("si_memory: on\n").si_memory_handle(handle()));
+        for name in [
+            adam_llm_agent::SI_RECALL,
+            adam_llm_agent::SI_RECORD,
+            "load__group__memory",
+        ] {
+            assert!(on.iter().any(|tool| tool == name), "{name} in {on:?}");
+        }
+
+        let off = tools_of(def_with("si_memory: off\n").si_memory_handle(handle()));
+        assert!(!off.iter().any(|tool| tool.starts_with("si_")), "{off:?}");
+        assert!(
+            !off.iter().any(|tool| tool == "load__group__memory"),
+            "{off:?}"
+        );
+
+        let ceiling = tools_of(
+            def_with("si_memory: on\n")
+                .si_memory_ceiling(SiMemoryCeiling::Off)
+                .si_memory_handle(handle()),
+        );
+        assert!(
+            !ceiling.iter().any(|tool| tool.starts_with("si_")),
+            "SI_MEMORY=off with a handle offers nothing: {ceiling:?}"
+        );
+
+        let no_handle = tools_of(def_with("si_memory: on\n"));
+        assert!(
+            !no_handle.iter().any(|tool| tool.starts_with("si_")),
+            "{no_handle:?}"
+        );
+    }
+
     /// A folder that names options turns memory on and keeps them, so the run reads the bounds it
     /// wrote rather than the defaults.
     #[test]

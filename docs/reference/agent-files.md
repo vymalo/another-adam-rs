@@ -714,6 +714,9 @@ si_memory:                # on, tuned
   scopes: [agent, repository]
 ```
 
+* **What `on` gives a run.** `si_recall` and `si_record`, as one lazy group (`load__group__memory`), over the folder
+  `SI_MEMORY_DIR` names ([environment](environment.md#environment-variables)). With no folder, L1 is absent: the tools
+  are still offered and answer that nothing is recorded, and the run goes on (ADR 0081 decision 12).
 * **The deployment's ceiling wins downwards.** `SI_MEMORY=off` ([environment](environment.md#environment-variables))
   is off whatever the folder says; a folder's `off` is off whatever the deployment allows; an absent key follows the
   ceiling. Neither can widen the other.

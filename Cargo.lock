@@ -234,6 +234,7 @@ dependencies = [
  "adam-host",
  "adam-llm-agent",
  "adam-mcp-testkit",
+ "adam-memory",
  "adam-model",
  "adam-postgres",
  "adam-runtime",
