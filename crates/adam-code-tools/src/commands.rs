@@ -40,7 +40,7 @@ pub struct CommandLimits {
     /// The bytes of output a result shows: a longer output is shown as its head and tail and kept.
     pub output_tail: usize,
     /// What a result shows of the output when the call gives no `output`, per tool
-    /// ([`OutputDefaults::TOOLS`] unless the workspace was given others; ADR 0088 slice T3).
+    /// ([`OutputDefaults::TOOLS`] unless the workspace was given others; ADR 0090 slice T3).
     pub output: OutputDefaults,
 }
 

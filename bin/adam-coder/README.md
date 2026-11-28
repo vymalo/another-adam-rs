@@ -625,7 +625,7 @@ exit code 0
 [more: 200000 lines are kept as o-3f9c2a17b0d4e8a1; read_output {"id":"o-3f9c2a17b0d4e8a1"} reads them page by page]
 ```
 
-**A command that succeeds can be one line** ([ADR 0088](../../docs/decisions/0088-a-tool-result-is-bounded-when-it-is-made-and-a-command-that-succeeds-says-so.md), slice T1). The three tools take `output`, `"on_error"` or `"full"` (`adam_code_tools::OutputMode`; any other value is an error result that names both and the tool's default, and nothing runs):
+**A command that succeeds can be one line** ([ADR 0090](../../docs/decisions/0090-a-tool-result-is-bounded-when-it-is-made-and-a-command-that-succeeds-says-so.md), slice T1). The three tools take `output`, `"on_error"` or `"full"` (`adam_code_tools::OutputMode`; any other value is an error result that names both and the tool's default, and nothing runs):
 
 | Tool | Default | A command that succeeds, with `on_error` |
 |---|---|---|
@@ -1732,10 +1732,10 @@ stateDiagram-v2
   columns in UTF-8, UTF-16 or characters, finding the symbol on its line, `file://` addresses; **`table.rs`** the closed `Language` and the
   `ServerTable` (`ToolEnv::language_table`), with the settings each server is started with.
 * **Eleven languages** (the table and the markers are [in the reference](../../docs/reference/coder-agent.md#language-servers)): Rust,
-  TypeScript and JavaScript, Python, Go, Dart, and the six of [ADR 0089](../../docs/decisions/0089-the-coder-knows-six-more-languages-the-files-every-repository-has.md):
+  TypeScript and JavaScript, Python, Go, Dart, and the six of [ADR 0091](../../docs/decisions/0091-the-coder-knows-six-more-languages-the-files-every-repository-has.md):
   TOML (`taplo`), YAML, JSON, shell, Dockerfile and C and C++ (`clangd --background-index=false`). A file is matched by its name
   (`Dockerfile`, `Containerfile`) and then by its extension. The YAML, JSON and TOML servers fetch no schema on their own, in either mode.
-  The workspace image does not have the six yet (ADR 0089 L2): a call on such a file says the server is not on `PATH`.
+  The workspace image does not have the six yet (ADR 0091 L2): a call on such a file says the server is not on `PATH`.
 * **A server is a process the coder holds**: `ExecSpec::background` through `EnvSession::prepare`, `stdin` and `stdout` piped, a process
   group of its own; killed by group, by the environment's `kill` of the exec id and by what the group left, at every stop point of a command that keeps
   running (`Commands::stop_run`, `sweep`, `stop_all`; a dropped registry), and when it is idle, for room, or when its environment is not the one it
@@ -1750,7 +1750,7 @@ stateDiagram-v2
 * **The scripted server** `src/bin/adam-lsp-script.rs` (`tests/language_servers.rs`) is a second binary of the crate, not built into any image
   (`log_argv` logs the arguments its launch line gave it, so a test runs the production launch lines on it); the
   gated `tests/real_language_servers.rs` runs the real servers (`ADAM_TEST_LANGUAGE_SERVERS=1`; the `image` job of `.github/workflows/coder.yml`
-  runs it in the built image, where the workspace base has them, and `IN_THE_IMAGE` names the servers it may not skip: not yet the six of ADR 0089).
+  runs it in the built image, where the workspace base has them, and `IN_THE_IMAGE` names the servers it may not skip: not yet the six of ADR 0091).
 * **Settings:** `LANGUAGE_SERVERS`, `LANGUAGE_SERVER_IDLE_SECS`, `LANGUAGE_SERVERS_MAX` ([Configuration](#configuration)).
 
 ### Making something with a command
@@ -1944,7 +1944,7 @@ greets from the persona lines gets the run to wait without any tool, editing the
 
 One file, [`agent/instructions.md`](agent/instructions.md), holds what describes the agent, in the format of
 [`docs/reference/agent-files.md`](../../docs/reference/agent-files.md): the frontmatter has `name` (`coder`, which must equal
-`AGENT_NAME`), `description`, `limits` (200 turns, 400 tool calls, 200000 tokens of history, the `LlmAgent` default stated in the folder, ADR 0086; no output cap, so the
+`AGENT_NAME`), `description`, `limits` (200 turns, 400 tool calls, 200000 tokens of history, the `LlmAgent` default stated in the folder, ADR 0088; no output cap, so the
 model's profile or the 128,000 fallback applies, ADR 0064),
 `vars.max_check_cycles` (the default, 3), `vars.scratch_check_cycles` (5), `vars.display_name` (`Adam`: the name the agent says), `vars.repository_creation` (what the prompt says about making a repository for the person: the default is the sentence for a deployment that allows it, and **when `CREATE_REPO_OWNERS` is empty `CoderAgent` replaces it with a note that there is no such tool**, that the person must create the repository and name it, and that "a new repository" is never an option of a question; a folder that does not declare the var keeps its own text) and `card:` (the A2A
 card: name `Adam`, the skills `explain`, `research`, `documents` and `coding-task`, each with tags and examples); the body is the system prompt.
@@ -2217,7 +2217,7 @@ way; every problem is reported at once at startup):
 | `MODEL_EXTRA_BODY` | a JSON object merged into every chat-completions request of the agent's model, for a flag that makes a gateway or model emit its reasoning: `{"reasoning_effort":"medium"}`, `{"thinking":{"type":"enabled"}}`, `{"chat_template_kwargs":{"enable_thinking":true}}`. **Not a secret** (it shows in the pod's environment). A request's typed reasoning level wins over the members its model's `reasoningWire` would duplicate (ADR 0063 decision 6). Not JSON, not an object, or a member the runtime owns (`model`, `messages`, `tools`, `tool_choice`, `stream`): exit 78 at startup, the message names the variable and never repeats the value; read by the agent's own model calls only | unset: nothing is added |
 | `MODEL_ECHO_REASONING` | `reasoning_content` or `reasoning`: keep the model's reasoning in the run's history and send it back under that member name. For a provider that requires it (DeepSeek's thinking mode with tools answers a request without it with a 400); `false` or unset sends none, which is what almost every model wants. Anything else: exit 78 | unset: never sent |
 | `MODEL_PROMPT_CACHE_KEY` | `off` or `conversation`: send each request's `prompt_cache_key` (a hash of the conversation id cut to 32 characters), so a gateway with a prompt cache routes one conversation's requests together; a `MODEL_EXTRA_BODY` member of that name wins. Anything else: exit 78 | `off` |
-| `DEFAULT_MODEL_CONTEXT_WINDOW` | the context window of the model `MODEL` names, in tokens (1 to 9007199254740991), used only when its profile in `MODEL_ALIASES_FILE` names no `contextWindow` ([ADR 0086](../../docs/decisions/0086-the-context-window-follows-the-model-and-the-history-budget-is-200k.md)): what each `usage/v1` call report of a call on that alias says as `contextWindow`; a subagent whose `model:` names another alias takes its own profile's window, or reports none. Anything else: exit 78 | unset: the profile's window, else none |
+| `DEFAULT_MODEL_CONTEXT_WINDOW` | the context window of the model `MODEL` names, in tokens (1 to 9007199254740991), used only when its profile in `MODEL_ALIASES_FILE` names no `contextWindow` ([ADR 0088](../../docs/decisions/0088-the-context-window-follows-the-model-and-the-history-budget-is-200k.md)): what each `usage/v1` call report of a call on that alias says as `contextWindow`; a subagent whose `model:` names another alias takes its own profile's window, or reports none. Anything else: exit 78 | unset: the profile's window, else none |
 | `MODEL_CONTEXT_WINDOW` | **deprecated** alias of `DEFAULT_MODEL_CONTEXT_WINDOW`: read only when that is unset, with one warning at startup; both set to different values is exit 78 | unset |
 | `GITHUB_TOKEN` | push and pull request token (a personal access token); only ever sent to the `ALLOWED_REPO_HOSTS`. Must be unset or empty in App mode | one of this or the App's variables, for `all` and `worker` |
 | `GITHUB_APP_ID` | GitHub App mode: the App's application ID or client ID (the JWT's `iss`). See [GitHub credentials](#github-credentials-a-token-or-an-app-installation) | required in App mode |
@@ -2641,7 +2641,7 @@ Deployment: `docker/coder/Dockerfile` and the chart in `deploy/coder/`.
 ## Export
 
 `adam-coder export` writes the coder's runs as training records, one JSON Lines record per run
-([ADR 0085](../../docs/decisions/0085-runs-are-exported-as-training-records.md), the record is
+([ADR 0087](../../docs/decisions/0087-runs-are-exported-as-training-records.md), the record is
 [`adam-export`](../../crates/adam-export/README.md)'s). It serves nothing: no A2A server, no worker, no janitor, no
 schedule, no MCP server. Without `export` as its first argument the binary serves, as before.
 
@@ -2679,7 +2679,7 @@ otherwise as below (78 configuration, files or an unknown `--agent`, 69 a store 
 cannot be created). `--current-tools` (attach the agent's current prompt and tools) is not available yet: it is a
 usage error (64), and a record says `tools_source: "none"`.
 
-**The outcome a record carries** (ADR 0085, slice E4). The `checks` and `pull_request` artifacts above are the
+**The outcome a record carries** (ADR 0087, slice E4). The `checks` and `pull_request` artifacts above are the
 exporter's outcome contract (`adam_export::CHECKS_ARTIFACT`, `adam_export::PULL_REQUEST_ARTIFACT`, both
 `application/json`): a record's `outcome.pull_requests` is each pull request the run reported, `{number, repository,
 verified}` as last reported, the repository a pseudonym and the URL and commit left out, and `outcome.checks` is
@@ -2746,7 +2746,7 @@ database of its own, so the role needs `CREATEDB`):
   servers (also under two concurrent starts), a call dropped mid-write of a 3.6 MiB file, a server whose output stops being messages, a start that is dropped
   or ends after its run stopped, diagnostics under another spelling of the file's address and a server that publishes nothing, and each stop point (idle, park, the end of the run,
   a cancelled run reached by the sweep, `use_repository_environment`, the worker's stop, a dropped registry) with a server that has a child and a grandchild,
-  asserted by pid; the six of ADR 0089 (each file reaches its own server with its production launch line, `languageId` and the slot's root;
+  asserted by pid; the six of ADR 0091 (each file reaches its own server with its production launch line, `languageId` and the slot's root;
   a Dockerfile by its name and not by its directory's; clangd's and taplo's markers; the YAML, TOML and JSON servers told to fetch no schema,
   and the JSON server's `vscode/content` refused; a missing one answered as not installed); `tests/tool_specs.rs` (three specs, seven paged tools), `time_limits.rs`, `tiers.rs`, `config.rs` (three settings, exit 78),
 * **Commands that keep running** (`tests/background.rs`, real processes with short lifetimes and sweeps through the settings;

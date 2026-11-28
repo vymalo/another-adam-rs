@@ -5,7 +5,7 @@ For agents: [the invariants, the gates and the evidence](../../.agents/docs/guid
 `adam-coder export` and `adam-agent export` write the runs in the store as training records, one JSON line per run (or
 per assistant turn), in the chat shape most fine-tuning tools read. Use them to train a small model on what a strong model did with adam as
 its harness: for example an instruct model that knows Rust and CrateStack and drives adam's tools well. The decision is
-[ADR 0085](../decisions/0085-runs-are-exported-as-training-records.md).
+[ADR 0087](../decisions/0087-runs-are-exported-as-training-records.md).
 
 ## Export
 
@@ -106,7 +106,7 @@ export is always a command someone runs; no worker or schedule exports anything.
 A run's model calls record their system prompt and tools from this version on. A run from before has no system
 message and no tools (`tools_source: "none"`); keep it out of a tool-use dataset.
 
-**A subagent's run is a record of its own**, its `parent` the parent's record: since ADR 0087 slice C1 every subagent's
+**A subagent's run is a record of its own**, its `parent` the parent's record: since ADR 0089 slice C1 every subagent's
 child is a session and has a conversation, which is what the exporter lists runs by. A subagent run from before C1 has
 none and is not exported. Without `--agent`, the subagents (`coder/reviewer`) are exported with the rest.
 

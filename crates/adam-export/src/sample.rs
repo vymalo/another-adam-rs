@@ -1,4 +1,4 @@
-//! One training sample per assistant turn (ADR 0085, slice E5): each is the request the model was
+//! One training sample per assistant turn (ADR 0087, slice E5): each is the request the model was
 //! sent at that call, as far as the state still holds it, and its answer as the last message.
 //!
 //! The stored history is the run's **current** one. A compaction replaced the turns before it with

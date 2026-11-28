@@ -107,15 +107,15 @@ pub struct SessionAgent {
     ///
     /// [ADR 0054]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md
     pub bounds: SessionBounds,
-    /// What the subagent's file says of its sessions (`session:`, [ADR 0087] decision 4): the
+    /// What the subagent's file says of its sessions (`session:`, [ADR 0089] decision 4): the
     /// `mode` and `wait` of a start that names none, and the widest `mode` a start may name.
     /// [`SessionDefaults::default`] is a file without the block: `one_shot` up to `open`, no wait.
     ///
-    /// [ADR 0087]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0087-every-child-is-a-session-and-the-one-shot-subagent-tool-goes.md
+    /// [ADR 0089]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0089-every-child-is-a-session-and-the-one-shot-subagent-tool-goes.md
     pub session: SessionDefaults,
 }
 
-/// A subagent file's `session:` block ([ADR 0087] decision 4), as `subagent_start` applies it.
+/// A subagent file's `session:` block ([ADR 0089] decision 4), as `subagent_start` applies it.
 ///
 /// * `mode` is the **default and the ceiling** at once: a start that names no mode gets it, and a
 ///   start may name it or a narrower one (`one_shot` is narrower than `sealed`, which is narrower
@@ -124,7 +124,7 @@ pub struct SessionAgent {
 ///   gets `one_shot` and may ask up to `open`.
 /// * `wait` is a default only: a start that says `wait` is never refused for it.
 ///
-/// [ADR 0087]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0087-every-child-is-a-session-and-the-one-shot-subagent-tool-goes.md
+/// [ADR 0089]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0089-every-child-is-a-session-and-the-one-shot-subagent-tool-goes.md
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SessionDefaults {
     /// The file's `session.mode`.
@@ -331,11 +331,11 @@ impl SessionTools {
     }
 
     /// The mode a `subagent_start` naming none gives each subagent ([`SessionDefaults::default_mode`],
-    /// [ADR 0087] slice C3), by the name the model writes in `agent`, in the roster's order: what
+    /// [ADR 0089] slice C3), by the name the model writes in `agent`, in the roster's order: what
     /// [`LlmAgentBuilder::session_default_modes`](crate::LlmAgentBuilder::session_default_modes)
     /// takes, so the `session.started` of a start that waits names the mode it started in.
     ///
-    /// [ADR 0087]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0087-every-child-is-a-session-and-the-one-shot-subagent-tool-goes.md
+    /// [ADR 0089]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0089-every-child-is-a-session-and-the-one-shot-subagent-tool-goes.md
     pub fn default_modes(&self) -> Vec<(String, SessionMode)> {
         self.roster
             .agents
@@ -459,12 +459,12 @@ fn bool_arg(args: &Value, key: &str, default: bool) -> Result<bool, String> {
     }
 }
 
-/// The [`SessionMode`] a `subagent_start` call asks for ([ADR 0087] slice C2): its `mode`, else
+/// The [`SessionMode`] a `subagent_start` call asks for ([ADR 0089] slice C2): its `mode`, else
 /// the `keep_open` of before (read for one release: `true` is `open`, `false` is `one_shot`), else
 /// `None`, which the subagent's [`SessionDefaults`] fill (slice C3). Both given and disagreeing is
 /// the sentence that names both, as is a mode that is none of the three.
 ///
-/// [ADR 0087]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0087-every-child-is-a-session-and-the-one-shot-subagent-tool-goes.md
+/// [ADR 0089]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0089-every-child-is-a-session-and-the-one-shot-subagent-tool-goes.md
 pub(crate) fn mode_arg(args: &Value) -> Result<Option<AskedMode>, String> {
     let asked = match args.get("mode") {
         None | Some(Value::Null) => None,
@@ -785,7 +785,7 @@ fn one_shot_description(message: &str) -> String {
     cut
 }
 
-/// Start `agent` as a **one-shot session** of the run of `ctx` ([ADR 0087] slice C1): round 1 of a
+/// Start `agent` as a **one-shot session** of the run of `ctx` ([ADR 0089] slice C1): round 1 of a
 /// session whose id is [`ToolCtx::child_run_id`], with `message` as its first user message, a
 /// session's conversation id (`<parent escaped>/s/<session>`), and a header that says it is
 /// [`SessionMode::OneShot`] and **closed from the start**: it closes when its round ends, and
@@ -801,7 +801,7 @@ fn one_shot_description(message: &str) -> String {
 /// [`MAX_SESSION_CONVERSATION_BYTES`](adam_runtime::MAX_SESSION_CONVERSATION_BYTES), as a deeply
 /// nested child's can), the child is started as a plain child run, which finds the existing one.
 ///
-/// [ADR 0087]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0087-every-child-is-a-session-and-the-one-shot-subagent-tool-goes.md
+/// [ADR 0089]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0089-every-child-is-a-session-and-the-one-shot-subagent-tool-goes.md
 pub(crate) async fn start_one_shot(
     ctx: &ToolCtx,
     agent: &str,
@@ -984,7 +984,7 @@ impl Tool for Start {
                 prompt.chars().count()
             ));
         }
-        // The subagent's file gives the defaults and the ceiling of `mode` (ADR 0087 decision 4):
+        // The subagent's file gives the defaults and the ceiling of `mode` (ADR 0089 decision 4):
         // a start may narrow it, never widen it, and nothing starts when it asks wider.
         let mode = match mode_arg(&args).and_then(|asked| agent.session.admit(&agent.name, asked)) {
             Ok(mode) => mode,
@@ -1723,7 +1723,7 @@ mod tests {
     use super::*;
     use adam_runtime::{ReportRound, RoundOutcome};
 
-    /// ADR 0087 slice C3: a filed mode is the default of a start that names none and the widest
+    /// ADR 0089 slice C3: a filed mode is the default of a start that names none and the widest
     /// one a start may name; no file is `one_shot` up to `open`.
     #[test]
     fn a_start_may_narrow_the_filed_mode_and_never_widen_it() {

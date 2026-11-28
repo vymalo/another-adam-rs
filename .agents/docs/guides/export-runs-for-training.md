@@ -2,7 +2,7 @@
 
 For people: [Export runs for training](../../../docs/guides/export-runs-for-training.md). That page decides; this one gives
 the invariants to check on a change to the exporter, the commands to run and where each claim stands in the code. The
-decision is [ADR 0085](../../../docs/decisions/0085-runs-are-exported-as-training-records.md); the crate is
+decision is [ADR 0087](../../../docs/decisions/0087-runs-are-exported-as-training-records.md); the crate is
 [`adam-export`](../../../crates/adam-export/README.md). Written on 2026-11-27 against the working tree on `f69e6ea` plus
 the slice E1 and E2 change, and updated the same day for slice E5 (per-turn samples) on `3bc7997` and for the ports
 and adapters on `6a859c0`, and on 2026-11-28 for slice E4 (the outcome contract) on `27afaae`; line numbers move, so
@@ -45,7 +45,7 @@ the function names are the anchors.
    route or schedule runs one. Check with `grep -rn "Exporter::new\|export_runs" crates bin --include=*.rs`.
 8. **Which runs are reached.** `RuntimeSource::page` lists with `ConversationScope::Prefix(String::new())`
    (`crates/adam-export/src/runtime_source.rs:85`), and `ConversationScope::contains` is `false` for a run with no conversation id
-   (`crates/adam-core/src/store/query.rs:23-29`). Since ADR 0087 slice C1 a subagent's own tool starts its child as a
+   (`crates/adam-core/src/store/query.rs:23-29`). Since ADR 0089 slice C1 a subagent's own tool starts its child as a
    one-shot session (`SubagentTool::call` → `ToolCtx::start_one_shot_session`), so every subagent run has a session's
    conversation id and is exported, linked by `parent`
    (`crates/adam-export/tests/export.rs` `a_subagents_run_is_a_record_of_its_own_linked_to_its_parent`). Still not
@@ -54,7 +54,7 @@ the function names are the anchors.
    change. A source lists per agent name (`RunSource::agents`), and the `export` subcommand defaults to every registered agent
    (`agents_to_export`, `crates/adam-service/src/export.rs`), the subagents included.
 9. **The schema is stable.** `SCHEMA` is `adam.export/v1` (`crates/adam-export/src/record.rs:11`). A new optional field
-   is fine; a changed meaning is a new schema and an *Amended* note on ADR 0085. Slice E5 added `train_on` (default
+   is fine; a changed meaning is a new schema and an *Amended* note on ADR 0087. Slice E5 added `train_on` (default
    `assistant`, so an older record reads the same) and `sample` (absent from a run record).
 10. **A per-turn sample is never invented** (slice E5). `samples_of` (`sample.rs:204`) makes samples only for the
     answers of the calls since the run's own last compaction (`last_compaction`, `:59`, skips a continuation's
@@ -80,7 +80,7 @@ the function names are the anchors.
     of messages and tools / 4, rounded up, the rule of `adam-llm-agent`'s `compaction::estimate`) is over it, and
     counts it (`over_budget`, `export.rs:209`, `:223`). In turn mode the filter keeps compacted runs (`record_filter`,
     `export.rs:98-104`).
-14. **Ports and adapters** (ADR 0085, *Amended* 2026-11-27). The pipeline (`Exporter`, `crates/adam-export/src/export.rs:88`)
+14. **Ports and adapters** (ADR 0087, *Amended* 2026-11-27). The pipeline (`Exporter`, `crates/adam-export/src/export.rs:88`)
     names no store and no file: it reads `&dyn RunSource` (`crates/adam-export/src/source.rs:34`) and writes
     `&mut dyn RecordSink` (`crates/adam-export/src/sink.rs:27`), both `#[async_trait]` like `Store`. Neither error names a
     backend type (Rule 2): `SourceError::Backend` and `SinkError::Backend` box it with a class; a runtime's error keeps its
@@ -193,7 +193,7 @@ whose request recording failed while the tools changed reads the entry before. E
 ## Unverified
 
 * That the OpenAI chat shape of a record is what the chat templates of Qwen and the common SFT tools accept: from
-  memory (ADR 0085 decision 2), not checked against each trainer's current documentation.
+  memory (ADR 0087 decision 2), not checked against each trainer's current documentation.
 * The benchmark harness drops and recreates its slot's database before each run (`bench/postgres-init.sql`'s comment,
   `resetDatabase` in `bench/lib/stack.mjs`), so its runs cannot be exported after the fact: *verified* by reading
   them on 2026-11-27, not by running the harness.

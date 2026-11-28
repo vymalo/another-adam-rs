@@ -1,4 +1,4 @@
-# 0085. Runs are exported as training records
+# 0087. Runs are exported as training records
 
 Status: **Accepted** (2026-11-27). The owner decided on 2026-11-27: *"Adam needs an exporter. Even for chats and all, we
 need to have that. I wanna train small language models so that they'll use adam-rs very well. And at the same time,

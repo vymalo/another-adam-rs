@@ -534,7 +534,7 @@ pub mod cases {
         }
 
         /// A yielded run carries its JSON artifacts, data included and in the order it committed
-        /// them: what the outcome contract is read from (ADR 0085, slice E4).
+        /// them: what the outcome contract is read from (ADR 0087, slice E4).
         pub async fn a_run_keeps_its_json_artifacts_in_order<M, F>(make: M, case: &str)
         where
             M: FnOnce(Vec<SeedRun>) -> F,

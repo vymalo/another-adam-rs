@@ -38,7 +38,7 @@ const USAGE = `usage: bench <command>
                                   the figures from the ledger, per agent over finished runs (calls, read_output
                                   calls and input tokens per task, the cache share of the fixed prompt, the
                                   run_checks share of named tool calls), with the basis of each; --against a
-                                  baseline ledger prints both and the change on the tasks both finished (ADR 0088)
+                                  baseline ledger prints both and the change on the tasks both finished (ADR 0090)
   review                          score every Done run's patch with one blind reviewer and rubric ($BENCH_HOME/reviews.jsonl)
   tasks fetch|mine|lint|build|check|select
                                   task sources, the environment check and selection (bench tasks --help)
@@ -93,7 +93,7 @@ function report(argv, env) {
 /**
  * The figures from a ledger: the three the faster-coder epic rests on (sys#345, slice 1) — calls per
  * task, the cache share of the fixed prompt, the `run_checks` share of the named tool calls — and
- * the two ADR 0088 decision 5 adds, `read_output` calls and input tokens per task. With `--against`,
+ * the two ADR 0090 decision 5 adds, `read_output` calls and input tokens per task. With `--against`,
  * the ledger (after) beside a baseline (before) on the tasks both finished. Read-only, no
  * configuration and no key: it is a fold over records (bench/lib/numbers.mjs).
  */
@@ -112,7 +112,7 @@ function numbers(argv, env) {
   const records = read(ledgerFile, '--ledger');
   if (records.length === 0) return 1;
   if (values.against !== undefined) {
-    // ADR 0088 decision 5: the ledger measured against a baseline, on the tasks both finished.
+    // ADR 0090 decision 5: the ledger measured against a baseline, on the tasks both finished.
     assertOutsideRepo(values.against, '--against');
     const baseline = read(values.against, '--against');
     if (baseline.length === 0) return 1;

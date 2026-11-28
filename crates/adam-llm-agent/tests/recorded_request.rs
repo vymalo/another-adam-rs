@@ -1,5 +1,5 @@
 //! The model step records the final request's system prompt and tools as content-addressed blobs
-//! (ADR 0085 decision 7): the run's state names the last call's ([`Conversation::request`]), the
+//! (ADR 0087 decision 7): the run's state names the last call's ([`Conversation::request`]), the
 //! same content is stored once however many turns and runs send it, a replay of a recorded call
 //! names the same blobs without storing anything, and a store that refuses the bytes never fails
 //! the run. A real `Runtime` with a worker, a scripted `MockModel` and a `FaultyStore` over
@@ -350,7 +350,7 @@ async fn three_calls(rig: &Rig, lose_commit: bool) -> (Conversation, usize) {
     (conversation(&rt, run).await, rig.mock.requests().len())
 }
 
-/// Tools that change during a run (ADR 0085, slice E5): `requests` keeps one entry per distinct
+/// Tools that change during a run (ADR 0087, slice E5): `requests` keeps one entry per distinct
 /// request, with the turn it was first sent at, and a call whose request is the one before
 /// appends nothing. A replay of a lost commit writes the same list without calling the model.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

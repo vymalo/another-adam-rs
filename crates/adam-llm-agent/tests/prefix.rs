@@ -580,7 +580,7 @@ async fn without_a_budget_nothing_is_shortened_and_the_state_has_no_member_for_i
     assert!(written.get("shortening_usage").is_none(), "{written}");
 }
 
-/// ADR 0088: each shortening is counted in the run's usage, with the characters it took out, so
+/// ADR 0090: each shortening is counted in the run's usage, with the characters it took out, so
 /// the task's `usage/v1` totals say that the cached prefix moved.
 #[tokio::test]
 async fn a_shortening_is_counted_in_the_runs_usage() {

@@ -37,7 +37,7 @@
 //! By default ([`DEFAULT_OUTPUT`], `output: "on_error"`) a check that passes is shown as its
 //! command, `exit code 0: passed` and one line with the size of its output and the id it is kept
 //! under (`read_output` reads it); a check that fails is shown as before, and so is every check
-//! with `output: "full"` (ADR 0088). The folder's `limits.output.run_checks` may set the other
+//! with `output: "full"` (ADR 0090). The folder's `limits.output.run_checks` may set the other
 //! default ([`CoderSettings::checks_output`](crate::CoderSettings::checks_output)); a call's
 //! `output` wins. Only the result changes: the `checks` artifact, the record in the notes and the
 //! check cycles are the same either way.
@@ -61,7 +61,7 @@ use super::shell::{
 use super::{Outcome, ToolEnv, non_empty, notes_error, run_error};
 
 /// What `run_checks` shows of an output when the call asks for nothing: one line for a check that
-/// passed, which needs no output (ADR 0088, decision 3).
+/// passed, which needs no output (ADR 0090, decision 3).
 pub const DEFAULT_OUTPUT: OutputMode = OutputMode::OnError;
 
 /// The name of the artifact `run_checks` emits.
@@ -1144,7 +1144,7 @@ mod tests {
         assert!(none.findings[0].message.contains("an unknown tree"));
     }
 
-    /// The `checks` artifact is the exporter's outcome contract (ADR 0085, slice E4): its name,
+    /// The `checks` artifact is the exporter's outcome contract (ADR 0087, slice E4): its name,
     /// media type and `passed` are what `adam_export::checks_of` reads.
     #[test]
     fn the_artifact_is_the_export_contract() {

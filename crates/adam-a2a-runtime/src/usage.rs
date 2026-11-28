@@ -38,7 +38,7 @@
 //! `totals` is always there when the object is, `[]` for a run that made no model call.
 //!
 //! It carries a `shortenings` member when the run's loop shortened old tool results to keep its
-//! history within its budget (`state.shortening_usage`, [`ShorteningUsage`]; ADR 0088): how many
+//! history within its budget (`state.shortening_usage`, [`ShorteningUsage`]; ADR 0090): how many
 //! times, and the characters that took out. Each one moves the cached prompt prefix. A run that
 //! never shortened has no member, so its object is the one it always was:
 //!
@@ -387,7 +387,7 @@ mod tests {
         );
     }
 
-    /// ADR 0088: a run whose history was shortened says how often and how much, beside its totals;
+    /// ADR 0090: a run whose history was shortened says how often and how much, beside its totals;
     /// a run that never shortened writes the object it always did (above).
     #[test]
     fn shortenings_are_a_member_beside_the_totals_only_when_there_were_some() {

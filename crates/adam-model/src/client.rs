@@ -33,7 +33,7 @@ pub trait ModelClient: Send + Sync + 'static {
     }
 
     /// The context window, in tokens, of the model the alias `model` names, as the deployment
-    /// configured it ([ADR 0086](https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0086-the-context-window-follows-the-model-and-the-history-budget-is-200k.md)):
+    /// configured it ([ADR 0088](https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0088-the-context-window-follows-the-model-and-the-history-budget-is-200k.md)):
     /// what the history budget, the clamp of the output cap and each `usage/v1` report use for
     /// that alias. `None` when nobody said: a report then carries no window.
     ///

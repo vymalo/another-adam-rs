@@ -33,7 +33,7 @@ use crate::workspace::{Intent, Outcome};
 pub const MAX_LISTED: usize = 20;
 
 /// What `run` shows of an output when the call asks for nothing: one line for a command that
-/// succeeded, since its result is the files it made (ADR 0088, decision 3).
+/// succeeded, since its result is the files it made (ADR 0090, decision 3).
 pub const DEFAULT_OUTPUT: OutputMode = OutputMode::OnError;
 
 /// The tool `run` over `ws`. Its description is the caller's own declaration (the coder's

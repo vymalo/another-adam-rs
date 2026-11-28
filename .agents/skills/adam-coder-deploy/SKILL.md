@@ -141,7 +141,7 @@ https://github.com/vymalo/another-adam-rs/blob/main/deploy/coder/README.md.
      run parks up to `MODEL_PARK_LIMIT` (`NOTES.txt` warns when the placeholder is still there). Workers only.
      `MODEL_CA_FILE` has no chart value yet (ADR 0067 decision 9, a later slice). Chart only, no image dependency
      (chart README, "Model authentication").
-   * `config.modelContextWindow` (null): `DEFAULT_MODEL_CONTEXT_WINDOW` (ADR 0086; it rendered `MODEL_CONTEXT_WINDOW`,
+   * `config.modelContextWindow` (null): `DEFAULT_MODEL_CONTEXT_WINDOW` (ADR 0088; it rendered `MODEL_CONTEXT_WINDOW`,
      now the binary's deprecated alias, before 2026-11-28), the model's window in tokens when its profile names no
      `contextWindow`, said by each usage report, and the output cap's window: the cap is clamped to the window less
      20,000 and the coder's history (ADR 0064). Refused beside either name in `config.extraEnv`; the binary exits 78

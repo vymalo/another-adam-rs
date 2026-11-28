@@ -1,4 +1,4 @@
-//! The outcome contract (ADR 0085, slice E4): the two artifacts an agent emits for the exporter to
+//! The outcome contract (ADR 0087, slice E4): the two artifacts an agent emits for the exporter to
 //! say what it delivered, and how a record's [`Outcome`](crate::Outcome) reads them.
 //!
 //! The contract is the exporter's, not one agent's: any agent that emits these artifacts gets the

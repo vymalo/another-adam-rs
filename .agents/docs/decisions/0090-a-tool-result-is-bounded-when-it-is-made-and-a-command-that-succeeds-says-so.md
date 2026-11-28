@@ -1,6 +1,6 @@
-# 0088: the evidence and the slice proofs
+# 0090: the evidence and the slice proofs
 
-For people: [0088. A tool result is bounded when it is made, and a command that succeeds can say only that](../../../docs/decisions/0088-a-tool-result-is-bounded-when-it-is-made-and-a-command-that-succeeds-says-so.md),
+For people: [0090. A tool result is bounded when it is made, and a command that succeeds can say only that](../../../docs/decisions/0090-a-tool-result-is-bounded-when-it-is-made-and-a-command-that-succeeds-says-so.md),
 which states the decision. This page holds where each slice is in the code, the invariants to check when it changes, and
 the tests that prove it.
 
@@ -77,7 +77,7 @@ The MCP bound follows the tool-result bound; shortenings counted in the run's us
    `skip_serializing_if = "ShorteningUsage::is_empty"`, and the `usage/v1` object has no `shortenings` member then.
 4. **The count is a function of the committed state**, like the shortening: a retried model call does not count again.
 5. **The run's own history only.** A child's `shortening_usage` is not merged into its parent's (the child-answer code is
-   ADR 0087's to change); a continuation starts with none.
+   ADR 0089's to change); a continuation starts with none.
 
 ### Tests
 
@@ -156,4 +156,4 @@ first 64 of one answer (`MAX_TOOL_NAMES`), and the cache share of the whole prom
 |---|---|
 | `bench/test/numbers.test.mjs`: the new figures (a child session, a failed call, a call with no usage, an unfinished run), a resumed run across attempts, the comparison and its left-out lists, the verdict cases, the printed rows, the CLI with `--against` and its two exit-1 cases, and the read-only run under `--permission` with the network made to throw | the figures, the comparison and the guarantee |
 
-The result table in `bench/NUMBERS.md` ("ADR 0088: hidden outputs") waits for the owner's runs.
+The result table in `bench/NUMBERS.md` ("ADR 0090: hidden outputs") waits for the owner's runs.

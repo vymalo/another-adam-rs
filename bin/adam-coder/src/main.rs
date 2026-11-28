@@ -7,7 +7,7 @@
 //! done by [`adam_coder::serve`].
 //!
 //! `adam-coder export [...]` serves nothing: it writes the coder's runs as training records
-//! ([`adam_coder::export`], ADR 0085) and exits.
+//! ([`adam_coder::export`], ADR 0087) and exits.
 
 use std::future::Future;
 use std::process::ExitCode;

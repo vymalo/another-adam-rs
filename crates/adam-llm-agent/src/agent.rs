@@ -252,7 +252,7 @@ fn has_effect(tool: &str) -> bool {
 /// Whether a round of the session is doing work somebody will want to read. A round that only
 /// closes the session is not: it calls no model, ends by itself and reports nothing new, so a run
 /// neither waits for it at the end of a turn nor cancels it when it ends.
-/// `event` with a session's `mode` (ADR 0087 slice C2) and the `keep_open` it means, which a hook
+/// `event` with a session's `mode` (ADR 0089 slice C2) and the `keep_open` it means, which a hook
 /// of before reads.
 fn with_mode(
     event: adam_plugin::HookEvent,
@@ -313,7 +313,7 @@ pub const UNATTENDED: &str = "nobody answers this run: a schedule started it, no
 can be asked. Do what you can without asking, and say in your final answer what is still needed";
 
 /// The result a tool that asks the person gets in a child run that may not ask (ADR 0045 decision
-/// 9): only a round of an `open` session (ADR 0087) that a client shows (`child-sessions/v1`) has
+/// 9): only a round of an `open` session (ADR 0089) that a client shows (`child-sessions/v1`) has
 /// somebody to answer it, so the model is told to go on and say what it needs in its report.
 pub const NOT_ASKABLE: &str = "nobody can answer this run: only an open subagent session whose \
 client shows child sessions may ask the person. Do what you can without asking, and say in your \
@@ -939,7 +939,7 @@ fn ask_end(
     }
 }
 
-/// The history budget of an agent whose `limits.max_history_tokens` is omitted, in tokens (ADR 0086):
+/// The history budget of an agent whose `limits.max_history_tokens` is omitted, in tokens (ADR 0088):
 /// [`Limits::default`]'s. The budget a run compacts at is the smaller of this and what the model's
 /// window leaves, so a known smaller window still wins.
 pub const DEFAULT_MAX_HISTORY_TOKENS: u32 = 200_000;
@@ -1245,7 +1245,7 @@ struct Recorded {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     grew: bool,
     /// The final request's system prompt and tools, stored as blobs while the model answered
-    /// ([`RecordedRequest`], ADR 0085 decision 7): the turn transition keeps it in
+    /// ([`RecordedRequest`], ADR 0087 decision 7): the turn transition keeps it in
     /// [`Conversation::request`](crate::Conversation::request) and names its blobs in the commit,
     /// so a replay does the same without storing or reading anything. Absent when the store keeps
     /// no blobs or a put failed (recording is fail-open), and in journals written before it existed.
@@ -1621,14 +1621,14 @@ impl LlmAgentBuilder {
         self
     }
 
-    /// The mode `subagent_start` gives each subagent when a call names none ([ADR 0087] slice C3:
+    /// The mode `subagent_start` gives each subagent when a call names none ([ADR 0089] slice C3:
     /// the `session.mode` of its file), by the name the model writes in `agent`:
     /// [`SessionTools::default_modes`](crate::SessionTools::default_modes). Only the
     /// `session.started` event of a start that waits reads it, which is said when the call parks,
     /// from the call's arguments; a subagent not listed here is `one_shot` there. The default is
     /// none.
     ///
-    /// [ADR 0087]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0087-every-child-is-a-session-and-the-one-shot-subagent-tool-goes.md
+    /// [ADR 0089]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0089-every-child-is-a-session-and-the-one-shot-subagent-tool-goes.md
     #[must_use]
     pub fn session_default_modes(
         mut self,
@@ -3026,7 +3026,7 @@ impl LlmAgent {
 
     /// A child the run waited on has answered its call ([`Self::answer_run`]): when this agent tells
     /// the model the reports of sessions, the child is counted as reported, so a child that is a
-    /// session's round (a subagent's one-shot session, ADR 0087 slice C1) is told once, as the
+    /// session's round (a subagent's one-shot session, ADR 0089 slice C1) is told once, as the
     /// call's result, and never again as a report of its session. A plain child run is in no
     /// listing, so counting it changes nothing; an agent that tells no reports keeps no count.
     fn note_answered_round(&self, state: &mut Conversation, child: RunId) {
@@ -3224,7 +3224,7 @@ impl LlmAgent {
         let early_slot: Arc<Mutex<Option<Early<'_>>>> = Arc::new(Mutex::new(None));
         let slot = Arc::clone(&early_slot);
         let agent = self;
-        // The request is recorded for export (ADR 0085 decision 7) through the store's blobs; the
+        // The request is recorded for export (ADR 0087 decision 7) through the store's blobs; the
         // blobs the state already names are not sent again.
         let blob_writer = ctx.blob_writer();
         let known_request = state.request.clone();
@@ -6175,7 +6175,7 @@ impl LlmAgent {
                 ToolResult::error(&call.id, backstop(&reason, &call.name, false).into_owned())
             }
             // Only a round of an `open` session a client shows may ask the person (ADR 0045
-            // decision 9, ADR 0087): a child that cannot would wait for an answer nobody can give.
+            // decision 9, ADR 0089): a child that cannot would wait for an answer nobody can give.
             Err(ToolError::NeedsInput { question, .. }) if !may_ask => {
                 let reason = format!("{NOT_ASKABLE}. The question was: {question}");
                 say(
@@ -6404,7 +6404,7 @@ impl LlmAgent {
     ) -> Option<adam_plugin::HookEvent> {
         use adam_plugin::EventKind;
         let kind = match tool {
-            // A start that waited (ADR 0087 slice C2) settles as a read does: with the report.
+            // A start that waited (ADR 0089 slice C2) settles as a read does: with the report.
             SUBAGENT_START | SUBAGENT_READ if !reported.is_empty() => EventKind::SessionRoundEnded,
             SUBAGENT_START => EventKind::SessionStarted,
             SUBAGENT_SEND => EventKind::SessionRoundStarted,
@@ -6437,7 +6437,7 @@ impl LlmAgent {
         Some(event)
     }
 
-    /// `session.started` for a `subagent_start` that waits for its first report (ADR 0087 slice
+    /// `session.started` for a `subagent_start` that waits for its first report (ADR 0089 slice
     /// C2): it is said when the call parks, from the call's own arguments, since the answer that
     /// settles it is the report (`session.round.ended`), not the start.
     fn observe_waited_start(
@@ -6462,7 +6462,7 @@ impl LlmAgent {
             event = event.text("agent", agent, &scrub);
         }
         // The call parked, so it was admitted: the mode it names is the session's, and a call
-        // that names none has its subagent's default (ADR 0087 slice C3).
+        // that names none has its subagent's default (ADR 0089 slice C3).
         let mode = match crate::sessions::mode_arg(&call.arguments) {
             Ok(Some(asked)) => asked.mode,
             Ok(None) | Err(_) => self
@@ -8291,7 +8291,7 @@ impl LlmAgent {
             // signatures no longer hold, and the commit signs them again (ADR 0068).
             crate::signing::unsign_from(&mut state.messages, shortened.first);
             state.shortenings.push(state.turns);
-            // Counted in the run's usage, which the task carries (ADR 0088): a deployment sees
+            // Counted in the run's usage, which the task carries (ADR 0090): a deployment sees
             // what moved the cached prompt prefix.
             let chars_removed = u64::try_from(shortened.chars_removed).unwrap_or(u64::MAX);
             state.shortening_usage.shortened(chars_removed);
@@ -9039,7 +9039,7 @@ mod failure_tests {
         assert_eq!(back.reports[0].round, round);
         assert_eq!(back.sessions_open, Some(true));
 
-        // The recorded request (ADR 0085 decision 7) is beside the response, and absent from an old
+        // The recorded request (ADR 0087 decision 7) is beside the response, and absent from an old
         // record, which reads as none.
         assert_eq!(old.request, None);
         let request = RecordedRequest {

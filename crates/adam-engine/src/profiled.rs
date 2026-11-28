@@ -1,4 +1,4 @@
-//! The host's model client with the engine's profiles behind it ([ADR 0086], slice W1 amended).
+//! The host's model client with the engine's profiles behind it ([ADR 0088], slice W1 amended).
 //!
 //! [`EngineBuilder::models`](crate::EngineBuilder::models) gives the deployment's profiles to the
 //! assembly, which resolves a folder's effort, preset and cap against them; the window of a model
@@ -6,7 +6,7 @@
 //! a client that has no profile for an alias answers with the engine's, through the same rule
 //! ([`resolve_context_window`]), so the host does not give its client the profiles a second time.
 //!
-//! [ADR 0086]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0086-the-context-window-follows-the-model-and-the-history-budget-is-200k.md
+//! [ADR 0088]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0088-the-context-window-follows-the-model-and-the-history-budget-is-200k.md
 
 use std::sync::Arc;
 

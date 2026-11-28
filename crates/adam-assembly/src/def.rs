@@ -490,13 +490,13 @@ impl AgentDef {
             .collect()
     }
 
-    /// What each subagent's file says of its sessions (`session:`, [ADR 0087] decision 4), by the
+    /// What each subagent's file says of its sessions (`session:`, [ADR 0089] decision 4), by the
     /// name the model writes in `agent`, in the order of the root's manifest: the `mode` and `wait`
     /// a `subagent_start` naming none gets, and the widest `mode` one may name. A subagent whose
     /// file has no block is [`SessionDefaults::default`]. The same list the session tools are made
     /// with, and made without binding, as [`session_bounds`](Self::session_bounds) is.
     ///
-    /// [ADR 0087]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0087-every-child-is-a-session-and-the-one-shot-subagent-tool-goes.md
+    /// [ADR 0089]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0089-every-child-is-a-session-and-the-one-shot-subagent-tool-goes.md
     pub fn session_defaults(&self) -> Vec<(String, SessionDefaults)> {
         session_targets(&self.manifest, &self.manifest.name, &self.remote)
             .into_iter()
@@ -912,7 +912,7 @@ pub(crate) struct SessionTarget {
     /// The time limit of each of its rounds (`None`: none).
     pub(crate) within: Option<Duration>,
     pub(crate) remote: bool,
-    /// The file's `session:`: the defaults and the ceiling of a start (ADR 0087 decision 4).
+    /// The file's `session:`: the defaults and the ceiling of a start (ADR 0089 decision 4).
     pub(crate) session: SessionDefaults,
 }
 
@@ -1545,7 +1545,7 @@ fn lowered_by_file(
     )
 }
 
-/// A subagent file's `session:` as `subagent_start` applies it (ADR 0087 decision 4): its `mode`,
+/// A subagent file's `session:` as `subagent_start` applies it (ADR 0089 decision 4): its `mode`,
 /// the default and the ceiling, and its `wait`, a default. No block is no default.
 fn session_defaults(file: Option<SessionDef>) -> SessionDefaults {
     let Some(SessionDef { mode, wait }) = file else {

@@ -43,11 +43,11 @@ guard kept are said, with `changed files: ...`; an undone or unreadable look is 
 `undid a change made by: ...`; a refusal of the guard is the answer with the note and nothing runs; the refusals before the
 guard (a blank command, a timeout, an unknown place, a `cwd` outside it) have no note and take no guard; a missing tool is
 the workspace's answer with `the workspace lacks a tool`, or the command's result when it has none; the command is scrubbed
-and a failed one carries its repeat key; `after_run` is never called; and `output` (ADR 0088): the whole output by default and
+and a failed one carries its repeat key; `after_run` is never called; and `output` (ADR 0090): the whole output by default and
 with `full`, one line with the call's output id for a success with `on_error` (and the output kept, read back from the
 workspace's keeper), the output for a failure, `(no output)` for a success that printed nothing, a wrong value refused
 before the guard, and a workspace whose `CommandLimits::output` says `on_error` for `run_command` (the coder's folder,
-ADR 0088 slice T3) showing a call that gives none as one line, a call's `full` still winning and `run`'s default not
+ADR 0090 slice T3) showing a call that gives none as one line, a call's `full` still winning and `run`'s default not
 reaching it.
 `tests/run.rs` does the same for `adam_code_tools::make::run`, the guard taken for a `Make`: files the guard saw change are
 listed from `git status` (in a repository the test makes: exactly as git lists them, the first entry with its leading

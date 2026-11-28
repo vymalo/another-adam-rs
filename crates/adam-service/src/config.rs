@@ -48,8 +48,8 @@
 //! | `MODEL_ALIASES_FILE` | the per-model profiles (ADR 0063, ADR 0064): **JSON only for now**, one object with `profiles` and `presets`; a file that cannot be read or does not parse is a startup error naming the file and the key ([`ModelConfig::profiles`]) | unset (no profile) |
 //! | `MODEL_EXTRA_BODY` | a JSON object merged into every chat-completions request, to make a gateway or a model emit its reasoning (`{"reasoning_effort":"medium"}`); **not secret**; an invalid value is a startup error ([`ModelConfig::extra_body`]) | unset (nothing added) |
 //! | `MODEL_ECHO_REASONING` | send the reasoning of earlier turns back, under this member name (`reasoning_content` or `reasoning`), for a provider that requires it (DeepSeek's thinking mode with tools); `false` or unset sends none ([`ModelConfig::echo_reasoning`]) | unset (never sent) |
-//! | `DEFAULT_MODEL_CONTEXT_WINDOW` | the context window of the model `MODEL` names, in tokens (1 to 9007199254740991), used only when that model's profile names no `contextWindow` (ADR 0086): the window its history budget, its output cap and each `usage/v1` call report on that alias take; an invalid value is a startup error ([`ModelConfig::context_window`]) | unset (the profile's, else none) |
-//! | `MODEL_CONTEXT_WINDOW` | **deprecated** alias of `DEFAULT_MODEL_CONTEXT_WINDOW`, read only when that is unset, with one warning at startup naming it; both set to different values is a startup error (two answers to one question), to equal values the value and the warning (ADR 0086 decision 2) | unset |
+//! | `DEFAULT_MODEL_CONTEXT_WINDOW` | the context window of the model `MODEL` names, in tokens (1 to 9007199254740991), used only when that model's profile names no `contextWindow` (ADR 0088): the window its history budget, its output cap and each `usage/v1` call report on that alias take; an invalid value is a startup error ([`ModelConfig::context_window`]) | unset (the profile's, else none) |
+//! | `MODEL_CONTEXT_WINDOW` | **deprecated** alias of `DEFAULT_MODEL_CONTEXT_WINDOW`, read only when that is unset, with one warning at startup naming it; both set to different values is a startup error (two answers to one question), to equal values the value and the warning (ADR 0088 decision 2) | unset |
 //! | `MODEL_PROMPT_CACHE_KEY` | `off` or `conversation`: with `conversation` each request carries a `prompt_cache_key` that is the same for every request of one conversation (a SHA-256 of its id cut to 32 hex digits), so that a gateway with a prompt cache routes them together; anything else is a startup error ([`ModelConfig::prompt_cache_key`]) | `off` |
 //! | `MODEL_INPUT_MODALITIES` | `text` or `text,image`: what the model `MODEL` names can read. With `image`, an image the person sends or a tool returns reaches the model, within the four limits below; without it a request carries a line of text in the image's place. Never guessed from a model name ([`ModelConfig::images`]) | `text` |
 //! | `MODEL_IMAGE_MAX_BYTES` | the most bytes of one image sent to the model (1 to 4194304); needs `image` in `MODEL_INPUT_MODALITIES` | `1048576` |
@@ -1143,7 +1143,7 @@ pub struct ModelConfig {
     pub echo_reasoning: Option<ReasoningField>,
     /// `DEFAULT_MODEL_CONTEXT_WINDOW` (or its deprecated alias `MODEL_CONTEXT_WINDOW`): the
     /// context window, in tokens, of the model [`alias`](Self::alias) names. The client says it for that alias only ([`OpenAiCompatible::with_context_window`]),
-    /// and only when the alias's profile names no `contextWindow`, which wins (ADR 0086): an agent
+    /// and only when the alias's profile names no `contextWindow`, which wins (ADR 0088): an agent
     /// whose files name another alias has its own profile's window, or none. `None` when unset.
     pub context_window: Option<u64>,
     /// `MODEL_PROMPT_CACHE_KEY`: whether the client sends the conversation's `prompt_cache_key`.
@@ -1267,7 +1267,7 @@ impl ModelConfig {
         let model_aliases_file = parse_file(&get, "MODEL_ALIASES_FILE", problems);
         let profiles = parse_profiles(model_aliases_file.as_deref(), problems);
         let context_window = parse_default_context_window(&get, problems);
-        // The window the client will answer for `MODEL` (ADR 0086): the profile's, else the variable's.
+        // The window the client will answer for `MODEL` (ADR 0088): the profile's, else the variable's.
         let window = adam_model::resolve_context_window(profiles.profile(&alias), context_window);
         if warns_no_output_limit(model_aliases_file.as_deref(), &profiles, &alias) {
             tracing::warn!(
@@ -1697,14 +1697,14 @@ fn parse_extra_body(
 /// `contextWindow`.
 pub use adam_model::MAX_CONTEXT_WINDOW;
 
-/// The variable of the window of the model `MODEL` names when its profile names none (ADR 0086).
+/// The variable of the window of the model `MODEL` names when its profile names none (ADR 0088).
 const DEFAULT_CONTEXT_WINDOW_VAR: &str = "DEFAULT_MODEL_CONTEXT_WINDOW";
 
-/// The deprecated alias of [`DEFAULT_CONTEXT_WINDOW_VAR`], kept for one minor release (ADR 0086
+/// The deprecated alias of [`DEFAULT_CONTEXT_WINDOW_VAR`], kept for one minor release (ADR 0088
 /// decision 2).
 const DEPRECATED_CONTEXT_WINDOW_VAR: &str = "MODEL_CONTEXT_WINDOW";
 
-/// `DEFAULT_MODEL_CONTEXT_WINDOW`, else its deprecated alias `MODEL_CONTEXT_WINDOW` (ADR 0086
+/// `DEFAULT_MODEL_CONTEXT_WINDOW`, else its deprecated alias `MODEL_CONTEXT_WINDOW` (ADR 0088
 /// decision 2). The alias is read only when the new variable is unset, and warns once (this runs
 /// once, at startup). Both set to different values is a problem naming both: two answers to one
 /// question fail closed. Both set to the same value is that value, with the warning.
@@ -1719,7 +1719,7 @@ fn parse_default_context_window(
     };
     tracing::warn!(
         "{DEPRECATED_CONTEXT_WINDOW_VAR} is deprecated: rename it {DEFAULT_CONTEXT_WINDOW_VAR} \
-         (ADR 0086)"
+         (ADR 0088)"
     );
     let alias = parse_context_window(DEPRECATED_CONTEXT_WINDOW_VAR, &deprecated, problems);
     let Some(current) = current else {
@@ -3264,7 +3264,7 @@ mod tests {
         (out, logs)
     }
 
-    /// ADR 0086 decision 2: `MODEL_CONTEXT_WINDOW` is the deprecated alias of
+    /// ADR 0088 decision 2: `MODEL_CONTEXT_WINDOW` is the deprecated alias of
     /// `DEFAULT_MODEL_CONTEXT_WINDOW`: read only when that is unset, with one warning that names
     /// the new variable; both set agree or are a problem naming both, never their values.
     #[test]
@@ -3352,7 +3352,7 @@ mod tests {
         assert!(!logs.contains("deprecated"), "{logs}");
     }
 
-    /// ADR 0086 decision 1: a profile's `contextWindow` is its alias's window, over
+    /// ADR 0088 decision 1: a profile's `contextWindow` is its alias's window, over
     /// `DEFAULT_MODEL_CONTEXT_WINDOW`, and an alias `MODEL` does not name (a subagent's) has its own.
     #[test]
     fn a_profiles_context_window_wins_over_default_model_context_window() {

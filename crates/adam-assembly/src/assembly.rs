@@ -685,7 +685,7 @@ impl BoundDef {
     /// [`WINDOW_MARGIN_TOKENS`] and the history the agent keeps: `max_history_tokens` (an omitted
     /// key is [`DEFAULT_MAX_HISTORY_TOKENS`](adam_llm_agent::DEFAULT_MAX_HISTORY_TOKENS)), at most
     /// half the window, and half the window when it is `0`. A history larger than half the window
-    /// is one the window cannot hold anyway: the window wins (ADR 0086 decision 4), so a 200,000
+    /// is one the window cannot hold anyway: the window wins (ADR 0088 decision 4), so a 200,000
     /// default on a 131,072-token window leaves the output 45,536 tokens, not one.
     ///
     /// A preset above the model's limit is refused, not clamped: a preset is the deployment's

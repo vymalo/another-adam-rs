@@ -2,7 +2,7 @@
 //! refusals of a command that changed what it may not, and the changes `run` keeps. Pinned before the
 //! two tools move to a library crate (ADR 0047), so that the move cannot change what the model is
 //! told. And that every `run` that ran moves the run's check epoch by one, and `run_command` never.
-//! `run` shows a command that succeeded as one line by default (`output: "on_error"`, ADR 0088);
+//! `run` shows a command that succeeded as one line by default (`output: "on_error"`, ADR 0090);
 //! `run_command` shows its output.
 #![allow(clippy::unwrap_used, clippy::expect_used)] // integration tests assert by unwrapping
 

@@ -292,7 +292,7 @@ struct Rig {
     asks: bool,
     /// How long a kept-open session may sit idle (`None`: the runtime's default).
     idle_ttl: Option<Duration>,
-    /// What `helper`'s file says of its sessions (`session:`, ADR 0087 slice C3).
+    /// What `helper`'s file says of its sessions (`session:`, ADR 0089 slice C3).
     session: adam_llm_agent::SessionDefaults,
     sink: CollectingSink,
     clock: ManualClock,
@@ -5444,7 +5444,7 @@ mod cases {
                 v.waiting || v.state == SessionState::Idle
             })
             .await;
-            // A sealed round has nobody to answer it, shown or not (ADR 0087): the person cannot
+            // A sealed round has nobody to answer it, shown or not (ADR 0089): the person cannot
             // write to it.
             assert_eq!(
                 view.waiting,
@@ -5455,7 +5455,7 @@ mod cases {
         }
     }
 
-    /// ADR 0087 slice C2: each `mode` is the session's header, and what happens after the first
+    /// ADR 0089 slice C2: each `mode` is the session's header, and what happens after the first
     /// round follows it: `one_shot` closes and refuses a send, `sealed` and `open` stay idle and
     /// take the parent's next round.
     pub async fn each_mode_is_kept_in_the_header_and_decides_what_follows_the_round(
@@ -5503,7 +5503,7 @@ mod cases {
         }
     }
 
-    /// ADR 0087 slice C2: `wait: true` parks the start on its round and answers the first report,
+    /// ADR 0089 slice C2: `wait: true` parks the start on its round and answers the first report,
     /// as a read that waits does; the report is counted as read, so it is never told again as a
     /// report of the session. Observers see the start when it parks and the report when it settles.
     pub async fn a_start_that_waits_answers_its_first_report_once(store: DynStore) {
@@ -5571,7 +5571,7 @@ mod cases {
         assert_eq!(named("session.round.ended").len(), 1, "the report, settled");
     }
 
-    /// ADR 0087 slice C2: `keep_open` is read for one release and mapped onto `mode`; the two
+    /// ADR 0089 slice C2: `keep_open` is read for one release and mapped onto `mode`; the two
     /// disagreeing is an error result naming both, and so is a mode that is none of the three.
     /// Nothing is started for a refused call.
     pub async fn keep_open_maps_onto_mode_and_a_disagreement_is_refused(store: DynStore) {
@@ -5622,7 +5622,7 @@ mod cases {
         assert_eq!(list.total, 2, "the refused calls started nothing");
     }
 
-    /// ADR 0087 slice C3: a subagent filed `session.mode: sealed` starts `sealed` when a call names
+    /// ADR 0089 slice C3: a subagent filed `session.mode: sealed` starts `sealed` when a call names
     /// no mode, and a call may narrow it (`one_shot`, or `keep_open: false`), never widen it:
     /// `open`, or `keep_open: true`, is an error result naming the mode asked, the ceiling and the
     /// subagent, and starts nothing.
@@ -5689,7 +5689,7 @@ mod cases {
         assert_eq!(list.total, 3, "the refused calls started nothing");
     }
 
-    /// ADR 0087 slice C3: a subagent filed `session.wait: true` makes a start that does not say
+    /// ADR 0089 slice C3: a subagent filed `session.wait: true` makes a start that does not say
     /// wait for its first report, and a start that says `wait: false` returns at once; `wait` is a
     /// default, never a ceiling. The `session.started` of the start that waited names the filed
     /// mode, which the call did not.
@@ -5772,7 +5772,7 @@ fn limits_do_not_change_the_specs() {
     );
 }
 
-/// ADR 0087 slice C3: the roster of `subagent_start` says a subagent's filed `session:` only on that
+/// ADR 0089 slice C3: the roster of `subagent_start` says a subagent's filed `session:` only on that
 /// subagent's line, so a folder without the block keeps the bytes of every spec (the pinned file
 /// below), and one with it changes that line alone.
 #[test]

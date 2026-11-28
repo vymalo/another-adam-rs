@@ -20,7 +20,7 @@ pub(crate) const COMMIT_AND_PUSH: &str = "commit_and_push";
 /// The name of the artifact [`open_pull_request`] (and the `pull_request` of [`commit_and_push`])
 /// emits: `url`, `number` (a string), `branch`, `repository`, `commit` (the pull request's head)
 /// and `verified` (the checks passed on exactly that code). It is also the exporter's outcome
-/// contract (`adam_export::PULL_REQUEST_ARTIFACT`, ADR 0085 slice E4), which reads `number`,
+/// contract (`adam_export::PULL_REQUEST_ARTIFACT`, ADR 0087 slice E4), which reads `number`,
 /// `repository` and `verified`.
 pub const PULL_REQUEST_ARTIFACT: &str = "pull_request";
 
@@ -630,7 +630,7 @@ async fn open_in(
     }
     // The number is a string: A2A carries JSON numbers as floats (`7` would arrive as `7.0`).
     // `commit` and `verified` say what the gate saw: the pull request's head, and whether the
-    // checks passed on exactly its code (the exporter's outcome contract, ADR 0085 slice E4).
+    // checks passed on exactly its code (the exporter's outcome contract, ADR 0087 slice E4).
     let data = json!({
         "url": pr.url,
         "number": pr.number.to_string(),

@@ -1,6 +1,6 @@
-//! The tools against the **real** language servers (ADR 0044 slice 17, ADR 0089), on tiny projects
+//! The tools against the **real** language servers (ADR 0044 slice 17, ADR 0091), on tiny projects
 //! with one deliberate error each (`tests/fixtures/language-servers/`): Rust, TypeScript, Python, Go
-//! and Dart; and TOML, YAML, JSON, shell, Dockerfile and C (ADR 0089, written before any of their
+//! and Dart; and TOML, YAML, JSON, shell, Dockerfile and C (ADR 0091, written before any of their
 //! servers was run here: *unverified* until L2 runs them).
 //!
 //! Gated, like the tests that need a database (Rule 7): without `ADAM_TEST_LANGUAGE_SERVERS=1` they
@@ -8,7 +8,7 @@
 //! `ADAM_TEST_REQUIRE_LANGUAGE_SERVERS=1` turns every skip of a server the image has
 //! ([`IN_THE_IMAGE`]) into a failure (it implies the gate). **CI runs them in the built image**: the
 //! `image` job of `.github/workflows/coder.yml` sets both variables, so a server the workspace base
-//! lacks fails the job. The six of ADR 0089 are not in the image until its slice L2, which adds them
+//! lacks fails the job. The six of ADR 0091 are not in the image until its slice L2, which adds them
 //! to [`IN_THE_IMAGE`]; until then they run where their server is installed and are skipped
 //! elsewhere, even under `REQUIRE`. What is proved on every run is `language_servers.rs`, over a
 //! scripted server.
@@ -33,7 +33,7 @@ use serde_json::{Value, json};
 const GATE: &str = "ADAM_TEST_LANGUAGE_SERVERS";
 const REQUIRE: &str = "ADAM_TEST_REQUIRE_LANGUAGE_SERVERS";
 
-/// The servers the coder image has, which `REQUIRE` may not skip. ADR 0089 L2 adds `taplo`,
+/// The servers the coder image has, which `REQUIRE` may not skip. ADR 0091 L2 adds `taplo`,
 /// `yaml-language-server`, `vscode-json-language-server`, `bash-language-server`,
 /// `docker-langserver` and `clangd` when the workspace image installs them.
 const IN_THE_IMAGE: [&str; 5] = [
@@ -232,7 +232,7 @@ async fn real_dart_language_server_reports_an_error_and_finds_a_definition_and_r
     }
 }
 
-// The six of ADR 0089: skipped where their server is not installed, even under REQUIRE, until L2.
+// The six of ADR 0091: skipped where their server is not installed, even under REQUIRE, until L2.
 
 #[tokio::test]
 async fn real_taplo_reports_an_error_in_a_toml_file() {
@@ -263,7 +263,7 @@ async fn real_docker_langserver_reports_an_error_in_a_dockerfile() {
 }
 
 /// The error is shellcheck's (SC2068, an error), which `bash-language-server` runs when it is on
-/// `PATH`: the image installs both (ADR 0089 L2).
+/// `PATH`: the image installs both (ADR 0091 L2).
 #[tokio::test]
 async fn real_bash_language_server_reports_an_error_and_finds_a_definition_and_references() {
     if run_for("bash-language-server") {

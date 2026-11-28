@@ -294,7 +294,7 @@ test('the comparison prints each figure before and after, the change, the verdic
   assert.match(text, /^\| read_output calls \/ task \| 0 \(0\) \| 1\.50 \(3\) \| \+1\.50 \|$/m);
   assert.match(text, /^\| input tokens \/ task \| 20000 \| 15000 \| -5000 \(-25\.0%\) \|$/m);
   assert.match(text, /^\| cache share of the fixed prompt \| 90\.0% \| 95\.0% \| \+5\.0 pt \|$/m);
-  assert.match(text, /^Decision 5 \(ADR 0088\): read_output calls per task up, input tokens per task down — weigh: /m);
+  assert.match(text, /^Decision 5 \(ADR 0090\): read_output calls per task up, input tokens per task down — weigh: /m);
   assert.match(text, /^- adam: 1 only after \(T4\); 1 only before \(T3\)$/m);
   assert.match(text, /^- opencode: 1 only after \(T1\)$/m);
   assert.match(text, /^- finished runs with no task id, which cannot be matched: 0 before, 1 after$/m);

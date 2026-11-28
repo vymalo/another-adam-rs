@@ -21,7 +21,7 @@
 //                    therefore does not reproduce from a ledger, which this module says instead of
 //                    inventing a denominator.
 //
-// And the figures ADR 0088's decision 5 compares before and after hidden outputs, over the same
+// And the figures ADR 0090's decision 5 compares before and after hidden outputs, over the same
 // settled calls of the same finished runs:
 //
 //   read_output / task  the `read_output` entries of the settled calls' `toolNames`
@@ -40,7 +40,7 @@ import { readLedger } from './ledger.mjs';
 /** The tools that run the project's checks: their share is the epic's "checks step". */
 export const CHECK_TOOLS = new Set(['run_checks']);
 
-/** The tool that pages a kept output (ADR 0088): its calls are what hidden outputs may add. */
+/** The tool that pages a kept output (ADR 0090): its calls are what hidden outputs may add. */
 export const READ_OUTPUT_TOOL = 'read_output';
 
 export class NumbersError extends Error {
@@ -214,7 +214,7 @@ export function directionOf(before, after) {
 }
 
 /**
- * Decision 5 of ADR 0088, stated, not tuned: hidden outputs are kept when the input tokens they save
+ * Decision 5 of ADR 0090, stated, not tuned: hidden outputs are kept when the input tokens they save
  * outweigh the `read_output` calls they add; otherwise the default goes back to `full`. This says
  * which way each moved and which case of the rule that is; the weighing, when both moved the way
  * that needs it, is the owner's.
@@ -358,7 +358,7 @@ export function formatComparison(cmp, { ledger = 'after.jsonl', against = 'befor
       `| input tokens / task | ${tok(x.inputPerTask)} | ${tok(y.inputPerTask)} | ${change(x.inputPerTask, y.inputPerTask, (d) => String(Math.round(d)))} |`,
       `| cache share of the fixed prompt | ${pct(x.cache.share)} | ${pct(y.cache.share)} | ${changePoints(x.cache.share, y.cache.share)} |`,
       '',
-      `Decision 5 (ADR 0088): read_output calls per task ${v.readOutput ?? 'n/a'}, input tokens per task ${v.input ?? 'n/a'} — ${v.rule}.`,
+      `Decision 5 (ADR 0090): read_output calls per task ${v.readOutput ?? 'n/a'}, input tokens per task ${v.input ?? 'n/a'} — ${v.rule}.`,
     );
     if (x.input.missing > 0 || y.input.missing > 0) {
       lines.push(`Settled calls without usage: ${x.input.missing} before, ${y.input.missing} after; the input tokens on that side are a lower bound.`);

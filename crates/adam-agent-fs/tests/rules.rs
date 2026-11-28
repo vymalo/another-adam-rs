@@ -2130,7 +2130,7 @@ fn the_process_limits_are_read_in_both_spellings_and_are_no_diagnostic() {
     }
 }
 
-/// `limits.output` reads a mode per command tool (ADR 0088 slice T3), leaves the tools it does not
+/// `limits.output` reads a mode per command tool (ADR 0090 slice T3), leaves the tools it does not
 /// name unset, and survives the round trip the embedded copy makes (JSON).
 #[test]
 fn limits_output_is_read_per_tool_and_is_no_diagnostic() {

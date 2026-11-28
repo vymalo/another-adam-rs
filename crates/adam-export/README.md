@@ -9,7 +9,7 @@ conformance suites in [`adam-export-testkit`](../adam-export-testkit/README.md).
 reads one or several sources into one sink.
 
 The decision is
-[ADR 0085](https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0085-runs-are-exported-as-training-records.md),
+[ADR 0087](https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0087-runs-are-exported-as-training-records.md),
 slices E1, E4 (the outcome contract) and E5 (per-turn samples). The binaries' `export` subcommand (slice E2) is described in
 [`adam-agent`](../../bin/adam-agent/README.md) and [`adam-coder`](../../bin/adam-coder/README.md);
 the training pipeline around it is the guide
@@ -263,7 +263,7 @@ failed listing or write stops it.
 
 **Only runs that have a conversation id are listed.** The query's scope is
 `ConversationScope::Prefix("")`, and `ConversationScope::contains` is `false` for a run with no
-conversation id. **Every subagent's run has one** since [ADR 0087](../../docs/decisions/0087-every-child-is-a-session-and-the-one-shot-subagent-tool-goes.md)
+conversation id. **Every subagent's run has one** since [ADR 0089](../../docs/decisions/0089-every-child-is-a-session-and-the-one-shot-subagent-tool-goes.md)
 slice C1: a subagent's own tool starts its child as a one-shot session (`<parent escaped>/s/<id>`),
 so it is a record of its own, its `parent` the pseudonym of the parent's record
 (`a_subagents_run_is_a_record_of_its_own_linked_to_its_parent` in `tests/export.rs`). Child sessions
@@ -318,7 +318,7 @@ a dev-dependency on the testkit would be a cycle. No test needs a database.
 
 ## See also
 
-* [ADR 0085](../../docs/decisions/0085-runs-are-exported-as-training-records.md): the decision and
+* [ADR 0087](../../docs/decisions/0087-runs-are-exported-as-training-records.md): the decision and
   its slices.
 * [`adam-export-testkit`](../adam-export-testkit/README.md): the conformance suites of the two ports.
 * [Export runs for training](../../docs/guides/export-runs-for-training.md): the pipeline, from

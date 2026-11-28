@@ -649,7 +649,7 @@ pub struct Conversation {
     pub sandbox_usage: SandboxUsage,
     /// How many times this run's history was shortened ([`shortenings`](Self::shortenings)) and the
     /// characters that took out of it: what the A2A server writes on the task as the `shortenings`
-    /// member of the `usage/v1` totals when it ends or waits (ADR 0088), so a deployment sees what
+    /// member of the `usage/v1` totals when it ends or waits (ADR 0090), so a deployment sees what
     /// moved the cached prompt prefix. This run's own history only, never a child's. Absent from
     /// state written before it existed, and not written while empty, so a run that never shortens
     /// writes the bytes it always did; a run that continues another starts with none.
@@ -978,14 +978,14 @@ pub struct Conversation {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chain_started: Option<Timestamp>,
     /// The system prompt and tools of the run's last model call, by content address
-    /// ([`RecordedRequest`], ADR 0085 decision 7): what an export attaches as the exact request the
+    /// ([`RecordedRequest`], ADR 0087 decision 7): what an export attaches as the exact request the
     /// run's answers were made from. Set by every turn's model call: `None` when that call recorded
     /// none (the store keeps no blobs, or a put failed: recording is fail-open), so a stale record
     /// never stands for a later call. A call that failed leaves it as it was. Not carried to a later
     /// task. Absent from state written before it existed, and not written while `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request: Option<RecordedRequest>,
-    /// The distinct requests of the run's model calls, oldest first (ADR 0085, slice E5): an entry
+    /// The distinct requests of the run's model calls, oldest first (ADR 0087, slice E5): an entry
     /// is appended when a call recorded its request ([`request`](Self::request)) and the request's
     /// system prompt or tools are not the ones the entry before names, so a run whose tools never
     /// change has one entry, and a run whose tools change (a group loaded, a tool removed) has one
@@ -1074,7 +1074,7 @@ fn has_expired(value: &Value, now: Timestamp) -> bool {
 /// store, and each model call would re-read, everything said before. Why this size: it was about
 /// what `Limits::max_history_tokens` let through to the model at its first default (100 000 tokens
 /// of about 4 characters); the default is [`DEFAULT_MAX_HISTORY_TOKENS`](crate::DEFAULT_MAX_HISTORY_TOKENS)
-/// since ADR 0086, and the cap was not raised with it. Bytes of JSON, not tokens: the cap has to be checkable without a tokenizer, and it
+/// since ADR 0088, and the cap was not raised with it. Bytes of JSON, not tokens: the cap has to be checkable without a tokenizer, and it
 /// over-counts the JSON's own punctuation, which only makes it stricter.
 ///
 /// What is given up to meet it, in this order, and only as far as needed:
@@ -1472,7 +1472,7 @@ impl Conversation {
 
     /// Whether a tool of this run may **ask the person** ([`ToolError::NeedsInput`], ADR 0045
     /// decision 9): a root run always; a round of a session only when the session is `open`, so the
-    /// person may write to it ([`SessionMode::Open`](adam_runtime::SessionMode::Open), ADR 0087: a
+    /// person may write to it ([`SessionMode::Open`](adam_runtime::SessionMode::Open), ADR 0089: a
     /// `sealed` or `one_shot` round cannot be answered), and a client shows it
     /// ([`SessionHeader::visible`](adam_runtime::SessionHeader::visible)); and no
     /// other child run at all, because nobody would answer it and it would wait for ever. A round

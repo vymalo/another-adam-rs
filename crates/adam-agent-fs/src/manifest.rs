@@ -115,7 +115,7 @@ pub struct RemoteAgent {
     #[serde(skip_serializing_if = "is_false")]
     pub files: bool,
     /// The frontmatter's `session:`: the defaults and the ceiling of the sessions a parent starts
-    /// on it (ADR 0087 decision 4). Left out of the JSON (and so of the digest) when absent.
+    /// on it (ADR 0089 decision 4). Left out of the JSON (and so of the digest) when absent.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session: Option<SessionDef>,
     /// The body of the file, if any: it extends the tool description.

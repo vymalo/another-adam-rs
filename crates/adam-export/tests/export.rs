@@ -51,7 +51,7 @@ struct Harness {
 }
 
 /// The subagent `coder/helper` as its parent calls it: a one-shot session whose answer is the
-/// call's result (what `adam_assembly::SubagentTool` does, ADR 0087 slice C1).
+/// call's result (what `adam_assembly::SubagentTool` does, ADR 0089 slice C1).
 struct Helper;
 
 #[async_trait]
@@ -77,7 +77,7 @@ const HELPER: &str = "coder/helper";
 /// not reach a record.
 const REPOSITORY: &str = "https://git.corp.example/alice/payroll.git";
 
-/// Delivers the way the coder does (ADR 0085, slice E4): a `checks` verdict, then a `pull_request`
+/// Delivers the way the coder does (ADR 0087, slice E4): a `checks` verdict, then a `pull_request`
 /// whose head was verified when the call says so, both artifacts of the outcome contract.
 struct Deliver;
 
@@ -275,7 +275,7 @@ async fn a_stack_filter_keeps_the_run_that_read_the_manifest() {
     assert!(raw.contains("[deployment secret]"), "{raw}");
     assert_eq!(record["facets"]["dep"], json!(["axum"]));
     assert_eq!(record["facets"]["lang"], json!(["toml"]));
-    // The run recorded its last model call (ADR 0085 slice E3): the record carries the system
+    // The run recorded its last model call (ADR 0087 slice E3): the record carries the system
     // prompt and the tools that call was sent.
     assert_eq!(record["tools_source"], "recorded");
     assert_eq!(record["compacted"], false);
@@ -334,7 +334,7 @@ async fn a_stack_filter_keeps_the_run_that_read_the_manifest() {
     h.stop().await;
 }
 
-/// Per turn (ADR 0085, slice E5): the run of two model calls is two samples, each the request of
+/// Per turn (ADR 0087, slice E5): the run of two model calls is two samples, each the request of
 /// its call (the recorded system prompt and tools, the history before the answer) and the answer
 /// last, `train_on: "last"`. A token budget leaves out the samples over it, whole.
 #[tokio::test]
@@ -419,7 +419,7 @@ async fn a_turn_export_writes_one_sample_per_answer() {
     h.stop().await;
 }
 
-/// A subagent's one-shot session (ADR 0087 slice C1) has a session's conversation id, so the
+/// A subagent's one-shot session (ADR 0089 slice C1) has a session's conversation id, so the
 /// exporter reaches it: it is a record of its own, linked to its parent's by `parent`.
 #[tokio::test]
 async fn a_subagents_run_is_a_record_of_its_own_linked_to_its_parent() {
@@ -478,7 +478,7 @@ async fn a_subagents_run_is_a_record_of_its_own_linked_to_its_parent() {
     h.stop().await;
 }
 
-/// The outcome contract end to end (ADR 0085, slice E4): the artifacts a run's tool committed are
+/// The outcome contract end to end (ADR 0087, slice E4): the artifacts a run's tool committed are
 /// read from the store through `RuntimeSource`, the record says which pull request the run
 /// delivered and whether its head was verified, and `verified_only` keeps only such runs. The
 /// repository is a pseudonym: its host and owner, and the pull request's URL, are not written.
@@ -559,7 +559,7 @@ fn lines(out: Vec<u8>) -> Vec<Value> {
         .collect()
 }
 
-/// Two stores into one dataset (ADR 0085, *Amended*: ports and adapters): each record names its
+/// Two stores into one dataset (ADR 0087, *Amended*: ports and adapters): each record names its
 /// source by label, the summary adds both up, and the ids are pseudonyms under the one key, so a
 /// run's id is the same whether its store is exported alone or with the other.
 #[tokio::test]

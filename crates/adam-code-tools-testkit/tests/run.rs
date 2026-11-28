@@ -636,7 +636,7 @@ async fn a_run_that_succeeded_printing_nothing_says_so() {
 
 /// A workspace that defaults `run` to `full` (the coder's folder, `limits.output.run`) shows a call
 /// that gives no `output` whole; a call's `on_error` still wins; and `run_command`'s default does
-/// not touch `run` (ADR 0088 slice T3).
+/// not touch `run` (ADR 0090 slice T3).
 #[tokio::test]
 async fn the_workspaces_default_is_what_a_call_without_output_shows() {
     let dir = tempfile::tempdir().unwrap();

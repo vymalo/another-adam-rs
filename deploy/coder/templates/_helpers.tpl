@@ -119,7 +119,7 @@ string is used as written, and empty (or an empty map) is nothing at all.
 {{- end -}}
 
 {{/*
-config.modelContextWindow as the text DEFAULT_MODEL_CONTEXT_WINDOW holds (ADR 0086 of adam-rs; it rendered
+config.modelContextWindow as the text DEFAULT_MODEL_CONTEXT_WINDOW holds (ADR 0088 of adam-rs; it rendered
 MODEL_CONTEXT_WINDOW, now the binary's deprecated alias, before): Helm reads the numbers of a values file as
 floats, so a whole one is written in full (1000000, not 1e+06); anything else is written as it is, for
 _validate.tpl to refuse. Null or empty is nothing at all.

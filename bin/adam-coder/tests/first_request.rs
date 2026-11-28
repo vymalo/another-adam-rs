@@ -26,7 +26,7 @@ use common::Fixture;
 /// allowed (a tool's description may gain a sentence); anything more is a reviewed decision.
 const BASELINE_PROMPT_BYTES: usize = 30814; // measured 2026-11-21 on the merged head (b16c076a)
 // The tools: re-measured 2026-11-28 when `run_command`, `run` and `run_checks` took `output` (ADR
-// 0088, slice T1): 1114 B of the growth is that argument and its sentence in each description.
+// 0090, slice T1): 1114 B of the growth is that argument and its sentence in each description.
 const BASELINE_TOOLS_BYTES: usize = 64049;
 const GROWTH_ALLOWED: usize = 1024;
 /// The owner's budget for the coder's tools once S3 makes it lean (ADR 0066).

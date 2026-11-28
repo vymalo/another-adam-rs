@@ -170,7 +170,7 @@ services:
       # answers of the other mocks back: text, no tool call, no pull request.
       MODEL: ${CODER_MODEL:-mock-coder}
       # What each usage/v1 report of a call on that model says as its context window (ADR 0032): the
-      # window of a model whose profile names none (ADR 0086; MODEL_CONTEXT_WINDOW is its deprecated alias).
+      # window of a model whose profile names none (ADR 0088; MODEL_CONTEXT_WINDOW is its deprecated alias).
       DEFAULT_MODEL_CONTEXT_WINDOW: "131072"
       GITHUB_API_URL: http://mock-github:8080
       # Dummy. Set MOCK_GITHUB_TOKEN=bad-token to make mock-github answer 401. An installation is

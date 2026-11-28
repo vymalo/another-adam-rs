@@ -1,4 +1,4 @@
-//! `adam-agent export`: the folder's runs as training records (ADR 0085, slice E2).
+//! `adam-agent export`: the folder's runs as training records (ADR 0087, slice E2).
 //!
 //! It reads what an export needs and nothing a role needs: `ADAM_AGENT_DIR` (the folder, as
 //! serving reads it), `DATABASE_URL`, `ADAM_EXTRA_MCP_FILE` when it is set, and

@@ -1,4 +1,4 @@
-//! Export adam-rs runs as training records ([ADR 0085]): one JSON Lines record per run, in the
+//! Export adam-rs runs as training records ([ADR 0087]): one JSON Lines record per run, in the
 //! chat shape most trainers read, with the facets a stack filter needs, the outcome the store
 //! holds, every string scrubbed and every id a pseudonym.
 //!
@@ -17,7 +17,7 @@
 //! * [`facets`] derives `lang` and `dep` from a transcript; [`Scrub`] and
 //!   [`scrub_known_shapes`] remove secrets; [`Pseudonyms`] hide ids.
 //!
-//! [ADR 0085]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0085-runs-are-exported-as-training-records.md
+//! [ADR 0087]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0087-runs-are-exported-as-training-records.md
 
 mod convert;
 mod export;

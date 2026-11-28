@@ -1,4 +1,4 @@
-//! The exported record: one run, in the chat shape trainers read (ADR 0085 decision 2).
+//! The exported record: one run, in the chat shape trainers read (ADR 0087 decision 2).
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -158,7 +158,7 @@ pub enum TrainOn {
     Last,
 }
 
-/// Where a per-turn sample stands in its run (ADR 0085, slice E5).
+/// Where a per-turn sample stands in its run (ADR 0087, slice E5).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Sample {
     /// The model call the answer is from: [`Conversation::turns`](adam_llm_agent::Conversation::turns)
@@ -175,7 +175,7 @@ pub struct Sample {
     pub exact: bool,
 }
 
-/// Where a record's `tools` and system message come from (ADR 0085 decision 7).
+/// Where a record's `tools` and system message come from (ADR 0087 decision 7).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ToolsSource {
@@ -188,7 +188,7 @@ pub enum ToolsSource {
     Recorded,
 }
 
-/// How a run ended: what the store says (ADR 0085 decision 6), and what the run delivered, read
+/// How a run ended: what the store says (ADR 0087 decision 6), and what the run delivered, read
 /// from the artifacts of the outcome contract (slice E4, [`pull_requests_of`](crate::pull_requests_of)
 /// and [`checks_of`](crate::checks_of)).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -255,7 +255,7 @@ pub struct OutcomeArtifact {
     pub mime_type: Option<String>,
 }
 
-/// What a run touched, by kind (`lang`, `dep`), derived from its transcript (ADR 0085 decision
+/// What a run touched, by kind (`lang`, `dep`), derived from its transcript (ADR 0087 decision
 /// 5). A heuristic, not a fact.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]

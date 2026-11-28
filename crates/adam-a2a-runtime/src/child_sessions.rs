@@ -22,7 +22,7 @@
 //! | Request | Answer |
 //! |---|---|
 //! | a message to `C` with `start` | round 1 of a new session; no turn of the parent |
-//! | a message to `K`, no `taskId` | to a working session: delivered into its round; to an idle one: the next round; to a closed one, or one the person may not write to (an agent's session that is not `open`, ADR 0087): `UnsupportedOperation` |
+//! | a message to `K`, no `taskId` | to a working session: delivered into its round; to an idle one: the next round; to a closed one, or one the person may not write to (an agent's session that is not `open`, ADR 0089): `UnsupportedOperation` |
 //! | a message to `K` with `close` | an idle session closes by a round of its own, a working one when its round ends (`cancel` first when asked); a person may close any session they see, whatever its mode |
 //! | `taskId` of a round | the follow-up rules of any task, in context `K`; a working round of a closed session, or of one the person may not write to, takes no steer |
 //! | `GetTask`, `SubscribeToTask`, `CancelTask` of a round | the round as a task; cancel is `Runtime::cancel` |
@@ -472,12 +472,12 @@ fn parse_start(start: &Value, sessions: &ChildSessions) -> Result<Start, String>
     })
 }
 
-/// The mode of a person's `start` ([ADR 0087] decision 2): `start.mode`, else what `start.keepOpen`
+/// The mode of a person's `start` ([ADR 0089] decision 2): `start.mode`, else what `start.keepOpen`
 /// meant (read for one release: `true` is `open`, `false` is `one_shot`), else `one_shot`; both
 /// given and disagreeing is refused naming both. `sealed` is refused: it leaves the session to the
 /// agent that started it, and a person's session has no such agent.
 ///
-/// [ADR 0087]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0087-every-child-is-a-session-and-the-one-shot-subagent-tool-goes.md
+/// [ADR 0089]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0089-every-child-is-a-session-and-the-one-shot-subagent-tool-goes.md
 fn start_mode(start: &Map<String, Value>) -> Result<SessionMode, String> {
     let words = || SessionMode::ALL.map(SessionMode::as_str).join(", ");
     let asked = match start.get("mode") {
@@ -518,17 +518,17 @@ fn start_mode(start: &Map<String, Value>) -> Result<SessionMode, String> {
     }
 }
 
-/// The session object's members that say who may write to it ([ADR 0087] decision 2): `mode`,
+/// The session object's members that say who may write to it ([ADR 0089] decision 2): `mode`,
 /// and the `keepOpen` it means, which a client of before reads.
 ///
-/// [ADR 0087]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0087-every-child-is-a-session-and-the-one-shot-subagent-tool-goes.md
+/// [ADR 0089]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0089-every-child-is-a-session-and-the-one-shot-subagent-tool-goes.md
 pub(crate) fn put_mode(object: &mut Value, mode: SessionMode) {
     object["mode"] = json!(mode.as_str());
     object["keepOpen"] = json!(mode.keeps_open());
 }
 
 /// The refusal of a person's message to `view`'s session when the person may not write to it
-/// ([`SessionHeader::takes_person_messages`], ADR 0087): an agent started it and it is not `open`.
+/// ([`SessionHeader::takes_person_messages`], ADR 0089): an agent started it and it is not `open`.
 /// `None` when they may, and for a session with no header, which is kept open.
 fn refused_to_the_person(view: &SessionView) -> Option<BackendError> {
     let header = view.header.as_ref()?;
@@ -1151,7 +1151,7 @@ impl RuntimeTaskBackend {
                 }
                 // A round of a closed session takes no message, as the session itself takes none
                 // (a message to `K`, below): a subagent's one-shot session is closed from its start
-                // (ADR 0087 slice C1), so a person cannot steer it; nor can they steer a round of a
+                // (ADR 0089 slice C1), so a person cannot steer it; nor can they steer a round of a
                 // session they may not write to (an agent's session that is not `open`, slice C2).
                 // The answer to a round's question and a round parked on the model still go
                 // through: those only unblock it.
@@ -2100,7 +2100,7 @@ mod tests {
         }
     }
 
-    /// ADR 0087 slice C2: a person's start names its mode, or the `keepOpen` of before, which maps
+    /// ADR 0089 slice C2: a person's start names its mode, or the `keepOpen` of before, which maps
     /// onto it; the two disagreeing are refused naming both, and `sealed` is refused, since it
     /// leaves a session to an agent and a person's session has none.
     #[test]

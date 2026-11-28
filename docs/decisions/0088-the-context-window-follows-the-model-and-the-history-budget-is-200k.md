@@ -1,4 +1,4 @@
-# 0086. The context window follows the model, and the history budget is 200,000 tokens
+# 0088. The context window follows the model, and the history budget is 200,000 tokens
 
 Status: **Accepted** (2026-11-27). The owner decided on 2026-11-27: *"No user, while using the agent locally, will do
 export MODEL_CONTEXT_WINDOW. Normally, it should be removed and left to be configured by model. I'll rename it

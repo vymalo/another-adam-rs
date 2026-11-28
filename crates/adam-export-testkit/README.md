@@ -10,7 +10,7 @@ is the `Store`'s. An adapter crate lists it as a dev-dependency and runs the sam
 the testkit" means "the `Exporter` reads from it (or writes to it) like from every other". It is a
 separate crate from `adam-export` to avoid a dev-dependency cycle, so the reference adapters
 (`RuntimeSource` over the memory store, `JsonLines`) run the suites from this crate's own tests.
-The decision is [ADR 0085](../../docs/decisions/0085-runs-are-exported-as-training-records.md),
+The decision is [ADR 0087](../../docs/decisions/0087-runs-are-exported-as-training-records.md),
 *Amended* for ports and adapters.
 
 ## API at a glance
@@ -23,7 +23,7 @@ The decision is [ADR 0085](../../docs/decisions/0085-runs-are-exported-as-traini
   `async fn() -> Option<SinkFixture>`.
 * `SeedRun { id, agent, conversation_id, status, artifacts, state }`, `SeedRun::new(agent, status, state)`,
   `SeedRun::done(agent, text)`, `.with_artifact(RunArtifact)`: a run a case needs. `artifacts` are its JSON
-  artifacts (ADR 0085, slice E4), which the source yields as `meta.artifacts`: **a maker must store them**, or the new
+  artifacts (ADR 0087, slice E4), which the source yields as `meta.artifacts`: **a maker must store them**, or the new
   case `a_run_keeps_its_json_artifacts_in_order` fails. Every seed has a conversation id of its own and
   is `done` or `failed`. `SeedState` (closed): `Conversation(Box<Conversation>)` (yielded),
   `Other(Value)` (a readable state that is not a conversation: `not_a_conversation`),

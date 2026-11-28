@@ -17,7 +17,7 @@
 //!
 //! [`ShorteningUsage`] says how often a run's loop shortened old tool results to keep its history
 //! within its budget, and how many characters that took out: each shortening moves the cached
-//! prompt prefix, so a deployment sees what it cost (ADR 0088). The loop keeps it in the run's state,
+//! prompt prefix, so a deployment sees what it cost (ADR 0090). The loop keeps it in the run's state,
 //! and the A2A server writes it on the task beside the totals.
 
 use adam_model::Usage;
@@ -335,7 +335,7 @@ impl SandboxUsage {
 /// The shortenings of one run's history: how many times its loop shortened old tool results to
 /// keep the history within its budget, and the characters they took out. A shortening rewrites the
 /// past of the conversation, so the request after it is read from the provider's cache only up to
-/// the first result it changed (ADR 0088, decision 1).
+/// the first result it changed (ADR 0090, decision 1).
 ///
 /// The loop keeps it in the run's state (the member `shortening_usage`), and the A2A server writes
 /// it on the task beside the `usage/v1` totals while it is not empty. It counts the run's **own**

@@ -125,7 +125,7 @@ impl Tool for Ask {
 }
 
 /// A subagent's own tool on the helper: a call runs it as a one-shot session of the parent and
-/// waits for its answer (`adam_assembly::SubagentTool`, ADR 0087 slice C1).
+/// waits for its answer (`adam_assembly::SubagentTool`, ADR 0089 slice C1).
 struct OneShot {
     helper: String,
 }
@@ -1046,7 +1046,7 @@ async fn a_message_to_a_working_session_goes_into_its_round() {
     }
 }
 
-/// A subagent's own tool runs it as a one-shot session (ADR 0087 slice C1): the person sees it in
+/// A subagent's own tool runs it as a one-shot session (ADR 0089 slice C1): the person sees it in
 /// the parent's sessions, working and then closed, and cannot write to it, neither to its context
 /// nor by naming its round, even with `steer/v1`; the parent gets its answer as the call's result.
 #[tokio::test]
@@ -1569,7 +1569,7 @@ async fn a_session_the_model_starts_is_listed_and_a_person_can_talk_to_it() {
     }
 }
 
-/// ADR 0087 slice C2: a session the model starts `sealed` or `one_shot` is the agent's to write
+/// ADR 0089 slice C2: a session the model starts `sealed` or `one_shot` is the agent's to write
 /// to. The session object says its mode; the person's message to its child context and their steer
 /// of its working round are refused, naming the mode; once its round has ended a sealed session is
 /// idle and still refuses the person, who may close it, and a one-shot one is closed.

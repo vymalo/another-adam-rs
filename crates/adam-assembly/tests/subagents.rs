@@ -630,7 +630,7 @@ async fn a_parent_restarted_mid_wait_still_gets_the_childs_answer() {
             (parent.status == RunStatus::Parked
                 && kid.status == RunStatus::Runnable
                 && kid.parent_id == Some(run)
-                // A one-shot session of the parent (ADR 0087 slice C1).
+                // A one-shot session of the parent (ADR 0089 slice C1).
                 && kid.conversation_id
                     == Some(session_conversation_id(&format!("run:{run}"), child_id)))
             .then_some(())
@@ -671,7 +671,7 @@ async fn a_parent_restarted_mid_wait_still_gets_the_childs_answer() {
     }
 }
 
-// --- a subagent's call is a one-shot session (ADR 0087 slice C1) ---------------------------
+// --- a subagent's call is a one-shot session (ADR 0089 slice C1) ---------------------------
 
 /// The conversation the sessions of a run that has none belong to (`ChildStarter`).
 fn sessions_of(run: RunId) -> String {
@@ -1151,7 +1151,7 @@ fn the_root_may_ask_and_a_subagent_that_does_not_is_fine() {
     assert_eq!(assembly.info()[1].tools, ["fetch"]);
 }
 
-// --- `session:` in a subagent's file (ADR 0087 slice C3) -----------------------------------
+// --- `session:` in a subagent's file (ADR 0089 slice C3) -----------------------------------
 
 #[test]
 fn the_definition_carries_each_subagents_session_block() {

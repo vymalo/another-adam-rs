@@ -461,7 +461,7 @@ async fn a_look_with_on_error_shows_a_failure_and_says_when_nothing_was_printed(
 
 /// A workspace that defaults `run_command` to `on_error` (the coder's folder,
 /// `limits.output.run_command`) shows a look that succeeded and gives no `output` as one line; a
-/// call's `full` still wins; and `run`'s default does not touch `run_command` (ADR 0088 slice T3).
+/// call's `full` still wins; and `run`'s default does not touch `run_command` (ADR 0090 slice T3).
 #[tokio::test]
 async fn the_workspaces_default_is_what_a_look_without_output_shows() {
     let dir = tempfile::tempdir().unwrap();

@@ -191,10 +191,10 @@ every agent a `ModelBinding` for each other profiled model, for `Say::with_model
 `limits.max_output_tokens`, the preset its `model_preset` names, the profile's `maxOutputTokens`, the profile's base
 preset, then `adam_model::DEFAULT_MAX_OUTPUT_TOKENS` (128,000). It is then the smallest of that, the model's
 `maxOutputTokensLimit` and, when the client knows the alias's context window (`ModelClient::context_window`: the
-profile's `contextWindow`, else `DEFAULT_MODEL_CONTEXT_WINDOW` for the alias `MODEL` names; ADR 0086), what the window leaves after
+profile's `contextWindow`, else `DEFAULT_MODEL_CONTEXT_WINDOW` for the alias `MODEL` names; ADR 0088), what the window leaves after
 `adam_llm_agent::WINDOW_MARGIN_TOKENS` (20,000) and the history the agent keeps: `max_history_tokens`
 (`adam_llm_agent::DEFAULT_MAX_HISTORY_TOKENS`, 200,000, when the key is omitted), at most half the window, and half the
-window when it is `0` (ADR 0086: a history the window cannot hold gives way, so the 200,000 default on a 131,072-token
+window when it is `0` (ADR 0088: a history the window cannot hold gives way, so the 200,000 default on a 131,072-token
 window leaves 45,536, not one; at least 1). A lowered cap is logged once per agent and model. A **preset** above the
 model's limit is `Error::OutputCap` (a preset is the deployment's promise); the folder's value is clamped, and a
 profile's own cap above its limit is refused when the profiles file is read. The resolved cap is
@@ -546,7 +546,7 @@ tools and its skills' tools, in the order of the manifest (`AgentInfo::tools` li
   (`ToolCtx::start_one_shot_session` and `ToolError::AwaitRun`, see "Child runs" in `docs/architecture.md`). The
   child's final **text** is the tool result; an error result if the child failed, and the parent goes on. A
   blank or missing `message` is an error result and starts nothing;
-* **the child is a one-shot session** of the parent ([ADR 0087](../../docs/decisions/0087-every-child-is-a-session-and-the-one-shot-subagent-tool-goes.md)
+* **the child is a one-shot session** of the parent ([ADR 0089](../../docs/decisions/0089-every-child-is-a-session-and-the-one-shot-subagent-tool-goes.md)
   slice C1): round 1 of a session under the id the call derives, closed from its start. It has a session's conversation
   id (`<parent escaped>/s/<id>`), so `subagent_list`, `child-sessions/v1` and the exporter see it; the parent's
   `subagent_send` and a person's message are refused (it is closed); the model gets its answer once, as the call's
@@ -601,7 +601,7 @@ The five session tools hold them (`SessionTools::bounds`), `Assembly::session_bo
 
 ### The defaults of a session
 
-A subagent's file may say how the sessions its parent starts on it begin (`session:`, [ADR 0087](../../docs/decisions/0087-every-child-is-a-session-and-the-one-shot-subagent-tool-goes.md) slice C3): `mode` is the mode of a `subagent_start` that names none and the widest one a start may name, and `wait` is a default only. The roster (`session_targets`, the list the tools, the card and the A2A front are made from) reads it from the file, local or remote, and maps the file's `SessionModeDef` onto `adam_runtime::SessionMode` with a match that has no wildcard (Rule 3), into each `SessionAgent::session` (`adam_llm_agent::SessionDefaults`), where `subagent_start` applies it. `AgentDef::session_defaults()` lists it by name without binding. The agent's `LlmAgentBuilder::session_default_modes` gets each default mode too, so the `session.started` of a start that waits names the filed one. A person's own start through `child-sessions/v1` is not held to it (a person's session is theirs, ADR 0087 C2). Tests: `tests/subagents.rs` `the_definition_carries_each_subagents_session_block` and `a_start_gets_the_filed_mode_says_it_in_the_roster_and_may_not_widen_it`.
+A subagent's file may say how the sessions its parent starts on it begin (`session:`, [ADR 0089](../../docs/decisions/0089-every-child-is-a-session-and-the-one-shot-subagent-tool-goes.md) slice C3): `mode` is the mode of a `subagent_start` that names none and the widest one a start may name, and `wait` is a default only. The roster (`session_targets`, the list the tools, the card and the A2A front are made from) reads it from the file, local or remote, and maps the file's `SessionModeDef` onto `adam_runtime::SessionMode` with a match that has no wildcard (Rule 3), into each `SessionAgent::session` (`adam_llm_agent::SessionDefaults`), where `subagent_start` applies it. `AgentDef::session_defaults()` lists it by name without binding. The agent's `LlmAgentBuilder::session_default_modes` gets each default mode too, so the `session.started` of a start that waits names the filed one. A person's own start through `child-sessions/v1` is not held to it (a person's session is theirs, ADR 0089 C2). Tests: `tests/subagents.rs` `the_definition_carries_each_subagents_session_block` and `a_start_gets_the_filed_mode_says_it_in_the_roster_and_may_not_widen_it`.
 
 ## Remote subagents
 
@@ -728,7 +728,7 @@ rules are the same and the token is never journaled or logged. Only the root's r
 * **Time and cancel.** A round has the limit `AgentDef::remote_timeout`. A round that is cancelled sends the remote
   `CancelTask` (`Agent::on_cancelled` of `adam-runtime`), best effort. A process that registered only the starter sends none;
   the next round of the session cancels what the round before left working.
-* **`mode` and `wait`** ([ADR 0087](../../docs/decisions/0087-every-child-is-a-session-and-the-one-shot-subagent-tool-goes.md)
+* **`mode` and `wait`** ([ADR 0089](../../docs/decisions/0089-every-child-is-a-session-and-the-one-shot-subagent-tool-goes.md)
   slice C2) work as on a local session, because the rounds are local runs carrying the session's header: `one_shot` closes
   after its round, `sealed` stays idle and the A2A front refuses the person's message and steer, `open` takes both, and
   `wait: true` parks the start on round 1 and answers the remote's report. The remote is told nothing of the mode (no A2A
@@ -923,8 +923,8 @@ place each:
   default tool access, duplicate tools; unknown, unused and unset vars, values for undeclared vars and
   unknown agents, syntax errors with their line, an error in an `instructions/*.md` part.
 * `tests/cap.rs`: the output cap's order and clamps (ADR 0064), and
-  `a_subagent_on_another_alias_has_its_own_profiles_window` (ADR 0086: its profile's `contextWindow` clamps that
-  subagent's cap, not the root's); `a_history_the_window_cannot_hold_leaves_the_output_half_the_window` (ADR 0086
+  `a_subagent_on_another_alias_has_its_own_profiles_window` (ADR 0088: its profile's `contextWindow` clamps that
+  subagent's cap, not the root's); `a_history_the_window_cannot_hold_leaves_the_output_half_the_window` (ADR 0088
   slice W3: the 200,000 default on a 200,000-token window leaves 80,000). The unit
   `an_omitted_history_budget_is_the_loops_default` (`src/def.rs`) holds the default.
 * `tests/model.rs`: alias resolution through three generations, alias errors, a deployment's alias list,
@@ -955,7 +955,7 @@ place each:
 * `tests/remote_sessions.rs`: remote sessions against an in-process A2A server whose backend records what it was asked: the
   context carried across rounds, a steer and a queued message, a restart, a lost send response, a failed round, a question, a
   closing round, and the four cancel cases (`CancelTask` on close with cancel, on a cancelled parent, at the time limit, and
-  from the next round after a lost one), and `a_remote_session_takes_mode_and_wait_as_a_local_one_does` (ADR 0087 slice C2:
+  from the next round after a lost one), and `a_remote_session_takes_mode_and_wait_as_a_local_one_does` (ADR 0089 slice C2:
   `sealed` with `wait: true`). Memory, and PostgreSQL when set.
 * `tests/subagents.rs`: a parent calls a subagent which calls its own (root, researcher, summarizer) on a
   `MockModel` through a `Runtime`, on the memory store and on PostgreSQL when `ADAM_TEST_POSTGRES_URL` is

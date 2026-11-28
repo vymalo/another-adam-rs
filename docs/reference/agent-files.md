@@ -113,7 +113,7 @@ limits:                        # LlmAgent Limits; Claude's `maxTurns` is read as
   max_turns: 200               # model calls that may be followed by tools, plus one closing turn in which it may call none (0: one call with no tools)
   max_tool_calls: 400          # over it, the turn's calls are answered "not run" and the closing turn follows
   max_output_tokens: 64000     # the output cap this agent asks for, at least 1; absent: its preset's, the model profile's, then 128,000, clamped to the model's limit and window (ADR 0064)
-  max_history_tokens: 200000   # the history budget: the run compacts at the smaller of this and what the window leaves; 0: the window's alone; absent: 200,000 (ADR 0086)
+  max_history_tokens: 200000   # the history budget: the run compacts at the smaller of this and what the window leaves; 0: the window's alone; absent: 200,000 (ADR 0088)
   max_minutes: 30              # subagent only: the longest one run may take; 0 = no limit, at most 1440
   max_parallel: 4              # tool calls of one turn that run at once, 1 to 32: lowers MAX_PARALLEL_TOOL_CALLS for this agent, never raises it
   max_processes: 2             # processes (commands) of the worker at once, 1 to 256: lowers MAX_PROCESSES, never raises it (read by adam-coder; ADR 0065)
@@ -123,8 +123,8 @@ limits:                        # LlmAgent Limits; Claude's `maxTurns` is read as
   max_working_sessions: 2      # root only: most rounds working at once, 1 to 32 and at most max_open_sessions; lowers SESSION_MAX_WORKING
   max_inline_upload_bytes: 10485760 # root only: the largest file sent inline (`uploads/v1`; a larger one asks for a slot; the card carries no params), 1 to 268435456 (256 MiB); wins over UPLOADS_INLINE_MAX_BYTES (a subagent's value is ignored, with a warning)
   max_session_rounds: 10       # root only: most rounds one session may have, 2 to 200; lowers SESSION_MAX_ROUNDS (a subagent's value is ignored, with a warning)
-  output: { run_command: on_error }  # root only: what a command tool shows when a call gives no `output` (below; read by adam-coder; ADR 0088)
-session: { mode: sealed, wait: true }   # subagent only: what a session its parent starts defaults to, and the widest mode it may be (below; ADR 0087)
+  output: { run_command: on_error }  # root only: what a command tool shows when a call gives no `output` (below; read by adam-coder; ADR 0090)
+session: { mode: sealed, wait: true }   # subagent only: what a session its parent starts defaults to, and the widest mode it may be (below; ADR 0089)
 retry:                         # a retry policy per tool (below); this agent's own, none inherits
 plugins: [audit]                # compiled plugins the deployment registered; subagents inherit them (ADR 0050); an unknown name exits 78
   web_search: { attempts: 5, backoff: 2s, max_backoff: 5m, on: [rate-limited] }
@@ -174,11 +174,11 @@ You are the coder agent. Stop after at most {{max_check_cycles}} failed check cy
   without it the cap is its `model_preset`'s, else the model profile's `maxOutputTokens`, else the
   profile's base preset, else 128,000 (ADR 0064). The result is clamped to the model's
   `maxOutputTokensLimit` and, when the context window is known (the model profile's `contextWindow`, else
-  `DEFAULT_MODEL_CONTEXT_WINDOW` for the alias `MODEL` names; [ADR 0086](../decisions/0086-the-context-window-follows-the-model-and-the-history-budget-is-200k.md)),
+  `DEFAULT_MODEL_CONTEXT_WINDOW` for the alias `MODEL` names; [ADR 0088](../decisions/0088-the-context-window-follows-the-model-and-the-history-budget-is-200k.md)),
   to what the window leaves after
   20,000 tokens and the history the agent keeps: `max_history_tokens` (200,000 when the key is omitted), at most half
   the window, and half the window when it is `0`. A history the window cannot hold gives way, so a 200,000-token
-  window leaves the output 80,000 tokens, not one (ADR 0086). A **preset** above the model's limit is refused at startup, and a profile's own
+  window leaves the output 80,000 tokens, not one (ADR 0088). A **preset** above the model's limit is refused at startup, and a profile's own
   `maxOutputTokens` above its limit is refused when the profiles file is read; the folder's own
   value is clamped. `0` is refused: leave the key out to take the profile and the fallback.
 * **The tools a root agent has without writing any** are the person's screen and a plan: `ask_user`, `show`,
@@ -205,7 +205,7 @@ You are the coder agent. Stop after at most {{max_check_cycles}} failed check cy
   declared server that gave no tools (an `optional` one that is down) is skipped with a warning. Ignored, with a
   warning, on a remote subagent. A policy only applies to failures the tool reports as retryable: an MCP tool's
   call that fails is an error result for the model, so its `retry:` covers little more than a refused bearer.
-* **`session:` is a subagent's say in its sessions** ([ADR 0087](../decisions/0087-every-child-is-a-session-and-the-one-shot-subagent-tool-goes.md),
+* **`session:` is a subagent's say in its sessions** ([ADR 0089](../decisions/0089-every-child-is-a-session-and-the-one-shot-subagent-tool-goes.md),
   slice C3). `mode` (`one_shot`, `sealed` or `open`) is what a `subagent_start` that names no mode gets, **and the widest
   one a call may ask**: a call only narrows it (`open` is wider than `sealed`, which is wider than `one_shot`). `wait`
   (`true` or `false`) is a default only. Without the block a session starts `one_shot`, may be asked up to `open`, and
@@ -227,7 +227,7 @@ You are the coder agent. Stop after at most {{max_check_cycles}} failed check cy
   subagent's line in `subagent_start`'s description says what the file sets (`(mode sealed by default, at most sealed;
   waits by default)`), and a subagent without the block keeps its line as it was. A person's own session through
   `child-sessions/v1` is theirs and is not held to it.
-* **`limits.output` sets what a command tool shows by default** ([ADR 0088](../decisions/0088-a-tool-result-is-bounded-when-it-is-made-and-a-command-that-succeeds-says-so.md),
+* **`limits.output` sets what a command tool shows by default** ([ADR 0090](../decisions/0090-a-tool-result-is-bounded-when-it-is-made-and-a-command-that-succeeds-says-so.md),
   slice T3). Its keys are the three command tools, `run_checks`, `run` and `run_command`; each value is `on_error` (a
   command that succeeds is one line naming the id its output is kept under) or `full` (the output however it ended).
   A call that gives no `output` takes the file's value; a tool the block leaves out keeps its own default
@@ -414,7 +414,7 @@ so a mode's narrowing reaches the helpers too.
 ```
 
 * **A long result is kept and paged, not cut.** A text answer over 16 KiB (the deployment's bound of a tool result,
-  `CHECK_OUTPUT_TAIL_BYTES` in the coder; [ADR 0088](../decisions/0088-a-tool-result-is-bounded-when-it-is-made-and-a-command-that-succeeds-says-so.md))
+  `CHECK_OUTPUT_TAIL_BYTES` in the coder; [ADR 0090](../decisions/0090-a-tool-result-is-bounded-when-it-is-made-and-a-command-that-succeeds-says-so.md))
   is kept and the model is shown a first page within that bound and an output id; the agent gets a `read_output` tool (added when its tools include an MCP tool) that reads the rest by
   lines. A folder agent has no volume, so it keeps the text **in the run's state, at most 4 MiB for the run** (as the tools gave it: a host that sets `ToolCtx::with_scrub` has it scrubbed before it is folded and at every read; the shipped `adam-agent` sets none and has no secrets registry, so it does not); a
   result that would go over is shown as its first page and `[not kept: ...]`. An error result is still cut at

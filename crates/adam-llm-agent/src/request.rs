@@ -1,4 +1,4 @@
-//! The request a model call was given, recorded as content-addressed blobs ([ADR 0085] decision 7).
+//! The request a model call was given, recorded as content-addressed blobs ([ADR 0087] decision 7).
 //!
 //! The model step stores the final request's system prompt (its UTF-8 bytes) and its tool list (the
 //! RFC 8785 canonical JSON of the `Vec<ToolSpec>`, so equal lists are equal bytes) with
@@ -12,7 +12,7 @@
 //! put that fails, never fails the model call. The turn records no request (logged once), and the
 //! state's `request` is `None` for it.
 //!
-//! [ADR 0085]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0085-runs-are-exported-as-training-records.md
+//! [ADR 0087]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0087-runs-are-exported-as-training-records.md
 
 use std::sync::atomic::{AtomicBool, Ordering};
 

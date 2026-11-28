@@ -31,7 +31,7 @@ pub const DEFAULT_THREAD_TOOLS_MAX_CALL: Duration = Duration::from_secs(3600);
 /// The most bytes of an MCP result the model reads whole when the deployment says nothing (the
 /// default of [`McpPolicy::result_bytes`]): 16 KiB, the default of the coder's
 /// `CHECK_OUTPUT_TAIL_BYTES`, so that a call costs the same whichever kind of tool made it
-/// ([ADR 0088](https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0088-a-tool-result-is-bounded-when-it-is-made-and-a-command-that-succeeds-says-so.md),
+/// ([ADR 0090](https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0090-a-tool-result-is-bounded-when-it-is-made-and-a-command-that-succeeds-says-so.md),
 /// decision 2). A longer result is kept and shown as a first page within the bound, which
 /// `read_output` pages on.
 pub const DEFAULT_RESULT_BYTES: usize = 16 * 1024;
@@ -345,7 +345,7 @@ impl McpPolicy {
     /// result is cut at it. Default 16 KiB ([`DEFAULT_RESULT_BYTES`]); less than
     /// [`MIN_RESULT_BYTES`] is raised to it. **The deployment's, not the agent's:** the coder sets
     /// it to its `CHECK_OUTPUT_TAIL_BYTES`, so an MCP result and a command's output have one bound
-    /// (ADR 0088).
+    /// (ADR 0090).
     #[must_use]
     pub fn result_bytes(mut self, bytes: usize) -> Self {
         self.result_bytes = bytes.max(MIN_RESULT_BYTES);

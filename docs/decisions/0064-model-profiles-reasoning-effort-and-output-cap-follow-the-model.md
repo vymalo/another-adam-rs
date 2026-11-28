@@ -388,7 +388,7 @@ front's reading and the card entry that lets a client offer the choices. It is a
 what a served run is answered by, which is this ADR's subject, and claims no number.
 
 1. **The extension and its card entry.** URI `https://agents.vymalo.com/a2a/extensions/model-pick/v1`, aligned with the
-   system's ADR 0086 (`docs/api/model-pick-v1.md`): the card's `params` are `{"choices": ["<alias>", ..]}` — the
+   system's ADR 0088 (`docs/api/model-pick-v1.md`): the card's `params` are `{"choices": ["<alias>", ..]}` — the
    aliases the deployment offers this agent, each once, in the order the assembly lists them — and a message names one
    as `metadata[URI] = {"model": "<alias>"}`. The reading is `adam_a2a::ModelChoices`; `ExtensionConfig::model_pick` builds
    the entry. **Only aliases the deployment lists:** the list is the profiles of `MODEL_ALIASES_FILE` minus the
@@ -461,7 +461,7 @@ served card in `crates/adam-service/tests/serve.rs`.
 
 *Amended 2026-11-28:* **decision 4's clamp reserves at most half the window for the history**, for the agent's own
 model as for a fallback or a pick (amended 2026-11-23): `min(max_history_tokens, window / 2)`, and `window / 2` for
-`0`. An omitted key is 200,000 tokens since [ADR 0086](0086-the-context-window-follows-the-model-and-the-history-budget-is-200k.md)
+`0`. An omitted key is 200,000 tokens since [ADR 0088](0088-the-context-window-follows-the-model-and-the-history-budget-is-200k.md)
 slice W3, which would otherwise leave one output token on any window up to 220,000. A folder whose explicit
 `max_history_tokens` is over half its window no longer squeezes the cap below what half the window leaves; its
 compaction budget is then the window's.

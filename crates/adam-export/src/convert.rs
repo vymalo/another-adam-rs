@@ -695,7 +695,7 @@ mod tests {
 
     /// The bytes of a record as the exporter wrote them before records could name their source
     /// (`Record::source`): a record with no source is the same line, so one unnamed source's export
-    /// is byte-identical to the one before the ports (ADR 0085, *Amended*: ports and adapters).
+    /// is byte-identical to the one before the ports (ADR 0087, *Amended*: ports and adapters).
     #[test]
     fn a_record_without_a_source_is_the_line_it_was() {
         let id = |text: &str| -> RunId { serde_json::from_value(json!(text)).expect("a run id") };

@@ -190,7 +190,7 @@ async fn build_agent(
         folder.and_then(|l| l.command_memory.as_deref()),
         folder.and_then(|l| l.command_cpu.as_deref()),
     ));
-    // What the command tools show when a call gives no `output` (ADR 0088 slice T3): the folder's
+    // What the command tools show when a call gives no `output` (ADR 0090 slice T3): the folder's
     // `limits.output`, else each tool's own default.
     if let Some(output) = folder.and_then(|l| l.output.as_ref()) {
         settings.set_output_defaults(output);
@@ -250,7 +250,7 @@ async fn build_agent(
         // An App that finds the installation of each owner needs each call to name its account.
         worker.github.finds_installations(),
     ));
-    // A result over CHECK_OUTPUT_TAIL_BYTES is kept and paged, as a command's output is (ADR 0088).
+    // A result over CHECK_OUTPUT_TAIL_BYTES is kept and paged, as a command's output is (ADR 0090).
     let policy =
         worker
             .mcp_policy()

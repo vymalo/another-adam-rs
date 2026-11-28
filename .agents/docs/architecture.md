@@ -31,7 +31,7 @@ bindings ([ADR 0031](../../docs/decisions/0031-swagger-ui-and-the-a2a-rest-bindi
 * The chart was rendered, not applied to a cluster; how it reaches the cluster after the tag bump is
   outside this repository.
 
-## The model's window (ADR 0086, slice W1)
+## The model's window (ADR 0088, slice W1)
 
 Built 2026-11-27. The invariant: **one rule answers a model alias's window**, and every reader asks the client.
 
@@ -66,7 +66,7 @@ Tests: `profiles.rs` `a_context_window_is_one_to_two_to_the_53_minus_one_tokens`
 `a_subagent_on_another_alias_has_its_own_profiles_window`; `adam-engine` `tests/engine.rs`
 `the_profiles_window_reaches_a_client_without_profiles` and the unit tests of `src/profiled.rs`.
 
-## The history budget's default (ADR 0086, slice W3)
+## The history budget's default (ADR 0088, slice W3)
 
 Built 2026-11-28. The invariants: **one constant is the default**, and **a history the window cannot hold never
 squeezes the output cap to nothing**.
@@ -90,7 +90,7 @@ Tests: `compaction.rs` `the_default_history_budget_is_the_budget_when_no_window_
 `adam-assembly` `tests/cap.rs` `a_history_the_window_cannot_hold_leaves_the_output_half_the_window` and the cases
 before it; `adam-engine` `the_deployments_profiles_reach_an_engines_agent` (80,000 on a 200,000 window).
 
-## The default window's variable (ADR 0086, slice W2)
+## The default window's variable (ADR 0088, slice W2)
 
 Built 2026-11-28. The invariant: **one variable answers the window outside the profiles, and two answers fail closed.**
 
@@ -108,7 +108,7 @@ Built 2026-11-28. The invariant: **one variable answers the window outside the p
   `config.extraEnv`. No golden sets the value, so no golden changed; `tests/render-check.sh` holds the name.
 * Every in-repository writer moved: `compose.yaml`, `dev/compose.real-model.yaml`. `bench/` did not: it starts the
   coder image pinned in `bench/pins.json` (`sha-9a9e6c5`, 2026-11-21), which reads only the old name; it moves with the pin.
-* The alias is removed in a later minor release, with a dated *Amended* note on ADR 0086.
+* The alias is removed in a later minor release, with a dated *Amended* note on ADR 0088.
 
 Tests: `adam-service` `model_context_window_is_a_deprecated_alias_of_default_model_context_window` (new alone, old
 alone with one warning, equal, different, one invalid, blank alias; the `WARN` lines captured with a
@@ -232,7 +232,7 @@ Read 2026-11-26 at the head of PR #453.
 * **Vector.** `crates/adam-llm-agent/tests/vectors/turn_chain_vector.py` regenerates the golden constants of `signing.rs`
   (checked identical 2026-11-26).
 
-## Child runs: a subagent's tool starts a one-shot session (ADR 0087, slice C1)
+## Child runs: a subagent's tool starts a one-shot session (ADR 0089, slice C1)
 
 For people: [Child runs](../../docs/architecture.md#child-runs). *Verified 2026-11-27* by reading the code and running the
 tests named here.

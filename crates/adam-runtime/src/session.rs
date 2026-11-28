@@ -158,13 +158,13 @@ pub fn closing_round_payload(header: &SessionHeader) -> Value {
     Value::Object(payload)
 }
 
-/// Who may write to a session after it started, chosen when it starts ([ADR 0087] decision 2).
+/// Who may write to a session after it started, chosen when it starts ([ADR 0089] decision 2).
 /// Ordered from the narrowest to the widest, as ADR 0054 narrows an option: `OneShot` is narrower
 /// than `Sealed`, which is narrower than `Open`.
 ///
 /// The enum is closed on purpose (Rule 3): a new mode must fail to compile in every consumer.
 ///
-/// [ADR 0087]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0087-every-child-is-a-session-and-the-one-shot-subagent-tool-goes.md
+/// [ADR 0089]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0089-every-child-is-a-session-and-the-one-shot-subagent-tool-goes.md
 #[derive(
     Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
 )]
@@ -201,7 +201,7 @@ impl SessionMode {
     }
 
     /// The mode the `keep_open` of before means: `true` is [`Open`](Self::Open), `false`
-    /// [`OneShot`](Self::OneShot). Read for one release (ADR 0087, amended 2026-11-27).
+    /// [`OneShot`](Self::OneShot). Read for one release (ADR 0089, amended 2026-11-27).
     pub fn of_keep_open(keep_open: bool) -> Self {
         if keep_open { Self::Open } else { Self::OneShot }
     }
@@ -250,12 +250,12 @@ pub struct SessionHeader {
     pub agent: String,
     /// What the session is for, in the words of whoever started it (a line, at most 80 characters).
     pub description: String,
-    /// Who may write to the session after its first round ([ADR 0087] decision 2): it closes when
+    /// Who may write to the session after its first round ([ADR 0089] decision 2): it closes when
     /// its round has ended ([`SessionMode::OneShot`], the default of the tools), or it waits for a
     /// message of its agent only ([`SessionMode::Sealed`]) or of the person too
     /// ([`SessionMode::Open`]).
     ///
-    /// [ADR 0087]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0087-every-child-is-a-session-and-the-one-shot-subagent-tool-goes.md
+    /// [ADR 0089]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0089-every-child-is-a-session-and-the-one-shot-subagent-tool-goes.md
     pub mode: SessionMode,
     /// The session takes no more messages: set by the round that closes it, or by a close request
     /// that a working round has read. Absent when `false`.
@@ -312,13 +312,13 @@ pub struct SessionHeader {
 }
 
 impl SessionHeader {
-    /// Whether a person may write to the session ([ADR 0087] decision 2): a session an agent
+    /// Whether a person may write to the session ([ADR 0089] decision 2): a session an agent
     /// started takes the person's messages only when it is [`SessionMode::Open`]; a session a
     /// person started is theirs, whatever its mode. A person's session names no root run
     /// ([`root`](Self::root) is `None`), and neither does a header written before `root` existed,
     /// which therefore reads as a person's, as every session did before modes.
     ///
-    /// [ADR 0087]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0087-every-child-is-a-session-and-the-one-shot-subagent-tool-goes.md
+    /// [ADR 0089]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0089-every-child-is-a-session-and-the-one-shot-subagent-tool-goes.md
     pub fn takes_person_messages(&self) -> bool {
         self.mode.takes_person_messages() || self.root.is_none()
     }
@@ -1498,7 +1498,7 @@ mod tests {
         assert_eq!(back.root, Some(root));
     }
 
-    /// ADR 0087 slice C2: a header of before, with `keep_open` only, reads as the mode it meant; a
+    /// ADR 0089 slice C2: a header of before, with `keep_open` only, reads as the mode it meant; a
     /// header of now writes `mode` and, for one release, the `keep_open` a reader of before needs;
     /// and one with neither is no header.
     #[test]
@@ -1517,7 +1517,7 @@ mod tests {
             mode(json!({"keep_open": false})),
             Some(SessionMode::OneShot)
         );
-        // A one-shot session closed from its start (ADR 0087 slice C1) reads the same way.
+        // A one-shot session closed from its start (ADR 0089 slice C1) reads the same way.
         let c1 = of(json!({"keep_open": false, "closed": true})).unwrap();
         assert!(c1.mode == SessionMode::OneShot && c1.closed);
         assert_eq!(mode(json!({"mode": "sealed"})), Some(SessionMode::Sealed));

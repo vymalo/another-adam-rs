@@ -8,7 +8,7 @@
 //! [`adam_agent::serve`].
 //!
 //! `adam-agent export [...]` serves nothing: it writes the folder's runs as training records
-//! ([`adam_agent::export`], ADR 0085) and exits.
+//! ([`adam_agent::export`], ADR 0087) and exits.
 
 use std::future::Future;
 use std::process::ExitCode;

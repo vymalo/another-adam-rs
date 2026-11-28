@@ -77,9 +77,9 @@ table above:
    (with the plan pages as its other attachments) — it is prose over the same runs, not a ledger,
    so a figure that has to be *recomputed* comes from step 1, never from it.
 
-## ADR 0088: hidden outputs
+## ADR 0090: hidden outputs
 
-[ADR 0088](../docs/decisions/0088-a-tool-result-is-bounded-when-it-is-made-and-a-command-that-succeeds-says-so.md)
+[ADR 0090](../docs/decisions/0090-a-tool-result-is-bounded-when-it-is-made-and-a-command-that-succeeds-says-so.md)
 hides a successful command's output behind one line and keeps it for `read_output`. Its decision 5
 keeps that only if it is measured: on the same tasks, before and after, compare calls per task,
 `read_output` calls, input tokens per task and the cache share of the prompt; **if hidden outputs make

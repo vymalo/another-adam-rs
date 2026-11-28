@@ -678,7 +678,7 @@ pub async fn keep_long_cut(
 /// many lines as fit beside the line that names the kept text and the page's final line, so the
 /// next offset it names is where the shown lines end. A page always has one line, so a line longer
 /// than the room is shown whole (folded at [`MAX_LINE_CHARS`] characters). An MCP result is shown
-/// this way, within the deployment's bound of a tool result (ADR 0088).
+/// this way, within the deployment's bound of a tool result (ADR 0090).
 pub async fn keep_long_within(
     ctx: &ToolCtx,
     text: &str,

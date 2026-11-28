@@ -303,7 +303,7 @@ pub struct Limits {
     pub max_output_tokens: Option<u32>,
     /// Budget for the history sent to the model, in tokens: the run compacts at the smaller of
     /// this and what the model's window leaves; `0` leaves the window's alone. Absent: the loop's
-    /// default, 200,000 (`adam_llm_agent::DEFAULT_MAX_HISTORY_TOKENS`, ADR 0086).
+    /// default, 200,000 (`adam_llm_agent::DEFAULT_MAX_HISTORY_TOKENS`, ADR 0088).
     #[serde(skip_serializing_if = "Option::is_none", alias = "maxHistoryTokens")]
     pub max_history_tokens: Option<u32>,
     /// The longest a run of this agent may take **as a subagent**, in minutes; `0` is no limit, at
@@ -352,11 +352,11 @@ pub struct Limits {
         alias = "maxInlineUploadBytes"
     )]
     pub max_inline_upload_bytes: Option<u64>,
-    /// What the command tools show of an output when a call gives no `output` ([ADR 0088]
+    /// What the command tools show of an output when a call gives no `output` ([ADR 0090]
     /// decision 3): a default per tool. Root agent only (the tools are the process's); read by
     /// `adam-coder`, the agent that has the three tools.
     ///
-    /// [ADR 0088]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0088-a-tool-result-is-bounded-when-it-is-made-and-a-command-that-succeeds-says-so.md
+    /// [ADR 0090]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0090-a-tool-result-is-bounded-when-it-is-made-and-a-command-that-succeeds-says-so.md
     #[serde(skip_serializing_if = "Option::is_none")]
     pub output: Option<OutputDef>,
     /// Keys this schema does not know.
@@ -364,13 +364,13 @@ pub struct Limits {
     pub extra: BTreeMap<String, Value>,
 }
 
-/// What a command's result shows of its output (`limits.output.<tool>`, [ADR 0088] decision 3):
+/// What a command's result shows of its output (`limits.output.<tool>`, [ADR 0090] decision 3):
 /// the file's word for `adam_code_tools::OutputMode`, which this crate does not depend on.
 ///
 /// The enum is closed on purpose (Rule 3): `adam-coder` maps it onto the tools' with a match that
 /// has no wildcard, so a mode added on either side fails to compile there.
 ///
-/// [ADR 0088]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0088-a-tool-result-is-bounded-when-it-is-made-and-a-command-that-succeeds-says-so.md
+/// [ADR 0090]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0090-a-tool-result-is-bounded-when-it-is-made-and-a-command-that-succeeds-says-so.md
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OutputModeDef {
@@ -399,13 +399,13 @@ impl fmt::Display for OutputModeDef {
 }
 
 /// `limits.output`: the default `output` of each command tool, the one a call that gives none
-/// takes ([ADR 0088] decision 3). A tool the block leaves out keeps its own default (`run_checks`
+/// takes ([ADR 0090] decision 3). A tool the block leaves out keeps its own default (`run_checks`
 /// and `run`: `on_error`; `run_command`: `full`), and a call's `output` always wins.
 ///
 /// **Unknown keys are refused** (`deny_unknown_fields`): the keys are the three tools' names, and
 /// a misspelt one would leave a tool showing what the file says it does not.
 ///
-/// [ADR 0088]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0088-a-tool-result-is-bounded-when-it-is-made-and-a-command-that-succeeds-says-so.md
+/// [ADR 0090]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0090-a-tool-result-is-bounded-when-it-is-made-and-a-command-that-succeeds-says-so.md
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct OutputDef {
@@ -420,14 +420,14 @@ pub struct OutputDef {
     pub run_command: Option<OutputModeDef>,
 }
 
-/// Who may write to a session of a subagent after its first round (`session.mode`, [ADR 0087]
+/// Who may write to a session of a subagent after its first round (`session.mode`, [ADR 0089]
 /// decision 2): the file's word for `adam_runtime::SessionMode`, which this crate does not depend
 /// on. Narrowest first, as the runtime's: `one_shot`, `sealed`, `open`.
 ///
 /// The enum is closed on purpose (Rule 3): `adam-assembly` maps it onto the runtime's with a match
 /// that has no wildcard, so a mode added on either side fails to compile there.
 ///
-/// [ADR 0087]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0087-every-child-is-a-session-and-the-one-shot-subagent-tool-goes.md
+/// [ADR 0089]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0089-every-child-is-a-session-and-the-one-shot-subagent-tool-goes.md
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SessionModeDef {
@@ -457,7 +457,7 @@ impl fmt::Display for SessionModeDef {
     }
 }
 
-/// `session:` in a subagent's file ([ADR 0087] decision 4): the defaults of a `subagent_start` that
+/// `session:` in a subagent's file ([ADR 0089] decision 4): the defaults of a `subagent_start` that
 /// does not say, and the ceiling of one that does. `mode` is both the mode a start gets when it
 /// names none and the widest it may ask (a start only narrows it: `open` is wider than `sealed`,
 /// which is wider than `one_shot`); `wait` is a default only. Both are optional; a file without the
@@ -466,7 +466,7 @@ impl fmt::Display for SessionModeDef {
 /// **Unknown keys are refused** (`deny_unknown_fields`): a misspelt `mode` would leave a subagent
 /// wider than its file says. A subagent's key: on the root agent it is ignored with a warning.
 ///
-/// [ADR 0087]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0087-every-child-is-a-session-and-the-one-shot-subagent-tool-goes.md
+/// [ADR 0089]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0089-every-child-is-a-session-and-the-one-shot-subagent-tool-goes.md
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct SessionDef {
@@ -690,7 +690,7 @@ pub struct AgentFrontmatter {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub files: Option<bool>,
     /// The defaults and the ceiling of the sessions a parent starts on this subagent
-    /// ([`SessionDef`], ADR 0087 decision 4); local and remote subagents alike. Left out of the
+    /// ([`SessionDef`], ADR 0089 decision 4); local and remote subagents alike. Left out of the
     /// JSON (and so of the digest) when absent.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session: Option<SessionDef>,

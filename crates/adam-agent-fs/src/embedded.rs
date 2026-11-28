@@ -353,7 +353,7 @@ pub struct EmbeddedRemote {
     pub auth: Option<EmbeddedAuth>,
     /// `files: true`: the file parts of the agent's answer are shared as files of the calling run.
     pub files: bool,
-    /// The frontmatter's `session:` (ADR 0087 decision 4).
+    /// The frontmatter's `session:` (ADR 0089 decision 4).
     pub session: Option<SessionDef>,
     /// The body of the file, which extends the tool description.
     pub note: &'static str,

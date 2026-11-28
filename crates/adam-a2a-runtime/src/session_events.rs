@@ -166,7 +166,7 @@ pub(crate) struct Seen {
     pub context: String,
     pub agent: String,
     pub description: String,
-    /// Who may write to the session (ADR 0087).
+    /// Who may write to the session (ADR 0089).
     pub mode: adam_runtime::SessionMode,
     pub by: By,
     pub round: u32,

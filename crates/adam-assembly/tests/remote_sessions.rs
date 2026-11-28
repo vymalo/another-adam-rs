@@ -611,7 +611,7 @@ async fn a_remote_session_keeps_its_context_across_rounds() {
     }
 }
 
-/// ADR 0087 slice C2: a remote session takes `mode` and `wait` as a local one does, since its
+/// ADR 0089 slice C2: a remote session takes `mode` and `wait` as a local one does, since its
 /// rounds are local runs of the round agent: `sealed` with `wait: true` parks the start on round 1,
 /// answers the remote's report as the call's result, and leaves the session idle for the parent's
 /// next round, which continues the remote's context.

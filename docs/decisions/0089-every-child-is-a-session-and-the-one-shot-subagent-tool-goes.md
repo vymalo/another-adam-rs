@@ -1,4 +1,4 @@
-# 0087. Every child is a session, and the one-shot subagent tool goes
+# 0089. Every child is a session, and the one-shot subagent tool goes
 
 Status: **Accepted** (2026-11-27). The owner decided on 2026-11-27: *"I don't like the idea of the parent waiting for the
 one-shot. [...] We should remove the one-shot thing; a normal child session can also be one-shot. We can simply have
@@ -9,7 +9,7 @@ the agent has config options."* Decisions 2 (the defaults of `wait` and `mode`),
 [ADR 0045](0045-a-subagent-can-run-in-the-background-as-a-session.md),
 [ADR 0054](0054-a-child-session-can-be-configured-within-what-its-folder-allows.md) and
 [ADR 0037](0037-parallel-subagent-calls-and-an-editing-worker.md); serves
-[ADR 0085](0085-runs-are-exported-as-training-records.md).
+[ADR 0087](0087-runs-are-exported-as-training-records.md).
 
 *Amended 2026-11-27, the owner:* *"We'll stay only with sub-agents with sessions, and have one option for sealed or
 one-shot sub-agents while creating them."* Decision 2's `access` and ADR 0045's `keep_open` overlapped (a session that
@@ -43,7 +43,7 @@ An agent has two ways to use a subagent today (*verified 2026-11-27*):
 | Options | the folder's limits only | `keep_open`, `config` (ADR 0054) |
 
 So the same thing has two shapes, the one-shot shape blocks the parent, and its child cannot be followed up. Because it
-has no conversation id, it is not listed by conversation, so the exporter of ADR 0085 cannot reach its trajectory.
+has no conversation id, it is not listed by conversation, so the exporter of ADR 0087 cannot reach its trajectory.
 
 ## Decision
 
@@ -78,7 +78,7 @@ has no conversation id, it is not listed by conversation, so the exporter of ADR
 
 | Slice | What |
 |---|---|
-| C1 | Every child gets a session's conversation id; the named subagent tools wrap `subagent_start`. ADR 0085's exporter reaches every child. |
+| C1 | Every child gets a session's conversation id; the named subagent tools wrap `subagent_start`. ADR 0087's exporter reaches every child. |
 | C2 | `mode` and `wait` on `subagent_start`, local and remote; `keep_open` read for one release and mapped onto `mode`; the person's write is refused by `mode`; tests for each value. |
 | C3 | `session:` defaults in a subagent's file, narrowed by ADR 0054's rule; `docs/reference/agent-files.md`. |
 | C4 | The named tools go; the coder's instructions, the dev agents and the parity page use `subagent_start`; `child-sessions/v1` carries `mode`. |

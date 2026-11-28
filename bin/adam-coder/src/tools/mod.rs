@@ -181,7 +181,7 @@ pub struct CoderSettings {
     /// What `run_command` and `run` show of an output when a call gives no `output`: the tools'
     /// own defaults ([`OutputDefaults::TOOLS`](adam_code_tools::OutputDefaults::TOOLS)) unless the
     /// folder's `limits.output` sets others ([`set_output_defaults`](Self::set_output_defaults),
-    /// ADR 0088 slice T3).
+    /// ADR 0090 slice T3).
     pub command_output: adam_code_tools::OutputDefaults,
     /// The same for `run_checks`: [`checks::DEFAULT_OUTPUT`] unless the folder's
     /// `limits.output.run_checks` sets another.
@@ -270,7 +270,7 @@ impl CoderSettings {
         !self.create_repo_owners.is_empty() || self.create_for_installed_owners
     }
 
-    /// Take the defaults of the folder's `limits.output` (ADR 0088 slice T3): each command tool it
+    /// Take the defaults of the folder's `limits.output` (ADR 0090 slice T3): each command tool it
     /// names shows what it says when a call gives no `output`; a tool it leaves out keeps the
     /// default it had. A call's `output` still wins.
     pub fn set_output_defaults(&mut self, folder: &adam::agent_fs::OutputDef) {

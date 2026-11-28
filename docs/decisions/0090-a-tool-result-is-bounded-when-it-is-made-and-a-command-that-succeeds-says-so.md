@@ -1,11 +1,11 @@
-# 0088. A tool result is bounded when it is made, and a command that succeeds can say only that
+# 0090. A tool result is bounded when it is made, and a command that succeeds can say only that
 
 Status: **Accepted** (2026-11-27). The owner decided on 2026-11-27: *"Yes do the ADR on capping tool. One idea too. For
 bash scripts, we hide the response by default if no error and add an option to view the responses even if successful."*
 Decision 3's per-tool defaults (`run_command` keeps showing its output) and decision 2's bound for MCP results are this
 ADR's choices for the owner to confirm. Builds on
 [ADR 0044](0044-paged-tools-a-stable-prompt-prefix-a-plan-skills-commands-and-project-context.md) (paged tools, a stable
-prompt prefix) and [ADR 0086](0086-the-context-window-follows-the-model-and-the-history-budget-is-200k.md) (the history
+prompt prefix) and [ADR 0088](0088-the-context-window-follows-the-model-and-the-history-budget-is-200k.md) (the history
 budget).
 
 *Amended 2026-11-28:* slice T1 is built. `run_command`, `run` and `run_checks` take `output` (`adam_code_tools::OutputMode`),
@@ -15,7 +15,7 @@ line, its exit line as before (`exit code 0`, or `exit code 0: passed` for a che
 deviations from the table: the exit code stays on its own line, and the size and id go on a line in brackets, so that a
 shortened history recognises it as a kept-output pointer; and an output that printed nothing says `(no output)` and keeps
 nothing. An output the keeper refused is shown as with `full`. The evidence:
-[0088: the evidence and the slice proofs](../../.agents/docs/decisions/0088-a-tool-result-is-bounded-when-it-is-made-and-a-command-that-succeeds-says-so.md).
+[0090: the evidence and the slice proofs](../../.agents/docs/decisions/0090-a-tool-result-is-bounded-when-it-is-made-and-a-command-that-succeeds-says-so.md).
 
 ## Context
 
@@ -84,7 +84,7 @@ What adam does today (*verified 2026-11-27*):
 * A typical run (several builds and test passes that succeed) keeps far fewer tokens in its history, so each later call is
   cheaper and a shortening, which moves the cached prefix, is rarer.
 * The model loses nothing: every output is kept and one `read_output` call away.
-* The exporter's samples (ADR 0085) show the success line, which is what the model saw.
+* The exporter's samples (ADR 0087) show the success line, which is what the model saw.
 * No `Store`, `Notifier` or `ModelClient` method changes.
 
 *Amended 2026-11-28:* slice T2 is built. The MCP bound is the deployment's, `McpPolicy::result_bytes`: 16 KiB by default
@@ -96,7 +96,7 @@ state (`shortening_usage`: the count and the characters it took out) and written
 the `usage/v1` object, `{"count": 2, "charsRemoved": 412000}`, with an `info` log line. Two choices the decision left open:
 the count is the run's own history, not its children's, and a task whose history was never shortened carries the object it
 always did. The evidence:
-[0088: the evidence and the slice proofs](../../.agents/docs/decisions/0088-a-tool-result-is-bounded-when-it-is-made-and-a-command-that-succeeds-says-so.md#t2-built-2026-11-28).
+[0090: the evidence and the slice proofs](../../.agents/docs/decisions/0090-a-tool-result-is-bounded-when-it-is-made-and-a-command-that-succeeds-says-so.md#t2-built-2026-11-28).
 
 *Amended 2026-11-28:* slice T4's tooling is built; the measurement waits for the owner's ledgers. `bench numbers` prints,
 per agent over the finished runs, `read_output` calls per task (the `read_output` entries of the settled calls'
@@ -105,7 +105,7 @@ the fixed prompt, and `bench numbers --ledger <after> --against <before>` puts t
 finished, with the change and the case of decision 5 that the movement is (no threshold: the weighing stays the owner's).
 The ledger keeps a tool call's name, not its arguments, so it cannot say whose output a `read_output` call read; decision 5
 is per tool, and a case that points back to `full` does not name the tool. The command, the table to fill and what a
-ledger cannot say: [The numbers: ADR 0088](../../bench/NUMBERS.md#adr-0088-hidden-outputs).
+ledger cannot say: [The numbers: ADR 0090](../../bench/NUMBERS.md#adr-0090-hidden-outputs).
 
 *Amended 2026-11-28:* slice T3 is built. The root agent's file sets the defaults with `limits.output`, a map from the three
 tools to the two modes: `limits: { output: { run_checks: full, run_command: on_error } }`. A tool the block leaves out
@@ -114,4 +114,4 @@ choices the decision left open: the block is the **root agent's** (the tools are
 ignored with a warning), and the tools' descriptions keep naming their own defaults, so the prompt prefix does not move
 with a folder; every result says what it shows. `adam-coder` reads it; `adam-agent` has none of these tools. No variable
 is involved, and the shipped folder sets none. The evidence:
-[0088: the evidence and the slice proofs](../../.agents/docs/decisions/0088-a-tool-result-is-bounded-when-it-is-made-and-a-command-that-succeeds-says-so.md#t3-built-2026-11-28).
+[0090: the evidence and the slice proofs](../../.agents/docs/decisions/0090-a-tool-result-is-bounded-when-it-is-made-and-a-command-that-succeeds-says-so.md#t3-built-2026-11-28).

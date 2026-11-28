@@ -152,7 +152,7 @@ pub(crate) fn parse_agent_file(
     {
         sink.warn(
             key_line(&split, "limits"),
-            "`limits.output` is the root agent's (the command tools are the process's, ADR 0088): \
+            "`limits.output` is the root agent's (the command tools are the process's, ADR 0090): \
              ignored on a subagent",
         );
     }

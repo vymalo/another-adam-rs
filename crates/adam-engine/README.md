@@ -81,7 +81,7 @@ host brings the one it chooses), the agent's definition (`AgentDef`, from `inclu
 the model (`DynModel`, with its credentials: ADR 0047 decision 4, [ADR
 0058](../../docs/decisions/0058-the-models-credentials-come-from-a-provider-asked-for-each-call.md)), the
 deployment's profiles (`ModelProfiles`, `EngineBuilder::models`: what each model takes as a reasoning effort, the
-preset it starts from, its output cap and its `contextWindow`, ADR 0063, ADR 0064 and ADR 0086; without them an
+preset it starts from, its output cap and its `contextWindow`, ADR 0063, ADR 0064 and ADR 0088; without them an
 agent whose file sets an effort or a preset is refused, fail closed), and, for an embedded agent whose file sets none, the root's reasoning level
 (`EngineBuilder::reasoning_effort`, a `ReasoningEffort`; the folder's key wins). If the agent's files name secrets,
 a `SecretSource` too. The profiles reach the model client as well: for an alias the host's client has no profile
@@ -428,7 +428,7 @@ every wait is bounded by `tokio::time::timeout`:
   `Rig`: `GateModel` forwards no `context_window`);
 * `the_profiles_window_reaches_a_client_without_profiles`: `EngineBuilder::models` with `contextWindow: 200000` and
   `maxOutputTokens: 100000`, over a client with no profiles told a 1,000,000-token window for the alias: the run's
-  `usage/v1` report carries 200,000 and the cap is clamped to 80,000 (ADR 0086, slice W1 amended 2026-11-28; the unit
+  `usage/v1` report carries 200,000 and the cap is clamped to 80,000 (ADR 0088, slice W1 amended 2026-11-28; the unit
   tests of `src/profiled.rs` pin the precedence: the client's own profile wins whole, a profile without a window falls
   through to the client's);
 * `the_builders_level_is_the_roots_and_the_file_wins`: `EngineBuilder::reasoning_effort(high)` with a folder

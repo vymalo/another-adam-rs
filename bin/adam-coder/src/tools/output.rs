@@ -14,7 +14,7 @@ pub(super) use adam_code_tools::output::{
     OutputMode, escaped, head_of, section, section_as, tail_of,
 };
 
-/// The tools' mode for the file's word (`limits.output.<tool>`, ADR 0088 slice T3). No wildcard
+/// The tools' mode for the file's word (`limits.output.<tool>`, ADR 0090 slice T3). No wildcard
 /// (Rule 3): a mode added on either side fails to compile here until it is mapped.
 pub(super) fn mode_of(file: OutputModeDef) -> OutputMode {
     match file {

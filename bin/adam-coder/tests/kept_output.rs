@@ -1,7 +1,7 @@
 //! Kept command output and `read_output` (ADR 0044, slice 3): a long output is shown as its head and
 //! tail with an id, kept whole and scrubbed on the volume, and read back by lines; a command takes a
 //! `timeout` of its own, never over the deployment's limit; and each command tool takes `output`
-//! (ADR 0088): with `on_error` (the default of `run` and `run_checks`) a command that succeeds is one
+//! (ADR 0090): with `on_error` (the default of `run` and `run_checks`) a command that succeeds is one
 //! line naming the id its output is kept under, short output included.
 #![allow(clippy::unwrap_used, clippy::expect_used)] // integration tests assert by unwrapping
 
@@ -1121,7 +1121,7 @@ fn the_kept_output_of_a_command_is_in_the_value_only_as_text() {
     assert!(v.get("kept").is_none());
 }
 
-/// The folder's `limits.output` (ADR 0088 slice T3) is what a call that gives no `output` shows, for
+/// The folder's `limits.output` (ADR 0090 slice T3) is what a call that gives no `output` shows, for
 /// each of the three tools: here each is set to the other mode than its own. A call's `output`
 /// still wins, and a tool the block leaves out keeps its own default.
 #[tokio::test]
@@ -1190,7 +1190,7 @@ async fn the_folders_output_defaults_are_what_a_call_without_output_shows() {
     );
 }
 
-/// Without `limits.output` the settings hold each tool's own default (ADR 0088 decision 3), and an
+/// Without `limits.output` the settings hold each tool's own default (ADR 0090 decision 3), and an
 /// empty block changes nothing.
 #[test]
 fn without_a_folder_block_each_tool_keeps_its_own_default() {

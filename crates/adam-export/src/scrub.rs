@@ -1,4 +1,4 @@
-//! What removes secrets from a record's text (ADR 0085 decision 4).
+//! What removes secrets from a record's text (ADR 0087 decision 4).
 
 use std::borrow::Cow;
 use std::sync::LazyLock;

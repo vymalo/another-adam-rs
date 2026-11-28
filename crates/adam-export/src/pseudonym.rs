@@ -1,4 +1,4 @@
-//! Pseudonymous ids: HMAC-SHA256 under the operator's key (ADR 0085 decision 4).
+//! Pseudonymous ids: HMAC-SHA256 under the operator's key (ADR 0087 decision 4).
 
 use std::fmt;
 

@@ -1,4 +1,4 @@
-//! `adam-coder export`: the coder's runs as training records (ADR 0085, slice E2).
+//! `adam-coder export`: the coder's runs as training records (ADR 0087, slice E2).
 //!
 //! It reads what an export needs and nothing a role needs: `DATABASE_URL`, `ADAM_AGENT_DIR` (the
 //! folder, or the embedded copy when it is unset, as serving reads it), `ADAM_EXTRA_MCP_FILE` when

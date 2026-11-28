@@ -1,4 +1,4 @@
-//! What a run touched, read from its transcript (ADR 0085 decision 5).
+//! What a run touched, read from its transcript (ADR 0087 decision 5).
 //!
 //! * `lang`: the language of each file a tool call names (`src/main.rs` is `rust`), and of the
 //!   build tool a command runs (`cargo` is `rust`).

@@ -1,4 +1,4 @@
-//! The `export` command every agent binary has (ADR 0085, slice E2): its arguments, its
+//! The `export` command every agent binary has (ADR 0087, slice E2): its arguments, its
 //! environment and the run that writes the records.
 //!
 //! A binary reads its own files, builds its scrub from the secrets it knows and registers its
@@ -43,7 +43,7 @@ pub fn usage(binary: &str) -> String {
          [--since RFC3339] [--until RFC3339] [--include-compacted] [--verified-only] \
          [--include-reasoning] [--samples run|turn] [--max-tokens N] [--out PATH]\n\
          \n\
-         Writes one JSON Lines record per run, or per assistant turn (ADR 0085), to standard output, \
+         Writes one JSON Lines record per run, or per assistant turn (ADR 0087), to standard output, \
          or to PATH (created or truncated, mode 0600).\n\
          \n\
          --agent NAME          an agent this binary registers (repeatable); default: every one\n\

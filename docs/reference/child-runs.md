@@ -254,12 +254,12 @@ background as a session that is sent more messages. The runtime half (slice 1) i
 
 **What the runtime has.**
 
-* **A subagent's own tool starts a one-shot session** (ADR 0087, slice C1): `ToolCtx::start_one_shot_session`, which
+* **A subagent's own tool starts a one-shot session** (ADR 0089, slice C1): `ToolCtx::start_one_shot_session`, which
   `SubagentTool` calls, starts round 1 of a session whose header says it is closed from the start, under
   `child_run_id(parent, call_id)` as before. The parent parks on it as on any child ([a local child](#a-local-child)).
   A remote subagent's own tool is unchanged: it calls the remote from the parent's step and starts no child run
   (slice C2 keeps it so; [remote sessions](#remote-sessions) say why).
-* **`mode` and `wait`** (ADR 0087, slice C2): `subagent_start` chooses who may write after the first round and whether the
+* **`mode` and `wait`** (ADR 0089, slice C2): `subagent_start` chooses who may write after the first round and whether the
   call waits for the first report. `SessionMode` is kept in the header (`SessionHeader::mode`):
 
   | `mode` | After the first round | Who sends the next one | A person's message or steer |
@@ -451,10 +451,10 @@ answer has streamed, not before the call.
 | S16 | A journal from before slice 3, or one with reports, is replayed, with a message that arrived since | The same history, no model asked, no child run, no disagreement; the rounds are counted once even when the answer is dropped as stale |
 | S17 | A session has sat idle for `idle_ttl` | It reads closed, frees its place, refuses a send in words; a working round never expires; its unreported report is told once |
 | S18 | A round asks the person, and one that may not asks anyway | A shown kept-open round parks `input-required` and the parent's read says `blocked`; an answer in the child context resumes it; a child that may not ask is told `NOT_ASKABLE` and goes on |
-| S19 | A subagent's own tool is called (ADR 0087, slice C1) | The child is a **one-shot session**: round 1 under the call's derived id, closed from its start. It has a session's conversation id, is listed working and then closed, refuses a send from the parent and a message or a steer from a person, and its answer is the call's result once, never a report; a child a journal started before C1 (no conversation) is found by the call |
-| S20 | `subagent_start` names a `mode` (ADR 0087, slice C2) | `one_shot` closes after its round and refuses a send; `sealed` and `open` stay idle and take the parent's next round. A person's message to an agent's `sealed` or `one_shot` session, and a steer of its round, are `UnsupportedOperation` naming the mode; a close passes. Only an `open` round may ask the person. `keep_open` maps onto `mode`, and a disagreement is an error result naming both |
+| S19 | A subagent's own tool is called (ADR 0089, slice C1) | The child is a **one-shot session**: round 1 under the call's derived id, closed from its start. It has a session's conversation id, is listed working and then closed, refuses a send from the parent and a message or a steer from a person, and its answer is the call's result once, never a report; a child a journal started before C1 (no conversation) is found by the call |
+| S20 | `subagent_start` names a `mode` (ADR 0089, slice C2) | `one_shot` closes after its round and refuses a send; `sealed` and `open` stay idle and take the parent's next round. A person's message to an agent's `sealed` or `one_shot` session, and a steer of its round, are `UnsupportedOperation` naming the mode; a close passes. Only an `open` round may ask the person. `keep_open` maps onto `mode`, and a disagreement is an error result naming both |
 | S21 | `subagent_start` with `wait: true` | The call parks on round 1 and its result is the first report, with the session id; the report is not told again; observers see `session.started` at the park and `session.round.ended` at the settle |
-| S22 | The subagent's file has `session:` (ADR 0087, slice C3) | A start that names no `mode` gets the file's, and one that names no `wait` the file's; a narrower `mode` (or `keep_open: false`) starts; a wider one (or `keep_open: true`) is an error result naming the mode asked, the ceiling and the subagent, and starts nothing; `wait: false` beats a filed `wait: true`. Only that subagent's roster line in `subagent_start` changes |
+| S22 | The subagent's file has `session:` (ADR 0089, slice C3) | A start that names no `mode` gets the file's, and one that names no `wait` the file's; a narrower `mode` (or `keep_open: false`) starts; a wider one (or `keep_open: true`) is an error result naming the mode asked, the ceiling and the subagent, and starts nothing; `wait: false` beats a filed `wait: true`. Only that subagent's roster line in `subagent_start` changes |
 
 **Tokens.** Each round a run started or sent to is counted once in the run's `usage_totals`: a journaled step `usage:<call id>` reads it when a report is given to the model and, at the latest, when the run ends (`sessions_end`), whether or not the report was read; a store error on the read is retried. **Known limit:** the checks scan every round of the conversation, and past 5,000 rounds of one subagent a start **and a send** are refused.
 
@@ -507,7 +507,7 @@ round that only closes a session, for the tools and for the A2A front.
 A **round of an `open` session** may ask the person (ADR 0045 decision 9), and only that: the person sees the
 session because their client activated `child-sessions/v1`, and answers in the round's own thread. Anything else in
 a child run is told that nobody can answer and goes on: a one-shot child, a round of a `one_shot` or `sealed` session
-(ADR 0087: the person cannot write to it), and a round of a session whose client does not show it (`adam_llm_agent::NOT_ASKABLE`). A hook's request to approve a
+(ADR 0089: the person cannot write to it), and a round of a session whose client does not show it (`adam_llm_agent::NOT_ASKABLE`). A hook's request to approve a
 call (ADR 0050, slice H8) follows the same rule: such a child reads it as a refusal, the call is answered with
 `adam_llm_agent::NOT_APPROVABLE` and the hook's question, and nothing waits.
 
@@ -572,7 +572,7 @@ registered as `<root>/<subagent>` by `Assembly::register`. The round has no mode
 task and reports. It shares the connection of the subagent's tool (`RemoteEndpoint` in `remote.rs`: card, token,
 interface rules), so the token goes only where the tool sends it.
 
-**`mode` and `wait` on a remote session** (ADR 0087, slice C2) are the local ones: the rounds are local runs with the
+**`mode` and `wait` on a remote session** (ADR 0089, slice C2) are the local ones: the rounds are local runs with the
 session's header, so `one_shot` closes, `sealed` refuses the person's message and steer at the A2A front, and `wait: true`
 parks the start on round 1. The remote agent is told nothing of the mode: it is ours to enforce, and no A2A field carries it.
 **What stays different: the remote subagent's own tool** (`RemoteSubagentTool`). It sends the message from the parent's own
@@ -672,7 +672,7 @@ look, or report. Every call to the remote is a journaled step (`card`, `send:<n>
 | R8 | The session is closed | The closing round calls nothing and repeats the last report |
 | R9 | The round is cancelled: `subagent_close` with `cancel`, the parent, or the time limit | `Agent::on_cancelled` sends `CancelTask` (10 s limit, best effort) |
 | R10 | The cancel is lost | The next round of the session cancels the task the round before left working (`cancel-prior`) |
-| R11 | A remote session started `sealed` with `wait: true` (ADR 0087, slice C2) | The start parks on round 1, its result is the remote's answer with the session id, and the parent's next round continues the remote's context |
+| R11 | A remote session started `sealed` with `wait: true` (ADR 0089, slice C2) | The start parks on round 1, its result is the remote's answer with the session id, and the parent's next round continues the remote's context |
 
 **Limits.** The cancel is not durable, and every cancel here (`on_cancelled`, `cancel-prior`, `cancel-limit`) is one try:
 a failed `CancelTask` is logged and not repeated. The send's request is committed before the call (`sending`), so a cancel

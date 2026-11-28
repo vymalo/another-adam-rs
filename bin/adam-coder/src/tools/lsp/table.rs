@@ -12,7 +12,7 @@
 //! server is told no setting, and its run of the suite is the pull request author's report
 //! (*unverified* here).
 //!
-//! The six of ADR 0089 (TOML, YAML, JSON, shell, Dockerfile, C and C++) were read, not run
+//! The six of ADR 0091 (TOML, YAML, JSON, shell, Dockerfile, C and C++) were read, not run
 //! (*verified* 2026-11-28 in the packages on npm, not executed): `yaml-language-server` 2.0.0 pulls
 //! the section `yaml` when it is initialized (`out/src/languageserver/handlers/settingsHandlers.js`:
 //! `schemaStore.enable`, `kubernetesCRDStore.enable`); `vscode-json-language-server` of
@@ -26,7 +26,7 @@
 //! 0.7.0) names its section `evenBetterToml`, with `schema.enabled` and the Schema Store catalog as
 //! its default. That taplo asks for its section (rather than waiting to be pushed it), the
 //! `languageId`s of shell and C, and everything about `clangd` are *unverified*: the gated suite
-//! (`ADAM_TEST_LANGUAGE_SERVERS=1`) is how they are checked once the image has them (ADR 0089 L2).
+//! (`ADAM_TEST_LANGUAGE_SERVERS=1`) is how they are checked once the image has them (ADR 0091 L2).
 
 use serde_json::{Value, json};
 
@@ -192,12 +192,12 @@ impl Language {
     /// (a directory of its own, removed when the server stops); a [`Mode::Full`] one has what the
     /// project's own build does.
     ///
-    /// No server fetches a schema from the network on its own (ADR 0089): taplo validates by no
+    /// No server fetches a schema from the network on its own (ADR 0091): taplo validates by no
     /// schema (its default catalog is the Schema Store's), the YAML server uses neither the Schema
     /// Store nor the Kubernetes catalog, and the JSON server handles only `file:` schemas itself and
     /// asks the client for the rest, which answers that it has none. A schema a YAML file names in a
     /// `# yaml-language-server: $schema=` comment is still fetched by that server: the deployment's
-    /// network decides. The six of ADR 0089 run no project code, so their two modes are the same.
+    /// network decides. The six of ADR 0091 run no project code, so their two modes are the same.
     pub fn settings(self, mode: Mode, scratch: &str) -> Settings {
         let reference = mode == Mode::Safe;
         match self {
@@ -318,7 +318,7 @@ pub struct ServerTable {
 impl ServerTable {
     /// The servers of the images (`rust-analyzer`, `typescript-language-server --stdio`,
     /// `pyright-langserver --stdio`, `gopls serve`, `dart language-server --protocol=lsp`), and the
-    /// six of ADR 0089, which the workspace image does not have yet (its L2): `taplo lsp stdio`,
+    /// six of ADR 0091, which the workspace image does not have yet (its L2): `taplo lsp stdio`,
     /// `yaml-language-server --stdio`, `vscode-json-language-server --stdio`,
     /// `bash-language-server start`, `docker-langserver --stdio`, `clangd --background-index=false`.
     pub fn production() -> Self {
@@ -537,7 +537,7 @@ mod tests {
         assert_eq!(Language::Toml.markers(), [".taplo.toml", "taplo.toml"]);
     }
 
-    /// ADR 0089: no server of the six fetches a schema on its own, in either mode.
+    /// ADR 0091: no server of the six fetches a schema on its own, in either mode.
     #[test]
     fn the_yaml_json_and_toml_servers_fetch_no_schema_from_the_network() {
         for mode in [Mode::Safe, Mode::Full] {

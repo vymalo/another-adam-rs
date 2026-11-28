@@ -1211,7 +1211,7 @@ mod tests {
 
     #[test]
     fn a_known_smaller_window_wins_over_the_default_history_budget() {
-        // ADR 0086 decision 4: 131,072 - 20,000 - 4,096 is under the 200,000 default.
+        // ADR 0088 decision 4: 131,072 - 20,000 - 4,096 is under the 200,000 default.
         assert_eq!(
             budget(Some(131_072), 4096, crate::DEFAULT_MAX_HISTORY_TOKENS),
             Some(106_976)

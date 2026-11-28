@@ -14,7 +14,7 @@
 //!   capture that is only the start of the output (or a tail that is only the end of it) is cut back
 //!   where it was cut, at a place no secret straddles, whatever scrubbing did to the length.
 //!
-//! What a result shows is the call's `output` ([`OutputMode`], ADR 0088), else the workspace's
+//! What a result shows is the call's `output` ([`OutputMode`], ADR 0090), else the workspace's
 //! default for the tool ([`CommandLimits::output`], [`OutputDefaults`]): `full` shows it as
 //! above; `on_error` shows a command that **succeeded** (exit code 0, no timeout, not stopped) as
 //! one line, its size and the id it is kept under, and one that failed as above. The output of such
@@ -50,7 +50,7 @@ use adam_llm_agent::ToolCtx;
 use crate::commands::{CommandLimits, CommandWorkspace};
 use crate::shell::{KeptNote, ShellOutcome};
 
-/// What a command's result shows of its output: the call's `output` argument (ADR 0088,
+/// What a command's result shows of its output: the call's `output` argument (ADR 0090,
 /// decision 3). Each tool has its default (`run_command`: [`Full`](Self::Full); `run` and the
 /// coder's `run_checks`: [`OnError`](Self::OnError)), a workspace may set others
 /// ([`OutputDefaults`]), and a call's `output` wins.
@@ -106,7 +106,7 @@ impl OutputMode {
 
 /// What `run_command` and `run` show of an output when a call gives no `output`
 /// ([`CommandLimits::output`]): each tool's own default ([`TOOLS`](Self::TOOLS)) unless the
-/// workspace was given others (the coder's: the folder's `limits.output`, ADR 0088 slice T3). A
+/// workspace was given others (the coder's: the folder's `limits.output`, ADR 0090 slice T3). A
 /// call's `output` always wins.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OutputDefaults {
@@ -118,7 +118,7 @@ pub struct OutputDefaults {
 
 impl OutputDefaults {
     /// Each tool's own default: `run_command` [`Full`](OutputMode::Full), `run`
-    /// [`OnError`](OutputMode::OnError) (ADR 0088, decision 3).
+    /// [`OnError`](OutputMode::OnError) (ADR 0090, decision 3).
     pub const TOOLS: Self = Self {
         run_command: crate::inspect::DEFAULT_OUTPUT,
         run: crate::make::DEFAULT_OUTPUT,

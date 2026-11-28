@@ -6,7 +6,7 @@ limits:
   # delegation, check and commit is a turn.
   max_turns: 200
   max_tool_calls: 400
-  # The coder's history budget, the LlmAgent default stated here (ADR 0086); a
+  # The coder's history budget, the LlmAgent default stated here (ADR 0088); a
   # known smaller window still wins.
   max_history_tokens: 200000
 vars:

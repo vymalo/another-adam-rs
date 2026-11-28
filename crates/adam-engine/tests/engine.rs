@@ -2245,7 +2245,7 @@ async fn the_deployments_profiles_reach_an_engines_agent() {
     timeout(WAIT, engine.shutdown()).await.unwrap().unwrap();
 }
 
-/// A profile's `contextWindow` given to the builder alone is the model's window (ADR 0086, slice
+/// A profile's `contextWindow` given to the builder alone is the model's window (ADR 0088, slice
 /// W1 amended 2026-11-28): the host's client has no profiles, and the window it was configured
 /// with loses to the profile's, as `resolve_context_window` rules. The clamp of the output cap and
 /// the `usage/v1` report read it; the history budget reads the same answer of the client.

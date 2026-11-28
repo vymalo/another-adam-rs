@@ -196,7 +196,7 @@ fn a_known_window_clamps_the_folders_own_value_too() {
     assert_eq!(assembly.info()[0].limits.max_output_tokens, 45_536);
 }
 
-/// ADR 0086 decision 4: the 200,000-token default, or a folder's history, never squeezes the
+/// ADR 0088 decision 4: the 200,000-token default, or a folder's history, never squeezes the
 /// output below what half the window leaves; a window that holds it keeps it whole.
 #[test]
 fn a_history_the_window_cannot_hold_leaves_the_output_half_the_window() {
@@ -377,7 +377,7 @@ async fn the_resolved_cap_reaches_the_request_of_a_run() {
     assert_eq!(model.requests()[0].max_output_tokens, Some(65_536));
 }
 
-/// ADR 0086 decisions 1 and 3: a subagent whose `model:` names another alias has its own window,
+/// ADR 0088 decisions 1 and 3: a subagent whose `model:` names another alias has its own window,
 /// its profile's `contextWindow`, which the client answers for that alias (no `DEFAULT_MODEL_CONTEXT_WINDOW`
 /// ever reached it); the window clamps that subagent's cap, and not the root's.
 #[test]

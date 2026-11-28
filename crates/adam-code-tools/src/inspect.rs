@@ -28,7 +28,7 @@ use crate::shell::{ShellOutcome, missing_tool, resolve_cwd, shell_spec};
 use crate::workspace::{Intent, Outcome, Place};
 
 /// What `run_command` shows of an output when the call asks for nothing: all of it, since what a
-/// look printed is its answer (ADR 0088, decision 3).
+/// look printed is its answer (ADR 0090, decision 3).
 pub const DEFAULT_OUTPUT: OutputMode = OutputMode::Full;
 
 /// The tool `run_command` over `ws`. Its description is the caller's own declaration (the coder's

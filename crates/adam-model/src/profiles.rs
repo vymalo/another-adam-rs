@@ -1,7 +1,7 @@
 //! The per-model profiles of `MODEL_ALIASES_FILE` ([ADR 0063](https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0063-a-reasoning-effort-is-one-setting.md),
 //! [ADR 0064](https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0064-model-profiles-reasoning-effort-and-output-cap-follow-the-model.md)):
 //! which reasoning levels a model takes and how they are sent, its output cap, its context window
-//! ([ADR 0086](https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0086-the-context-window-follows-the-model-and-the-history-budget-is-200k.md)),
+//! ([ADR 0088](https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0088-the-context-window-follows-the-model-and-the-history-budget-is-200k.md)),
 //! the members merged into its requests, the deployment's endpoint label for it, and the named
 //! presets.
 //!
@@ -210,7 +210,7 @@ pub const MAX_ENDPOINT_LABEL_LEN: usize = 128;
 /// document, and `DEFAULT_MODEL_CONTEXT_WINDOW` above it refuses to start.
 pub const MAX_CONTEXT_WINDOW: u64 = 9_007_199_254_740_991;
 
-/// The context window of a model, in tokens ([ADR 0086](https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0086-the-context-window-follows-the-model-and-the-history-budget-is-200k.md)
+/// The context window of a model, in tokens ([ADR 0088](https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0088-the-context-window-follows-the-model-and-the-history-budget-is-200k.md)
 /// decision 1): its profile's `contextWindow`, else `configured` (the window the deployment set for
 /// that alias outside the profiles, `DEFAULT_MODEL_CONTEXT_WINDOW`), else `None`.
 ///
@@ -285,7 +285,7 @@ pub struct ModelProfile {
     pub max_output_tokens: Option<u32>,
     /// The model's own documented maximum for one request: a cap above it is refused.
     pub max_output_tokens_limit: Option<u32>,
-    /// The model's context window, in tokens, 1 to [`MAX_CONTEXT_WINDOW`] (ADR 0086): the window
+    /// The model's context window, in tokens, 1 to [`MAX_CONTEXT_WINDOW`] (ADR 0088): the window
     /// the history budget, the output cap and each `usage/v1` report use for this model, over
     /// `DEFAULT_MODEL_CONTEXT_WINDOW` ([`resolve_context_window`]). A fact of the model, so no preset sets it.
     pub context_window: Option<u64>,
@@ -787,7 +787,7 @@ mod tests {
         assert_eq!(value, back, "via {json}");
     }
 
-    /// The example of ADR 0064, translated to JSON, with the `contextWindow` of ADR 0086.
+    /// The example of ADR 0064, translated to JSON, with the `contextWindow` of ADR 0088.
     fn example() -> serde_json::Value {
         json!({
             "presets": {
@@ -1224,7 +1224,7 @@ mod tests {
         );
     }
 
-    /// ADR 0086 decision 1: a window is 1 to 2^53 − 1 tokens, as `DEFAULT_MODEL_CONTEXT_WINDOW` is; `0` and
+    /// ADR 0088 decision 1: a window is 1 to 2^53 − 1 tokens, as `DEFAULT_MODEL_CONTEXT_WINDOW` is; `0` and
     /// anything larger refuse the document, naming the profile and the key. Absent is no window.
     #[test]
     fn a_context_window_is_one_to_two_to_the_53_minus_one_tokens() {
@@ -1279,7 +1279,7 @@ mod tests {
         assert!(ModelProfiles::parse_json(&preset.to_string()).is_ok());
     }
 
-    /// ADR 0086 decision 1: the profile's window wins, then the configured one, then none; a
+    /// ADR 0088 decision 1: the profile's window wins, then the configured one, then none; a
     /// hand-built `0` the loader refuses is no window.
     #[test]
     fn the_profiles_window_wins_over_the_configured_one() {

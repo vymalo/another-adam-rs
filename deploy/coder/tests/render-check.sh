@@ -96,7 +96,7 @@ check "modelEchoReasoning other than reasoning_content or reasoning is refused" 
   fails helm_reasoning --set config.modelEchoReasoning=yes
 check "modelEchoReasoning and extraEnv MODEL_ECHO_REASONING together are refused" \
   fails helm_reasoning --set config.modelEchoReasoning=reasoning_content --set-string config.extraEnv.MODEL_ECHO_REASONING=reasoning
-# The model's context window (ADR 0032 and ADR 0086 of adam-rs): DEFAULT_MODEL_CONTEXT_WINDOW, a count of
+# The model's context window (ADR 0032 and ADR 0088 of adam-rs): DEFAULT_MODEL_CONTEXT_WINDOW, a count of
 # tokens, nothing by default. It rendered MODEL_CONTEXT_WINDOW, now the binary's deprecated alias, before.
 # envval <name> <value>: the StatefulSet sets the variable to that literal.
 envval() { doc StatefulSet | grep -A1 -- "- name: $1\$" | grep -Fq -- "value: \"$2\""; }

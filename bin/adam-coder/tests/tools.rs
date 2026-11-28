@@ -600,7 +600,7 @@ async fn run_checks_runs_in_the_worktree_and_never_outside_it() {
     rig.prepare().await;
     let tool = RunChecks;
 
-    // `full`: a check that passes shows its output only when asked (ADR 0088).
+    // `full`: a check that passes shows its output only when asked (ADR 0090).
     let ok = tool
         .call(
             &rig.ctx,
@@ -1964,7 +1964,7 @@ async fn commit_and_push_is_idempotent_and_refuses_an_empty_branch() {
     assert!(is_error(&empty));
 }
 
-/// The pull requests the exporter reads from `out`'s artifacts (ADR 0085, slice E4): the coder's
+/// The pull requests the exporter reads from `out`'s artifacts (ADR 0087, slice E4): the coder's
 /// `pull_request` artifact is the exporter's outcome contract.
 fn exported_pull_requests(out: &ToolOutput) -> Vec<adam_export::PullRequestOutcome> {
     assert_eq!(
@@ -2042,7 +2042,7 @@ async fn open_pull_request_needs_a_push_and_green_checks_and_is_idempotent() {
     );
     assert_eq!(opened.artifacts[0].name, "pull_request");
     assert_eq!(opened.artifacts[0].data["url"], PR_URL);
-    // What the gate saw, for the exporter's outcome contract (ADR 0085, slice E4): the head it
+    // What the gate saw, for the exporter's outcome contract (ADR 0087, slice E4): the head it
     // let in, verified by the checks on exactly that code.
     let head = head_of(&rig.worktree());
     assert_eq!(opened.artifacts[0].data["commit"], head.as_str());

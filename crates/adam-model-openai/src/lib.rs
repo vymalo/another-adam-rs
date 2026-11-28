@@ -89,7 +89,7 @@
 //!   `reasoning_effort` goes out through the profile's `reasoningWire`, after the extra body, which
 //!   it wins over where the two would duplicate a member; a profile's `contextWindow` is the
 //!   window [`ModelClient::context_window`] answers for its alias, over
-//!   [`with_context_window`](OpenAiCompatible::with_context_window) (ADR 0086).
+//!   [`with_context_window`](OpenAiCompatible::with_context_window) (ADR 0088).
 
 #![warn(missing_docs)]
 
@@ -420,7 +420,7 @@ impl OpenAiCompatible {
     /// Say that the model the alias `model` names has a context window of `window` tokens, as the
     /// deployment knows it (`DEFAULT_MODEL_CONTEXT_WINDOW`): what [`ModelClient::context_window`] answers
     /// for that alias when its profile ([`with_profiles`](Self::with_profiles)) names no
-    /// `contextWindow`, and nothing for any other (ADR 0086). The client sends nothing of it; the
+    /// `contextWindow`, and nothing for any other (ADR 0088). The client sends nothing of it; the
     /// history budget and the output cap are taken from it, and a report of a call says it, so a
     /// screen can show how full the context is.
     #[must_use]
@@ -981,7 +981,7 @@ impl ModelClient for OpenAiCompatible {
 
     /// The profile's `contextWindow` for `model`, else the window
     /// [`with_context_window`](OpenAiCompatible::with_context_window) gave that alias
-    /// ([`adam_model::resolve_context_window`], ADR 0086).
+    /// ([`adam_model::resolve_context_window`], ADR 0088).
     fn context_window(&self, model: &str) -> Option<u64> {
         adam_model::resolve_context_window(
             self.profiles.profile(model),
@@ -1095,7 +1095,7 @@ mod tests {
         assert_eq!(shared.context_window("glm-5.3"), Some(131_072));
     }
 
-    /// ADR 0086 decision 1: the profile's window for an alias wins, then the window the deployment
+    /// ADR 0088 decision 1: the profile's window for an alias wins, then the window the deployment
     /// gave that alias (`DEFAULT_MODEL_CONTEXT_WINDOW`), then none; another alias with a profile has its
     /// own window, which `DEFAULT_MODEL_CONTEXT_WINDOW` never gave.
     #[test]

@@ -1,4 +1,4 @@
-# 0089. The coder knows six more languages: the files every repository has, and C and C++
+# 0091. The coder knows six more languages: the files every repository has, and C and C++
 
 Status: **Accepted** (2026-11-28). The owner asked on 2026-11-27: *"We need more language servers."* The owner then
 said *"Take decisions yourself"* (2026-11-28), so the batch, its order and decision 4 are this ADR's choices for the
@@ -99,7 +99,7 @@ until L2 adds them to its `IN_THE_IMAGE`. What differs from the decision as writ
 
 To paste as an issue there (the package names were *verified* on the npm registry on 2026-11-28; the rest is *unverified*):
 
-> **Install the six language servers of adam-rs ADR 0089 in the workspace image.** adam-coder now knows TOML, YAML, JSON,
+> **Install the six language servers of adam-rs ADR 0091 in the workspace image.** adam-coder now knows TOML, YAML, JSON,
 > shell, Dockerfile and C/C++, and answers "not on PATH" until the image has their programs:
 >
 > | Program | Install |
