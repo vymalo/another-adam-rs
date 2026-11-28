@@ -120,6 +120,28 @@ the key required. The turn key is not the card's key.
 | `TURN_SIGNING_KEY_ID` | the `kid` of its signatures: the vault reference `vault:<name>#v<n>`, or the id a registry knows the key by (printable ASCII, at most 256 bytes); without the key file: exit 78 | the key's RFC 7638 thumbprint |
 | `TURN_VERIFY_KEYS_FILE` | a JWKS of the public keys of earlier versions, each with its `kid` (`kty` `OKP`, `crv` `Ed25519`; a private member `d` is refused), and `revoked`, a list of the ids no longer accepted; not secret (a ConfigMap). Read and checked with the key; used to verify a history (T3); without the key file: exit 78 | the signing key's own public key only |
 
+## Run certificates (`adam-service`)
+
+A run can sign its model requests with a certificate of its own instead of the process turn key
+([ADR 0086](../decisions/0086-a-run-signs-its-model-requests-with-a-certificate.md) decision 6, A3). The
+variables are read with the model's configuration (`ModelConfig::run_cert`, `RunCertSettings`), so by the roles
+that call a model (`all`, `worker`). **Nothing is on unless every required variable is set**: all unset is off,
+and a half-set configuration is exit 78 naming the variable, because a half-set run certificate would silently
+sign with the process turn key.
+
+| Variable | Meaning | Default |
+|---|---|---|
+| `RUN_CERT_ISSUER` | which adapter issues the chain: `broker` (built), or `openbao` once A6 lands; anything else is exit 78 | required with the others |
+| `RUN_CERT_ISSUER_URL` | the broker's base URL; adam posts to `{URL}/internal/runs/{run}/certificate` (a path prefix on the URL is kept) | required |
+| `RUN_CERT_TOKEN_FILE` | the projected service-account token, **re-read on every call**, never from the environment's value; never in a log, `Debug` or an error | required |
+| `RUN_CERT_CA_FILE` | a PEM bundle trusted for the broker beside the system roots; a file that cannot be read or holds no certificate is exit 78 | unset: the system roots |
+| `RUN_CERT_RENEW_FRACTION` | when the run's key is replaced: `n/d`, strictly between 0 and 1 | `2/3` |
+
+The adapter and its configuration are built; the request path does not choose a run key from them yet (R3), so a
+run's calls are still signed by the process turn key. The broker's contract is v1: `{"v":1,"csr":"<base64 DER>"}`
+in, `{"v":1,"chain":["<base64 DER>", …]}` out, and the refusals `400` (`Invalid`), `401`/`403`
+(`Unauthenticated`), `429`/`5xx` (`Transient`). Source: [`adam-run-cert-broker`](../../crates/adam-run-cert-broker/README.md).
+
 ## Cross-process notifications (`adam-notify-postgres`)
 
 `adam-coder`, in every role (`all`, `control-plane`, `worker`): the `notify` component. Both binaries'

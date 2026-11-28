@@ -1,0 +1,7 @@
+{
+  "type": "about:blank",
+  "title": "The issuer is unavailable",
+  "status": 503,
+  "code": "unavailable",
+  "detail": "the issuing port did not answer; retry with the same CSR"
+}

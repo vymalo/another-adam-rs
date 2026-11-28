@@ -173,3 +173,90 @@ MSRV job, and CI. CI judges them. `cargo tree -p adam-core -i ring`/`-i aws-lc-r
    `TurnKeys` still signing the history, and the person the SAN names taken from the run's prompt statement.
 3. A backoff that survives a restart, if the deployment needs one: the retry window is in memory, so a
    restarted process asks the CA at once.
+
+## A3: the broker adapter and the config (2026-11-28)
+
+Built at `opencode/anr-1310-broker-adapter` from `origin/main` `7fd99b9b` on 2026-11-28. Paths are at that
+commit; re-read them before a later slice.
+
+| Piece | Where | What it promises |
+|---|---|---|
+| `BrokerIssuer` | `crates/adam-run-cert-broker/src/lib.rs` | the `RunCertIssuer` of **one run** over the broker's contract v1: `POST {url}/internal/runs/{run}/certificate`, `{"v":1,"csr":"<base64 DER>"}` in, `{"v":1,"chain":[...]}` out, the projected token from the file **re-read on every call**, the anchors of `RUN_CERT_CA_FILE` beside the system roots |
+| `http_client` | same | one client a host builds once: no redirect, 30 s, `tls_certs_merge` for the anchors; a bad PEM is `BrokerError::CaFile` (`Invalid`) at startup |
+| `BrokerError`, `TokenError`, `AnswerError` | same | the URL/anchors (`Invalid`), the token (`Unauthenticated`; it carries the path, never the contents), the answer (version, size, JSON, base64, chain, status) |
+| `RunCertSettings`, `RunCertIssuerKind` | `crates/adam-service/src/config.rs` | `RUN_CERT_*`: off when all unset, a problem naming the variable when half-set, `broker` built and `openbao` refused until A6, the fraction parsed as `n/d`; `issuer(run)` and `keyring(subject)` |
+| `RenewFraction`, `BadRenewFraction` | `crates/adam-core/src/turn/run_cert/keyring.rs` | the renewal point as an exact fraction (default `TWO_THIRDS`), `RunKeyring::with_renew_fraction` |
+
+**Why a new crate.** `adam-core` is the port and must stay free of an HTTP client and a TLS stack:
+`tools/embedded-deps/check.sh` forbids `reqwest`, `rustls`, `aws-lc-rs` and `ring` in `adam-engine`'s tree, and
+the A2 notes record that `x509-cert` was chosen so no crypto provider enters `adam-core`. The adapter is a crate
+of its own (`adam-run-cert-broker`) on the `reqwest`/rustls-on-aws-lc-rs already in the tree — the model client's
+stack, not a second one — and `adam-service` depends on it only for `RunCertSettings`. The port is unchanged: no
+driver type in a trait signature.
+
+**The token.** `issue` opens `RUN_CERT_TOKEN_FILE` every time, trims the trailing whitespace of a mounted secret,
+and refuses an empty or unreadable file without sending. The header is marked sensitive; the token is never in
+`Debug` (the issuer shows the endpoint's origin, the run and the file's path), never in a log line, and never in
+an error. The sentinel test captures our target's log and asserts the sentinel is absent while the mock asserts it
+was presented.
+
+**The refusals.** `400` → `Invalid`, `401`/`403` → `Refused` (`Unauthenticated`), `429`/`5xx` → `Unavailable`
+(`Transient`), another status → `Internal`. The answer's problem document is never echoed: an error carries the
+status, not the body. A wrong `v` is `Internal` (`AnswerError::Version`).
+
+**The contract fixtures.** ANR-1306's v1 fixtures (the system's `docs/api/fixtures/run-certificate-v1/`) are
+copied into `crates/adam-run-cert-broker/tests/fixtures/run-certificate-v1/` — the JSON bodies only, no README —
+so the request and the answer cross the wire byte for byte and the six refusals are tested for their class. The
+fixed answer cannot pass the conformance suite's `two_requests_get_two_chains`, so that mock mints a leaf per CSR
+with `FakeRunCertIssuer`; the fixed answer is the shape test.
+
+**A contract gap.** v1 allows up to 8 certificates; `CertificateChain::MAX_CERTIFICATES` is 4. A longer chain is
+`Internal`; real chains are 2 or 3. Raising the port's bound is a later change, not a silent truncation.
+
+### The deliberate failures (each seen red once)
+
+1. **Half-set config.** The required-variable loop no longer pushed its problem: `RUN_CERT_ISSUER is not named: []`,
+   exit 101 (`a_half_set_run_certificate_names_the_variable_and_is_78`). The process would have started with run
+   certificates silently off.
+2. **Token sentinel.** `issue` logged `tracing::debug!(token = %token.expose_secret(), …)`: `a rendering leaks the
+   token: 2026-11-28T00:10:44Z DEBUG adam_run_cert_broker: RED 2: the broker presents its token
+   token=anr1310-projected-token-SENTINEL-do-not-log`, exit 101.
+3. **The `v` check.** `answer.v != CONTRACT_VERSION` became `answer.v == 0`: the case panicked with
+   "called `Result::unwrap_err()` on an `Ok` value: CertificateChain { kid: …, certificates: 2 }"
+   (`a_wrong_version_is_refused`), exit 101.
+
+Restored, the three crates' suites are green except the pre-existing `hooks::tests::an_unknown_member_is_refused`
+(below).
+
+### What ran, and what did not
+
+Crate-scoped with `CARGO_TARGET_DIR=/run/media/selast/ai-ide-v2/claude/opencode/anr1310-target` and
+`CARGO_BUILD_BUILD_DIR=/run/media/selast/ai-ide-v2/claude/opencode/anr1310-build`, no `heavy`, no workspace build:
+
+| Command | Exit |
+|---|---|
+| `cargo fmt --all --check` | 0 |
+| `cargo check -p adam-core -p adam-service -p adam-run-cert-broker --all-targets` | 0 |
+| `cargo check -p adam-agent --all-targets` | 0 (its `ModelConfig` literal gains `run_cert: None`) |
+| `cargo test -p adam-core -p adam-run-cert-broker -p adam-service` | red on `hooks::tests::an_unknown_member_is_refused`, pre-existing |
+| `cargo test -p adam-core -p adam-run-cert-broker -p adam-service -- --skip hooks::tests::an_unknown_member_is_refused` | 0 |
+| `cargo clippy -p adam-core -p adam-service -p adam-run-cert-broker --all-targets -- -D warnings` | 0 |
+| `cargo metadata --locked` | 0 |
+| `node tools/docs-check/check-docs.mjs` | 0 |
+
+**The pre-existing red.** `an_unknown_member_is_refused` writes a hooks file with `"alow"` and expects the problem
+to name it; `parse_file` in `crates/adam-service/src/hooks.rs` formats only "a member is wrong at line … column …".
+The same code and test are at `7fd99b9b` (`git show 7fd99b9b:crates/adam-service/src/hooks.rs`), so it is not A3's;
+it is a separate ticket.
+
+Not run locally: the workspace clippy with the feature list, `cargo nextest run --workspace`, `cargo test -p adam
+--test ui`, `tools/embedded-deps/check.sh` (it builds `adam-engine`'s tree), the MSRV job, and CI. CI judges them.
+`cargo tree -p adam-core -i ring` and `-i aws-lc-rs` are empty (*checked 2026-11-28*); the broker crate brings
+`reqwest` with rustls on aws-lc-rs, which is the model client's stack.
+
+### What the next slice must add
+
+1. The wiring (R3): `ModelConfig::run_cert` → one `RunKeyring` per run, `KeySource::Run` on the request path, and
+   the person the SAN names taken from the run's prompt statement.
+2. A keyring-level test of the whole path over the broker adapter (the conformance suite proves the adapter; R3
+   proves the request path chooses it).

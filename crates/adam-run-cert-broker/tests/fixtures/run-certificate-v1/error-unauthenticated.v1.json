@@ -1,0 +1,7 @@
+{
+  "type": "about:blank",
+  "title": "Unauthenticated",
+  "status": 401,
+  "code": "unauthenticated",
+  "detail": "the caller did not present a projected service-account token the broker's audience accepts"
+}
