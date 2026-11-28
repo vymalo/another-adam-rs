@@ -77,7 +77,9 @@ flowchart LR
 sources), so each is statically linked with `mimalloc` as its allocator and starts in any x86-64 Linux image
 whatever its C library ([ADR 0053](../decisions/0053-sqlite-a-store-service-a-database-per-agent-and-a-static-coder.md)
 decision 11; the image's smoke test runs each in `debian:bookworm-slim` and Alpine, as uid 10001, and expects
-its configuration error, never a loader error). `adam-egress` is the HTTPS-only proxy for run pods, [`bin/adam-egress`](../../bin/adam-egress/README.md),
+its configuration error, never a loader error). `run-signer`, the one binary that serves, is also started on loopback
+with a run-certificate configuration and stopped with SIGTERM there, so its bind and clean stop are proved in the image
+and not only its exit 78. `adam-egress` is the HTTPS-only proxy for run pods, [`bin/adam-egress`](../../bin/adam-egress/README.md),
 smoke-tested in the image and run by the chart with run pods; `run-signer` is the loopback sidecar that signs a run's
 model requests with the run's own certificate, [`bin/run-signer`](../../bin/run-signer/README.md), smoke-tested in the
 image (the deployment that runs it beside an agent is a later change); `adam-git-sandbox` is the server that runs the coder's git

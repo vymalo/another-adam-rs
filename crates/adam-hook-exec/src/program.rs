@@ -207,7 +207,11 @@ fn read_lines(stdout: ChildStdout, shared: Arc<Shared>) {
                 Err(e) => {
                     // The detail is logged, not carried: a serde error quotes the line, and a
                     // hook's reason is recorded and read by the model.
-                    warn!(program = %shared.program, "{}", (shared.scrub.as_ref())(&e.to_string()));
+                    warn!(
+                        program = %shared.program,
+                        problem = %(shared.scrub.as_ref())(&e.to_string()),
+                        "a hello this build cannot read"
+                    );
                     shared.close(Fault::Malformed(
                         "a hello this build cannot read".to_owned(),
                     ));
@@ -217,7 +221,11 @@ fn read_lines(stdout: ChildStdout, shared: Arc<Shared>) {
             Some("reply") => match serde_json::from_value::<Reply>(value) {
                 Ok(reply) => shared.reply(Box::new(reply)),
                 Err(e) => {
-                    warn!(program = %shared.program, "{}", (shared.scrub.as_ref())(&e.to_string()));
+                    warn!(
+                        program = %shared.program,
+                        problem = %(shared.scrub.as_ref())(&e.to_string()),
+                        "a reply this build cannot read"
+                    );
                     shared.close(Fault::Malformed(
                         "a reply this build cannot read".to_owned(),
                     ));
@@ -263,13 +271,21 @@ fn read_stderr(stderr: ChildStderr, program: String, scrub: Arc<Scrub>) {
                         Some(_) => {}
                     }
                 }
-                debug!(program = %program, "a stderr line over {STDERR_LINE_MAX} bytes was dropped");
+                debug!(
+                    program = %program,
+                    limit = STDERR_LINE_MAX,
+                    "a stderr line was dropped for its length"
+                );
                 continue;
             }
             Some(false) => {}
         }
         let text = String::from_utf8_lossy(&line);
-        debug!(program = %program, "{}", scrub.as_ref()(text.trim_end()));
+        debug!(
+            program = %program,
+            line = %scrub.as_ref()(text.trim_end()),
+            "a line of the program's stderr"
+        );
     }
 }
 

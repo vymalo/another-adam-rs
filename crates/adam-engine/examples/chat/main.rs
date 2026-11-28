@@ -4,6 +4,8 @@
 //! ```sh
 //! MODEL_BASE_URL=https://gateway.example.com/v1 MODEL_API_KEY=... MODEL=my-model \
 //!   cargo run -p adam-engine --example chat
+//! # Or with a local agent over the person's directory:
+//! ... cargo run -p adam-engine --example chat -- --dir /path/to/dir
 //! ```
 //!
 //! The host gives everything the engine uses: the model client (`adam-model-openai`, a
@@ -12,6 +14,10 @@
 //! folder next to this file, read once at startup as `adam-agent` reads one. The engine reads no
 //! environment variable: this file does, and passes what it read.
 //!
+//! `--dir <path>` adds the local agent (ADR 0047 slice 7 part 2): the file and command tools over
+//! the directory, with a hook that asks before every write or command. The host answers with
+//! `/approve` and `/deny [reason]`, as for the example's own `save_note` tool.
+//!
 //! Reading the folder from disk is the development path: edit the text, run again. An application
 //! ships its agent inside its binary instead: `adam_agent_fs::build("agent").root("examples/chat")
 //! .emit()` in its `build.rs`, `adam::include_agent!();` in its crate, then
@@ -19,7 +25,7 @@
 
 mod app;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use adam_engine::Engine;
@@ -57,13 +63,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let store: DynStore = Arc::new(MemoryStore::new());
     // The host's own tool, and the hook that asks the person before it runs (ADR 0047 slice 5).
     let notes = app::Notes::default();
-    let engine = Engine::builder(store, folder.def, model, alias)
+    let mut builder = Engine::builder(store, folder.def, model, alias)
         .tools(ToolSet::new().tool(app::save_note(notes)))
-        .plugin(app::AsksBeforeSaving)
-        .start()
-        .await?;
+        .plugin(app::AsksBeforeSaving);
+    if let Some(dir) = dir_arg()? {
+        builder = builder.local_agent(dir);
+    }
+    let engine = builder.start().await?;
 
     println!("{}", app::HELP);
+    if let Some(dir) = dir_arg()? {
+        println!("local agent: {dir}", dir = dir.display());
+    }
     app::run(
         engine,
         BufReader::new(tokio::io::stdin()),
@@ -80,4 +91,22 @@ fn required(name: &str) -> Result<String, String> {
             "{name} is required (MODEL_BASE_URL, MODEL, and MODEL_API_KEY if the gateway wants one)"
         )),
     }
+}
+
+/// Read `--dir <path>` from the command line, returning `Some(path)` when present, `None`
+/// otherwise. Refused with a clear error if the flag is given without a value.
+fn dir_arg() -> Result<Option<PathBuf>, Box<dyn std::error::Error>> {
+    let mut args = std::env::args().skip(1);
+    let mut dir = None;
+    while let Some(arg) = args.next() {
+        if arg == "--dir" {
+            let value = args.next().ok_or("--dir requires a path argument")?;
+            dir = Some(PathBuf::from(value));
+        } else if let Some(value) = arg.strip_prefix("--dir=") {
+            dir = Some(PathBuf::from(value));
+        } else {
+            return Err(format!("unknown argument: {arg}").into());
+        }
+    }
+    Ok(dir)
 }

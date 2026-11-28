@@ -47,6 +47,17 @@ and fails. A crate that takes `adam` with `default-features = false` loses remot
 that, **decision 2's feature set is complete**: `server`, `push`, `remote` and `thread-tools`. The check on Windows and
 macOS is still slice 8's runner.
 
+*Amended 2026-11-28: slice 7 part 2 is built (the local agent).* The embedded tree now carries `adam-code-tools`
+(the file and command tools over `PersonDir`, the person's directory as a `CodeWorkspace`), `adam-macros`
+(the `#[tool]` macro the local agent's tools use), and `adam-llm-agent`'s `schema` feature (the schemas the tools
+hand to the model). `tools/embedded-deps/check.sh` is the gate: it builds each split crate with its defaults off
+and with each feature alone, and fails when `adam-engine`'s tree holds a forbidden crate; no binary refers to
+`adam_llm_agent::__private::schemars`. The local agent's hook (`AsksBeforeWritingOrCommand`) is fail-closed: every
+mutating tool (`write_file`, `edit_file`, `apply_patch`, `run_command`, `run`) parks the run on the person's
+approval always, even when its argument is missing or empty. `PersonDir::guard` is exclusive: a second guard for
+the same place is refused with the message the tool appends to its error result, leaving the first guard's entry
+untouched so its report settles as it would have.
+
 ## Context
 
 A program that links adam-rs today takes `adam-service` (an HTTP server, Postgres, an OpenAI client, configuration read

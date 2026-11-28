@@ -51,7 +51,7 @@ pub async fn serve(
             .with_extra_mcp_file(file)
             .map_err(|e| AgentError::ExtraMcp(Box::new(e)))?;
         for warning in &warnings {
-            tracing::warn!("{warning}");
+            tracing::warn!(warning = %warning, "a warning while adding the extra MCP servers");
         }
         tracing::info!(file = %file.display(), "extra MCP servers added to the folder's own");
         folder.def = def;

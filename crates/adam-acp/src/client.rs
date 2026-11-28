@@ -683,7 +683,9 @@ async fn drain_stderr(stderr: ChildStderr, shared: Arc<Shared>) {
             Ok(_) => {
                 let line = String::from_utf8_lossy(&buf);
                 let line = line.trim_end_matches(['\n', '\r']);
-                tracing::info!(target: "adam_acp::agent_stderr", "{line}");
+                // The line is the agent program's stderr: a field the allowlist drops, so the
+                // collector gets the fact and the JSON log the text.
+                tracing::info!(target: "adam_acp::agent_stderr", line = %line, "a line of the agent's stderr");
                 lock(&shared.stderr).push(line);
             }
         }
@@ -810,7 +812,7 @@ async fn kill_group(_pid: Option<u32>) {}
 fn to_rpc_error(e: FsError) -> agent_client_protocol::Error {
     match e {
         FsError::Denied(msg) => {
-            tracing::warn!("{msg}");
+            tracing::warn!(problem = %msg, "a filesystem request was refused");
             agent_client_protocol::Error::new(-32602, msg)
         }
         FsError::NotFound(path) => agent_client_protocol::Error::resource_not_found(Some(path)),
