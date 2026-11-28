@@ -557,11 +557,24 @@ async fn a_server_is_kept_between_calls_and_one_exists_per_project_root() {
 
 #[tokio::test]
 async fn indexing_past_the_wait_gives_a_partial_result_and_the_next_call_finds_the_server_warm() {
-    let lsp = Lsp::new(
-        json!({"progress_ms": 3500, "diagnostics": [diag(1, 0, 0, "found while indexing")]}),
-    )
+    // The begin is sent 600 ms after `initialized`, longer than the quiet window a server needs to
+    // count as ready (`SETTLE`, 300 ms): a call made before it is read would be answered as if the
+    // server were idle. The test therefore gates on the server being **observed** indexing — the
+    // readiness latch, not a clock — which is what the flake needed.
+    let lsp = Lsp::new(json!({
+        "progress_ms": 3500,
+        "progress_delay_ms": 600,
+        "diagnostics": [diag(1, 0, 0, "found while indexing")]
+    }))
     .await;
     rust_project(&lsp);
+    // Start the server (this call may answer early: the gate below is what the test relies on).
+    lsp.diagnostics(json!({"path": "src/lib.rs", "wait": 1}))
+        .await;
+    until("the server is observed indexing", || {
+        lsp.servers().iter().any(|s| s.indexing)
+    })
+    .await;
     let started = Instant::now();
     let first = lsp
         .diagnostics(json!({"path": "src/lib.rs", "wait": 1}))
@@ -609,9 +622,22 @@ async fn indexing_past_the_wait_gives_a_partial_result_and_the_next_call_finds_t
 
 #[tokio::test]
 async fn a_server_that_reports_its_status_is_not_ready_until_it_says_it_is_quiescent() {
-    // Not a `$/progress` in sight: only `experimental/serverStatus`, as rust-analyzer says it.
-    let lsp = Lsp::new(json!({"status_ms": 3000, "diagnostics": [diag(1, 0, 0, "early")]})).await;
+    // Not a `$/progress` in sight: only `experimental/serverStatus`, as rust-analyzer says it. The
+    // "not quiescent" is sent 600 ms after `initialized` (longer than `SETTLE`), so the call below
+    // must be gated on the latch rather than on the clock — see the test above.
+    let lsp = Lsp::new(json!({
+        "status_ms": 3000,
+        "status_delay_ms": 600,
+        "diagnostics": [diag(1, 0, 0, "early")]
+    }))
+    .await;
     rust_project(&lsp);
+    lsp.diagnostics(json!({"path": "src/lib.rs", "wait": 1}))
+        .await;
+    until("the server reports it is not quiescent", || {
+        lsp.servers().iter().any(|s| s.indexing)
+    })
+    .await;
     let first = lsp
         .diagnostics(json!({"path": "src/lib.rs", "wait": 1}))
         .await;
