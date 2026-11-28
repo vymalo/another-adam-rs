@@ -17,7 +17,9 @@
 //! # Several independent checks at once
 //!
 //! A call names one command with `command`, or several **independent** ones with `commands`:
-//! exactly one of the two, never both. The commands run at the same time, at most
+//! exactly one of the two, never both. Independent is the whole point: a command that writes the
+//! worktree, or reads what another of the list writes, is not the same check when it runs beside it,
+//! and goes in a call of its own. The commands run at the same time, at most
 //! [`CoderSettings::max_parallel_tool_calls`](super::CoderSettings::max_parallel_tool_calls) at once
 //! (the run's own bound on the tool calls of a turn, so a deployment that sets it to 1 runs them one
 //! after another), each through the process pool (`MAX_PROCESSES`, ADR 0065). The call reports what
@@ -38,8 +40,9 @@
 //! When the notes hold a **failed** record for the same call — the same commands in the same order,
 //! directory, slot and timeout on exactly the tree the commands are about to run on, made at the
 //! current `ChecksNotes::epoch` (`run` and the file tools bump it; the call is told apart by the
-//! SHA-256 of its commands' raw text joined in order, so two calls that differ only in a secret are
-//! two checks), the call is not run: the result quotes that run's findings, names the call that made
+//! SHA-256 of its commands' raw text, each behind its length, so two calls that differ only in a
+//! secret, or in where one command ends and the next begins, are two checks), the call is not run:
+//! the result quotes that run's findings, names the call that made
 //! them, spends no check cycle and emits no `checks` artifact (the earlier run's is the verdict on
 //! this tree). It is still a failure, so the gate refuses a pull request on the tree. A passing
 //! record is never reused (the model may be confirming it, and the environment may have changed),
@@ -400,11 +403,21 @@ fn joined(shown: &[String]) -> String {
     shown.join("; ")
 }
 
-/// What makes two calls the same check: the SHA-256 of their commands' raw text, in order. A command
-/// cannot hold a NUL, so `["a\0b"]` and `["a", "b"]` are two calls; one command hashes as it always
-/// did.
+/// What makes two calls the same check: the SHA-256 of their commands' raw text, in order. One
+/// command hashes as it always did (`sha256(command)`), so a failure recorded before a call could
+/// name a list is still reused; several hash each command behind its length in bytes, so no two
+/// lists share a digest. [`commands_of`] refuses a NUL, which would make the length prefix the only
+/// thing telling `["a\0b"]` from `["a", "b"]`.
 fn call_sha(commands: &[String]) -> String {
-    sha256_hex(commands.join("\0").as_bytes())
+    if let [one] = commands {
+        return sha256_hex(one.as_bytes());
+    }
+    let mut bytes = Vec::new();
+    for command in commands {
+        bytes.extend_from_slice(&(command.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(command.as_bytes());
+    }
+    sha256_hex(&bytes)
 }
 
 /// The results of `jobs`, polled at most `bound` at a time, in the order they were given.
@@ -634,8 +647,9 @@ fn unchanged_failure_text(record: &CheckRecord, command: &str, failures: u32, ma
     } else {
         format!("{code}:\n{tail}")
     };
-    // One command keeps the words it always had; a call of several says the checks, in the plural.
-    let again = if failed > 1 {
+    // One command keeps the words it always had; a call of several says the checks, in the plural,
+    // whatever its findings were capped to.
+    let again = if record.commands > 1 {
         "the checks were not run again, because they would fail the same way"
     } else {
         "the command was not run again, because it would fail the same way"
@@ -652,24 +666,15 @@ fn unchanged_failure_text(record: &CheckRecord, command: &str, failures: u32, ma
     )
 }
 
-// Runs the commands of a call in the worktree and reports how each went.
-//
-// * `bash -lc <command>` (`sh -lc` without bash), cwd inside the worktree (`cwd`, if given, must stay
-//   inside it), the process group killed after the timeout, only the output
-//   tail kept.
-// * A failed call costs one check cycle, however many of its commands failed. After
-//   `max_check_cycles` failures the tool no longer runs anything and tells the model to stop and
-//   report.
-
-/// The commands a call names: `command`, or `commands`, exactly one of the two. Every command is
-/// trimmed, and an empty one is refused, as a blank `command` always was.
+/// The commands a call names: `command`, or `commands`, exactly one of the two (whether it is
+/// given is decided before trimming, so a blank `command` beside a list is still both). Every
+/// command is trimmed, an empty one is refused, and a NUL is refused: it is what the reuse key's
+/// length prefix has to tell from the boundary between two commands (see [`call_sha`]).
 fn commands_of(
     command: Option<String>,
     commands: Option<Vec<String>>,
 ) -> Result<Vec<String>, String> {
-    let one = command.as_deref().and_then(non_empty);
-    match (one, commands) {
-        (Some(one), None) => Ok(vec![one.to_owned()]),
+    match (command, commands) {
         (Some(_), Some(_)) => Err(
             "give either `command` (one command) or `commands` (a list of \
                                    independent commands), not both"
@@ -680,10 +685,20 @@ fn commands_of(
                              commands to run at the same time)"
                 .to_owned(),
         ),
-        (None, Some(commands)) if commands.is_empty() => Err(
-            "`commands` is empty: name at least one command, or use `command` for one".to_owned(),
-        ),
+        (Some(command), None) => {
+            let Some(command) = non_empty(&command) else {
+                return Err("`command` is empty: give the shell command to run".to_owned());
+            };
+            refuse_nul(command, "`command`")?;
+            Ok(vec![command.to_owned()])
+        }
         (None, Some(commands)) => {
+            if commands.is_empty() {
+                return Err(
+                    "`commands` is empty: name at least one command, or use `command` for one"
+                        .to_owned(),
+                );
+            }
             let mut list = Vec::with_capacity(commands.len());
             for (n, command) in commands.iter().enumerate() {
                 let Some(command) = non_empty(command) else {
@@ -691,11 +706,23 @@ fn commands_of(
                         "`commands[{n}]` is empty: every command must be a shell command to run"
                     ));
                 };
+                refuse_nul(command, &format!("`commands[{n}]`"))?;
                 list.push(command.to_owned());
             }
             Ok(list)
         }
     }
+}
+
+/// Refuse `command` (which the call named `name`) when it holds a NUL: a shell command cannot, and
+/// the reuse key could not tell it from the boundary between two commands.
+fn refuse_nul(command: &str, name: &str) -> Result<(), String> {
+    if command.contains('\0') {
+        return Err(format!(
+            "{name} holds a NUL character (U+0000), which a shell command cannot: remove it"
+        ));
+    }
+    Ok(())
 }
 
 /// The commands the shell could not find, by their place in the call: a missing toolchain is not a
@@ -799,6 +826,15 @@ fn batch_repeat_key(outcomes: &[ShellOutcome]) -> String {
         .collect::<Vec<_>>()
         .join(",")
 }
+
+// Runs the commands of a call in the worktree and reports how each went.
+//
+// * `bash -lc <command>` (`sh -lc` without bash), cwd inside the worktree (`cwd`, if given, must stay
+//   inside it), the process group killed after the timeout, only the output
+//   tail kept.
+// * A failed call costs one check cycle, however many of its commands failed. After
+//   `max_check_cycles` failures the tool no longer runs anything and tells the model to stop and
+//   report.
 
 /// Run one of the project's own checks in your worktree (the commands its CI, README or
 /// Makefile run: `cargo test`, `pnpm test`, `just ci`), in the workspace's environment (a run pod of
@@ -1032,6 +1068,7 @@ pub async fn run_checks(
         call_id: call,
         command: named.clone(),
         passed,
+        commands: u32::try_from(outcomes.len()).unwrap_or(u32::MAX),
         exit_code: first_failing_exit(&outcomes),
         tail: recorded_tail(&outcomes, &shown),
         tree,
@@ -1457,13 +1494,32 @@ mod tests {
         assert!(commands_of(None, Some(vec![])).is_err());
         let said = commands_of(None, Some(vec!["a".into(), " ".into()])).unwrap_err();
         assert!(said.contains("commands[1]"), "{said}");
+        // A blank `command` beside a list is both given, not one.
+        let said = commands_of(Some("  ".into()), Some(vec!["a".into()])).unwrap_err();
+        assert!(
+            said.contains("`command`") && said.contains("`commands`"),
+            "{said}"
+        );
+        // A NUL is refused in either form: it is what a length prefix has to tell from a boundary.
+        let said = commands_of(Some("echo a\0b".into()), None).unwrap_err();
+        assert!(said.contains("`command`") && said.contains("NUL"), "{said}");
+        let said = commands_of(None, Some(vec!["a".into(), "b\0c".into()])).unwrap_err();
+        assert!(
+            said.contains("`commands[1]`") && said.contains("NUL"),
+            "{said}"
+        );
     }
 
     #[test]
     fn one_command_hashes_as_it_always_did() {
         let one = vec!["cargo test".to_owned()];
         assert_eq!(call_sha(&one), sha256_hex(b"cargo test"));
-        // A list is its commands in order, and a command cannot hold the separator.
+        // A list is its commands in order, each behind its length: where one ends and the next
+        // begins is part of the key.
+        assert_ne!(
+            call_sha(&["a".to_owned(), "b".to_owned()]),
+            call_sha(&["ab".to_owned(), String::new()])
+        );
         assert_ne!(
             call_sha(&["a".to_owned(), "b".to_owned()]),
             call_sha(&["a\0b".to_owned()])

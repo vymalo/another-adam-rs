@@ -611,7 +611,7 @@ renamed over its target, which replaces a symlink that appeared meanwhile instea
 
 ### Kept output: `read_output` and the `timeout` of a command
 
-`run_command`, `run` and `run_checks` take `timeout` (seconds, optional): the command is killed after it, **never more than `CHECK_TIMEOUT_SECS`**, which is also the default. A larger value (or one below 1) is an error result that names the limit (`timeout 31 s is over the most this deployment allows, 30 s: ask for at most 30 s, or leave it out`) and **nothing runs**; it is never clamped. On a timeout the process group is killed as before and the result says `timed out`; the output produced so far is shown, or kept when long.
+`run_command`, `run` and `run_checks` take `timeout` (seconds, optional): the command is killed after it (for `run_checks`, each of the call's commands, which share the one `timeout`), **never more than `CHECK_TIMEOUT_SECS`**, which is also the default. A larger value (or one below 1) is an error result that names the limit (`timeout 31 s is over the most this deployment allows, 30 s: ask for at most 30 s, or leave it out`) and **nothing runs**; it is never clamped. On a timeout the process group is killed as before and the result says `timed out`; the output produced so far is shown, or kept when long.
 
 **Output that fits the tail (16 KiB) is shown whole, as it always was.** A longer one is shown as its **head** (a quarter, cut at a line end) and its **tail**, with the count of bytes between, and is **kept whole** under an output id:
 

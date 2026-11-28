@@ -1097,6 +1097,13 @@ impl Tool for Gated {
         own_limit(&self.name, &self.env.settings).or_else(|| self.inner.time_limit())
     }
 
+    /// [`own_limit_for`]: a `run_checks` call that names several commands is given the time they
+    /// need, waves and base re-runs included, so the agent never drops it mid-way.
+    fn time_limit_for(&self, args: &Value) -> Option<Duration> {
+        own_limit_for(&self.name, &self.env.settings, args)
+            .or_else(|| self.inner.time_limit_for(args))
+    }
+
     fn retry_policy(&self) -> Option<adam_runtime::RetryPolicy> {
         self.inner.retry_policy()
     }
@@ -1194,9 +1201,13 @@ pub const QUICK_TOOLS: [&str; 16] = [
 /// The time limit a coder tool declares: its own bound and [`LIMIT_MARGIN`], from the deployment's
 /// configured values. `None` for a tool with no bound of its own (see [`QUICK_TOOLS`]).
 ///
+/// The bound of a tool whose cost depends on what the call asks for is [`own_limit_for`]'s; this
+/// one is the bound of a call with no arguments, which for `run_checks` is a call of one command.
+///
 /// | tool | its own bound |
 /// |---|---|
-/// | `run_command`, `run`, `run_checks` | the environment is made ready (`environment_start`) and the command runs (`CHECK_TIMEOUT_SECS`) |
+/// | `run_checks` | the environment is made ready (`environment_start`), one `CHECK_TIMEOUT_SECS` for every wave of the call's commands and one for every command, which the base may run again |
+/// | `run_command`, `run` | the environment is made ready and the command runs (`CHECK_TIMEOUT_SECS`) |
 /// | `start_command` | the environment is made ready and the call waits for the command at most 120 s |
 /// | `stop_command` | the environment is made ready (for a command this worker does not hold) and the call waits for the process 60 s |
 /// | `list_commands` | the environment is asked for its session, and the records are read |
@@ -1204,9 +1215,24 @@ pub const QUICK_TOOLS: [&str; 16] = [
 /// | `file_diagnostics`, `find_definition`, `find_references` | the environment is made ready, and the call waits for a language server at most `wait` (120 s), `initialize` (60 s) and the probe and the sync (60 s): [`lsp::BEYOND_ENVIRONMENT`] |
 /// | `prepare_workspace`, `commit_and_push`, `publish_scratch`, `create_repository` | git: one network operation and the local ones around it |
 fn own_limit(name: &str, settings: &CoderSettings) -> Option<Duration> {
+    own_limit_for(name, settings, &Value::Null)
+}
+
+/// [`own_limit`] for a call that asks for `args`: the same, except that `run_checks` pays for the
+/// commands the call names. They run in waves of `MAX_PARALLEL_TOOL_CALLS` at once, and every
+/// command that fails is run again on the base, one after another, so the worst case is one
+/// `CHECK_TIMEOUT_SECS` for each wave **and** one for each command.
+fn own_limit_for(name: &str, settings: &CoderSettings, args: &Value) -> Option<Duration> {
     let environment = settings.environment_start;
     let bound = match name {
-        "run_command" | "run" | "run_checks" => environment + settings.check_timeout,
+        "run_checks" => {
+            let commands = checks_in(args);
+            let waves = commands.div_ceil(settings.max_parallel_tool_calls.max(1));
+            let waves_and_commands =
+                u32::try_from(waves.saturating_add(commands)).unwrap_or(u32::MAX);
+            environment.saturating_add(settings.check_timeout.saturating_mul(waves_and_commands))
+        }
+        "run_command" | "run" => environment + settings.check_timeout,
         // The environment is made ready, and the call waits at most 120 s for the command.
         "start_command" => {
             environment + Duration::from_secs(background::MAX_WAIT_SECS.unsigned_abs())
@@ -1227,7 +1253,16 @@ fn own_limit(name: &str, settings: &CoderSettings) -> Option<Duration> {
         }
         _ => return None,
     };
-    Some(bound + LIMIT_MARGIN)
+    Some(bound.saturating_add(LIMIT_MARGIN))
+}
+
+/// How many commands a `run_checks` call names: its `commands` array, or one `command`. A call that
+/// names neither, or a list that is empty, is refused before it runs; one command is the bound then
+/// too.
+fn checks_in(args: &Value) -> usize {
+    args.get("commands")
+        .and_then(Value::as_array)
+        .map_or(1, |commands| commands.len().max(1))
 }
 
 /// A tool whose results and errors are scrubbed by a [`Redactor`].
@@ -1284,6 +1319,10 @@ impl Tool for Redacting {
 
     fn time_limit(&self) -> Option<Duration> {
         self.inner.time_limit()
+    }
+
+    fn time_limit_for(&self, args: &Value) -> Option<Duration> {
+        self.inner.time_limit_for(args)
     }
 
     fn retry_policy(&self) -> Option<adam_runtime::RetryPolicy> {

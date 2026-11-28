@@ -841,6 +841,12 @@ async fn run_checks_takes_one_command_or_a_list_never_both() {
         .call(&rig.ctx, json!({"commands": ["true", " "]}))
         .await;
     assert!(text(out).contains("commands[1]"));
+    // A NUL is refused: the reuse key could not tell it from a boundary between two commands.
+    let out = RunChecks
+        .call(&rig.ctx, json!({"command": "echo a\u{0}b"}))
+        .await;
+    assert!(is_error(&out), "{out:?}");
+    assert!(text(out).contains("NUL"));
 }
 
 #[tokio::test]
@@ -7827,6 +7833,7 @@ fn failed(call: &str, scratch: bool) -> CheckRecord {
         call_id: call.to_owned(),
         command: "check".into(),
         passed: false,
+        commands: 1,
         exit_code: Some(1),
         tail: "red".into(),
         tree: None,

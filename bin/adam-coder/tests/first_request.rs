@@ -26,11 +26,11 @@ use common::Fixture;
 /// allowed (a tool's description may gain a sentence); anything more is a reviewed decision.
 // The old pin (30814, measured 2026-11-21 on the merged head b16c076a) plus 1766 bytes: "\n\n" and
 // the 1696 bytes of `SessionTools::guide_for(["explorer", "reviewer"])` (ADR 0054 decision 9), plus
-// the 68 bytes the `delete` argument of `subagent_close` added to that section (slice 5). The delta
-// is computed, not measured: re-pin this from the `system N B` line this test prints on the first
-// green CI run.
-const BASELINE_PROMPT_BYTES: usize = 32580;
-const BASELINE_TOOLS_BYTES: usize = 64103; // measured 2026-11-27 on the merged head (slice 6's token_budget, slice 3's tools)
+// the 68 bytes the `delete` argument of `subagent_close` added to that section (slice 5), plus the
+// 11 bytes `command | commands` added to `run_checks`'s line (ANR-243). The deltas are computed,
+// not measured: re-pin this from the `system N B` line this test prints on the first green CI run.
+const BASELINE_PROMPT_BYTES: usize = 32591;
+const BASELINE_TOOLS_BYTES: usize = 64752; // measured 2026-11-28 on the branch of ANR-243 (the `commands` argument of run_checks)
 const GROWTH_ALLOWED: usize = 1024;
 /// The owner's budget for the coder's tools once S3 makes it lean (ADR 0066).
 const TOOLS_BUDGET_TOKENS: usize = 3000;

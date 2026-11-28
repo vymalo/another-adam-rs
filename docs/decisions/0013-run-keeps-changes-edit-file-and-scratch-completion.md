@@ -50,10 +50,14 @@ a question (`stop_as_question`) unless the run failed.
    *Amended 2026-11-28 (the independent checks of a call run at the same time):* `run_checks` takes one command with
    `command`, or several **independent** ones with `commands` (a JSON array; exactly one of the two, and giving both or
    neither is an error that names both), and runs them at the same time, at most `MAX_PARALLEL_TOOL_CALLS` at once, each
-   through the process pool (`MAX_PROCESSES`). The verdict is the one running them one after another gave: every command
-   still runs, each keeps its own output tail and its place, `passed` is true only when all of them passed, `findings`
-   names the failing ones in the caller's order, and a call spends **one** check cycle when any of them fails. The
-   failure the notes reuse on an unchanged tree is keyed on the whole list. (Epic "adam: a faster coder", card ANR-243.)
+   through the process pool (`MAX_PROCESSES`). Independent is the whole point: a command that writes the worktree, or reads
+   what another of the list writes, is not the same check beside it, and goes in a call of its own. The verdict is the one
+   running them one after another gave: every command still runs, each keeps its own output tail and its place, `passed` is
+   true only when all of them passed, `findings` names the failing ones in the caller's order, and a call spends **one**
+   check cycle when any of them fails. The failure the notes reuse on an unchanged tree is keyed on the whole list, each
+   command behind its length, and a command holding a NUL is refused. The schema has no `required` list at all, because the
+   `#[tool]` macro cannot express `oneOf`: a call that names neither or both is refused by the tool, with words that name
+   both. (Epic "adam: a faster coder", card ANR-243.)
 
 2. **`run` keeps files and nothing of git.** The worktree is snapshotted before the command as `run_command` does it (git
    directory, `.git` file, `HEAD`, branch, refs, local configuration, `info/exclude`); after it, everything but the files is

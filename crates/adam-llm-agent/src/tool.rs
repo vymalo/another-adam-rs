@@ -137,6 +137,14 @@ pub trait Tool: Send + Sync + 'static {
         None
     }
 
+    /// [`time_limit`](Self::time_limit) for a call that asks for `args`: the same by default. A tool
+    /// whose bound depends on what the call asks for (a call that runs several commands at once,
+    /// each of which may be run again) says so here; the loop asks this one. A tool that wraps
+    /// another must forward it, as it forwards `time_limit`.
+    fn time_limit_for(&self, _args: &Value) -> Option<Duration> {
+        self.time_limit()
+    }
+
     /// The retry policy of this tool's retryable failures ([`ToolError::Transient`],
     /// [`ToolError::Retryable`]), counted under the key `tool:<name>` apart from the other steps
     /// of the run ([ADR 0061]). `None`, the default, leaves them to the runtime's policy. A policy

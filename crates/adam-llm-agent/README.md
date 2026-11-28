@@ -877,7 +877,9 @@ ADR 0037 says of its state: a worker that has not been rolled runs a tool whose 
   the same. A call that waits (a question, a child) resets it.
 * **`Tool::retry_policy`** (default `None`, the runtime's): see *Retry policies per tool*.
 * **`Tool::time_limit`** (default `None` = `DEFAULT_TOOL_TIME_LIMIT`, 300 s; `FnTool::with_time_limit`; a wrapper must forward
-  it). The timer runs inside the journaled `tool:<id>` step: the call gets a child `CancelToken`, which fires at the
+  it). **`Tool::time_limit_for(args)`** is the same by default and is what the loop asks: a tool whose bound depends on what
+  the call asks for (the coder's `run_checks` pays for every command of a list) declares it there. The timer runs inside
+  the journaled `tool:<id>` step: the call gets a child `CancelToken`, which fires at the
   limit; the tool has `TOOL_STOP_GRACE` (5 s) to stop and is then dropped; the model gets an error result that says the call
   did not finish, and that is what the journal keeps. `ToolCtx::start_child_within` starts a child with a run limit.
 * **A tool that finishes while it is told to stop** (during the 5 s grace, or at the instant of the limit) with a result that
