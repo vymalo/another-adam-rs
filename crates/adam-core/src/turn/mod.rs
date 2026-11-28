@@ -60,9 +60,9 @@ pub use request::{
     sign_request_at, verify_request,
 };
 pub use run_cert::{
-    BadCertificateRequest, BadRunSubject, CertificateRequest, DynRunCertIssuer, DynRunKeys,
-    RENEW_RETRY_SECS, RunCertError, RunCertIssuer, RunClock, RunKeyError, RunKeyring, RunKeys,
-    RunSubject, SystemClock,
+    BadCertificateRequest, BadRenewFraction, BadRunSubject, CertificateRequest, DynRunCertIssuer,
+    DynRunKeys, RENEW_RETRY_SECS, RenewFraction, RunCertError, RunCertIssuer, RunClock,
+    RunKeyError, RunKeyring, RunKeys, RunSubject, SystemClock,
 };
 
 /// Signs with the turn key and gives the keys a turn signature is verified with ([ADR 0068]

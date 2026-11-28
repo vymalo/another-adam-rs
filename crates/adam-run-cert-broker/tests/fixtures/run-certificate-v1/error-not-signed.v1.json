@@ -1,0 +1,7 @@
+{
+  "type": "about:blank",
+  "title": "The run is not on the signed path",
+  "status": 403,
+  "code": "not_signed",
+  "detail": "the binding's path is injected, so this run asks no certificate"
+}
