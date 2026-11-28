@@ -831,6 +831,13 @@ pub struct HookedOutput {
     /// outside the crate names it (`approval: None`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub approval: Option<String>,
+    /// The action a deciding hook asked for (ADR 0050, decision 11, slice H1d), recorded in the
+    /// step itself: a replay that finds the step recorded asks no hook again, and the loop
+    /// performs the action as its own journaled step after this one (`Compact` as the next
+    /// `compact:<n>:<turn>`, a declared action as `action:<turn>:<i>`). Absent when no hook asked
+    /// for one, and from a record written before H1d.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action: Option<adam_plugin::HookAction>,
 }
 
 impl HookedOutput {
@@ -843,6 +850,7 @@ impl HookedOutput {
             args: None,
             events: Vec::new(),
             approval: None,
+            action: None,
         }
     }
 
@@ -860,6 +868,13 @@ impl HookedOutput {
             .find(|decision| decision.verdict == HookDecision::STOP)
             .map(|decision| decision.reason.as_deref().unwrap_or_default())
     }
+
+    /// The action a hook asked for (slice H1d), recorded in the step so a replay asks no hook
+    /// again. The loop performs it as its own journaled step after this one.
+    #[must_use]
+    pub fn action(&self) -> Option<&adam_plugin::HookAction> {
+        self.action.as_ref()
+    }
 }
 
 /// What the step that takes a person's message in records (`message.received`, ADR 0050 decision 9).
@@ -876,6 +891,12 @@ pub struct MessageDecision {
     /// `failed` hook (a hook that cannot decide never lets a message through).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hook: Option<HookDecision>,
+    /// The action a deciding hook asked for (ADR 0050, decision 11, slice H1d), recorded in the
+    /// step itself: a replay that finds the step recorded asks no hook again, and the loop
+    /// performs the action as its own journaled step after this one. Absent when no hook asked
+    /// for one, and from a record written before H1d.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action: Option<adam_plugin::HookAction>,
 }
 
 impl MessageDecision {

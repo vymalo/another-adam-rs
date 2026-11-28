@@ -528,6 +528,7 @@ fn old_and_new_step_records_decode_both_ways() {
             data: json!({"n": 1}),
         }],
         approval: None,
+        action: None,
     };
     let new_json = serde_json::to_value(&new).unwrap();
     // A build that predates hooks reads the record as the output it flattened, and ignores the rest.

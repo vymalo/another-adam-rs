@@ -76,6 +76,74 @@ pub struct EventSpec {
     pub visibility: Visibility,
 }
 
+/// An action a plugin declares (ADR 0050, decision 11, slice H1d): the name it is performed under,
+/// the version of its declaration, and the JSON Schema of the data the action carries (`Value`
+/// [`Plugin::perform`](crate::Plugin::perform) returns). The name rules and the namespace check
+/// are the same as for [`EventSpec`]: `ns.name`, two to five segments of `[a-z][a-z0-9_]*`, and the
+/// namespace is not one of the core catalogue's. The loop bounds the data's size; the schema is
+/// carried for a consumer.
+///
+/// The plugin that declares the action is the one that performs it: `Plugin::actions` returns the
+/// list, and `Plugin::perform` runs the one the loop asked for in the journaled step
+/// `action:<turn>:<i>`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ActionSpec {
+    /// `ns.name`, up to five segments, each `[a-z][a-z0-9_]*`, the namespace not a core one.
+    pub name: String,
+    /// The version of the declaration, at least 1.
+    pub version: u32,
+    /// The JSON Schema of the data the action carries. The loop bounds the size; the schema is
+    /// carried for a consumer.
+    pub schema: Value,
+}
+
+impl ActionSpec {
+    /// An action called `name`: version 1, any data.
+    pub fn new(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            version: 1,
+            schema: json!({}),
+        }
+    }
+
+    /// The same action with the version of its declaration.
+    #[must_use]
+    pub fn with_version(mut self, version: u32) -> Self {
+        self.version = version;
+        self
+    }
+
+    /// The same action with the JSON Schema of its data.
+    #[must_use]
+    pub fn with_schema(mut self, schema: Value) -> Self {
+        self.schema = schema;
+        self
+    }
+
+    /// The namespace: the first segment of the name.
+    #[must_use]
+    pub fn namespace(&self) -> &str {
+        namespace_of(&self.name)
+    }
+
+    /// Whether the declaration is allowed: a name of the right shape outside the core namespaces,
+    /// and a version of at least 1.
+    ///
+    /// # Errors
+    /// [`DeclarationError::Reserved`], [`DeclarationError::BadName`] or
+    /// [`DeclarationError::BadVersion`].
+    pub fn validate(&self) -> Result<(), DeclarationError> {
+        check_event_name(&self.name)?;
+        if self.version == 0 {
+            return Err(DeclarationError::BadVersion {
+                name: self.name.clone(),
+            });
+        }
+        Ok(())
+    }
+}
+
 impl EventSpec {
     /// An event called `name`: version 1, any data, [`Visibility::Hooks`].
     pub fn new(name: impl Into<String>) -> Self {
@@ -524,6 +592,27 @@ mod tests {
             declared([&a, &c]),
             Err(DeclarationError::Conflict { .. })
         ));
+    }
+
+    /// An action is declared like a custom event: the name rules and the namespace check are the
+    /// same, and a version of 0 is refused the same way.
+    #[test]
+    fn an_action_is_declared_like_an_event() {
+        assert!(ActionSpec::new("demo.x").validate().is_ok());
+        assert!(ActionSpec::new("demo.x").with_version(2).validate().is_ok());
+        assert!(matches!(
+            ActionSpec::new("demo.x").with_version(0).validate(),
+            Err(DeclarationError::BadVersion { .. })
+        ));
+        assert!(matches!(
+            ActionSpec::new("tool.demo").validate(),
+            Err(DeclarationError::Reserved { .. })
+        ));
+        assert!(matches!(
+            ActionSpec::new("demo").validate(),
+            Err(DeclarationError::BadName { .. })
+        ));
+        assert_eq!(ActionSpec::new("demo.x").namespace(), "demo");
     }
 
     #[test]

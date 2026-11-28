@@ -615,3 +615,31 @@ and reads `Act` as `Continue`, and a program's action reply is still refused `Un
 stays closed (rule 3): a new variant must fail to compile in every host. Proof:
 `an_action_is_a_decision_and_carries_no_reason` in `crates/adam-plugin/src/lib.rs`, seen red with `decides()`
 counting `Act` as `Continue` and green with it as a decision.
+
+*Amended 2026-11-28 (slice **H1d** built):* the loop performs the action a deciding hook asked for as its
+own journaled step. `Compact` becomes the next `compact:<n>:<turn>` (a new [`CompactionReason::Requested`](../../crates/adam-llm-agent/src/compaction.rs)
+in `adam-llm-agent`), within ADR 0044's bound of compactions per run; at the bound the existing path's cap is
+what the step records. A declared action (a name a plugin declared with `actions()`) becomes the journaled
+step `action:<turn>:<i>` in which the declaring plugin's `perform` runs and its `Value` is recorded
+([`ActionOutcome`](../../crates/adam-plugin/src/lib.rs) in `adam-plugin`, with the `Result<Value, HookError>`
+the plugin returned and the plugin's name). A hook never performs an action itself. **The action is recorded
+in the step that asked, so a replay that finds it recorded asks no hook again.** The new fields (`HookedOutput::action`,
+`MessageDecision::action`, `Recorded::action`, `Summarised::action`, `EndDecision::action`) are
+`#[serde(default, skip_serializing_if = "Option::is_none")]`, so an older build reads a new record and a newer
+build reads an older one. The plugin trait gained two defaulted methods — `fn actions(&self) -> Vec<ActionSpec>`
+and `fn perform(&self, cx: &HookCtx, action: &HookAction) -> BoxFuture<Result<Value, HookError>>` — so the
+trait change is additive (rule 2). The new variant `HookAction::Declared { name, version }` carries the
+plugin's declaration into the journaled record. `HookCtx { run, root_run, agent, point, key, attempt,
+deadline, cancelled }` is the minimal context the ADR sketches (`emit_event` is **not** built yet for a
+plugin, as the ADR has it for tools and not plugins; a plugin that needs to emit is added with that seam
+later). The six `Continue | Act(_)` readings of the loop are gone: every deciding point records the action
+in its step (`before_tool`, `after_tool`, `message.received`, `model.request` in both kinds, `compaction.before`,
+`run_ending`), and the loop performs it after. Proof: `crates/adam-llm-agent/tests/hook_actions.rs`
+— a requested compaction is the next `compact:<n>:<turn>` step with reason `requested`, a declared
+action's `perform` runs once across a crash and the counter stays at 1 on the replay (red with the action
+removed from the recording step), and a read-only hook changes nothing. `crates/adam-plugin/src/lib.rs`
+gained the declaration and unit tests of the new types. **Not built here:** the engine's run state,
+events and answer path for an embedding host (ADR 0047 slice 5), `HookCtx::emit_event` (no plugin emits
+yet), the audit and conformance testkit for actions (slice H6b / `adam-plugin-testkit`), and the
+`perform` step's class-based retry on a `Transient` failure (a retryable `perform` ends the run today;
+the runtime's retry policy is what an action will be retried under).

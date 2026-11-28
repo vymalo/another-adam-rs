@@ -99,6 +99,11 @@ pub enum CompactionReason {
     Budget,
     /// The provider rejected the prompt as too long.
     Overflow,
+    /// A deciding hook asked for one (ADR 0050, decision 11, slice H1d): `HookAction::Compact` in
+    /// the step that asked, recorded as the next `compact:<n>:<turn>` with this reason. Within
+    /// ADR 0044's bound of compactions per run; at the bound, the existing path's cap is what the
+    /// step records.
+    Requested,
 }
 
 /// How big the last model call's prompt was, as the provider reported it, and how many messages the

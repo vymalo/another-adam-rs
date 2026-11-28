@@ -13,7 +13,8 @@
 //!    the message is refused like any other error.
 //! 3. **Order is the declaration order**, and the first verdict other than [`Decision::Continue`] is
 //!    the set's: a later plugin is not asked once one has decided. An action ([`Decision::Act`]) is
-//!    a decision too: it ends the set, and the loop performs nothing until slice H1d is built.
+//!    a decision too: it ends the set, and the loop performs it as its own journaled step
+//!    (`Compact` as the next `compact:<n>:<turn>`, a declared action as `action:<turn>:<i>`).
 //!
 //! The loop runs a set **inside** the journaled step it affects, with `LlmAgentBuilder::hooks` of
 //! `adam-llm-agent`: in the step that takes a message in for `message.received`, inside
@@ -36,8 +37,9 @@ mod events;
 
 pub use audit::Audit;
 pub use custom::{
-    DATA_MAX, DeclarationError, EventSpec, RESERVED_NAMESPACES, STEP_EVENTS_MAX, Subscriptions,
-    TRANSITION_EVENTS_MAX, Visibility, check_event_name, declared, has_event_name_shape,
+    ActionSpec, DATA_MAX, DeclarationError, EventSpec, RESERVED_NAMESPACES, STEP_EVENTS_MAX,
+    Subscriptions, TRANSITION_EVENTS_MAX, Visibility, check_event_name, declared,
+    has_event_name_shape,
 };
 pub use events::{
     EVENT_MAX, EventHeader, EventKind, EventQueue, FIELD_MAX, FlushReport, HookEvent, JSON_MAX,
@@ -49,6 +51,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use adam_error::ErrorClass;
+use futures::future::BoxFuture;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 /// What a call is, as a hook sees it: the tool's name and the arguments the model sent, which a
@@ -163,16 +167,32 @@ pub struct HookedCompaction<'a> {
 ///
 /// The set is **open and versioned** on purpose, and this is the one place the workspace's closed
 /// enums rule does not hold: a plugin declares an action of its own (`ActionSpec { name, version,
-/// schema }`, ADR 0050 decision 11), and the loop performs it in `action:<turn>:<i>` with the
-/// declaring plugin's `perform`. A new action is therefore a variant here and no trait change, so
+/// schema }`), and the loop performs it in `action:<turn>:<i>` with the declaring plugin's
+/// `perform`. A new action is therefore a variant here and no trait change, so
 /// `#[non_exhaustive]` is correct and is not to be "fixed": a host that matches this must carry an
 /// arm for an action it does not know.
+///
+/// The `serde` derive is for the journal: a step's record carries the action it asked for, so
+/// the record decides on a replay and the hook is not asked again (`#[serde(tag = "kind")]` so
+/// the variants read with a tag, and the version field of `Declared` is versioned under the
+/// record).
 #[non_exhaustive]
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum HookAction {
     /// Summarise the history now, as the next `compact:<n>:<turn>` step, within ADR 0044's bound of
     /// compactions per run.
     Compact,
+    /// A plugin-declared action (a name in [`Plugin::actions`](crate::Plugin::actions)). The loop
+    /// looks up the plugin that declared `name`, runs its `perform`, and records the result.
+    /// Declaring an action with no version is refused at build, and a plugin that does not
+    /// declare the action the hook asked for returns [`HookError::unsupported`].
+    Declared {
+        /// The action's name, as declared.
+        name: String,
+        /// The version of its declaration.
+        version: u32,
+    },
 }
 
 /// What a deciding hook says about the call it runs at: a verdict, and the action it asks for.
@@ -191,8 +211,10 @@ pub enum Decision {
     Stop(String),
     /// Perform [`HookAction`] as its own journaled step after this one, and otherwise go on.
     ///
-    /// Until slice H1d is built the loop performs nothing and reads this as [`Decision::Continue`];
-    /// the type carries the shape the journaled step will record.
+    /// The journaled step records the action, so a replay that finds it asks no hook again
+    /// (ADR 0050, decision 11, slice H1d). `Compact` is performed as the next `compact:<n>:<turn>`
+    /// step, with the reason `requested`; a declared action (a name a plugin declares with
+    /// `actions()`) is performed in `action:<turn>:<i>` by the declaring plugin's `perform`.
     Act(HookAction),
 }
 
@@ -234,6 +256,19 @@ impl HookError {
             plugin: plugin.into(),
             class,
             reason: reason.into(),
+        }
+    }
+
+    /// The default error a [`Plugin::perform`] returns when the plugin does not declare the
+    /// action: a hook that does not declare an action never performs one, and the loop records
+    /// the result of `perform` as this error. `class` is `Invalid` (a broken declaration is a
+    /// build-time mistake, not a transient one), so the run fails for good on it.
+    #[must_use]
+    pub fn unsupported() -> Self {
+        HookError {
+            plugin: String::new(),
+            class: ErrorClass::Invalid,
+            reason: "this plugin does not declare the action".to_owned(),
         }
     }
 
@@ -321,6 +356,33 @@ pub trait Plugin: Send + Sync {
     fn observe(&self, _event: &HookEvent) -> Result<(), HookError> {
         Ok(())
     }
+
+    /// The actions this plugin performs (ADR 0050, decision 11, slice H1d), declared before any
+    /// step can ask for one. The name rules and the namespace check are the same as for
+    /// [`EventSpec`]: a name of the right shape outside the core namespaces, version of at least
+    /// 1, two declarations of one name equal. The default declares none.
+    fn actions(&self) -> Vec<ActionSpec> {
+        Vec::new()
+    }
+
+    /// Perform `action` as the loop's own journaled step `action:<turn>:<i>`. **A hook never
+    /// performs an action itself**: the loop performs it here, and the result (`Value`) is what
+    /// the step records. The default returns [`HookError::unsupported`], because a plugin that
+    /// does not declare the action cannot perform it.
+    ///
+    /// The step is the loop's, not the plugin's: a crash before this returns is replayed, and the
+    /// replay runs `perform` again. A [`HookError`] of a retryable class is the step's failure,
+    /// and the transition is tried again; an `Invalid` failure ends the run.
+    ///
+    /// Returns a boxed future so `Plugin` stays dyn-compatible (the trait is also held as
+    /// `Arc<dyn Plugin>` by [`HookSet`]).
+    fn perform(
+        &self,
+        _cx: &HookCtx,
+        _action: &HookAction,
+    ) -> BoxFuture<'_, Result<Value, HookError>> {
+        Box::pin(async { Err(HookError::unsupported()) })
+    }
 }
 
 /// What a hook says, and which plugin said it: the record of a decision names both (ADR 0050,
@@ -331,6 +393,116 @@ pub struct Decided<'a> {
     pub plugin: &'a str,
     /// What it said.
     pub verdict: Decision,
+}
+
+/// What a hook's [`Plugin::perform`] returned in the journaled `action:<turn>:<i>` step
+/// (ADR 0050, decision 11, slice H1d): the plugin's `Value` on success, the error on failure,
+/// and the plugin's name. The step records this so a replay that finds it recorded runs `perform`
+/// no second time, and a host that reads the journal sees what happened.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ActionOutcome {
+    /// The plugin that performed the action, by its name. Empty when no plugin declared the
+    /// action (the step recorded the miss and the run went on).
+    pub plugin: String,
+    /// What `perform` returned. `None` when `perform` errored.
+    pub result: Option<Value>,
+}
+
+impl ActionOutcome {
+    /// An outcome for a plugin's success.
+    #[must_use]
+    pub fn from_result(plugin: impl Into<String>, result: Value) -> Self {
+        Self {
+            plugin: plugin.into(),
+            result: Some(result),
+        }
+    }
+
+    /// An outcome for a plugin's failure.
+    #[must_use]
+    pub fn from_error(plugin: impl Into<String>) -> Self {
+        Self {
+            plugin: plugin.into(),
+            result: None,
+        }
+    }
+
+    /// An outcome for an action nobody declared.
+    #[must_use]
+    pub fn undeclared(name: impl Into<String>) -> Self {
+        Self {
+            plugin: format!("no plugin declares the action `{}`", name.into()),
+            result: None,
+        }
+    }
+
+    /// The error class of the recorded failure, when one is recorded.
+    #[must_use]
+    pub fn into_error(self) -> Option<HookError> {
+        if self.result.is_none() {
+            Some(HookError {
+                plugin: self.plugin,
+                class: ErrorClass::Invalid,
+                reason: "the action's perform returned an error".to_owned(),
+            })
+        } else {
+            None
+        }
+    }
+}
+
+impl From<Result<Value, HookError>> for ActionOutcome {
+    fn from(result: Result<Value, HookError>) -> Self {
+        match result {
+            Ok(value) => ActionOutcome {
+                plugin: String::new(),
+                result: Some(value),
+            },
+            Err(error) => ActionOutcome {
+                plugin: error.plugin,
+                result: None,
+            },
+        }
+    }
+}
+
+impl ActionOutcome {
+    /// The plugin that performed the action, by its name. Set by the loop after `perform` runs
+    /// (the loop knows which plugin declared the action).
+    #[must_use]
+    pub fn with_plugin(mut self, plugin: impl Into<String>) -> Self {
+        self.plugin = plugin.into();
+        self
+    }
+}
+
+/// The context a plugin's [`Plugin::perform`] runs with: identifying the run, root run, agent,
+/// point and attempt, the deadline the step has, and the cancel token the loop has set. **No
+/// `Ctx`, store or run context** (ADR 0050, decision 13): a hook never reads the state or asks
+/// the store for one.
+///
+/// `emit_event` is **not built** here (slice H5 has it for tools, not plugins yet): a plugin's
+/// `observe` is the path today, and a plugin that needs to emit from `perform` is added with
+/// that seam, not with a stopgap. The field is reserved by the trait shape, not by this struct.
+#[derive(Debug, Clone)]
+pub struct HookCtx {
+    /// The run the hook runs for.
+    pub run: String,
+    /// The root of the run's parent chain (the top of the chain, the run itself for one that is
+    /// nobody's child).
+    pub root_run: String,
+    /// The agent's name.
+    pub agent: String,
+    /// The point the hook runs at (`"before_tool"`, `"action"`, ...).
+    pub point: &'static str,
+    /// The step the hook runs in (e.g. `tool:c1`, `action:3:0`).
+    pub key: String,
+    /// Which attempt of the step (0 the first time, then retries).
+    pub attempt: u8,
+    /// The deadline the hook may take.
+    pub deadline: Duration,
+    /// Whether the run has been cancelled meanwhile.
+    pub cancelled: bool,
 }
 
 /// How long one hook may take, and how many times a transient failure is tried again.
@@ -436,8 +608,10 @@ impl HookSet {
     /// Runs every plugin's `before_tool` in order, until one denies or stops.
     ///
     /// A [`Decision::Act`] ends the set like any other decision: the action is the first one asked
-    /// for, and the plugins after it are not asked. The loop performs nothing until slice H1d, and
-    /// reads the action as `Continue`, so the call runs.
+    /// for, and the plugins after it are not asked. The loop performs the action as its own
+    /// journaled step after the call's step (`Compact` as the next `compact:<n>:<turn>`, a
+    /// declared action as `action:<turn>:<i>`), so the call runs with any rewrite the hooks
+    /// left.
     ///
     /// A [`Decision::Ask`] does not end the set (ADR 0050, decision 8 and slice H8): the plugins
     /// after it are still asked, each seeing the arguments the ones before it left, because a call a
@@ -504,6 +678,20 @@ impl HookSet {
             guard(plugin.name(), self.limits.deadline, || {
                 plugin.after_tool(call, output)
             })
+        })
+    }
+
+    /// The plugin that declared the action `name`, or `None` when no plugin declares it. Two
+    /// plugins that declared the same name at different versions conflict at build (the same
+    /// check as for [`EventSpec`]); a plugin whose `actions` does not include the action is not
+    /// the one to perform it.
+    #[must_use]
+    pub fn declarer_of(&self, name: &str) -> Option<&Arc<dyn Plugin>> {
+        self.plugins.iter().find(|plugin| {
+            plugin
+                .actions()
+                .iter()
+                .any(|spec| spec.name == name)
         })
     }
 
@@ -712,5 +900,53 @@ mod tests {
             .expect("no plugin, no failure");
         assert!(decided.is_none(), "an empty set decides nothing");
         assert_eq!(text, "hello");
+    }
+
+    /// A plugin that does not implement `actions` declares no actions, and a `perform` call on it
+    /// returns the unsupported error of class `Invalid`.
+    #[test]
+    fn an_unaction_plugin_unsupports_perform() {
+        struct Quiet;
+        impl Plugin for Quiet {
+            fn name(&self) -> &str {
+                "quiet"
+            }
+        }
+        let plugin = Quiet;
+        assert!(plugin.actions().is_empty());
+        let cx = HookCtx {
+            run: "r".into(),
+            root_run: "r".into(),
+            agent: "a".into(),
+            point: "action",
+            key: "action:0:0".into(),
+            attempt: 0,
+            deadline: Duration::from_secs(1),
+            cancelled: false,
+        };
+        let error = futures::executor::block_on(plugin.perform(&cx, &HookAction::Compact))
+            .expect_err("a hook that does not declare an action cannot perform it");
+        assert_eq!(error.class, ErrorClass::Invalid);
+        assert!(
+            error.reason.contains("does not declare"),
+            "{error}"
+        );
+    }
+
+    /// A declared action is a `HookAction::Declared { name, version }` with the version the plugin
+    /// declared. An action has no reason and is a decision.
+    #[test]
+    fn a_declared_action_carries_name_and_version() {
+        let action = HookAction::Declared {
+            name: "demo.refresh".into(),
+            version: 2,
+        };
+        match &action {
+            HookAction::Declared { name, version } => {
+                assert_eq!(name, "demo.refresh");
+                assert_eq!(*version, 2);
+            }
+            _ => panic!("expected Declared"),
+        }
     }
 }

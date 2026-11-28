@@ -55,6 +55,7 @@ adam-store-testkit.workspace = true
 adam-model-openai = { workspace = true, features = ["aws-lc"] }
 secrecy.workspace = true
 wiremock.workspace = true
+tempfile.workspace = true
 
 [lints]
 workspace = true

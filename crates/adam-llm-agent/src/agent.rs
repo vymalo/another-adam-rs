@@ -221,6 +221,12 @@ struct Summarised {
     /// shortened instead, and the reason is what the step says.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     vetoed: Option<String>,
+    /// The action a deciding hook asked for (ADR 0050, decision 11, slice H1d), recorded in the
+    /// step itself: a replay that finds the step recorded asks no hook again, and the loop
+    /// performs the action as its own journaled step after this one. Absent when no hook asked
+    /// for one, and from a record written before H1d.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    action: Option<adam_plugin::HookAction>,
 }
 
 /// The id of the summary call `n` of `run` in its usage report: made inside the journaled step, like
@@ -912,6 +918,12 @@ struct EndDecision {
     reason: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     plugin: Option<String>,
+    /// The action a hook asked for (ADR 0050, decision 11, slice H1d), recorded in the step
+    /// itself: a replay that finds the step recorded asks no hook again, and the loop performs
+    /// the action as its own journaled step after this one. Absent when the hook did not ask for
+    /// one, and from a journal written before H1d.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    action: Option<adam_plugin::HookAction>,
 }
 
 /// Asks the `run.ending` hooks about the answer; a retryable failure fails the try.
@@ -925,34 +937,53 @@ fn ask_end(
         text,
         continuations,
     };
-    let one = |verdict: &str, reason: Option<String>, plugin: &str| EndDecision {
+    let one = |verdict: &str,
+               reason: Option<String>,
+               plugin: Option<&str>,
+               action: Option<adam_plugin::HookAction>| EndDecision {
         verdict: verdict.into(),
         reason,
-        plugin: Some(plugin.into()),
+        plugin: plugin.map(str::to_owned),
+        action,
     };
     match hooks.run_ending(&end) {
-        // An action is a decision with nothing to perform yet (slice H1d): the end is allowed.
-        Ok(None)
-        | Ok(Some(adam_plugin::Decided {
-            verdict: Decision::Continue | Decision::Act(_),
-            ..
-        })) => Ok(EndDecision {
+        // No plugin decided: the end is allowed.
+        Ok(None) => Ok(EndDecision {
             verdict: "allow".into(),
             reason: None,
             plugin: None,
+            action: None,
         }),
-        Ok(Some(d)) => Ok(match d.verdict {
-            Decision::Deny(reason) if continuations >= cap => one("capped", Some(reason), d.plugin),
-            Decision::Deny(reason) => one("continue", Some(reason), d.plugin),
-            Decision::Stop(reason) => one("stop", Some(reason), d.plugin),
-            _ => one(
+        // A plugin decided: the verdict is the decision. An action is a decision with something to
+        // perform beyond the verdict (slice H1d): the end is allowed, and the action (recorded
+        // here) is performed as the loop's own step after this one.
+        Ok(Some(adam_plugin::Decided {
+            plugin,
+            verdict,
+        })) => Ok(match verdict {
+            Decision::Continue => one("allow", None, Some(plugin), None),
+            Decision::Act(action) => one("allow", None, Some(plugin), Some(action)),
+            Decision::Deny(reason) if continuations >= cap => {
+                one("capped", Some(reason), Some(plugin), None)
+            }
+            Decision::Deny(reason) => one("continue", Some(reason), Some(plugin), None),
+            Decision::Stop(reason) => one("stop", Some(reason), Some(plugin), None),
+            Decision::Ask(reason) => one(
                 "failed",
-                Some("the hook gave a verdict run.ending does not have".into()),
-                d.plugin,
+                Some(format!(
+                    "the hook gave a verdict run.ending does not have: {reason}"
+                )),
+                Some(plugin),
+                None,
             ),
         }),
         Err(error) if error.is_retryable() => Err(format!("{}: {}", error.plugin, error.reason)),
-        Err(error) => Ok(one("failed", Some(error.reason), &error.plugin)),
+        Err(error) => Ok(one(
+            "failed",
+            Some(error.reason),
+            Some(&error.plugin),
+            None,
+        )),
     }
 }
 
@@ -1255,6 +1286,12 @@ struct Recorded {
     /// Absent when it did not, and in journals written before it existed.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     grew: bool,
+    /// The action a deciding hook asked for (ADR 0050, decision 11, slice H1d), recorded in the
+    /// step itself: a replay that finds the step recorded asks no hook again, and the loop
+    /// performs the action as its own journaled step after this one. Absent when no hook asked
+    /// for one, and from a record written before H1d.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    action: Option<adam_plugin::HookAction>,
 }
 
 /// The report of one round, read for a model call that did not ask for it: the result of a
@@ -3153,9 +3190,9 @@ impl LlmAgent {
         ctx: &mut Ctx,
         state: &mut Conversation,
         context: Option<&Arc<Map<String, Value>>>,
-    ) -> Result<(Flow, Option<Early<'_>>), AgentError> {
+    ) -> Result<(Flow, Option<Early<'_>>, Option<adam_plugin::HookAction>), AgentError> {
         if ctx.is_cancelled() {
-            return Ok((Flow::Fail(CANCELLED.into()), None));
+            return Ok((Flow::Fail(CANCELLED.into()), None, None));
         }
         // The run was reopened after its closing answer. With no message since (the answer is still
         // the last one), it ends with exactly that output again and calls no model. A message that
@@ -3166,7 +3203,7 @@ impl LlmAgent {
             if let Some(answer) = &hit.answer
                 && matches!(state.messages.last(), Some(Message::Assistant { .. }))
             {
-                return Ok((Flow::Done(answer.clone()), None));
+                return Ok((Flow::Done(answer.clone()), None, None));
             }
             hit.answered = false;
             hit.answer = None;
@@ -3403,6 +3440,7 @@ impl LlmAgent {
                 // The `model.request` hooks (ADR 0050, slice H3) run here, inside the step, on the
                 // final request: a replay of a recorded turn asks none. They may rewrite only the
                 // temperature and top-p, the bound on output tokens, the metadata, the headers and an extra body.
+                let mut step_action: Option<adam_plugin::HookAction> = None;
                 if !agent.hooks.is_empty() {
                     let mut temperature = request.temperature;
                     let mut top_p = request.top_p;
@@ -3420,7 +3458,21 @@ impl LlmAgent {
                         metadata: &mut metadata,
                     });
                     match verdict {
-                        Ok(Decision::Continue | Decision::Act(_)) => {
+                        Ok(Decision::Continue) => {
+                            apply_hooked(
+                                &mut request,
+                                temperature,
+                                top_p,
+                                headers,
+                                extra_body,
+                                max_output_tokens,
+                                metadata,
+                            )?;
+                        }
+                        Ok(Decision::Act(action)) => {
+                            // An action is a decision: the call goes on, the action is recorded in
+                            // the step, and the loop performs it as its own step after this one.
+                            step_action = Some(action);
                             apply_hooked(
                                 &mut request,
                                 temperature,
@@ -3476,6 +3528,7 @@ impl LlmAgent {
                         loaders,
                         task_loaded,
                         grew,
+                        action: step_action,
                     });
                 }
                 // The words go out while they are written, under an id made here, inside the step, and
@@ -3512,6 +3565,7 @@ impl LlmAgent {
                     loaders,
                     task_loaded,
                     grew,
+                    action: step_action,
                 })
             })
             .await?;
@@ -3567,6 +3621,7 @@ impl LlmAgent {
         let answered_stale: bool;
         let mut seen_at: usize;
         let own_order: Vec<String>;
+        let mut turn_action: Option<adam_plugin::HookAction> = None;
         let (response, stream) = match recorded {
             Ok(Recorded {
                 response,
@@ -3582,6 +3637,7 @@ impl LlmAgent {
                 loaders,
                 task_loaded,
                 grew,
+                action,
             }) => {
                 // What the request carried **before the tier withheld any** is the truth of the
                 // loaded set: every loaded tool it did not carry is journaled as removed, and a
@@ -3663,6 +3719,7 @@ impl LlmAgent {
                 return Ok((flow, early));
             }
         };
+        turn_action = action;
 
         let ModelResponse {
             mut message,
@@ -3705,7 +3762,7 @@ impl LlmAgent {
                 turn,
                 "the recorded answer predates a message the run has read: the model answers again"
             );
-            return Ok((Flow::Next, early));
+            return Ok((Flow::Next, early, turn_action.clone()));
         }
         // A message that reached the run while the model wrote its answer has not been read by it:
         // the answer is not the last word, and the run takes another turn instead of ending
@@ -3768,7 +3825,7 @@ impl LlmAgent {
                 turn,
                 "a message arrived while the model answered: the run takes another turn"
             );
-            return Ok((Flow::Next, early));
+            return Ok((Flow::Next, early, turn_action.clone()));
         }
         if let Some(limit) = state.limit.as_ref().map(|hit| hit.limit) {
             let said = state.announced.clone().unwrap_or(text);
@@ -3777,24 +3834,24 @@ impl LlmAgent {
             }
             // No turn is left for a correction: an answer that does not match fails the round.
             if let Some(flow) = self.report_gate(state, &said, false) {
-                return Ok((flow, early));
+                return Ok((flow, early, turn_action.clone()));
             }
             let output = limited_output(state, limit, said, finish == FinishReason::Length, stream);
             if let Some(hit) = &mut state.limit {
                 hit.answered = true;
                 hit.answer = Some(output.clone());
             }
-            return Ok((Flow::Done(output), early));
+            return Ok((Flow::Done(output), early, turn_action.clone()));
         }
         if calls.is_empty() {
             // What a tool announced as the answer is the run's answer (the last announcement wins);
             // without one, the words that end the turn are.
             if let Some(announced) = state.announced.clone() {
                 if let Some(flow) = self.report_gate(state, &announced, true) {
-                    return Ok((flow, early));
+                    return Ok((flow, early, turn_action.clone()));
                 }
                 if self.run_ending(ctx, state, &announced).await? {
-                    return Ok((Flow::Next, early));
+                    return Ok((Flow::Next, early, turn_action.clone()));
                 }
                 return Ok((
                     Flow::Done(json!({
@@ -3834,13 +3891,13 @@ impl LlmAgent {
                 if state.turns < self.limits_of(state).max_turns {
                     state.messages.push(Message::user_text(THINKING_CUT_TURN));
                 }
-                return Ok((Flow::Next, early));
+                return Ok((Flow::Next, early, turn_action.clone()));
             }
             if let Some(flow) = self.report_gate(state, &text, true) {
-                return Ok((flow, early));
+                return Ok((flow, early, turn_action.clone()));
             }
             if self.run_ending(ctx, state, &text).await? {
-                return Ok((Flow::Next, early));
+                return Ok((Flow::Next, early, turn_action.clone()));
             }
             let mut output = json!({
                 "text": text,
@@ -3854,7 +3911,7 @@ impl LlmAgent {
             if let Some(stream) = stream {
                 output["stream"] = json!(stream);
             }
-            return Ok((Flow::Done(output), early));
+            return Ok((Flow::Done(output), early, turn_action.clone()));
         }
 
         let requested = u32::try_from(calls.len()).unwrap_or(u32::MAX);
@@ -3877,13 +3934,13 @@ impl LlmAgent {
                 answered: false,
                 answer: None,
             });
-            return Ok((Flow::Next, early));
+            return Ok((Flow::Next, early, turn_action.clone()));
         }
         state.tool_calls += requested;
         let (calls, ordered_calls) = ordered_by_the_model(calls, &own_order);
         state.pending_calls = calls;
         state.ordered_calls = ordered_calls;
-        Ok((Flow::Next, early))
+        Ok((Flow::Next, early, turn_action.clone()))
     }
 
     /// The budget of the history, in tokens (see [`compaction::budget`]).
@@ -3932,6 +3989,9 @@ impl LlmAgent {
         let limit = match (reason, self.history_budget(state)) {
             (CompactionReason::Budget, budget) => budget.unwrap_or(estimate),
             (CompactionReason::Overflow, budget) => budget.unwrap_or(estimate).min(estimate),
+            // A hook asked for one (ADR 0050, decision 11, slice H1d): within ADR 0044's bound,
+            // and the cut is the same the budget would take.
+            (CompactionReason::Requested, budget) => budget.unwrap_or(estimate),
         };
         compaction::cut_point(&state.messages, limit)
     }
@@ -4049,7 +4109,9 @@ impl LlmAgent {
         // rejected as too long is sent shorter, with each image said in a few words.
         let image_limits = self.model.input_modalities(&live_alias).images;
         request.messages = match reason {
-            CompactionReason::Budget => for_sending(&state.messages, image_limits.as_ref()),
+            CompactionReason::Budget | CompactionReason::Requested => {
+                for_sending(&state.messages, image_limits.as_ref())
+            }
             CompactionReason::Overflow => {
                 described(&shortened_for_overflow(&state.messages[..cut.index]))
             }
@@ -4123,13 +4185,19 @@ impl LlmAgent {
                 // The compaction hooks (ADR 0050, slice H9) run here, inside the journaled step:
                 // a replay of a recorded summary asks none. A hook may add context to the request
                 // or veto the summary, and the history is shortened instead; it never writes the
-                // summary itself.
+                // summary itself. An action is a decision: the summary goes on as asked, and the
+                // action is recorded in the step (slice H1d) so the loop performs it as its own
+                // step after this one.
+                let mut step_action: Option<adam_plugin::HookAction> = None;
                 if !hooks.is_empty() {
                     let mut context = String::new();
                     match hooks.compaction_before(&mut HookedCompaction {
                         context: &mut context,
                     }) {
-                        Ok(Decision::Continue | Decision::Act(_)) => {}
+                        Ok(Decision::Continue) => {}
+                        Ok(Decision::Act(action)) => {
+                            step_action = Some(action);
+                        }
                         Ok(Decision::Deny(reason)) => {
                             return Ok(Summarised {
                                 summary: None,
@@ -4137,6 +4205,7 @@ impl LlmAgent {
                                 usage: adam_model::Usage::default(),
                                 call: compaction_call_id(run, n),
                                 vetoed: Some(reason),
+                                action: step_action,
                             });
                         }
                         Ok(Decision::Stop(reason)) => {
@@ -4179,7 +4248,19 @@ impl LlmAgent {
                         max_output_tokens: &mut max_output_tokens,
                         metadata: &mut metadata,
                     }) {
-                        Ok(Decision::Continue | Decision::Act(_)) => {
+                        Ok(Decision::Continue) => {
+                            apply_hooked(
+                                &mut request,
+                                temperature,
+                                top_p,
+                                headers,
+                                extra_body,
+                                max_output_tokens,
+                                metadata,
+                            )?;
+                        }
+                        Ok(Decision::Act(action)) => {
+                            step_action = Some(action);
                             apply_hooked(
                                 &mut request,
                                 temperature,
@@ -4225,6 +4306,7 @@ impl LlmAgent {
                     usage: answer.usage.accounted(),
                     call: compaction_call_id(run, n),
                     vetoed: None,
+                    action: step_action,
                 })
             })
             .await?;
@@ -4920,7 +5002,7 @@ impl LlmAgent {
                 state.approval = None;
             }
             state.sandbox_usage.merge(&reported);
-            let (message, artifacts) = match result {
+            let (message, artifacts, mut call_action) = match result {
                 ToolResult::Answered {
                     message,
                     artifacts,
@@ -4932,6 +5014,7 @@ impl LlmAgent {
                     reported,
                     pinned,
                     kept_images,
+                    action,
                 } => {
                     if pinned {
                         state.pinned_calls.push(call.id.clone());
@@ -4954,7 +5037,7 @@ impl LlmAgent {
                         state.note_reported(&reported);
                         Self::count_rounds(ctx, state, false).await?;
                     }
-                    (message, artifacts)
+                    (message, artifacts, action)
                 }
                 ToolResult::NeedsInput { question, ui } => {
                     state.repeats = None;
@@ -5131,6 +5214,13 @@ impl LlmAgent {
             state.messages.push(message);
             add_artifact_refs(&mut state.artifacts, artifacts);
             state.pending_calls.remove(0);
+            // A hook asked for an action (ADR 0050, decision 11, slice H1d): record it as a
+            // request the loop fulfils as its own step. `Compact` becomes the next transition's
+            // `compact:<n>:<turn>` (within ADR 0044's bound); a declared action becomes
+            // `action:<turn>:<i>`. Recorded in the step, never asked again on a replay.
+            if let Some(asked) = call_action.take() {
+                self.apply_requested_action(ctx, state, asked, state.turns).await?;
+            }
             // Its result is committed before the next call runs (see `step`).
             if effect && !state.pending_calls.is_empty() {
                 return Ok(Flow::Next);
@@ -5146,6 +5236,111 @@ impl LlmAgent {
     /// nothing.
     fn access_of(&self, call: &ToolCall) -> ToolAccess {
         access_of(self.tool(&call.name), &self.sources, call)
+    }
+
+    /// Fulfill an action a deciding hook asked for (ADR 0050, decision 11, slice H1d). `Compact`
+    /// becomes the next transition's `compact:<n>:<turn>` step (within ADR 0044's bound), with
+    /// the reason `requested`. A declared action becomes the journaled step `action:<turn>:<i>`
+    /// in which the declaring plugin's `perform` runs and its `Value` is recorded. The action is
+    /// recorded in the step that asked, so a replay that finds it recorded asks no hook again
+    /// and re-runs the action step from its record.
+    ///
+    /// An action nobody declared, or a `perform` that errors, is recorded and the run goes on:
+    /// the class of the error decides whether the loop retries, as it does elsewhere. Never a
+    /// silent drop.
+    async fn apply_requested_action(
+        &self,
+        ctx: &mut Ctx,
+        state: &mut Conversation,
+        action: adam_plugin::HookAction,
+        turn: u32,
+    ) -> Result<(), AgentError> {
+        match action {
+            adam_plugin::HookAction::Compact => {
+                // The next transition's `compact_if_due` picks `compact_next = Some(Requested)` and
+                // runs the compaction step. ADR 0044's bound of `MAX_COMPACTIONS` is what the
+                // existing path checks: past it, the history is shortened instead.
+                state.compact_next = Some(CompactionReason::Requested);
+                Ok(())
+            }
+            adam_plugin::HookAction::Declared { name, version: _ } => {
+                let plugin = self.hooks.declarer_of(&name);
+                match plugin {
+                    None => {
+                        // No plugin declares the action: the step records the miss and the run
+                        // goes on. The class is `Invalid` (a broken declaration is a build-time
+                        // mistake), but we do not fail the run for it: a hook that asked for an
+                        // action nobody declared should not poison the whole run.
+                        let id = format!("action:{turn}:0");
+                        let reason = format!(
+                            "no plugin declares the action `{name}`; the loop did not perform it"
+                        );
+                        tracing::warn!(%reason, "an undeclared action was asked for");
+                        let outcome: Result<Option<adam_plugin::HookAction>, String> =
+                            ctx.step(&id, || async { Ok::<_, String>(None) }).await?;
+                        let _ = outcome;
+                        Ok(())
+                    }
+                    Some(plugin) => {
+                        let cx = adam_plugin::HookCtx {
+                            run: ctx.run_id().to_string(),
+                            root_run: state
+                                .root_run
+                                .unwrap_or_else(|| ctx.run_id())
+                                .to_string(),
+                            agent: self.name.clone(),
+                            point: "action",
+                            key: format!("action:{turn}:0"),
+                            attempt: 0,
+                            deadline: Duration::from_secs(5),
+                            cancelled: ctx.is_cancelled(),
+                        };
+                        let id = format!("action:{turn}:0");
+                        let action = adam_plugin::HookAction::Declared {
+                            name: name.clone(),
+                            version: 1,
+                        };
+                        let plugin = plugin.clone();
+                        let plugin_name = plugin.name().to_owned();
+                        let outcome: Result<adam_plugin::ActionOutcome, String> =
+                            ctx.step(&id, move || async move {
+                                let result = plugin.perform(&cx, &action).await;
+                                Ok(adam_plugin::ActionOutcome::from(result)
+                                    .with_plugin(plugin_name.clone()))
+                            })
+                            .await?;
+                        let outcome = match outcome {
+                            Ok(o) => o,
+                            Err(reason) => {
+                                let plugin_name = name.clone();
+                                return Err(AgentError::permanent(format!(
+                                    "the action `{plugin_name}` failed: {reason}"
+                                )));
+                            }
+                        };
+                        if let Some(error) = outcome.into_error() {
+                            // An error class decides retry (loop's policy), as the rest of the
+                            // loop does. `Invalid` ends the run for good; `Transient` lets the
+                            // runtime try again.
+                            return Err(AgentError::permanent(format!(
+                                "the action `{name}` failed in plugin `{}`: {}",
+                                error.plugin, error.reason
+                            )));
+                        }
+                        Ok(())
+                    }
+                }
+            }
+            // A new variant the loop does not know: an action a build that knew about it asked for,
+            // and the loop cannot perform it. The step records the miss and the run goes on (a
+            // host that adds a variant must also add an arm here).
+            _ => {
+                tracing::warn!(
+                    "an action the loop does not know was asked for; the loop did not perform it"
+                );
+                Ok(())
+            }
+        }
     }
 
     /// How many of the owed calls, from the first, run together as one segment: `1` when the first
@@ -5180,8 +5375,7 @@ impl LlmAgent {
     /// Run the first `n` owed calls at the same time ([`schedule`]): reserve their journal steps in
     /// call order, drive them in this task, and apply the results in call order. `Some(flow)` ends the
     /// transition (a cancel); `None` means the segment is applied and the loop goes on.
-    async fn run_segment(
-        &self,
+    async fn run_segment(        &self,
         ctx: &mut Ctx,
         state: &mut Conversation,
         n: usize,
@@ -5407,6 +5601,7 @@ impl LlmAgent {
                 reported,
                 pinned,
                 kept_images,
+                action: _,
             } = result
             else {
                 return Err(AgentError::permanent(
@@ -5904,6 +6099,7 @@ impl LlmAgent {
                 ));
             }
             let mut hooks_run: Vec<HookDecision> = Vec::new();
+            let mut step_action: Option<adam_plugin::HookAction> = None;
             let args = match approved {
                 // Approved: the arguments the asking step recorded, and no hook asked again.
                 Some(args) => args,
@@ -5918,6 +6114,7 @@ impl LlmAgent {
                         (own.as_ref(), &sources),
                         approvable,
                         &mut hooks_run,
+                        &mut step_action,
                     )?;
                     if let Some(refusal) = refusal {
                         return Ok(refusal);
@@ -5961,7 +6158,14 @@ impl LlmAgent {
             // a tool printed is stored and shown as U+FFFD, before either (ADR 0051).
             let answered =
                 with_reported_sandbox(&tool_ctx, &unjournaled, called).map(ToolOutput::sanitized);
-            let output = decide_after(&hooks, &name, &args, answered, &mut hooks_run);
+            let output = decide_after(
+                &hooks,
+                &name,
+                &args,
+                answered,
+                &mut hooks_run,
+                &mut step_action,
+            );
             // What the call emitted is recorded with its result, so delivery reads the record.
             let events = tool_ctx.emitted_events();
             output.map(|output| HookedOutput {
@@ -5970,6 +6174,7 @@ impl LlmAgent {
                 args: rewritten.then_some(args),
                 events,
                 approval: None,
+                action: step_action,
             })
         }
         .boxed()
@@ -6235,6 +6440,7 @@ impl LlmAgent {
                     reported,
                     pinned,
                     kept_images,
+                    action: hooked.action,
                 }
             }
             Err(ToolError::Permanent(reason)) => {
@@ -7186,17 +7392,27 @@ fn ask_message(
         hooks.message_received(&mut message)
     };
     Ok(match decided {
+        // No plugin decided: the message goes on, possibly rewritten.
         Ok(None) => MessageDecision {
             text: (text != original).then_some(text),
             hook: None,
+            action: None,
         },
         Ok(Some(decided)) => {
             let plugin = decided.plugin;
             match decided.verdict {
-                // An action has nothing to perform yet (slice H1d): the message goes on as allowed.
-                Decision::Continue | Decision::Act(_) => MessageDecision {
+                Decision::Continue => MessageDecision {
                     text: (text != original).then_some(text),
                     hook: None,
+                    action: None,
+                },
+                // An action is a decision (slice H1d): the message goes on as allowed (possibly
+                // rewritten), and the action is recorded here so the loop performs it as its own
+                // journaled step after this one.
+                Decision::Act(action) => MessageDecision {
+                    text: (text != original).then_some(text),
+                    hook: None,
+                    action: Some(action),
                 },
                 Decision::Deny(reason) => MessageDecision {
                     text: None,
@@ -7208,6 +7424,7 @@ fn ask_message(
                         )
                         .by(plugin),
                     ),
+                    action: None,
                 },
                 Decision::Stop(reason) => MessageDecision {
                     text: None,
@@ -7219,6 +7436,7 @@ fn ask_message(
                         )
                         .by(plugin),
                     ),
+                    action: None,
                 },
                 // The point allows, rewrites or refuses: an ask is a verdict this point does not
                 // have, so it is a failure of the hook and the message does not go through.
@@ -7252,6 +7470,7 @@ fn refuse_at_message(plugin: &str, reason: &str) -> MessageDecision {
             )
             .by(plugin),
         ),
+        action: None,
     }
 }
 
@@ -7553,6 +7772,7 @@ fn decide_before(
     (own, sources): (Option<&DynTool>, &[DynToolSource]),
     approvable: bool,
     recorded: &mut Vec<HookDecision>,
+    action: &mut Option<adam_plugin::HookAction>,
 ) -> Result<Option<HookedOutput>, ToolError> {
     if hooks.is_empty() {
         return Ok(None);
@@ -7580,7 +7800,10 @@ fn decide_before(
              schedule of the turn was not made from: the call is not run"
         )
     };
-    let mut refuse = |verdict: &str, reason: String, plugin: Option<&str>| {
+    let mut refuse = |verdict: &str,
+                       reason: String,
+                       plugin: Option<&str>,
+                       action: Option<&adam_plugin::HookAction>| {
         let decision = match plugin {
             Some(plugin) => {
                 HookDecision::new(HookDecision::TOOL_BEFORE, verdict, Some(&reason)).by(plugin)
@@ -7594,20 +7817,39 @@ fn decide_before(
             args: None,
             events: Vec::new(),
             approval: None,
+            action: action.cloned(),
         }
     };
     match verdict {
-        // An action has nothing to perform yet (slice H1d): the call runs as if it continued.
-        Ok(Decision::Continue | Decision::Act(_)) => {
+        // An action is a decision: the call still runs (the action is performed as the loop's own
+        // step after this one), and the action is recorded here for the journal.
+        Ok(Decision::Continue) => {
             if !changes_access(args) {
                 return Ok(None);
             }
-            Ok(Some(refuse(HookDecision::FAILED, changed_access(), None)))
+            Ok(Some(refuse(HookDecision::FAILED, changed_access(), None, action.as_ref())))
         }
-        Ok(Decision::Deny(reason)) => Ok(Some(refuse(HookDecision::DENY, reason, None))),
+        Ok(Decision::Act(asked)) => {
+            *action = Some(asked);
+            if !changes_access(args) {
+                return Ok(None);
+            }
+            Ok(Some(refuse(HookDecision::FAILED, changed_access(), None, action.as_ref())))
+        }
+        Ok(Decision::Deny(reason)) => Ok(Some(refuse(
+            HookDecision::DENY,
+            reason,
+            None,
+            action.as_ref(),
+        ))),
         Ok(Decision::Ask(question)) => {
             if changes_access(args) {
-                return Ok(Some(refuse(HookDecision::FAILED, changed_access(), None)));
+                return Ok(Some(refuse(
+                    HookDecision::FAILED,
+                    changed_access(),
+                    None,
+                    action.as_ref(),
+                )));
             }
             // Nobody can answer this run (ADR 0045 decision 9): the ask is read as a denial.
             if !approvable {
@@ -7615,6 +7857,7 @@ fn decide_before(
                     HookDecision::DENY,
                     format!("{NOT_APPROVABLE}. The question was: {question}"),
                     None,
+                    action.as_ref(),
                 )));
             }
             // The run parks for the person's approval (slice H8). The output is what a build that
@@ -7630,14 +7873,21 @@ fn decide_before(
                 args: (*args != call.arguments).then(|| args.clone()),
                 events: Vec::new(),
                 approval: Some(question),
+                action: action.as_ref().cloned(),
             }))
         }
-        Ok(Decision::Stop(reason)) => Ok(Some(refuse(HookDecision::STOP, reason, None))),
+        Ok(Decision::Stop(reason)) => Ok(Some(refuse(
+            HookDecision::STOP,
+            reason,
+            None,
+            action.as_ref(),
+        ))),
         Err(error) if error.is_retryable() => Err(ToolError::Transient(error.to_string())),
         Err(error) => Ok(Some(refuse(
             HookDecision::FAILED,
             format!("the hook `{}` failed: {}", error.plugin, error.reason),
             Some(&error.plugin),
+            action.as_ref(),
         ))),
     }
 }
@@ -7650,12 +7900,17 @@ fn decide_before(
 /// recorded as a failure and the result becomes an error, so nothing a hook was meant to hold back
 /// reaches the model. A hook that fails does the same, except that a retryable failure is the step's
 /// own, and the call runs again (at-least-once, as for any step that is not yet recorded).
+///
+/// An action is a decision with something to perform beyond the verdict (slice H1d): the answer
+/// goes on as rewritten, and the action is recorded in `action` so the loop performs it as its own
+/// journaled step after this one.
 fn decide_after(
     hooks: &HookSet,
     tool: &str,
     args: &Value,
     answered: Result<ToolOutput, ToolError>,
     recorded: &mut Vec<HookDecision>,
+    action: &mut Option<adam_plugin::HookAction>,
 ) -> Result<ToolOutput, ToolError> {
     let mut output = answered?;
     if hooks.is_empty() {
@@ -7687,8 +7942,14 @@ fn decide_after(
         refused.sanitized()
     };
     match verdict {
-        // An action has nothing to perform yet (slice H1d): the answer goes on as rewritten.
-        Ok(Decision::Continue | Decision::Act(_)) => {
+        Ok(Decision::Continue) => {
+            output.content = text;
+            Ok(output.sanitized())
+        }
+        Ok(Decision::Act(asked)) => {
+            // An action is recorded beside the verdict: the answer goes on as rewritten, and the
+            // action is performed as the loop's own step after this one.
+            *action = Some(asked);
             output.content = text;
             Ok(output.sanitized())
         }
@@ -7761,6 +8022,7 @@ impl ToolResult {
             reported: Vec::new(),
             pinned: false,
             kept_images: Vec::new(),
+            action: None,
         }
     }
 }
@@ -7792,6 +8054,10 @@ enum ToolResult {
         /// The bytes of the images the result returns, for the run to keep in its own state (only
         /// when the agent has no image store), from a result that is not an error.
         kept_images: Vec<KeptImage>,
+        /// The action a deciding hook asked for (ADR 0050, decision 11, slice H1d), when one was
+        /// recorded in the call's step. The loop performs it as its own journaled step after this
+        /// one. Absent when no hook asked for one.
+        action: Option<adam_plugin::HookAction>,
     },
     NeedsInput {
         question: String,
@@ -8727,11 +8993,14 @@ impl LlmAgent {
         // otherwise this step is a fresh model turn.
         let mut flow = Flow::Next;
         let mut early: Option<Early<'_>> = None;
+        let mut turn_action: Option<adam_plugin::HookAction> = None;
         if state.pending_calls.is_empty() {
             state.messages.append(&mut state.deferred);
-            let (next, batch) = self.model_turn(ctx, &mut state, context.as_ref()).await?;
+            let (next, batch, action) =
+                self.model_turn(ctx, &mut state, context.as_ref()).await?;
             flow = next;
             early = batch;
+            turn_action = action;
             // A call that starts, sends to or closes a session has an effect no failed try can undo:
             // the turn and its calls are committed first, so a retry never asks the model again
             // (new call ids, so a second session) and the call runs under the id the history holds.
@@ -8741,12 +9010,25 @@ impl LlmAgent {
                 if let Some(mut batch) = early.take() {
                     batch.settle().await;
                 }
+                if let Some(action) = turn_action.take() {
+                    self.apply_requested_action(ctx, &mut state, action, state.turns)
+                        .await?;
+                }
                 return Ok(Transition::Continue(state));
             }
         }
         if matches!(flow, Flow::Next) {
             flow = self
                 .run_pending(ctx, &mut state, &notices, context.as_ref(), &mut early)
+                .await?;
+        }
+        // A deciding hook asked for an action during the model's turn or a tool call (ADR 0050,
+        // decision 11, slice H1d): the loop performs it as its own journaled step after this one.
+        // `Compact` becomes the next transition's `compact:<n>:<turn>` (within ADR 0044's bound),
+        // a declared action becomes `action:<turn>:<i>` with the plugin's `perform`. Recorded
+        // in the step, never asked again on a replay.
+        if let Some(action) = turn_action.take() {
+            self.apply_requested_action(ctx, &mut state, action, state.turns)
                 .await?;
         }
         // Whatever the turn did not use (a limit answered its calls, a barrier came first, a stream
@@ -9113,6 +9395,7 @@ mod failure_tests {
             loaders: None,
             task_loaded: Vec::new(),
             grew: false,
+            action: None,
         };
         let json = serde_json::to_value(&streamed).unwrap();
         assert_eq!(json["stream"], "run-m0-a1b2c3d4");
@@ -9140,6 +9423,7 @@ mod failure_tests {
             loaders: None,
             task_loaded: Vec::new(),
             grew: false,
+            action: None,
         };
         assert_eq!(serde_json::to_value(&plain).unwrap(), bare);
 
@@ -9159,6 +9443,7 @@ mod failure_tests {
             loaders: None,
             task_loaded: Vec::new(),
             grew: false,
+            action: None,
         };
         let json = serde_json::to_value(&noted).unwrap();
         assert_eq!(
@@ -9185,6 +9470,7 @@ mod failure_tests {
             loaders: None,
             task_loaded: Vec::new(),
             grew: false,
+            action: None,
         };
         let json = serde_json::to_value(&reported).unwrap();
         assert_eq!(json["call"], "run-c0-a1b2c3d4");
@@ -9215,6 +9501,7 @@ mod failure_tests {
             loaders: None,
             task_loaded: Vec::new(),
             grew: false,
+            action: None,
         };
         let json = serde_json::to_value(&told).unwrap();
         assert_eq!(json["sessions_open"], true);
