@@ -1,4 +1,4 @@
-//! `run_checks { command, cwd?, repo? }`, and the `checks` artifact it reports.
+//! `run_checks { command, cwd?, repo?, timeout?, output? }`, and the `checks` artifact it reports.
 //!
 //! # The `checks` artifact
 //!
@@ -31,6 +31,14 @@
 //! It is still a failure, so the gate refuses a pull request on the tree. A passing record is never
 //! reused (the model may be confirming it, and the environment may have changed), and neither is a
 //! pre-existing failure (it spends no cycle and the model is told the failure is the repository's).
+//!
+//! # A check that passes is one line
+//!
+//! By default ([`DEFAULT_OUTPUT`], `output: "on_error"`) a check that passes is shown as its
+//! command, `exit code 0: passed` and one line with the size of its output and the id it is kept
+//! under (`read_output` reads it); a check that fails is shown as before, and so is every check
+//! with `output: "full"` (ADR 0088). Only the result changes: the `checks` artifact, the record in
+//! the notes and the check cycles are the same either way.
 
 use adam::Artifact;
 use adam::prelude::*;
@@ -42,12 +50,17 @@ use serde_json::Value;
 use crate::redact::Redactor;
 
 use super::notes::{CheckKey, CheckRecord};
+use super::output::OutputMode;
 use super::preexisting::{self, OnBase};
 use super::shell::{
     MissingTool, ShellOutcome, cwd_key, missing_tool, project_dependency_hint, resolve_cwd,
     shell_spec,
 };
 use super::{Outcome, ToolEnv, non_empty, notes_error, run_error};
+
+/// What `run_checks` shows of an output when the call asks for nothing: one line for a check that
+/// passed, which needs no output (ADR 0088, decision 3).
+pub const DEFAULT_OUTPUT: OutputMode = OutputMode::OnError;
 
 /// The name of the artifact `run_checks` emits.
 pub const CHECKS_ARTIFACT: &str = "checks";
@@ -510,7 +523,13 @@ pub(crate) fn missing_tool_text(
     )
 }
 
-fn render(command: &str, outcome: &ShellOutcome, timeout: std::time::Duration) -> String {
+/// The command, its verdict, and its output as `mode` shows it.
+fn render(
+    command: &str,
+    outcome: &ShellOutcome,
+    timeout: std::time::Duration,
+    mode: OutputMode,
+) -> String {
     let verdict = if outcome.timed_out {
         format!(
             "TIMED OUT after {} (the command was killed): FAILED",
@@ -526,7 +545,7 @@ fn render(command: &str, outcome: &ShellOutcome, timeout: std::time::Duration) -
         }
     };
     let mut text = format!("$ {command}\n{verdict}\n");
-    text.push_str(&super::output::section(outcome));
+    text.push_str(&super::output::section_as(outcome, mode));
     text
 }
 
@@ -573,7 +592,8 @@ fn unchanged_failure_text(record: &CheckRecord, command: &str, failures: u32, ma
 /// failed check asked again on exactly the same unchanged code is answered from the earlier run
 /// (no cycle, no new `checks` artifact, still a failure). A
 /// command the shell cannot find means the workspace lacks that tool: that is reported, costs no
-/// cycle, and is for the person to decide.
+/// cycle, and is for the person to decide. By default (output "on_error") a check that passes is
+/// one line with an output id that read_output reads.
 #[tool(label = "Run the checks", icon = "execute", parallel = "exclusive")]
 pub async fn run_checks(
     env: State<ToolEnv>,
@@ -586,6 +606,8 @@ pub async fn run_checks(
     repo: Option<String>,
     /// Seconds before the command is killed; at most the deployment's limit, which is also the default. Example: {"command":"npm test","timeout":120}
     timeout: Option<i64>,
+    /// What you see of the output: "on_error" (a command that succeeds is one line with an output id that read_output reads) or "full". Default "on_error". Example: {"command":"cargo test","output":"full"}
+    output: Option<String>,
 ) -> Outcome {
     let Some(command) = non_empty(&command) else {
         return Ok(ToolOutput::error("command is required"));
@@ -627,6 +649,10 @@ pub async fn run_checks(
     };
     let timeout = match super::output::timeout_of(&env, timeout) {
         Ok(timeout) => timeout,
+        Err(reason) => return Ok(ToolOutput::error(reason)),
+    };
+    let mode = match OutputMode::of(output.as_deref(), DEFAULT_OUTPUT) {
+        Ok(mode) => mode,
         Err(reason) => return Ok(ToolOutput::error(reason)),
     };
 
@@ -691,7 +717,7 @@ pub async fn run_checks(
         .await
         .map_err(|e| run_error(redactor, &e))?;
 
-    super::output::settle(&env, ctx, &mut outcome).await;
+    super::output::settle_as(&env, ctx, &mut outcome, mode).await;
 
     // A command the shell could not find is a missing toolchain, not a failing check: the
     // workspace lacks the tool, and no change to the code would make the check pass. So it is not
@@ -761,7 +787,7 @@ pub async fn run_checks(
     })
     .scrubbed(redactor);
     let artifact = report.clone().into_artifact(redactor);
-    let text = render(&shown, &outcome, timeout);
+    let text = render(&shown, &outcome, timeout, mode);
     let failures = notes.record_check(CheckRecord {
         call_id: call,
         command: shown.clone(),

@@ -1,4 +1,4 @@
-//! `run_command { command, cwd?, repo? }`: look around in the worktree. (`run`, in [`make`](super::make),
+//! `run_command { command, cwd?, repo?, timeout?, output? }`: look around in the worktree. (`run`, in [`make`](super::make),
 //! is its sibling for making things: it keeps what the command changes.)
 //!
 //! The model explores a repository with commands (`git branch -r`, `ls`, `cat README.md`,
@@ -45,7 +45,8 @@ use super::{Outcome, ToolEnv};
 /// HEAD, the branch and the working tree are undone and refused (to make a file or change the
 /// worktree with a command, use run; to change code, write_file, edit_file or
 /// apply_patch). Use it to look; use run_checks only for the project's real checks. Long output is
-/// kept: you get its head and tail and an id to read the rest with read_output.
+/// kept: you get its head and tail and an id to read the rest with read_output. With output
+/// "on_error" a command that succeeds is one line with an output id that read_output reads.
 #[tool(label = "Run a command", icon = "execute", access = super::access::runs_a_command)]
 pub async fn run_command(
     env: State<ToolEnv>,
@@ -58,8 +59,10 @@ pub async fn run_command(
     repo: Option<String>,
     /// Seconds before the command is killed; at most the deployment's limit, which is also the default. Example: {"command":"npm test","timeout":120}
     timeout: Option<i64>,
+    /// What you see of the output: "on_error" (a command that succeeds is one line with an output id that read_output reads) or "full". Default "full". Example: {"command":"git log","output":"on_error"}
+    output: Option<String>,
 ) -> Outcome {
-    adam_code_tools::inspect::run_command(&*env, ctx, command, cwd, repo, timeout).await
+    adam_code_tools::inspect::run_command(&*env, ctx, command, cwd, repo, timeout, output).await
 }
 
 /// What a command must leave as it found it: `HEAD` and the branch, the files of the worktree,

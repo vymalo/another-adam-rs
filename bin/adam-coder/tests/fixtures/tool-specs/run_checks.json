@@ -1,6 +1,6 @@
 {
   "name": "run_checks",
-  "description": "Run one of the project's own checks in your worktree (the commands its CI, README or Makefile run: `cargo test`, `pnpm test`, `just ci`), in the workspace's environment (a run pod of the run's own when the deployment runs them), and get its exit code and the tail of its output. With several repositories in the workspace, say which with `repo`. Only exit code 0 counts as passing. Every failed run uses up one of your limited check cycles and is reported as a check: never use it to look around (use run_command) or to make a file or change the worktree (use run). A failed check asked again on exactly the same unchanged code is answered from the earlier run (no cycle, no new `checks` artifact, still a failure). A command the shell cannot find means the workspace lacks that tool: that is reported, costs no cycle, and is for the person to decide.",
+  "description": "Run one of the project's own checks in your worktree (the commands its CI, README or Makefile run: `cargo test`, `pnpm test`, `just ci`), in the workspace's environment (a run pod of the run's own when the deployment runs them), and get its exit code and the tail of its output. With several repositories in the workspace, say which with `repo`. Only exit code 0 counts as passing. Every failed run uses up one of your limited check cycles and is reported as a check: never use it to look around (use run_command) or to make a file or change the worktree (use run). A failed check asked again on exactly the same unchanged code is answered from the earlier run (no cycle, no new `checks` artifact, still a failure). A command the shell cannot find means the workspace lacks that tool: that is reported, costs no cycle, and is for the person to decide. By default (output \"on_error\") a check that passes is one line with an output id that read_output reads.",
   "parameters": {
     "type": "object",
     "properties": {
@@ -20,6 +20,10 @@
         "description": "Seconds before the command is killed; at most the deployment's limit, which is also the default. Example: {\"command\":\"npm test\",\"timeout\":120}",
         "format": "int64",
         "type": "integer"
+      },
+      "output": {
+        "type": "string",
+        "description": "What you see of the output: \"on_error\" (a command that succeeds is one line with an output id that read_output reads) or \"full\". Default \"on_error\". Example: {\"command\":\"cargo test\",\"output\":\"full\"}"
       }
     },
     "required": [

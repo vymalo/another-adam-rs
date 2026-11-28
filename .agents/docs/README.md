@@ -25,6 +25,7 @@ A page here that has a page for people sits at the same relative path, and the t
 | [Child runs: the tests](reference/child-runs.md) | [Child runs](../../docs/reference/child-runs.md) | the test of every failure interleaving, and how the tests make each happen |
 | [ADR 0081: the evidence](decisions/0081-an-agent-keeps-a-self-improvement-memory-near-it-and-what-holds-becomes-the-deployments-memory.md) | [ADR 0081](../../docs/decisions/0081-an-agent-keeps-a-self-improvement-memory-near-it-and-what-holds-becomes-the-deployments-memory.md) | the paper, the code the memory decision was checked against, the draft's values and the proof of each slice |
 | [0082: the evidence](decisions/0082-the-sql-adapters-keep-their-rules-in-the-database.md) | [ADR 0082](../../docs/decisions/0082-the-sql-adapters-keep-their-rules-in-the-database.md) | the survey of every rule the SQL adapters enforce in Rust, with `path:line`, the sources of the facts, and each slice's decisive cases and mutations |
+| [0088: the evidence](decisions/0088-a-tool-result-is-bounded-when-it-is-made-and-a-command-that-succeeds-says-so.md) | [ADR 0088](../../docs/decisions/0088-a-tool-result-is-bounded-when-it-is-made-and-a-command-that-succeeds-says-so.md) | where `output` is in the code, the invariants of the success line, the tests of slice T1 |
 
 ## Still mixed
 

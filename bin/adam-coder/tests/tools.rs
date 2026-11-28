@@ -600,8 +600,12 @@ async fn run_checks_runs_in_the_worktree_and_never_outside_it() {
     rig.prepare().await;
     let tool = RunChecks;
 
+    // `full`: a check that passes shows its output only when asked (ADR 0088).
     let ok = tool
-        .call(&rig.ctx, json!({"command": "cat README.md"}))
+        .call(
+            &rig.ctx,
+            json!({"command": "cat README.md", "output": "full"}),
+        )
         .await
         .unwrap();
     assert!(!ok.is_error, "{}", ok.content);
@@ -610,7 +614,10 @@ async fn run_checks_runs_in_the_worktree_and_never_outside_it() {
     std::fs::create_dir_all(rig.worktree().join("sub")).unwrap();
     std::fs::write(rig.worktree().join("sub/only-here.txt"), "x").unwrap();
     let sub = tool
-        .call(&rig.ctx, json!({"command": "ls", "cwd": "sub"}))
+        .call(
+            &rig.ctx,
+            json!({"command": "ls", "cwd": "sub", "output": "full"}),
+        )
         .await
         .unwrap();
     assert!(sub.content.contains("only-here.txt"), "{}", sub.content);
@@ -649,7 +656,10 @@ async fn run_checks_times_out_and_caps_its_output() {
     let out = tool
         .call(
             &rig.ctx,
-            json!({"command": "i=0; while [ $i -lt 500 ]; do echo line-$i; i=$((i+1)); done"}),
+            json!({
+                "command": "i=0; while [ $i -lt 500 ]; do echo line-$i; i=$((i+1)); done",
+                "output": "full"
+            }),
         )
         .await
         .unwrap();
@@ -3038,7 +3048,7 @@ async fn both_tools_run_bash_when_there_is_bash() {
         looked.content
     );
     let checked = RunChecks
-        .call(&rig.ctx, json!({ "command": command }))
+        .call(&rig.ctx, json!({ "command": command, "output": "full" }))
         .await
         .unwrap();
     assert!(!checked.is_error, "{}", checked.content);
@@ -7320,7 +7330,7 @@ async fn run_respects_the_timeout_the_cwd_rule_and_a_missing_tool() {
     let hidden = Run
         .call(
             &rig.ctx,
-            json!({"command": "echo \"[${GITHUB_TOKEN:-unset}]\""}),
+            json!({"command": "echo \"[${GITHUB_TOKEN:-unset}]\"", "output": "full"}),
         )
         .await
         .unwrap();

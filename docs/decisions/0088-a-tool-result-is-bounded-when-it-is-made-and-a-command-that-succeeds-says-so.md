@@ -8,6 +8,15 @@ ADR's choices for the owner to confirm. Builds on
 prompt prefix) and [ADR 0086](0086-the-context-window-follows-the-model-and-the-history-budget-is-200k.md) (the history
 budget).
 
+*Amended 2026-11-28:* slice T1 is built. `run_command`, `run` and `run_checks` take `output` (`adam_code_tools::OutputMode`),
+with decision 3's defaults, each a constant beside its tool. A command that succeeds with `on_error` is shown as its `$`
+line, its exit line as before (`exit code 0`, or `exit code 0: passed` for a check) and one line:
+`[output: N bytes, not shown because the command succeeded; kept as o-…; read_output {"id":"o-…"} reads it]`. Two
+deviations from the table: the exit code stays on its own line, and the size and id go on a line in brackets, so that a
+shortened history recognises it as a kept-output pointer; and an output that printed nothing says `(no output)` and keeps
+nothing. An output the keeper refused is shown as with `full`. The evidence:
+[0088: the evidence and the slice proofs](../../.agents/docs/decisions/0088-a-tool-result-is-bounded-when-it-is-made-and-a-command-that-succeeds-says-so.md).
+
 ## Context
 
 A provider caches a request's prefix: tools, then the system prompt, then the messages. A tool result appended at the end
@@ -77,3 +86,4 @@ What adam does today (*verified 2026-11-27*):
 * The model loses nothing: every output is kept and one `read_output` call away.
 * The exporter's samples (ADR 0085) show the success line, which is what the model saw.
 * No `Store`, `Notifier` or `ModelClient` method changes.
+

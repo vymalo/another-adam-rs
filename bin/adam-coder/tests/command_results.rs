@@ -2,6 +2,8 @@
 //! refusals of a command that changed what it may not, and the changes `run` keeps. Pinned before the
 //! two tools move to a library crate (ADR 0047), so that the move cannot change what the model is
 //! told. And that every `run` that ran moves the run's check epoch by one, and `run_command` never.
+//! `run` shows a command that succeeded as one line by default (`output: "on_error"`, ADR 0088);
+//! `run_command` shows its output.
 #![allow(clippy::unwrap_used, clippy::expect_used)] // integration tests assert by unwrapping
 
 mod common;
@@ -28,6 +30,18 @@ fn undone_look(command: &str) -> String {
          use write_file, edit_file or apply_patch. Output of the command, for what it is worth:\n"
     )
 }
+
+/// The line a command of `rig`'s call that succeeded printing `bytes` is shown as by `run`'s default.
+fn hidden(rig: &Rig, bytes: usize) -> String {
+    let id = output_id_of(&rig.ctx);
+    format!(
+        "[output: {bytes} bytes, not shown because the command succeeded; kept as {id}; \
+         read_output {{\"id\":\"{id}\"}} reads it]\n"
+    )
+}
+
+/// What `run`'s default shows of a command that succeeded printing nothing.
+const NO_OUTPUT: &str = "(no output)\n";
 
 /// The line `run` ends its list of changes with.
 const CHECK_AGAIN: &str =
@@ -348,8 +362,8 @@ async fn run_keeps_what_a_command_writes_and_lists_the_changes() {
     assert_eq!(
         made.content,
         format!(
-            "$ {command}\nexit code 0\n--- output ---\nrendered\n{CHANGES} M README.md\n?? out/a.txt\n\
-             {CHECK_AGAIN}"
+            "$ {command}\nexit code 0\n{}{CHANGES} M README.md\n?? out/a.txt\n{CHECK_AGAIN}",
+            hidden(&rig, "rendered\n".len())
         )
     );
     assert_eq!(
@@ -431,7 +445,7 @@ async fn run_timeout_cwd_and_a_missing_tool_first_and_repeated() {
     assert_eq!(
         sub.content,
         format!(
-            "$ echo here > f.txt\nexit code 0\n--- output ---\n\n{CHANGES}?? partial.txt\n?? \
+            "$ echo here > f.txt\nexit code 0\n{NO_OUTPUT}{CHANGES}?? partial.txt\n?? \
              sub/f.txt\n{CHECK_AGAIN}"
         )
     );
@@ -497,7 +511,7 @@ async fn run_in_a_scratch_project_adds_the_published_note_once_published() {
     assert_eq!(
         first.content,
         format!(
-            "$ echo 0 1 1 2 > fib.sh\nexit code 0\n--- output ---\n\n{CHANGES}?? fib.sh\n{CHECK_AGAIN}"
+            "$ echo 0 1 1 2 > fib.sh\nexit code 0\n{NO_OUTPUT}{CHANGES}?? fib.sh\n{CHECK_AGAIN}"
         )
     );
 
@@ -517,7 +531,7 @@ async fn run_in_a_scratch_project_adds_the_published_note_once_published() {
     assert_eq!(
         later.content,
         format!(
-            "$ echo 3 >> fib.sh\nexit code 0\n--- output ---\n\n{CHANGES}?? fib.sh\n{CHECK_AGAIN}\n\
+            "$ echo 3 >> fib.sh\nexit code 0\n{NO_OUTPUT}{CHANGES}?? fib.sh\n{CHECK_AGAIN}\n\
              Note: `fib` was published to {url}, and what changes here is not part of that \
              repository's pull request: make changes in its slot, or call publish_scratch again to \
              copy them (a file that differs needs `overwrite: true`)."
@@ -553,7 +567,9 @@ async fn both_tools_scrub_a_secret_from_the_command_the_output_and_the_progress(
         looked.content,
         "$ echo [redacted: secret removed, do not reuse]\nexit code 0\n--- output ---\n[redacted: secret removed, do not reuse]\n"
     );
-    let made = rig.make(json!({ "command": command })).await;
+    let made = rig
+        .make(json!({ "command": command, "output": "full" }))
+        .await;
     assert!(!made.is_error);
     assert_eq!(
         made.content,
@@ -577,25 +593,34 @@ async fn both_tools_give_the_repeat_key_of_how_the_command_ended() {
     let rig = Rig::prepared().await;
     const NO_CHANGE: &str = "(git sees no change in the worktree; files the project ignores are \
                              kept too, and are not listed)\n";
+    // `run`'s default shows a command that succeeded printing nothing as `(no output)`.
     let cases = [
-        (json!({"command": "true"}), "$ true\nexit code 0\n", None),
+        (
+            json!({"command": "true"}),
+            "$ true\nexit code 0\n",
+            None,
+            NO_OUTPUT,
+        ),
         (
             json!({"command": "exit 3"}),
             "$ exit 3\nexit code 3\n",
             Some("exit:3"),
+            "--- output ---\n\n",
         ),
         (
             json!({"command": "sleep 60", "timeout": 2}),
             "$ sleep 60\ntimed out (the command was killed)\n",
             Some("timeout"),
+            "--- output ---\n\n",
         ),
         (
             json!({"command": "kill -KILL $$"}),
             "$ kill -KILL $$\nkilled by a signal\n",
             Some("signal"),
+            "--- output ---\n\n",
         ),
     ];
-    for (args, said, key) in &cases {
+    for (args, said, key, made_output) in &cases {
         let looked = rig.look(args.clone()).await;
         assert!(!looked.is_error, "{args}");
         assert_eq!(
@@ -612,7 +637,7 @@ async fn both_tools_give_the_repeat_key_of_how_the_command_ended() {
         assert!(!made.is_error, "{args}");
         assert_eq!(
             made.content,
-            format!("{said}--- output ---\n\n{NO_CHANGE}"),
+            format!("{said}{made_output}{NO_CHANGE}"),
             "{args}"
         );
         assert_eq!(
@@ -674,13 +699,25 @@ async fn long_output_is_shown_as_its_head_and_tail_and_kept() {
     let looked = rig.look(json!({"command": "seq 1 200"})).await;
     assert!(!looked.is_error);
     assert_eq!(looked.content, view);
-    let made = rig.make(json!({"command": "seq 1 200"})).await;
+    let made = rig
+        .make(json!({"command": "seq 1 200", "output": "full"}))
+        .await;
     assert!(!made.is_error);
     assert_eq!(
         made.content,
         format!(
             "{view}(git sees no change in the worktree; files the project ignores are kept too, \
              and are not listed)\n"
+        )
+    );
+    // By default it succeeded, so it is one line, and the output is kept all the same.
+    let made = rig.make(json!({"command": "seq 1 200"})).await;
+    assert_eq!(
+        made.content,
+        format!(
+            "$ seq 1 200\nexit code 0\n{}(git sees no change in the worktree; files the project \
+             ignores are kept too, and are not listed)\n",
+            hidden(&rig, 692)
         )
     );
 }
@@ -906,9 +943,7 @@ async fn run_cuts_a_long_list_of_changes_and_says_when_git_lists_none() {
     .collect();
     assert_eq!(
         many.content,
-        format!(
-            "$ {command}\nexit code 0\n--- output ---\n\n{CHANGES}{listed}and 5 more\n{CHECK_AGAIN}"
-        )
+        format!("$ {command}\nexit code 0\n{NO_OUTPUT}{CHANGES}{listed}and 5 more\n{CHECK_AGAIN}")
     );
 
     // An edit of the run's put back as `HEAD` has it: the tree changed, and `git status` lists
@@ -921,7 +956,7 @@ async fn run_cuts_a_long_list_of_changes_and_says_when_git_lists_none() {
     assert_eq!(
         none.content,
         format!(
-            "$ {command}\nexit code 0\n--- output ---\n\n{CHANGES}(nothing that git lists: the \
+            "$ {command}\nexit code 0\n{NO_OUTPUT}{CHANGES}(nothing that git lists: the \
              files it changed are ignored by the project, or are back as HEAD has them)\n{CHECK_AGAIN}"
         )
     );

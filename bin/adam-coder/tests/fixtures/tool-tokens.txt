@@ -25,9 +25,9 @@ read_output	934	233
 read_skill_file	868	217
 request_repository	1431	357
 reviewer	720	180
-run	1833	458
-run_checks	1773	443
-run_command	1633	408
+run	2210	552
+run_checks	2145	536
+run_command	1998	499
 search_files	1378	344
 share_file	1840	460
 show	1549	387

@@ -1,6 +1,8 @@
 //! Kept command output and `read_output` (ADR 0044, slice 3): a long output is shown as its head and
 //! tail with an id, kept whole and scrubbed on the volume, and read back by lines; a command takes a
-//! `timeout` of its own, never over the deployment's limit.
+//! `timeout` of its own, never over the deployment's limit; and each command tool takes `output`
+//! (ADR 0088): with `on_error` (the default of `run` and `run_checks`) a command that succeeds is one
+//! line naming the id its output is kept under, short output included.
 #![allow(clippy::unwrap_used, clippy::expect_used)] // integration tests assert by unwrapping
 
 mod common;
@@ -14,7 +16,7 @@ use adam_coder::tools::make::Run;
 use adam_coder::tools::named::{named_in, without_untrusted};
 use adam_coder::tools::prepare::PrepareWorkspace;
 use adam_coder::tools::shell::KEPT_OUTPUT_MAX;
-use adam_llm_agent::{KeptStore, ReadOutput, Tool, ToolCtx, ToolOutput};
+use adam_llm_agent::{KeptStore, ReadOutput, Tool, ToolCtx, ToolOutput, output_id_of};
 use adam_runtime::CollectingSink;
 use common::{DB_PASSWORD, Fixture, GITHUB_TOKEN, LONG_TOKEN, MODEL_KEY};
 use serde_json::{Value, json};
@@ -951,17 +953,165 @@ async fn a_command_that_times_out_is_killed_and_its_output_so_far_is_kept() {
     assert!(last.starts_with("40000\n"), "{last}");
 }
 
+/// With `output: "full"`, a check that passes shows the bounded view of the other tools; by
+/// default it is one line, and the output is kept all the same.
 #[tokio::test]
 async fn run_checks_shows_the_same_bounded_view() {
     let rig = Rig::new().await;
     let out = RunChecks
-        .call(&rig.ctx, json!({"command": "seq 1 30000"}))
+        .call(
+            &rig.ctx,
+            json!({"command": "seq 1 30000", "output": "full"}),
+        )
         .await
         .unwrap();
     let text = out.content;
     assert!(text.contains("exit code 0: passed"), "{text}");
     assert!(text.contains("head and tail shown, kept as o-"), "{text}");
     assert!(text.contains("read_output"), "{text}");
+
+    let ctx = rig.call_ctx("default");
+    let out = RunChecks
+        .call(&ctx, json!({"command": "seq 1 30000"}))
+        .await
+        .unwrap();
+    let id = output_id_of(&ctx);
+    assert_eq!(
+        out.content,
+        format!(
+            "$ seq 1 30000\nexit code 0: passed\n[output: 168894 bytes, not shown because the \
+             command succeeded; kept as {id}; read_output {{\"id\":\"{id}\"}} reads it]\n"
+        )
+    );
+    assert!(rig.read(&id, -1).await.content.starts_with("30000\n"));
+}
+
+/// A command tool called by name with `args` in `ctx`.
+async fn call_command(name: &str, ctx: &ToolCtx, args: Value) -> ToolOutput {
+    match name {
+        "run_command" => RunCommand.call(ctx, args).await,
+        "run" => Run.call(ctx, args).await,
+        _ => RunChecks.call(ctx, args).await,
+    }
+    .unwrap()
+}
+
+/// The command tools whose default `output` is `on_error`, and the line a command that succeeded
+/// starts with.
+const COMMAND_TOOLS: [(&str, bool, &str); 3] = [
+    ("run_command", false, "exit code 0"),
+    ("run", true, "exit code 0"),
+    ("run_checks", true, "exit code 0: passed"),
+];
+
+/// With `on_error`, asked or the tool's default, a command that succeeds is one line with its size
+/// and the id its output is kept under, short as it is, and `read_output` reads the whole output; with
+/// `full`, and by default for `run_command`, the output is shown as it always was.
+#[tokio::test]
+async fn a_command_that_succeeds_is_one_line_with_on_error_and_read_output_reads_it() {
+    let rig = Rig::new().await;
+    for (tool, on_error_by_default, passed) in COMMAND_TOOLS {
+        let command = format!("seq 1 3 # {tool}");
+        for output in [Some("on_error"), Some("full"), None] {
+            let ctx = rig.call_ctx(&format!("{tool}-{output:?}"));
+            let mut args = json!({ "command": command });
+            if let Some(output) = output {
+                args["output"] = json!(output);
+            }
+            let out = call_command(tool, &ctx, args).await;
+            assert!(!out.is_error, "{tool} {output:?}: {}", out.content);
+            let id = output_id_of(&ctx);
+            let hidden = output == Some("on_error") || (output.is_none() && on_error_by_default);
+            let shown = if hidden {
+                format!(
+                    "$ {command}\n{passed}\n[output: 6 bytes, not shown because the command \
+                     succeeded; kept as {id}; read_output {{\"id\":\"{id}\"}} reads it]\n"
+                )
+            } else {
+                format!("$ {command}\n{passed}\n--- output ---\n1\n2\n3\n")
+            };
+            // `run` follows with what git sees: nothing here.
+            assert!(
+                out.content.starts_with(&shown),
+                "{tool} {output:?}: {}",
+                out.content
+            );
+            if hidden {
+                assert_eq!(
+                    rig.read(&id, 1).await.content,
+                    "1\n2\n3\n[end: 3 lines]",
+                    "{tool}"
+                );
+            }
+        }
+    }
+}
+
+/// With `on_error`, a command that fails shows its output as `full` does, one that succeeds printing
+/// nothing says so, and a value that is neither is refused naming both and the tool's default.
+#[tokio::test]
+async fn on_error_shows_a_failure_says_no_output_and_another_value_is_refused() {
+    let rig = Rig::new().await;
+    for (tool, on_error_by_default, passed) in COMMAND_TOOLS {
+        for output in [Some("on_error"), None] {
+            // Another command each time: a failed check asked again on the same tree is not run.
+            let failing = format!("echo no; exit 4 # {tool} {output:?}");
+            let ctx = rig.call_ctx(&format!("{tool}-fails-{output:?}"));
+            let mut args = json!({ "command": failing });
+            if let Some(output) = output {
+                args["output"] = json!(output);
+            }
+            let out = call_command(tool, &ctx, args).await;
+            assert!(
+                out.content.contains("exit code 4")
+                    && out.content.contains("\n--- output ---\nno\n"),
+                "{tool} {output:?}: {}",
+                out.content
+            );
+        }
+
+        let quiet = format!("true # {tool}");
+        let ctx = rig.call_ctx(&format!("{tool}-quiet"));
+        let out = call_command(tool, &ctx, json!({"command": quiet, "output": "on_error"})).await;
+        assert!(
+            out.content
+                .starts_with(&format!("$ {quiet}\n{passed}\n(no output)\n")),
+            "{tool}: {}",
+            out.content
+        );
+
+        let default = if on_error_by_default {
+            "on_error"
+        } else {
+            "full"
+        };
+        let ctx = rig.call_ctx(&format!("{tool}-bad"));
+        let out = call_command(
+            tool,
+            &ctx,
+            json!({"command": "touch ran", "output": "errors"}),
+        )
+        .await;
+        assert!(out.is_error, "{tool}");
+        assert!(
+            out.content.starts_with("output must be \"on_error\"")
+                && out.content.contains("or \"full\"")
+                && out.content.contains("not \"errors\"")
+                && out
+                    .content
+                    .ends_with(&format!("the tool's default, \"{default}\"")),
+            "{tool}: {}",
+            out.content
+        );
+    }
+    assert!(
+        !rig.fx
+            .root
+            .join("workspaces")
+            .join(rig.ctx.run_id().to_string())
+            .join("remote/ran")
+            .exists()
+    );
 }
 
 #[test]

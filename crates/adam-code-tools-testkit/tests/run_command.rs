@@ -1,7 +1,9 @@
 //! `adam_code_tools::inspect::run_command` over a scripted workspace: for each verdict of the guard,
 //! what the tool answers and the progress line it adds; the guard's refusal (nothing runs); the
 //! refusal note on refusals only; a missing tool answered by the workspace or left to the result;
-//! and that `run_command` never calls `after_run`.
+//! that `run_command` never calls `after_run`; and its `output`: the whole output by default,
+//! one line for a command that succeeded with `on_error` (the output kept for `read_output`).
+//! (`output` is unit-tested in `adam_code_tools::output`.)
 #![allow(clippy::unwrap_used, clippy::expect_used)] // integration tests assert by unwrapping
 
 use std::path::Path;
@@ -15,7 +17,7 @@ use adam_code_tools::{
     Redactor, Settled,
 };
 use adam_code_tools_testkit::DirWorkspace;
-use adam_llm_agent::{KeptOutputs, ToolCtx, ToolError, ToolOutput};
+use adam_llm_agent::{KeptOutputs, ToolCtx, ToolError, ToolOutput, output_id_of};
 use adam_runtime::{CollectingSink, RunEvent};
 use adam_workspace::EnvSession;
 use async_trait::async_trait;
@@ -154,12 +156,49 @@ async fn look(
     verdict: Result<Settled, String>,
     command: &str,
 ) -> (ToolOutput, Vec<String>, Scripted) {
+    let (out, said, ws, _) = look_as(dir, verdict, command, None).await;
+    (out, said, ws)
+}
+
+/// [`look`] with the call's `output`, and the call's context (its output id, its run).
+async fn look_as(
+    dir: &Path,
+    verdict: Result<Settled, String>,
+    command: &str,
+    output: Option<&str>,
+) -> (ToolOutput, Vec<String>, Scripted, ToolCtx) {
     let ws = Scripted::over(dir, verdict);
     let (ctx, sink) = ctx();
-    let out = run_command(&ws, &ctx, command.into(), None, None, None)
+    let out = run_command(
+        &ws,
+        &ctx,
+        command.into(),
+        None,
+        None,
+        None,
+        output.map(str::to_owned),
+    )
+    .await
+    .unwrap();
+    (out, progress(&sink), ws, ctx)
+}
+
+/// The line a command that succeeded is shown as with `output: "on_error"`.
+fn hidden(ctx: &ToolCtx, bytes: u64) -> String {
+    let id = output_id_of(ctx);
+    format!(
+        "[output: {bytes} bytes, not shown because the command succeeded; kept as {id}; \
+         read_output {{\"id\":\"{id}\"}} reads it]\n"
+    )
+}
+
+/// The first page of the output the call of `ctx` kept, as `read_output` reads it.
+async fn kept_page(ws: &Scripted, ctx: &ToolCtx) -> String {
+    let run = ctx.root_run_id().to_string();
+    ws.kept()
+        .page(&run, &output_id_of(ctx), 1, 100)
         .await
-        .unwrap();
-    (out, progress(&sink), ws)
+        .unwrap()
 }
 
 fn undone(command: &str, what: &str, output: &str) -> String {
@@ -250,17 +289,35 @@ async fn a_refusal_before_the_guard_has_no_note() {
     let dir = tempfile::tempdir().unwrap();
     let ws = Scripted::over(dir.path(), Ok(Settled::Undone { restored: true }));
     let (ctx, sink) = ctx();
-    for (command, cwd, repo, timeout, said) in [
-        ("  ", None, None, None, "command is required"),
+    for (command, cwd, repo, timeout, output, said) in [
+        ("  ", None, None, None, None, "command is required"),
         (
             "ls",
             None,
             None,
             Some(0),
+            None,
             "timeout must be at least 1 second",
         ),
-        ("ls", None, Some("elsewhere"), None, "no such place"),
-        ("ls", Some(".."), None, None, "must be a relative path"),
+        (
+            "ls",
+            None,
+            None,
+            None,
+            Some("quiet"),
+            "output must be \"on_error\" (a command that succeeds is one line, and read_output \
+             reads its output) or \"full\" (the output whatever the exit), not \"quiet\"; leave \
+             it out for the tool's default, \"full\"",
+        ),
+        ("ls", None, Some("elsewhere"), None, None, "no such place"),
+        (
+            "ls",
+            Some(".."),
+            None,
+            None,
+            None,
+            "must be a relative path",
+        ),
     ] {
         let out = run_command(
             &ws,
@@ -269,6 +326,7 @@ async fn a_refusal_before_the_guard_has_no_note() {
             cwd.map(str::to_owned),
             repo.map(str::to_owned),
             timeout,
+            output.map(str::to_owned),
         )
         .await
         .unwrap();
@@ -288,7 +346,7 @@ async fn a_missing_tool_is_the_workspaces_answer_or_the_result() {
     let mut ws = Scripted::over(dir.path(), Ok(Settled::Unchanged));
     ws.missing = Some("missing".into());
     let (ctx, sink) = ctx();
-    let out = run_command(&ws, &ctx, command.into(), None, None, None)
+    let out = run_command(&ws, &ctx, command.into(), None, None, None, None)
         .await
         .unwrap();
     assert!(out.is_error);
@@ -329,4 +387,64 @@ async fn the_command_is_scrubbed_and_a_result_has_its_repeat_key() {
         out.repeat_key.as_deref().map(String::as_str),
         Some("exit:3")
     );
+}
+
+/// The default of `run_command` is `full`, asked or not: what a look printed is its answer.
+#[tokio::test]
+async fn a_look_shows_its_output_by_default_and_with_full() {
+    let dir = tempfile::tempdir().unwrap();
+    for output in [None, Some("full")] {
+        let (out, _, _, _) = look_as(dir.path(), Ok(Settled::Unchanged), "echo hi", output).await;
+        assert!(!out.is_error, "{output:?}: {}", out.content);
+        assert_eq!(
+            out.content, "$ echo hi\nexit code 0\n--- output ---\nhi\n",
+            "{output:?}"
+        );
+    }
+}
+
+/// With `on_error`, a look that succeeded is one line, and its output, short as it is, is kept for
+/// `read_output`.
+#[tokio::test]
+async fn a_look_that_succeeded_with_on_error_is_one_line_and_its_output_is_kept() {
+    let dir = tempfile::tempdir().unwrap();
+    let (out, said, ws, ctx) = look_as(
+        dir.path(),
+        Ok(Settled::Unchanged),
+        "echo hi",
+        Some("on_error"),
+    )
+    .await;
+    assert!(!out.is_error, "{}", out.content);
+    assert_eq!(
+        out.content,
+        format!("$ echo hi\nexit code 0\n{}", hidden(&ctx, 3))
+    );
+    assert_eq!(said, ["running: echo hi"]);
+    assert!(kept_page(&ws, &ctx).await.starts_with("hi\n"));
+}
+
+/// With `on_error`, a look that failed shows its output as `full` does, and one that succeeded
+/// printing nothing says so and names no id.
+#[tokio::test]
+async fn a_look_with_on_error_shows_a_failure_and_says_when_nothing_was_printed() {
+    let dir = tempfile::tempdir().unwrap();
+    let (out, _, _, _) = look_as(
+        dir.path(),
+        Ok(Settled::Unchanged),
+        "echo no; exit 2",
+        Some("on_error"),
+    )
+    .await;
+    assert_eq!(
+        out.content,
+        "$ echo no; exit 2\nexit code 2\n--- output ---\nno\n"
+    );
+    assert_eq!(
+        out.repeat_key.as_deref().map(String::as_str),
+        Some("exit:2")
+    );
+    let (out, _, _, _) =
+        look_as(dir.path(), Ok(Settled::Unchanged), "true", Some("on_error")).await;
+    assert_eq!(out.content, "$ true\nexit code 0\n(no output)\n");
 }

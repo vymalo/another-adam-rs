@@ -189,9 +189,9 @@ The person watching a turn of yours sees two different things, and each has its 
   One look per command: put several short looks in one (`ls && cat package.json`,
   `git status && git diff`).
   It runs in the workspace's environment (see "The work environment").
-  It returns the exit code and the output; a long output shows its head and tail
-  with an id, and is kept whole. Read the rest with `read_output { id, offset?, limit? }`, a page
-  at a time. It costs no check cycle and
+  It returns the exit code and the output; a long one shows its head and tail and an id
+  that `read_output { id, offset?, limit? }` reads. `run` and `run_checks` show a success
+  as one line with its id. It costs no check cycle and
   reports no checks; it is for looking: changes it makes to HEAD, the branch
   and the working tree are undone and refused.
 - `run { command, repo? }`: make something with a shell command and **keep** it: generate

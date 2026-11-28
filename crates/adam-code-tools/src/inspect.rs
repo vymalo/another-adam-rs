@@ -1,4 +1,4 @@
-//! `run_command { command, cwd?, repo?, timeout? }`: look around in a place with a shell command,
+//! `run_command { command, cwd?, repo?, timeout?, output? }`: look around in a place with a shell command,
 //! over the commands' port ([`CommandWorkspace`]).
 //!
 //! It runs like the project's checks (the place, a `cwd` inside it, the login shell, the
@@ -9,6 +9,9 @@
 //! shell cannot find is answered by the workspace ([`CommandWorkspace::missing_tool_answer`]), when
 //! it has an answer.
 //!
+//! Its output is shown whole by default ([`DEFAULT_OUTPUT`]): it exists to look, and what a look
+//! printed is its answer. A call may ask for `output: "on_error"` ([`OutputMode`]).
+//!
 //! It never calls [`after_run`](CommandWorkspace::after_run): a look changes nothing that follows.
 //! The guard of a workspace that does not undo ([`Settled::FilesChanged`], [`Settled::Unwatched`])
 //! leaves what the command changed, and the result says so when the guard saw it.
@@ -17,14 +20,19 @@ use adam_llm_agent::{ToolCtx, ToolOutput};
 
 use crate::commands::{self, CommandWorkspace, Guarding, Settled, run_error};
 use crate::find::non_empty;
-use crate::output;
+use crate::output::{self, OutputMode};
 use crate::shell::{ShellOutcome, missing_tool, resolve_cwd, shell_spec};
 use crate::workspace::{Intent, Outcome, Place};
+
+/// What `run_command` shows of an output when the call asks for nothing: all of it, since what a
+/// look printed is its answer (ADR 0088, decision 3).
+pub const DEFAULT_OUTPUT: OutputMode = OutputMode::Full;
 
 /// The tool `run_command` over `ws`. Its description is the caller's own declaration (the coder's
 /// `tools::inspect`).
 ///
-/// In order: the command is required, the `timeout` within the limits, the place found for a read,
+/// In order: the command is required, the `timeout` within the limits, the `output` one of its
+/// values ([`OutputMode::of`], default [`DEFAULT_OUTPUT`]), the place found for a read,
 /// the `cwd` inside it, the session made (it may take a while, so before the place is watched), the
 /// guard taken (its refusal is the answer, and nothing runs), then the command runs, its output is
 /// settled, and the guard is settled: a command it undid is refused; a missing tool is the
@@ -40,6 +48,8 @@ pub async fn run_command(
     repo: Option<String>,
     // Seconds before the command is killed; at most the workspace's limit, which is also the default
     timeout: Option<i64>,
+    // What the result shows of the output: `on_error` or `full`; default `full`
+    output: Option<String>,
 ) -> Outcome {
     let Some(command) = non_empty(&command) else {
         return Ok(ToolOutput::error("command is required"));
@@ -47,6 +57,10 @@ pub async fn run_command(
     let limits = ws.limits();
     let timeout = match output::timeout_of(&limits, timeout) {
         Ok(timeout) => timeout,
+        Err(reason) => return Ok(ToolOutput::error(reason)),
+    };
+    let mode = match OutputMode::of(output.as_deref(), DEFAULT_OUTPUT) {
+        Ok(mode) => mode,
         Err(reason) => return Ok(ToolOutput::error(reason)),
     };
     let place = match ws.place(ctx, repo.as_deref(), Intent::Read).await {
@@ -79,7 +93,7 @@ pub async fn run_command(
     )
     .await
     .map_err(|e| run_error(redactor, &e))?;
-    output::settle(ws, ctx, &mut outcome).await;
+    output::settle_as(ws, ctx, &mut outcome, mode).await;
 
     let changed_files = match guard.settle().await {
         Settled::Undone { restored } | Settled::Unreadable { restored } => {
@@ -107,7 +121,7 @@ pub async fn run_command(
             .await;
         return Ok(ToolOutput::error(said));
     }
-    let mut text = render(&shown, &outcome);
+    let mut text = render(&shown, &outcome, mode);
     if changed_files {
         text.push_str(KEPT_BY_THE_WORKSPACE);
         ctx.emit_progress(format!("changed files: {shown}")).await;
@@ -151,10 +165,10 @@ fn changed_the_worktree(command: &str, outcome: &ShellOutcome, restored: bool) -
     )
 }
 
-/// The command, how it ended, and the tail of its output. A non-zero exit is said plainly: for a
-/// command that only looks, it is an answer ("no such file"), not a failure. `run`
-/// ([`make::run`](crate::make::run)) starts its result with it too.
-pub fn render(command: &str, outcome: &ShellOutcome) -> String {
+/// The command, how it ended, and its output as `mode` shows it ([`output::section_as`]). A
+/// non-zero exit is said plainly: for a command that only looks, it is an answer ("no such file"),
+/// not a failure. `run` ([`make::run`](crate::make::run)) starts its result with it too.
+pub fn render(command: &str, outcome: &ShellOutcome, mode: OutputMode) -> String {
     let how = if outcome.timed_out {
         "timed out (the command was killed)".to_owned()
     } else if let Some(stopped) = outcome.stopped {
@@ -166,7 +180,7 @@ pub fn render(command: &str, outcome: &ShellOutcome) -> String {
         }
     };
     let mut text = format!("$ {command}\n{how}\n");
-    text.push_str(&output::section(outcome));
+    text.push_str(&output::section_as(outcome, mode));
     text
 }
 
@@ -186,19 +200,32 @@ mod tests {
 
     #[test]
     fn a_result_says_how_the_command_ended_without_calling_it_a_failure() {
-        let ok = render("ls", &outcome(Some(0), "a\nb\n", false, false));
+        let ok = render(
+            "ls",
+            &outcome(Some(0), "a\nb\n", false, false),
+            OutputMode::Full,
+        );
         assert_eq!(ok, "$ ls\nexit code 0\n--- output ---\na\nb\n");
         let no = render(
             "cat x",
             &outcome(Some(1), "cat: x: No such file", false, false),
+            OutputMode::OnError,
         );
         assert!(no.contains("exit code 1") && !no.contains("FAILED"), "{no}");
         assert!(no.ends_with("No such file\n"), "{no}");
-        let cut = render("yes", &outcome(Some(0), "y\n", false, true));
+        let cut = render(
+            "yes",
+            &outcome(Some(0), "y\n", false, true),
+            OutputMode::Full,
+        );
         assert!(cut.contains("output truncated: the last 2 bytes"), "{cut}");
-        let slow = render("sleep 9", &outcome(None, "", true, false));
+        let slow = render(
+            "sleep 9",
+            &outcome(None, "", true, false),
+            OutputMode::OnError,
+        );
         assert!(slow.contains("timed out"), "{slow}");
-        let sig = render("x", &outcome(None, "", false, false));
+        let sig = render("x", &outcome(None, "", false, false), OutputMode::OnError);
         assert!(sig.contains("killed by a signal"), "{sig}");
     }
 

@@ -1,4 +1,4 @@
-//! `run { command, cwd?, repo? }`: make something with a shell command, and keep it.
+//! `run { command, cwd?, repo?, timeout?, output? }`: make something with a shell command, and keep it.
 //!
 //! The coder produces files with commands: a build, an export, a render, a generated chart. Until
 //! this tool the only command that could was `run_checks`, so a model that needed `npm run render`
@@ -52,7 +52,9 @@ use super::{Outcome, ToolEnv};
 /// not a check: it costs no check cycle and the pull request gate never sees it. It cannot touch
 /// git: a command that changes HEAD, the branch, a ref, .git or the git configuration is undone
 /// completely and refused, so commit with commit_and_push. After it changes the files, run the
-/// project's checks again before you commit. Show the person a file it made with share_file.
+/// project's checks again before you commit. Show the person a file it made with share_file. By
+/// default (output "on_error") a command that succeeds is one line with an output id that
+/// read_output reads.
 #[tool(label = "Make files with a command", icon = "execute", access = super::access::makes_files_with_a_command)]
 pub async fn run(
     env: State<ToolEnv>,
@@ -65,6 +67,8 @@ pub async fn run(
     repo: Option<String>,
     /// Seconds before the command is killed; at most the deployment's limit, which is also the default. Example: {"command":"npm test","timeout":120}
     timeout: Option<i64>,
+    /// What you see of the output: "on_error" (a command that succeeds is one line with an output id that read_output reads) or "full". Default "on_error". Example: {"command":"cargo build","output":"full"}
+    output: Option<String>,
 ) -> Outcome {
-    adam_code_tools::make::run(&*env, ctx, command, cwd, repo, timeout).await
+    adam_code_tools::make::run(&*env, ctx, command, cwd, repo, timeout, output).await
 }
