@@ -236,6 +236,7 @@ probe_refused "a tag below the floor" '      - uses: actions/checkout@v4'
 probe_refused "a dotted tag below the floor" '      - uses: actions/checkout@v4.2.2'
 probe_refused "a suffixed tag below the floor" '      - uses: actions/checkout@v4-rc'
 probe_refused "one major below the floor" '      - uses: actions/checkout@v6'
+probe_refused "a major too large to compare" '      - uses: actions/checkout@v99999999999999999999'
 probe_refused "a uses: under a named step, with no dash" '        uses: actions/checkout@v4'
 probe_refused "a quoted tag below the floor" '      - uses: "actions/checkout@v4"'
 probe_refused "a SHA whose comment is below the floor" \
