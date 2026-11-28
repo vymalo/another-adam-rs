@@ -1,8 +1,9 @@
 {{- if and (include "coder.runPods" .) (eq (toString .Values.runPods.admissionPolicy.enabled) "true") }}
 {{- $claim := include "coder.runPodWorkClaim" . -}}
-{{- /* With cache.*, the package cache's claim is the second one a run pod may mount (ADR 0040). */ -}}
+{{- /* The work claim, and the claims the deployment admits for its own cache (values cache.allowedClaims, ADR 0040
+       as amended 2026-11-26). Nothing else: no shared writable cache is provided by the chart. */ -}}
 {{- $claims := list $claim -}}
-{{- if include "coder.cache" . -}}{{- $claims = append $claims (include "coder.cacheClaim" .) -}}{{- end -}}
+{{- range .Values.cache.allowedClaims -}}{{- $claims = append $claims (toString .) -}}{{- end -}}
 {{- $class := include "coder.runPodsPriorityClass" . -}}
 {{- /* The pull secrets the template itself carries (values imagePullSecrets): the only ones a run pod may name. */ -}}
 {{- $pull := list -}}

@@ -197,3 +197,28 @@ filled by a pull-through proxy to the public registries (a proxy to build and ru
 Slices: (1) this amendment; (2) the admission policy refuses a read-write cache mount, with a kind scenario in which run A cannot
 write the cache path; (3) the proxy in the chart, filling the cache, with a kind scenario in which a package fetched through it lands
 in the cache.
+
+*2026-11-26 (the owner's decision, ANR-313; row 124 of `decisions-2026-11-26`):* the shared writable cache is gone. The owner's
+decision: *"No shared writable cache is provided to run pods. The user configures their own cache volume through the platform:
+`AgentConfig.environment.cache.existingClaim`, admitted only if the operator's `cache.allowedClaims` lists it."* What changes:
+
+* **The chart mounts no cache.** `cache.existingClaim`, `cache.create`, `cache.storageClass`, `cache.size` and
+  `cache.accessModes` are gone, and with them the claim `<release>-cache` and the `/cache` mount in the combined pod, the `split`
+  worker and the run pod template. `/cache` is a directory of each container's own file system, lost with the pod, and the image
+  keeps its caches there as before. Decision 1's "the chart can make the claim itself" and the chart's rows of decision 2 no
+  longer hold; the operator's row of decision 2 is what remains.
+* **A deployment's own claim is admitted, not provided.** The coder chart's `cache.allowedClaims` (empty by default) names the
+  claims a run pod may mount. The admission policy admits the work claim and those names, and refuses any other claim. The claim
+  itself arrives through the platform (`AgentConfig.environment.cache.existingClaim`), and the operator admits it only when its
+  own `cache.allowedClaims` lists it.
+* **What this replaces.** The read-only-in-run-pods option of 2026-11-24 (ANR-Q52) and the slice that would have refused a
+  read-write cache mount in a run pod are not built: with no chart-provided cache there is nothing for a run pod to mount
+  read-write. The proxy remains a possible later step and is not decided here.
+* **A claim is one trust domain, and its consequences stay the deployment's.** Every run that mounts a claim reads whatever any
+  run on it wrote, so a deployment lists only its own runs' claims. Cargo's missing lock on NFS, the root needing uid and gid
+  10001, and npm's `Vary: Authorization` risk are unchanged for a claim a deployment provides. The chart's refusal of
+  `CARGO_HOME` and the npm cache variable in `config.extraEnv` goes with the chart's cache: there is no chart volume for a
+  variable to miss.
+* **Checked by** `deploy/coder/tests/render-check.sh` (no cache volume, mount or claim; the policy's list; the refusals) and
+  `deploy/coder/tests/kind-cache-isolation.sh` (a file run A writes under `/cache` is invisible to run B, with the control that
+  two pods on one claim do share it).

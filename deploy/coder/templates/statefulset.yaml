@@ -469,11 +469,6 @@ spec:
           volumeMounts:
             - name: work
               mountPath: /work
-            {{- if include "coder.cache" . }}
-            {{- /* cache.*: the package cache (ADR 0040); the image's npm, pnpm and cargo caches are under it. */}}
-            - name: cache
-              mountPath: {{ include "coder.cacheDir" . }}
-            {{- end }}
             {{- if $githubApp }}
             - name: github-app
               mountPath: /var/run/secrets/github-app
@@ -517,17 +512,12 @@ spec:
               mountPath: {{ include "coder.turnSigningDir" . }}
               readOnly: true
             {{- end }}
-      {{- if or (include "coder.sharedWork" .) (include "coder.cache" .) $githubApp (include "coder.extraMcp" .) (include "coder.modelProfiles" .) (include "coder.references" .) (include "coder.runPods" .) $cardSigning $turnSigning }}
+      {{- if or (include "coder.sharedWork" .) $githubApp (include "coder.extraMcp" .) (include "coder.modelProfiles" .) (include "coder.references" .) (include "coder.runPods" .) $cardSigning $turnSigning }}
       volumes:
         {{- if include "coder.sharedWork" . }}
         - name: work
           persistentVolumeClaim:
             claimName: {{ include "coder.workClaim" . }}
-        {{- end }}
-        {{- if include "coder.cache" . }}
-        - name: cache
-          persistentVolumeClaim:
-            claimName: {{ include "coder.cacheClaim" . }}
         {{- end }}
         {{- if $githubApp }}
         - name: github-app

@@ -196,13 +196,11 @@ jobs:
           helm template coder deploy/coder --namespace another-agentic-system --set image.tag=sha-abc1234 \
             --set config.modelBaseUrlFromSecret=true --set topology=split --set front.replicas=2 \
             > "$RUNNER_TEMP/rendered-model-url-split.yaml"
-          # The package cache (ADR 0040): an existing claim, and a created one with run pods (the pod template and
-          # the admission policy carry the claim).
+          # The package cache (ADR 0040, amended 2026-11-26): the chart mounts none. cache.allowedClaims only widens
+          # the run pods' admission policy, and the pod template carries no cache volume.
           helm template coder deploy/coder --namespace another-agentic-system --set image.tag=sha-abc1234 \
-            --set cache.existingClaim=shared-cache > "$RUNNER_TEMP/rendered-cache.yaml"
-          helm template coder deploy/coder --namespace another-agentic-system --set image.tag=sha-abc1234 \
-            --set cache.create=true --set cache.storageClass=rwx --set runPods.enabled=true \
-            --set topology=split --set front.replicas=2 > "$RUNNER_TEMP/rendered-cache-run-pods.yaml"
+            --set 'cache.allowedClaims={shared-cache}' --set runPods.enabled=true \
+            --set topology=split --set front.replicas=2 > "$RUNNER_TEMP/rendered-cache.yaml"
           # GET /internal/activity on a port of its own (activity.*, ADR 0083): the container port, its Service
           # port, the tokens from a Secret and the policy's second rule, in the combined pod and on the split front.
           helm template coder deploy/coder --namespace another-agentic-system --set image.tag=sha-abc1234 \
@@ -226,7 +224,7 @@ jobs:
                 "$RUNNER_TEMP/rendered-a2a.yaml" "$RUNNER_TEMP/rendered-a2a-split.yaml" \
                 "$RUNNER_TEMP/rendered-model-url.yaml" "$RUNNER_TEMP/rendered-model-url-split.yaml" \
                 "$RUNNER_TEMP/rendered-run-pods.yaml" "$RUNNER_TEMP/rendered-run-pods-shared.yaml" \
-                "$RUNNER_TEMP/rendered-cache.yaml" "$RUNNER_TEMP/rendered-cache-run-pods.yaml" \
+                "$RUNNER_TEMP/rendered-cache.yaml" \
                 "$RUNNER_TEMP/rendered-activity.yaml" "$RUNNER_TEMP/rendered-activity-split.yaml" \
                 > "$RUNNER_TEMP/kubeconform.out" 2>&1 || status=$?
             cat "$RUNNER_TEMP/kubeconform.out"
