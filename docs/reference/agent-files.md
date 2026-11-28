@@ -103,6 +103,7 @@ superset of the two custom-agent formats below.
 name: coder                    # default: CARGO_PKG_NAME (root), file name (subagents)
 description: Turns a coding task into a verified pull request.   # required on subagents
 model: coder-large             # a gateway alias; `inherit` = the parent's (default for subagents)
+models: [coder-large, coder-small]   # the aliases a session of this agent may name, on top of the deployment's (ADR 0054 slice 11); absent: the deployment's alone
 reasoning_effort: low          # the level the model calls ask for by default; one the model's profile declares (ADR 0063)
 model_preset: quick            # a named preset of MODEL_ALIASES_FILE the calls start from (ADR 0064)
 model_fallback: coder-lite     # overrides the preset's and the profile's `fallback`: the alias the run continues on, once, if the endpoint refuses `model` as locked or over the person's limit (ADR 0064)
