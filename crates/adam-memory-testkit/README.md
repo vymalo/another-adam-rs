@@ -60,6 +60,19 @@ adam_memory_testkit::memory_conformance!(crate::make);
 case with the case's scope, and twice with two scopes for `two_scopes_never_see_each_other`; an
 adapter whose instances share one database must build both against it.
 
+Both suites also take an optional second path, to a `fn() -> bool` whose `false` skips every test
+of the suite. This is the hook for a database adapter, whose store is not always reachable: build
+it on `adam_core::testing::test_env`, so an unset variable skips the suite and
+`ADAM_TEST_REQUIRE_DB=1` fails it instead (the CI switch).
+
+```rust
+fn available() -> bool {
+    adam_core::testing::test_env("ADAM_TEST_MY_DB_URL").is_some()
+}
+
+adam_memory_testkit::memory_conformance!(crate::make, crate::available);
+```
+
 Both suites assume the store holds nothing under their fixed scopes and audiences. A persistent
 adapter must clear those keys before the run, or prefix every scope the macro hands it with a
 per-run value.
@@ -117,6 +130,7 @@ with a remedy, a rationale and two sources.
 | `a_retired_lesson_is_kept_and_not_served` | a retired lesson is kept and not served, retiring twice is one retirement, an unknown lesson is `NotFound`, and a fresh record serves it again |
 | `a_full_audience_refuses_a_revived_lesson` | the bound counts what is served: reviving needs a free slot, and a full audience refuses it |
 | `retire_takes_the_stored_root_cause` | `retire` finds a lesson only by the stored, scrubbed root cause; the raw text is `NotFound` |
+| `an_empty_key_is_refused` | an empty audience is refused by `recall` and `retire` before anything is read |
 | `sixteen_writers_share_one_audience` | the port is `Send + Sync` and one audience keeps every writer's lesson |
 
 ## The doubles

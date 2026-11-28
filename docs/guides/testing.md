@@ -1,9 +1,10 @@
 # Testing
 
 ```sh
-docker compose up -d --wait        # postgres, mongodb and the mocks
+docker compose up -d --wait        # postgres, mongodb, redis and the mocks
 export ADAM_TEST_POSTGRES_URL=postgres://postgres:postgres@127.0.0.1:5432/adam_test
 export ADAM_TEST_MONGODB_URI=mongodb://127.0.0.1:27017
+export ADAM_TEST_REDIS_URL=redis://127.0.0.1:6379
 export ADAM_TEST_MOCK_OPENAI_URL=http://127.0.0.1:8081      # the root of the mock, no /v1
 export ADAM_TEST_MOCK_GITHUB_URL=http://127.0.0.1:8082
 cargo test --workspace
