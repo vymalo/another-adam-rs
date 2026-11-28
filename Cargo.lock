@@ -959,6 +959,8 @@ version = "0.7.0"
 dependencies = [
  "adam-core",
  "adam-error",
+ "adam-memory",
+ "adam-memory-testkit",
  "adam-store-testkit",
  "async-trait",
  "futures",
