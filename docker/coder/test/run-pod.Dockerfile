@@ -31,6 +31,9 @@ RUN apt-get update \
 COPY --chmod=0755 crates/adam-env-kubernetes/src/adam-exec.sh /opt/adam/bin/adam-exec
 COPY --from=egress --chmod=0755 adam-egress /usr/local/bin/adam-egress
 COPY --from=gitsandbox --chmod=0755 adam-git-sandbox adam-git /usr/local/bin/
+# The workspace image's /cache (ADR 0040): the directory the toolchains keep their caches in. It is the image's own
+# writable layer, per pod: the chart mounts no cache volume over it.
+RUN mkdir -p /cache && chown 10001:10001 /cache && chmod 1777 /cache
 # The pod's own user, numeric, as the chart's template and its admission policy require.
 USER 10001
 WORKDIR /work

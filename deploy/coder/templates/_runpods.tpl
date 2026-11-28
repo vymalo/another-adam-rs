@@ -252,11 +252,6 @@ spec:
         {{- /* The one mount of the workspace volume, whole: the coder replaces it by the run's own mounts (see above). */}}
         - name: work
           mountPath: /work
-        {{- if include "coder.cache" . }}
-        {{- /* The package cache, shared with the coder pod and the other run pods (ADR 0040). */}}
-        - name: cache
-          mountPath: {{ include "coder.cacheDir" . }}
-        {{- end }}
         - name: tools
           mountPath: /opt/adam/bin
           readOnly: true
@@ -264,11 +259,6 @@ spec:
     - name: work
       persistentVolumeClaim:
         claimName: {{ include "coder.runPodWorkClaim" . }}
-    {{- if include "coder.cache" . }}
-    - name: cache
-      persistentVolumeClaim:
-        claimName: {{ include "coder.cacheClaim" . }}
-    {{- end }}
     - name: tools
       emptyDir: {}
 {{- end -}}
