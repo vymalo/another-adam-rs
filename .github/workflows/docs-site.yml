@@ -16,6 +16,10 @@ permissions:
   contents: read
 
 concurrency:
+  # One docs build per ref, and a newer one cancels the older (ANR-1457): the site publishes the
+  # **newest** commit, so an older commit's build is deliberately not finished. That is the intent,
+  # not an accident — a push that is superseded leaves its site unpublished on purpose. The group is
+  # per ref (not per commit) so a burst of pushes to `main` cannot pile up deploys of the same site.
   group: pages-${{ github.ref }}
   cancel-in-progress: true
 
