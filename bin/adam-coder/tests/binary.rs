@@ -3673,10 +3673,16 @@ async fn export_over_an_empty_store_writes_nothing_and_exits_0() {
         .find(|l| l["fields"]["message"] == "export finished")
         .unwrap_or_else(|| panic!("no summary line:\n{stderr}"));
     assert_eq!(summary["fields"]["written"], 0);
-    assert!(
-        stderr.contains("EXPORT_PSEUDONYM_KEY is unset"),
-        "a random key is said: {stderr}"
-    );
+    let random_key = stderr
+        .lines()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .find(|l| {
+            l["fields"]["message"]
+                .as_str()
+                .is_some_and(|m| m.starts_with("no pseudonym key is set"))
+        })
+        .unwrap_or_else(|| panic!("a random key is said:\n{stderr}"));
+    assert_eq!(random_key["fields"]["variable"], "EXPORT_PSEUDONYM_KEY");
     assert_eq!(export(&["--agent", "nobody"]).await.status.code(), Some(78));
     assert_eq!(export(&["--current-tools"]).await.status.code(), Some(64));
 }
