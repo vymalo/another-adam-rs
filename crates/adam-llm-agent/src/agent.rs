@@ -9731,8 +9731,13 @@ mod call_span_tests {
         }
     }
 
-    /// What `span` renders, as text.
-    fn rendered(span: tracing::Span) -> String {
+    /// What the span `make` builds renders, as text.
+    ///
+    /// The span must be created **inside** the subscriber's scope: a span created with no
+    /// dispatcher installed is disabled at its callsite, and `in_scope` then writes nothing. That
+    /// is why the builder is a closure and not a `Span` — nextest runs each test in its own
+    /// process, so a test that relied on another test's global subscriber would fail there.
+    fn rendered(make: impl FnOnce() -> tracing::Span) -> String {
         let sink = Captured::default();
         let subscriber = tracing_subscriber::fmt()
             .with_writer(sink.clone())
@@ -9740,7 +9745,7 @@ mod call_span_tests {
             .with_max_level(tracing::Level::INFO)
             .finish();
         tracing::subscriber::with_default(subscriber, || {
-            span.in_scope(|| {});
+            make().in_scope(|| {});
         });
         let bytes = sink
             .0
@@ -9752,7 +9757,7 @@ mod call_span_tests {
 
     #[test]
     fn a_model_span_names_the_alias_and_holds_no_content() {
-        let text = rendered(model_span("some-alias", false));
+        let text = rendered(|| model_span("some-alias", false));
         assert!(text.contains("adam.model"), "{text}");
         assert!(text.contains("some-alias"), "{text}");
         // A prompt, a message, a tool spec or an answer is never a field.
@@ -9765,7 +9770,7 @@ mod call_span_tests {
 
     #[test]
     fn a_tool_span_names_the_tool_and_holds_no_arguments() {
-        let text = rendered(tool_span("read_file"));
+        let text = rendered(|| tool_span("read_file"));
         assert!(text.contains("adam.tool"), "{text}");
         assert!(text.contains("read_file"), "{text}");
         for forbidden in ["args", "arguments", "output", "content"] {
