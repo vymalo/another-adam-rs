@@ -28,19 +28,23 @@ decisions 2 to 5 and 10; slices M1 and M2a (the L2 port and its kit; the L2 adap
 | `InProcessSiMemory` | The in-process reference the suite and a test use. |
 | `Memory` | The L2 port: `record`, `recall`, `retire`. `Send + Sync + 'static`; no driver type, no URL, no client in a signature. |
 | `DynMemory` | `Arc<dyn Memory>`, what a host or a tool is given. |
-| `MemoryScope` | The scope an L2 adapter is configured with; every key and query carries it. Two scopes on one store never see each other's lessons. |
-| `Audience` | Who a lesson is served to inside its scope; the promotion pass computes it, the port keeps it opaque. |
+| `MemoryScope` | The scope an L2 adapter is configured with; every key and query carries it. Two scopes on one store never see each other's lessons. `MemoryScope::validate` is what a call checks first. |
+| `Audience` | Who a lesson is served to inside its scope; the promotion pass computes it, the port keeps it opaque. `Audience::validate` is what `recall` and `retire` check first. |
 | `Lesson` | A root cause, its remedy and rationale, anchors as text, provenance, `state`, `created`, `updated` and `retired_at`. |
 | `LessonDraft` | What a caller writes; the adapter scrubs it, checks it and stamps it. |
 | `LessonProvenance` | The L1 scopes (opaque labels) whose evidence made the lesson, and the review that approved it. |
 | `LessonState` | `Proposed`, `Active`, `Retired`. A closed set; a recall serves `Active` only. |
 | `LessonSettings`, `LessonLimits` | The injected scrub and the bounds an L2 adapter is built with. |
+| `prepare_lesson` | Public preparation **for adapters**: scrub, check and stamp a draft into a served lesson with the port's own rules. `InProcessMemory` uses this same function; a database adapter prepares a draft with it and stores the stamped lesson. |
 | `InProcessMemory` | The in-process L2 reference the suite and a test use. |
 | `InProcessLessonStore` | The storage several `InProcessMemory` adapters share, so a test can put two scopes on one store. |
 
 The crate is the two ports, the values, L1's in-folder adapter and the two in-process references.
-The PostgreSQL, MongoDB and Redis adapters are features of crates of their own (M2b); a store
-reached over the network is L2 (ADR 0081 decision 2).
+The PostgreSQL L2 adapter is [`adam-store-postgres`](../adam-store-postgres/README.md)'s `memory`
+feature (M2b, built); the MongoDB and Redis adapters remain unbuilt. A store reached over the
+network is L2 (ADR 0081 decision 2). Adapters in other crates use this crate's public
+write-path pieces: `prepare_lesson`, `MemoryScope::validate`, `Audience::validate` and
+`MemoryError::backend`.
 
 ```rust
 use adam_core::RunId;
@@ -161,7 +165,8 @@ so the two cannot drift.
 variant. A refused text, a bound, an empty field or an address is `Invalid`; a full scope, problem or
 audience is `Rejected`; an unknown problem, attempt or lesson is `NotFound`; a file that does not
 parse is `Corrupt`; a storage failure is `Transient` (ADR 0081 decision 12: an unreachable memory is
-a transient tool error).
+a transient tool error). `MemoryError::backend` is public **for adapters**: a driver failure maps to
+`Backend`, whose class is `Transient`.
 
 ## Environment
 
@@ -181,7 +186,9 @@ variable.
 
 `cargo test -p adam-memory --test lesson` runs
 [`memory_conformance!`](../adam-memory-testkit/README.md) against `InProcessMemory`, over one shared
-store so two configured scopes are two scopes on one store.
+store so two configured scopes are two scopes on one store. The same suite runs against the
+PostgreSQL adapter in [`adam-store-postgres`](../adam-store-postgres/README.md) (`tests/memory.rs`,
+feature `memory`).
 
 The unit tests cover the class table, the marker, the address detector, the slug and the digest.
 

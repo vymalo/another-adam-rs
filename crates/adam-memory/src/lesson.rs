@@ -36,7 +36,15 @@ impl MemoryScope {
         &self.0
     }
 
-    pub(crate) fn validate(&self) -> MemoryResult<()> {
+    /// Check the key a call needs; an empty scope is refused with [`MemoryError::EmptyField`].
+    ///
+    /// **For adapters**: run it in every call, as [`InProcessMemory`](crate::InProcessMemory) does,
+    /// so an adapter refuses an empty key exactly as the port's reference does.
+    ///
+    /// # Errors
+    ///
+    /// [`MemoryError::EmptyField`] when the scope is empty or only whitespace.
+    pub fn validate(&self) -> MemoryResult<()> {
         if self.0.trim().is_empty() {
             return Err(MemoryError::EmptyField {
                 field: "memory scope",
@@ -74,7 +82,16 @@ impl Audience {
         &self.0
     }
 
-    pub(crate) fn validate(&self) -> MemoryResult<()> {
+    /// Check the key a call needs; an empty audience is refused with [`MemoryError::EmptyField`].
+    ///
+    /// **For adapters**: run it in `recall` and `retire`, as
+    /// [`InProcessMemory`](crate::InProcessMemory) does, so an adapter refuses an empty key exactly
+    /// as the port's reference does.
+    ///
+    /// # Errors
+    ///
+    /// [`MemoryError::EmptyField`] when the audience is empty or only whitespace.
+    pub fn validate(&self) -> MemoryResult<()> {
         if self.0.trim().is_empty() {
             return Err(MemoryError::EmptyField { field: "audience" });
         }
@@ -300,8 +317,18 @@ impl LessonSettings {
 /// refused. A lesson may not name a repository, a path, a URL, a host or an e-mail address whatever
 /// its audience (ADR 0081 decision 5), so every lesson text goes through the address check too. The
 /// audience is a key, validated and bounded, never scrubbed; the provenance labels are scrubbed and
-/// bounded.
-pub(crate) fn prepare(
+/// bounded. The scope is checked first: an empty one is refused.
+///
+/// **For adapters**: this is the port's own write path — every adapter prepares a draft through it
+/// (re-exported as [`prepare_lesson`](crate::prepare_lesson)), so the scrub, the marker, the
+/// bounds and the address check are the port's rules wherever a lesson is stored. It stamps
+/// `state = Active` and both timestamps with `now`; a store keeps the creation time of the lesson a
+/// key already holds and returns its stored row.
+///
+/// # Errors
+///
+/// [`MemoryError`], whose class says whether to retry (a backend failure) or not (a refusal).
+pub fn prepare(
     scope: &MemoryScope,
     draft: LessonDraft,
     settings: &LessonSettings,
