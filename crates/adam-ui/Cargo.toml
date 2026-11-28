@@ -18,8 +18,8 @@ thread-tools = ["dep:adam-mcp", "dep:secrecy"]
 [dependencies]
 a2a-lf.workspace = true
 adam-core.workspace = true
-adam-a2a = { path = "../adam-a2a", version = "0.7.0", default-features = false } # x-release-please-version
-adam-a2a-runtime = { path = "../adam-a2a-runtime", version = "0.7.0", default-features = false } # x-release-please-version
+adam-a2a = { path = "../adam-a2a", version = "0.8.0", default-features = false } # x-release-please-version
+adam-a2a-runtime = { path = "../adam-a2a-runtime", version = "0.8.0", default-features = false } # x-release-please-version
 adam-llm-agent.workspace = true
 adam-mcp = { workspace = true, optional = true }
 adam-model.workspace = true

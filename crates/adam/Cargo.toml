@@ -27,7 +27,7 @@ remote = ["adam-assembly/remote"]
 
 [dependencies]
 adam-agent-fs.workspace = true
-adam-assembly = { path = "../adam-assembly", version = "0.7.0", default-features = false } # x-release-please-version
+adam-assembly = { path = "../adam-assembly", version = "0.8.0", default-features = false } # x-release-please-version
 adam-core.workspace = true
 adam-error.workspace = true
 adam-llm-agent = { workspace = true, features = ["schema"] }

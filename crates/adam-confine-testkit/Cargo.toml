@@ -10,7 +10,7 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-adam-workspace = { path = "../adam-workspace", version = "0.7.0", default-features = false } # x-release-please-version
+adam-workspace = { path = "../adam-workspace", version = "0.8.0", default-features = false } # x-release-please-version
 tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "process", "io-util", "time"] }
 
