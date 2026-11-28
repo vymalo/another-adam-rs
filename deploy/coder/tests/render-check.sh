@@ -2377,4 +2377,13 @@ check "generate and a pulled key together are refused" \
 check "generate without the ExternalSecret's store is refused" \
   fails helm template coder "$chart" --set image.tag=sha-abc1234 --set turnSigning.generate.enabled=true --set externalSecrets.enabled=false
 
+# A long release name must not push a generated name past 63 characters: a Job's name reaches its pods through the
+# `job-name` label, whose value is limited to 63, so a longer one makes the Job's pods fail to be created.
+helm template coder "$chart" --namespace coder-ns --set image.tag=sha-abc1234 --set turnSigning.generate.enabled=true \
+  --set fullnameOverride=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa > "$out"
+job_name=$(doc Job | awk '/^  name: /{print $2; exit}')
+account_name=$(doc ServiceAccount | awk '/^  name: /{print $2; exit}')
+check "a long fullname keeps the Job name within 63 characters (${#job_name})" test "${#job_name}" -le 63
+check "... and its ServiceAccount too (${#account_name})" test "${#account_name}" -le 63
+
 if [ "$fail" -eq 0 ]; then echo "render checks passed"; else echo "render checks FAILED"; exit 1; fi

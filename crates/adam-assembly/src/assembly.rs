@@ -827,15 +827,17 @@ impl BoundDef {
         )
     }
 
-    /// The names of the tools the subagent `target` is bound with, for `tools` and `deny_tools` to
-    /// be checked against (ADR 0054 slice 3), and whether they are **every** tool it can have: the
-    /// node whose registered name is the target's, and what it holds (its own tools and the
-    /// `mcp.json` servers' as `server__tool`).
+    /// The names of the tools the subagent `target` can be offered, for `tools` and `deny_tools` to
+    /// be checked against (ADR 0054 decision 4), and whether they are **every** tool it can have: the
+    /// node whose registered name is the target's, its own tools (its `tools:` and the `mcp.json`
+    /// servers' as `server__tool`), and what every source of that node declares
+    /// ([`ToolSource::declared`]). A declared name may be a **shape** (`*__*` for a relayed
+    /// `<server>__<tool>`): it is joined as a name, once, like a concrete one (ADR 0054, amended
+    /// 2026-11-28).
     ///
-    /// The set is **incomplete** when a source adds tools at run time, which no list made now can
-    /// name: a server whose `when` loads it by the task, or a source the deployment gave (both
-    /// shipped agents have some: the coder's references and UI, the folder agent's UI). A remote
-    /// target, and a name no node has, give no names.
+    /// The set is **incomplete** when a source cannot name its tools before a run calls it
+    /// ([`adam_llm_agent::Declared::Unknown`]): an endpoint whose listing is another system's and may change with the
+    /// conversation. A remote target, and a name no node has, give no names.
     fn bound_tool_names(&self, target: &SessionTarget) -> (Vec<String>, bool) {
         if target.remote {
             return (Vec::new(), false);
@@ -843,10 +845,36 @@ impl BoundDef {
         let Some(node) = self.nodes.iter().find(|node| node.name == target.agent) else {
             return (Vec::new(), false);
         };
-        (
-            node.tools.iter().map(|(name, _)| name.clone()).collect(),
-            self.sources.is_empty() && node.sources.is_empty(),
-        )
+        let mut names: Vec<String> = node.tools.iter().map(|(name, _)| name.clone()).collect();
+        let mut complete = true;
+        for source in self.sources_of(node) {
+            match source.declared().names() {
+                Some(declared) => {
+                    for name in declared {
+                        if !names.contains(name) {
+                            names.push(name.clone());
+                        }
+                    }
+                }
+                None => complete = false,
+            }
+        }
+        (names, complete)
+    }
+
+    /// Every [`ToolSource`] the agent of `node` is built with, in the order it asks them: the modes'
+    /// (which only holds tools back), the node's own (the `mcp.json` servers a run loads when its
+    /// task matches), then the deployment's. [`build`](Self::build) gives them to the agent in this
+    /// order, and [`bound_tool_names`](Self::bound_tool_names) reads what each declares from the
+    /// same list, so the agent and the session bounds cannot disagree.
+    fn sources_of(&self, node: &Node) -> Vec<DynToolSource> {
+        let mut sources: Vec<DynToolSource> = Vec::new();
+        if let Some(modes) = &node.modes {
+            sources.push(Arc::new(crate::modes::ModeSource::new(Arc::clone(modes))));
+        }
+        sources.extend(node.sources.iter().cloned());
+        sources.extend(self.sources.iter().cloned());
+        sources
     }
 
     /// The tool as the agent gets it: a session tool is scrubbed when the deployment gave a scrub.
@@ -943,17 +971,12 @@ impl BoundDef {
             builder = apply(builder);
         }
         // The modes of `agent-mode/v1` first: they hold back what the mode does not offer, and
-        // every other source's holds still apply beside theirs (a mode only narrows).
-        if let Some(modes) = &node.modes {
-            builder = builder.tool_source(crate::modes::ModeSource::new(Arc::clone(modes)));
-        }
-        // The agent's own sources first (the `mcp.json` servers a run loads only when its task
-        // matches), then the deployment's, in the order it added them.
-        for source in &node.sources {
-            builder = builder.dyn_tool_source(Arc::clone(source));
-        }
-        for source in &self.sources {
-            builder = builder.dyn_tool_source(Arc::clone(source));
+        // every other source's holds still apply beside theirs (a mode only narrows). Then the
+        // agent's own sources (the `mcp.json` servers a run loads only when its task matches), then
+        // the deployment's, in the order it added them: one list, which `bound_tool_names` reads
+        // the declarations of too.
+        for source in self.sources_of(node) {
+            builder = builder.dyn_tool_source(source);
         }
         builder.try_build().map_err(|source| Error::Build {
             origin: origin.clone(),

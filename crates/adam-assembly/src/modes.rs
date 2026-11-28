@@ -17,7 +17,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use adam_llm_agent::{
-    MODE_CONTEXT_KEY, SourceCtx, ToolCtx, ToolError, ToolOutput, ToolSource, Withheld,
+    Declared, MODE_CONTEXT_KEY, SourceCtx, ToolCtx, ToolError, ToolOutput, ToolSource, Withheld,
 };
 use adam_model::ToolSpec;
 use async_trait::async_trait;
@@ -166,6 +166,13 @@ impl ToolSource for ModeSource {
         Vec::new()
     }
 
+    /// A mode offers no tool of its own: it holds back the ones it does not list, and a mode
+    /// neither raises the access tier nor grants a tool the agent does not have. It answers `All`
+    /// of nothing, so it never makes a session's set of tools incomplete (ADR 0054 decision 4).
+    fn declared(&self) -> Declared {
+        Declared::All(Vec::new())
+    }
+
     async fn instructions(&self, ctx: &SourceCtx) -> Option<String> {
         let mode = self.modes.in_force(ctx.context_map());
         // A mode that neither narrows nor says anything is the agent as it was: no words, so a
@@ -259,6 +266,14 @@ mod tests {
     #[test]
     fn an_empty_set_is_no_set() {
         assert!(Modes::new(Vec::new(), "build").is_none());
+    }
+
+    /// A mode only narrows: it declares no tool of its own, so it never makes a session's set of
+    /// tools incomplete (ADR 0054 decision 4).
+    #[test]
+    fn a_mode_declares_no_tool_of_its_own() {
+        let source = ModeSource::new(Arc::new(modes()));
+        assert_eq!(source.declared(), Declared::All(Vec::new()));
     }
 
     #[tokio::test]

@@ -99,7 +99,7 @@ pub use error::{MemoryError, MemoryResult};
 pub use folder::FolderSiMemory;
 pub use lesson::{
     Audience, Lesson, LessonDraft, LessonLimits, LessonProvenance, LessonSettings, LessonState,
-    MemoryScope,
+    MemoryScope, prepare, sort_newest_first as sort_lessons_newest_first,
 };
 pub use lesson_memory::{InProcessLessonStore, InProcessMemory};
 pub use memory::InProcessSiMemory;

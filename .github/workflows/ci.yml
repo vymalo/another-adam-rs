@@ -60,6 +60,10 @@ jobs:
       # one are gone. The scan is what keeps them from coming back by habit; the script says what it reads.
       - name: The dev stack and CI carry no container engine
         run: sh tools/check-dev-stack.sh
+      # ANR-1427: a pin below the major recorded in tools/workflow-pins.txt is how a node20 action comes
+      # back — #495 re-added actions/checkout@v4 after ANR-62 had moved every pin (ANR-1410).
+      - name: Every workflow action pin is at or above its recorded major
+        run: sh tools/check-workflow-pins.sh
       # ADR 0084: every version a release moves is marked for release-please, and the Cargo lines agree.
       - name: The release's version lines are marked and agree
         run: sh tools/release/check-versions.sh
@@ -309,8 +313,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with:
           node-version: 24
       - run: node --test "tools/release/test/*.test.mjs"
@@ -385,7 +389,7 @@ jobs:
           "$RUNNER_TEMP/github-mcp-server" --version
           echo "ADAM_TEST_GITHUB_MCP_SERVER=$RUNNER_TEMP/github-mcp-server" >> "$GITHUB_ENV"
       - name: Tests (memory, Postgres, MongoDB, coder end to end)
-        run: cargo nextest run --workspace --locked --profile ci --features adam-llm-agent/schema,adam-assembly/dev,adam/dev,adam-assembly/mcp,adam/mcp
+        run: cargo nextest run --workspace --locked --profile ci --features adam-llm-agent/schema,adam-assembly/dev,adam/dev,adam-assembly/mcp,adam/mcp,adam-store-mongodb/memory
       # Run the database suites a second time: this pass exercises migrate() on
       # an existing schema. The offline suites (coder end to end) do not repeat.
       - name: Database suites again, on the migrated schema

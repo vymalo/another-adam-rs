@@ -3,6 +3,19 @@
 Status: **Proposed** (2026-11-24, task ANR-268; sys#407, ROADMAP M11, second gap; sys#405, M9, fifth gap). Nothing is
 built. The number is the next free one at the time of writing (0074 is on an open branch); take the next free at merge.
 
+**Amended 2026-11-28** (ANR-1350). The owner's `otel-conventions` of 2026-11-27 replaces decision 6's exporter
+clause — "OTLP over HTTP JSON by hand on the workspace's `reqwest`, no SDK and no new third-party package". The
+exporter is built on the `opentelemetry` crates: `opentelemetry` 0.33.1, `opentelemetry_sdk` 0.33.1,
+`opentelemetry-otlp` 0.33.1 and `tracing-opentelemetry` 0.34.0 (*verified 2026-11-28* in the local cargo
+registry; the card measured the same versions on 2026-11-27). The OTLP/HTTP client is still the workspace's
+`reqwest` (`reqwest-client`, never `reqwest-blocking-client`; no tonic), the wire is protobuf, the queue is
+still bounded (2048 spans, drop and count) and driven by the SDK's async batch processor on the process's
+Tokio runtime, and the bridge's own attributes (`target`, `code.*`, `busy_ns`, `idle_ns`, `thread.*`) and
+events are switched off so decision 3's closed set still holds. Everything else in this decision stands
+unchanged: off by default, the closed attributes, drop-and-count, a failed export that never fails a run, and
+the chart values. The foundation is `crates/adam-otel` (ANR-1350); slices T1 and T2 are that crate, while the
+subscriber in the binaries and the configuration through `adam-service` are ANR-1385 and ANR-1386.
+
 ## Context
 
 *Verified 2026-11-24 at adam-rs `main` (`91a052d`):*

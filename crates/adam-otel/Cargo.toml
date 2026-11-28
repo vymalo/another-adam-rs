@@ -1,0 +1,36 @@
+[package]
+name = "adam-otel"
+description = "The OpenTelemetry layer of adam-rs: OTLP/HTTP spans, off unless an endpoint is set (ADR 0075)"
+readme = "README.md"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[features]
+# The TLS provider (aws-lc-rs) reqwest and rustls link. On by default; a host that installs its own
+# (ring, the platform's) builds with `default-features = false`.
+default = ["aws-lc"]
+aws-lc = ["reqwest/rustls", "rustls/aws_lc_rs"]
+
+[dependencies]
+adam-error.workspace = true
+opentelemetry.workspace = true
+opentelemetry-otlp.workspace = true
+opentelemetry_sdk.workspace = true
+reqwest.workspace = true
+rustls.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-opentelemetry.workspace = true
+tracing-subscriber = { workspace = true, features = ["registry"] }
+url.workspace = true
+
+[dev-dependencies]
+opentelemetry_sdk = { workspace = true, features = ["testing"] }
+tracing-subscriber = { workspace = true, features = ["fmt"] }
+
+[lints]
+workspace = true

@@ -119,7 +119,9 @@ pub enum MemoryError {
 
 impl MemoryError {
     /// A storage failure.
-    pub(crate) fn backend(error: impl std::error::Error + Send + Sync + 'static) -> Self {
+    /// A storage failure, for an adapter: the class is the backend's own, and a run treats it as
+    /// transient (ADR 0081 decision 12).
+    pub fn backend(error: impl std::error::Error + Send + Sync + 'static) -> Self {
         Self::Backend {
             source: Box::new(error),
         }

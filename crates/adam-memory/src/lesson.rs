@@ -36,7 +36,14 @@ impl MemoryScope {
         &self.0
     }
 
-    pub(crate) fn validate(&self) -> MemoryResult<()> {
+    /// Check the scope before a call uses it: an empty one is refused.
+    ///
+    /// Public for an adapter, which calls it first, exactly as the reference one does.
+    ///
+    /// # Errors
+    ///
+    /// [`MemoryError::EmptyField`] for an empty scope.
+    pub fn validate(&self) -> MemoryResult<()> {
         if self.0.trim().is_empty() {
             return Err(MemoryError::EmptyField {
                 field: "memory scope",
@@ -74,7 +81,8 @@ impl Audience {
         &self.0
     }
 
-    pub(crate) fn validate(&self) -> MemoryResult<()> {
+    /// Check the audience before a call uses it: an empty one is refused. Public for an adapter.
+    pub fn validate(&self) -> MemoryResult<()> {
         if self.0.trim().is_empty() {
             return Err(MemoryError::EmptyField { field: "audience" });
         }
@@ -301,7 +309,16 @@ impl LessonSettings {
 /// its audience (ADR 0081 decision 5), so every lesson text goes through the address check too. The
 /// audience is a key, validated and bounded, never scrubbed; the provenance labels are scrubbed and
 /// bounded.
-pub(crate) fn prepare(
+/// Validate a draft and turn it into the lesson an adapter stores.
+///
+/// This is the half of [`Memory::record`] that is the **rules** rather than the storage: the scrub,
+/// the redaction marker, the bounds and the address check. Every adapter calls it first, so the
+/// rules cannot drift between them. `now` is the adapter's clock.
+///
+/// # Errors
+///
+/// [`MemoryError`] for a draft the rules refuse; nothing is stored.
+pub fn prepare(
     scope: &MemoryScope,
     draft: LessonDraft,
     settings: &LessonSettings,
@@ -413,7 +430,9 @@ fn bytes(field: &'static str, clean: String, limit: usize) -> MemoryResult<Strin
 
 /// The order a recall serves: the freshest lesson first, then by root cause so the answer is
 /// stable.
-pub(crate) fn sort_newest_first(lessons: &mut [Lesson]) {
+/// Order lessons the way every recall serves them: the freshest first, then by root cause, so two
+/// adapters over one data set answer the same list.
+pub fn sort_newest_first(lessons: &mut [Lesson]) {
     lessons.sort_by(|a, b| {
         b.updated
             .cmp(&a.updated)

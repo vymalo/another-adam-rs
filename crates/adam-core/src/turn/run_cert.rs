@@ -29,7 +29,8 @@ mod keyring;
 mod x509;
 
 pub use keyring::{
-    BadRunSubject, RENEW_RETRY_SECS, RunClock, RunKeyError, RunKeyring, RunSubject, SystemClock,
+    BadRenewFraction, BadRunSubject, RENEW_RETRY_SECS, RenewFraction, RunClock, RunKeyError,
+    RunKeyring, RunSubject, SystemClock,
 };
 
 /// The certificate signing request a [`RunCertIssuer`] signs: the DER of a PKCS#10 request
