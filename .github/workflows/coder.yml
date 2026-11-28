@@ -429,13 +429,17 @@ jobs:
         if: steps.guard.outputs.ready == 'true'
         env:
           POSTGRES_PORT: "15432"
+          # dev/uploads-e2e.sh's scenario: a file over this cap goes to the bucket by reference.
+          # It is set for the whole job, so the script's own `up` sees no change and does not
+          # recreate the coder; no other scenario shares a file.
+          UPLOADS_INLINE_MAX_BYTES: "1024"
           E2E_FULL: ${{ github.event_name != 'pull_request' || steps.e2e.outputs.full == 'true' }}
         run: |
           set -eu
           docker tag coder:smoke adam-rs/coder:dev
           docker compose --profile app build git-server
           docker compose --profile app up -d --no-build --wait \
-            postgres mock-openai mock-github mock-github-mcp git-server coder agent
+            postgres mock-openai mock-github mock-github-mcp mock-uploads git-server coder agent
           sh dev/coder-e2e.sh
           # The coder edits the files itself (read_file, write_file).
           SCENARIO=files sh dev/coder-e2e.sh
@@ -452,6 +456,11 @@ jobs:
           # a no it sees none.
           SCENARIO=create-repo ANSWER=yes sh dev/coder-e2e.sh
           SCENARIO=create-repo ANSWER=no sh dev/coder-e2e.sh
+          # uploads/v1's outgoing direction: the model writes a file over the inline cap, share_file
+          # asks the mock thread tools for a slot, PUTs the bytes to the mock bucket, and the task's
+          # artifact names the uploadId with no bytes in it — the bucket's journal is read back and
+          # compared byte for byte. (UPLOADS_E2E_TAMPER=1 is the red proof, run by hand.)
+          sh dev/uploads-e2e.sh
           # The other agent folders, and the greeting. A pull request skips it: the two App scenarios
           # after it still prove the App path and the file tools.
           if [ "$E2E_FULL" = "true" ]; then
