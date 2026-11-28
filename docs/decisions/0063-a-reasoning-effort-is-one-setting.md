@@ -312,3 +312,13 @@ lowest first; nothing else in decision 5 changes.
 - The full per-model probe table lives outside this repository; the deployment's profiles are the owner's.
 - Whether a model's `thinking_budget` budgets are per level a fixed table or a formula; the entry carries
   the table, and a formula is a later ADR if a model needs one.
+
+*Amended 2026-11-28 (ANR-55, the owner's answer to ANR-Q125):* under the `thinking_budget` wire, a typed level no longer
+removes the extra body's `thinking` object wholesale. It removes only the two members the wire writes — `thinking.type`
+and `thinking.budget_tokens` — and writes its own into the object, so a sibling the extra body set survives (GLM's
+`clear_thinking: false` keeps earlier turns' reasoning). A `thinking` that is not an object cannot hold those members, so
+the typed level replaces it, as the `reasoning` object wire does. Decision 6's "the members its wire would duplicate" is
+therefore read as the members the wire **writes**, not the object that holds them. Proof:
+`crates/adam-model-openai/src/wire.rs` — `the_thinking_budget_wire_keeps_a_thinking_objects_other_members` (red with
+`members.remove("thinking")`), `the_thinking_budget_wire_replaces_a_thinking_that_is_not_an_object`, and the third arm of
+`each_wire_writes_its_own_member`.

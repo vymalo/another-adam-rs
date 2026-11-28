@@ -189,7 +189,7 @@ byte the one without the feature.
 |---|---|
 | `reasoning_effort` | `{"reasoning_effort": "<level>"}` — **verified 2026-11-21** on the deployment's gateway (every family accepts it; Gemini rejects `max` and `xhigh`) |
 | `reasoning_object` | `{"reasoning": {"effort": "<level>"}}`, merged into the `reasoning` object the extra body already has; its other members stay. A `reasoning` member that is not an object is replaced, since the name collides: the typed level wins. **Unverified here** (a 400 on Gemini; ADR 0063) |
-| `thinking_budget` | `{"thinking": {"type": "enabled", "budget_tokens": <n>}}`, `<n>` from the profile's `reasoningBudgets` for that level. **Unverified here** (`thinking` is ignored or rejected by this gateway; ADR 0063) |
+| `thinking_budget` | `{"thinking": {"type": "enabled", "budget_tokens": <n>}}`, `<n>` from the profile's `reasoningBudgets` for that level. The extra body's `thinking` object keeps every member but those two, so a sibling such as `clear_thinking` survives; a `thinking` that is not an object is replaced (ADR 0063, amended 2026-11-28). **Unverified here** (`thinking` is ignored or rejected by this gateway; ADR 0063) |
 
 The typed level is applied **after** the extra body (`MODEL_EXTRA_BODY` until ADR 0064 slice 3 replaces it with
 the profile's `extraBody`), and it removes only the members its wire would duplicate: `reasoning_effort` and
