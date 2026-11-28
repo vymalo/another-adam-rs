@@ -254,9 +254,12 @@ and `&`, `<`, `>` are escaped. Skills that are preloaded are not listed.
 the loop composes them for every request (ADR 0054 slice 7). A session's `skills` narrows the catalog to
 those names; the preloaded skills' `<skill_content>` **stay** whatever it lists, and a skill it does not
 name is absent from the catalog and refused by `load_skill` and `read_skill_file`
-(`SkillError::NotInSession`, a result the model can correct). A root names no selection, so its catalog
-is the folder's own and its prompt is what it always was, byte for byte: `PromptCatalog::section(None)`
-through `adam_llm_agent::system_prompt`, the function `AgentInfo::prompt` reads too.
+(`SkillError::NotInSession`, a result the model can correct) — a preloaded one excepted, whose body is in
+the prompt and whose bundled files stay readable. A root names no selection, so its catalog
+is the folder's own and the prefix it sits in is what it always was, byte for byte: `PromptCatalog::section(None)`
+through `adam_llm_agent::system_prompt`, the function `AgentInfo::prompt` reads too. The session
+tools' guide that follows the catalog is the one part that moved: its option list gained `skills`
+(ADR 0054 slice 7), which is the whole of the golden's diff.
 
 **Tier 2, `load_skill { name, offset?, limit? }`.** `name` is a string, never an enum: the description and schema of the tool are the same whatever skills exist (an unknown name is answered with the list of those that do). It pages like `read_file`: at most 2,000 lines or 50 KiB a page, `offset` from 1 (negative from the end), and every result ends with the line that says where the next page starts, `[more: N lines left; next page: offset=K]` or `[end: N lines]`. The text it pages is
 

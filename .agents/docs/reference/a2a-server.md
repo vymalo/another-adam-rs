@@ -54,7 +54,8 @@ reads the lists from the round's session header first (`crates/adam-llm-agent/sr
 ## A session's `skills` (ADR 0054 decision 4, slice 7, `skills` half)
 
 For people: the same [`start.config` paragraph](../../../docs/reference/a2a-server.md#child-sessions-child-sessionsv1) — it
-says `skills` is an option of the model's tools and not of `start.config` yet, as `instructions` is.
+says `skills` is an option of the model's tools and not of `start.config` yet, and that `instructions` is taken by neither
+the front nor the tools.
 
 * `SessionConfig::skills` (`skills` on the wire, camelCase in the header too) is held by `SessionBounds::admit`
   (`crates/adam-runtime/src/session.rs`, `admit_skill_names`): at most `MAX_SESSION_SKILLS` (32) names of at most
@@ -67,16 +68,25 @@ says `skills` is an option of the model's tools and not of `start.config` yet, a
   `section(Some(names))` filters the loadable entries and **keeps every preloaded body**) and `Node::tail` (the session tools'
   guide), joined by `adam_llm_agent::system_prompt` at `LlmAgent::system_for` and at `AgentInfo::prompt`, so a root and a
   narrowed session share one renderer. `ToolCtx::skills` carries the list into `load_skill` and `read_skill_file`, which answer
-  `SkillError::NotInSession` (a result with `is_error`, never `Err`).
+  `SkillError::NotInSession` (a result with `is_error`, never `Err`) for a name it does not list — **except a preloaded one**:
+  `in_session` (`crates/adam-assembly/src/skills.rs`) lets a preloaded name through whatever the selection says, since its
+  body is in the prompt, so `read_skill_file` reads its files as it did before the option existed and `load_skill` on it
+  answers `AlreadyLoaded`.
 * **Evidence:** `adam-runtime` `session.rs` `a_skill_outside_the_folders_selection_is_refused_with_the_list`,
   `a_skills_entry_is_held_to_its_shape`, `skills_count_as_set_and_survive_a_clamp_and_an_edit`;
   `adam-assembly/src/skills.rs` `a_sessions_selection_leaves_an_unlisted_skill_out_of_the_catalog`,
-  `a_sessions_selection_keeps_a_preloaded_skill_in_the_prompt`, `load_skill_refuses_a_skill_the_session_does_not_list`;
-  `adam-llm-agent/src/catalog.rs` `the_three_parts_are_joined_with_a_blank_line_and_an_empty_one_is_left_out`, and
+  `a_sessions_selection_keeps_a_preloaded_skill_in_the_prompt`, `load_skill_refuses_a_skill_the_session_does_not_list`,
+  `a_narrowed_session_reads_a_preloaded_skills_files`;
+  `adam-llm-agent/src/catalog.rs` `the_three_parts_are_joined_with_a_blank_line_and_an_empty_one_is_left_out`,
   `src/agent.rs` `a_sessions_instructions_follow_the_folders_under_a_heading` and
-  `a_sessions_skills_narrow_the_catalog_and_the_text_follows_it`. The refusal was seen red: with the
+  `a_sessions_skills_narrow_the_catalog_and_the_text_follows_it`, and `tests/sessions.rs`
+  `a_start_with_skills_narrows_the_sessions_catalog` (a `skills` a start asks for reaches `config_of`, `admit`, the header and
+  the round's catalog, and a name outside the folder's selection and any selection on a remote subagent are refused).
+  The refusal was seen red: with the
   `in_session` check deleted from `LoadSkill::call`, `load_skill_refuses_a_skill_the_session_does_not_list` failed on
-  `assert!(refused.is_error)` (the call returned the body of `b`). The golden and ADR 0044 prefix tests are unchanged.
+  `assert!(refused.is_error)` (the call returned the body of `b`). ADR 0044's prefix test is unchanged; the golden
+  file moved by one clause only — `skills` added to the guide's `Options of config` line, because it is a `config` option
+  now — and by nothing the base/catalog/tail split does.
 
 ## `edit` of `child-sessions/v1` (ADR 0054 decision 11, slice 4)
 

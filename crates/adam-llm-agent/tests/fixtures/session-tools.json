@@ -85,6 +85,17 @@
             "report_schema": {
               "type": "object",
               "description": "A JSON Schema (draft 2020-12, at most 16 KiB, with no reference outside itself) that the subagent's final answer must match: one JSON value (a `format` is only an annotation, not enforced). The subagent is not shown it unless a first answer fails it: describe the shape in `prompt` too. Not for a remote subagent."
+            },
+            "skills": {
+              "type": [
+                "array",
+                "null"
+              ],
+              "items": {
+                "type": "string"
+              },
+              "maxItems": 32,
+              "description": "Only these skills, each one the helper's folder selects."
             }
           },
           "additionalProperties": false
@@ -251,6 +262,17 @@
                 "null"
               ],
               "description": "A JSON Schema (draft 2020-12, at most 16 KiB, with no reference outside itself) that the subagent's final answer must match."
+            },
+            "skills": {
+              "type": [
+                "array",
+                "null"
+              ],
+              "items": {
+                "type": "string"
+              },
+              "maxItems": 32,
+              "description": "Only these skills, each one the helper's folder selects."
             }
           },
           "additionalProperties": false

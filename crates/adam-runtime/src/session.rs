@@ -878,7 +878,7 @@ pub const MAX_SESSION_TOOL_ENTRIES: usize = 32;
 /// [ADR 0054]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md
 pub const MAX_SESSION_TOOL_ENTRY_CHARS: usize = 200;
 
-/// The most skill names a refusal lists before it says `and N more`.
+/// The most names a refusal lists before it says `and N more`: tool entries, and skill names.
 const REFUSAL_LIST_NAMES: usize = 50;
 
 /// The most entries of a session's `skills` ([ADR 0054], decision 4).

@@ -460,12 +460,17 @@ where a store is involved (`crates/adam-llm-agent/tests/sessions.rs` holds the s
   the set is complete), and `admit` refuses a name outside it with the list, and a remote subagent refuses the option by name.
   The three parts of the prompt are kept apart at bind (`Node::prompt` the folder's text, `Node::catalog` a `PromptCatalog`,
   `Node::tail` the session tools' guide) and composed per request by `adam_llm_agent::system_prompt` — the same function
-  `AgentInfo::prompt` reads — so the root's prompt is byte for byte what it was (ADR 0044's prefix test unchanged) and a
-  session's catalog offers only its names, with the preloaded skills' `<skill_content>` still there. `ToolCtx::skills` carries
-  the list to `load_skill` and `read_skill_file`, which refuse a skill it does not name as a result the model can correct
-  (`SkillError::NotInSession`), never as a failed step. `skills` is a *next round* option: an edit of a working round leaves it
-  in the header. **The model's `subagent_start`/`subagent_edit` take it; the A2A `start.config` does not yet**, as with
-  `instructions`.
+  `AgentInfo::prompt` reads — so a root's **prefix** (the folder's text and its catalog) is byte for byte what it was (ADR
+  0044's prefix test unchanged); the session tools' guide that follows it gained `skills` in its option list, the only move in
+  `tests/golden/coder-prompt.txt`. A session's catalog offers only its names, with the preloaded skills' `<skill_content>`
+  still there. `ToolCtx::skills` carries the list to `load_skill` and `read_skill_file`, which refuse a skill it does not name
+  as a result the model can correct (`SkillError::NotInSession`), never as a failed step — a **preloaded** skill is still read
+  from, since its body stays in the prompt. `skills` is a *next round* option: an edit of a working round leaves it in the
+  header. **The model's `subagent_start`/`subagent_edit` take `skills`; the A2A `start.config` does not yet**, and
+  `instructions` is taken by neither the front nor the tools (the loop renders it when a header carries it). A session the
+  model started with `skills` therefore reports the selection in the A2A session object — `config_value` serialises the whole
+  `SessionConfig` — while `parse_config` and `parse_edit` refuse to set it: the same asymmetry `report_schema` had before its
+  slice, closed by the slice that gives the front these members (slice 10, the A2A front).
 
 **8. `access_tier`** (the coder). Depends on 1.
 * Files: `bin/adam-coder/src/tier.rs` (`TierSource`, `Gated`), `crates/adam-llm-agent/src/source.rs` and `tool.rs` (the header's

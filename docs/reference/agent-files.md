@@ -744,8 +744,10 @@ own `skills/`, narrowed by `skills:`), never inherited. A folder with no `skills
   listing what is available.
 * **Rendered per run.** The catalog is not appended at bind: the run composes it after the folder's instructions,
   for a session's `skills` when it has one ([ADR 0054](../decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md),
-  decision 4). A session's catalog lists only the names it kept, and `load_skill`/`read_skill_file` refuse another;
-  a preloaded skill's body stays whatever it lists. The root names no selection, so its prompt is unchanged.
+  decision 4). A session's catalog lists only the names it kept, and `load_skill`/`read_skill_file` refuse another
+  (a preloaded skill excepted: its body is in the prompt, so its files stay readable); a preloaded skill's body
+  stays whatever it lists. The root names no selection, so the catalog and the folder's text before it are
+  unchanged; the session tools' guide after them gained `skills` in its option list.
 * **Both tools page like `read_file`**: `offset` from 1 (negative from the end) and `limit` at most 2,000 lines, at
   most 50 KiB a page, and every result ends with `[more: N lines left; next page: offset=K]` or `[end: N lines]`.
   A body that goes on names its bundled files in one line on the first page; the `<skill_resources>` list comes

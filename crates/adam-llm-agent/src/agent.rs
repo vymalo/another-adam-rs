@@ -9784,7 +9784,7 @@ mod session_instructions_tests {
     /// [ADR 0054]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md
     #[test]
     fn a_sessions_skills_narrow_the_catalog_and_the_text_follows_it() {
-        let model: DynModel = Arc::new(MockModel::new());
+        let model: DynModel = Arc::new(adam_model::MockModel::new());
         let agent = LlmAgent::builder("a", model, "m")
             .instructions("You are the coder.")
             .skill_catalog(Fixed)

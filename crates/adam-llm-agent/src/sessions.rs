@@ -23,9 +23,10 @@ use adam_core::time::Timestamp;
 use adam_core::RunId;
 use adam_model::ToolSpec;
 use adam_runtime::{
-    Inbound, MAX_SESSION_PAGE, MAX_SESSION_TOOL_ENTRIES, RuntimeError, SESSION_CLOSE_KIND,
-    SESSION_EDIT_KIND, SessionBounds, SessionConfig, SessionEditRequest, SessionEditor,
-    SessionHeader, SessionLimits, SessionPatch, SessionState, SessionSummary, SessionView,
+    Inbound, MAX_SESSION_PAGE, MAX_SESSION_SKILLS, MAX_SESSION_TOOL_ENTRIES, RuntimeError,
+    SESSION_CLOSE_KIND, SESSION_EDIT_KIND, SessionBounds, SessionConfig, SessionEditRequest,
+    SessionEditor, SessionHeader, SessionLimits, SessionPatch, SessionState, SessionSummary,
+    SessionView,
 };
 use async_trait::async_trait;
 use serde_json::{Value, json};
@@ -1005,6 +1006,13 @@ impl Tool for Start {
                                                 first answer fails it: describe the shape in \
                                                 `prompt` too. Not for a remote subagent.",
                             },
+                            "skills": {
+                                "type": ["array", "null"],
+                                "items": { "type": "string" },
+                                "maxItems": MAX_SESSION_SKILLS,
+                                "description": "Only these skills, each one the helper's folder \
+                                                selects.",
+                            },
                         },
                         "additionalProperties": false,
                     },
@@ -1602,6 +1610,13 @@ impl Tool for Edit {
                                 "description": "A JSON Schema (draft 2020-12, at most 16 KiB, \
                                                 with no reference outside itself) that the \
                                                 subagent's final answer must match.",
+                            },
+                            "skills": {
+                                "type": ["array", "null"],
+                                "items": { "type": "string" },
+                                "maxItems": MAX_SESSION_SKILLS,
+                                "description": "Only these skills, each one the helper's folder \
+                                                selects.",
                             },
                         },
                         "additionalProperties": false,

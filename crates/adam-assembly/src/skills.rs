@@ -361,7 +361,9 @@ impl SkillSet {
                  When a task matches a skill's description, call the load_skill tool with the \
                  skill's name to load its full instructions.",
             );
-            if self.has_read_tool() {
+            // The sentence names the tool only when a skill of *this* catalog bundles a file: a
+            // session narrowed to skills without files is not told to read any (ADR 0054, slice 7).
+            if loadable.iter().any(|entry| !entry.files.is_empty()) {
                 s.push_str(&format!(
                     "\nFiles a skill bundles are listed under <skill_resources> when it is loaded; \
                      read one with the {READ_SKILL_FILE} tool."
@@ -391,7 +393,8 @@ impl SkillSet {
                 "The following skills are already loaded. Follow them whenever a task matches \
                  their description.",
             );
-            if self.has_read_tool() {
+            // As above: only a preloaded skill that bundles a file is one to read from.
+            if preloaded.iter().any(|entry| !entry.files.is_empty()) {
                 s.push_str(&format!(
                     " Files a skill bundles are listed under <skill_resources>; read one with the \
                      {READ_SKILL_FILE} tool."
@@ -951,11 +954,19 @@ impl adam_llm_agent::SkillCatalog for PromptCatalog {
     }
 }
 
-/// Whether the session that runs the call lists `skill`: it does when the session names no
-/// selection (the folder's own stands) or when `skill` is one of the names (ADR 0054, slice 7).
-fn in_session(ctx: &ToolCtx, skill: &str) -> bool {
+/// Whether the session that runs the call may use `skill`: it may when the session names no
+/// selection (the folder's own stands), when `skill` is one of the names, or when it is **preloaded**
+/// — a preloaded skill's body is in the prompt whatever the selection says, so its bundled files are
+/// read from it (ADR 0054, slice 7).
+///
+/// [ADR 0054]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md
+fn in_session(ctx: &ToolCtx, set: &SkillSet, skill: &str) -> bool {
     ctx.skills()
         .is_none_or(|names| names.iter().any(|name| name == skill))
+        || set
+            .entries
+            .iter()
+            .any(|entry| entry.preloaded && entry.name == skill)
 }
 
 /// The refusal of a skill outside the session's selection, as the tool answers it.
@@ -1005,7 +1016,7 @@ impl Tool for LoadSkill {
         };
         // A session lists the skills it may use: one outside the list is not there to load
         // (ADR 0054, slice 7). A model-correctable refusal, never a failed step.
-        if !in_session(ctx, name) {
+        if !in_session(ctx, &self.set, name) {
             return answer(Err(outside_session(ctx, name.to_owned())));
         }
         match &self.run {
@@ -1053,7 +1064,7 @@ impl Tool for ReadSkillFile {
             Ok(window) => window,
             Err(refusal) => return answer(Err(refusal)),
         };
-        if !in_session(ctx, skill) {
+        if !in_session(ctx, &self.set, skill) {
             return answer(Err(outside_session(ctx, skill.to_owned())));
         }
         match &self.run {
@@ -1165,6 +1176,23 @@ mod tests {
         assert!(prefetched.prompt_section(false, Some(&[])).is_empty());
     }
 
+    /// The sentence about `read_skill_file` follows the catalog it sits in: a session narrowed to
+    /// skills that bundle no file is not told to read one ([ADR 0054], slice 7).
+    ///
+    /// [ADR 0054]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md
+    #[test]
+    fn a_narrowed_catalog_names_the_read_tool_only_for_a_skill_that_bundles_a_file() {
+        let pair = set(vec![
+            entry("plain", false, &[]),
+            entry("with", false, &[("f.md", b"x")]),
+        ]);
+        let plain = pair.prompt_section(false, Some(&["plain".to_owned()]));
+        assert!(plain.contains("<name>plain</name>"), "{plain}");
+        assert!(!plain.contains(READ_SKILL_FILE), "{plain}");
+        let with = pair.prompt_section(false, Some(&["with".to_owned()]));
+        assert!(with.contains(READ_SKILL_FILE), "{with}");
+    }
+
     /// A preloaded skill stays in the prompt whatever a session's selection says: its body is the
     /// folder's own instructions ([ADR 0054], slice 7).
     ///
@@ -1246,6 +1274,65 @@ mod tests {
                 .await
                 .expect("a result, not an error");
             assert!(!both.is_error, "{}", both.content);
+        });
+    }
+
+    /// A narrowed session still reads a preloaded skill's bundled files: its body is in the prompt
+    /// whatever the selection says, and the prompt tells the model to read them ([ADR 0054],
+    /// slice 7). Loading it answers that it is already there.
+    ///
+    /// [ADR 0054]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md
+    #[test]
+    fn a_narrowed_session_reads_a_preloaded_skills_files() {
+        futures::executor::block_on(async {
+            let set = set(vec![
+                entry("a", false, &[]),
+                entry("b", true, &[("references/guide.md", b"# Guide\n")]),
+                entry("c", false, &[("references/guide.md", b"# Guide\n")]),
+            ]);
+            let narrowed =
+                ToolCtx::detached(READ_SKILL_FILE, "c1", Arc::new(adam_runtime::NoopSink))
+                    .with_skills(Some(Arc::from(vec!["a".to_owned()])));
+            let read = ReadSkillFile {
+                set: set.clone(),
+                run: None,
+            };
+            let file = read
+                .call(
+                    &narrowed,
+                    json!({"skill": "b", "path": "references/guide.md"}),
+                )
+                .await
+                .expect("a result, not an error");
+            assert!(!file.is_error, "{}", file.content);
+            assert!(file.content.starts_with("# Guide"), "{}", file.content);
+
+            // `load_skill` on it says what is true: its body is already in the instructions.
+            let load = LoadSkill { set, run: None };
+            let again = load
+                .call(&narrowed, json!({"name": "b"}))
+                .await
+                .expect("a result, not an error");
+            assert!(again.is_error, "{}", again.content);
+            assert!(
+                again
+                    .content
+                    .contains("skill `b` is already in your instructions"),
+                "{}",
+                again.content
+            );
+
+            // A skill the selection left out, and that is not preloaded, is still refused.
+            let other = read
+                .call(&narrowed, json!({"skill": "c", "path": "x"}))
+                .await
+                .expect("a result, not an error");
+            assert!(other.is_error, "{}", other.content);
+            assert!(
+                other.content.contains("in this session"),
+                "{}",
+                other.content
+            );
         });
     }
 

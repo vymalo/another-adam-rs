@@ -29,10 +29,11 @@ use common::Fixture;
 // the 68 bytes the `delete` argument of `subagent_close` added to that section (slice 5), plus the
 // 11 bytes `command | commands` added to `run_checks`'s line (ANR-243), plus the 271 bytes
 // `subagent_edit`'s line adds to it (ANR-216, slice 4). The tools grew by that tool's 2095-byte
-// spec (ANR-216). The deltas are computed, not measured: re-pin this from the `system N B` line
-// this test prints on the first green CI run.
-const BASELINE_PROMPT_BYTES: usize = 32862; // 32591 + the 271 bytes `subagent_edit`'s line adds to the guide
-const BASELINE_TOOLS_BYTES: usize = 66847; // 64752 + the 2095 bytes of `subagent_edit`'s spec (ANR-216)
+// spec (ANR-216), then by the 148 bytes `skills` adds to `subagent_start` and `subagent_edit`
+// (ANR-214, slice 7), and the guide by the 10 bytes of "`, `skills`". The deltas are computed, not
+// measured: re-pin this from the `system N B` line this test prints on the first green CI run.
+const BASELINE_PROMPT_BYTES: usize = 32872; // 32862 + the 10 bytes `skills` adds to the guide's options line
+const BASELINE_TOOLS_BYTES: usize = 67143; // 66847 + 148 bytes in each of `subagent_start` and `subagent_edit` (ANR-214)
 const GROWTH_ALLOWED: usize = 1024;
 /// The owner's budget for the coder's tools once S3 makes it lean (ADR 0066).
 const TOOLS_BUDGET_TOKENS: usize = 3000;

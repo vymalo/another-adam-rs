@@ -342,6 +342,9 @@ struct Rig {
     child_tools: Option<Arc<std::sync::Mutex<Vec<String>>>>,
     /// The child agent has a tool source that offers `extra_tool`; the calls it ran.
     child_source: Option<Arc<std::sync::Mutex<Vec<String>>>>,
+    /// The skills the `helper` subagent's folder selects: the roster's bounds hold a session's
+    /// `skills` to them, and the child's catalog renders them (ADR 0054, slice 7).
+    helper_skills: Option<Vec<String>>,
     /// How long a kept-open session may sit idle (`None`: the runtime's default).
     idle_ttl: Option<Duration>,
     sink: CollectingSink,
@@ -368,6 +371,7 @@ impl Rig {
             asks: false,
             child_tools: None,
             child_source: None,
+            helper_skills: None,
             idle_ttl: None,
             sink: CollectingSink::new(),
             clock: ManualClock::new(),
@@ -406,6 +410,13 @@ impl Rig {
         self
     }
 
+    /// Give the `helper` subagent a folder that selects `skills`, and the child the catalog that
+    /// renders them: what a session's `skills` is held to, and what it narrows.
+    fn with_helper_skills(mut self, skills: &[&str]) -> Self {
+        self.helper_skills = Some(skills.iter().map(|skill| (*skill).to_owned()).collect());
+        self
+    }
+
     /// Hold the parent's n-th model call at the returned gate.
     fn holding_parent(mut self, n: usize) -> (Self, Arc<Gate>) {
         let gate = Arc::new(Gate::default());
@@ -420,6 +431,13 @@ impl Rig {
     }
 
     fn roster(&self) -> SessionTools {
+        let bounds = match &self.helper_skills {
+            Some(skills) => adam_runtime::SessionBounds {
+                skills: skills.clone(),
+                ..Default::default()
+            },
+            None => adam_runtime::SessionBounds::default(),
+        };
         let tools = SessionTools::new([
             SessionAgent {
                 name: "helper".into(),
@@ -427,7 +445,7 @@ impl Rig {
                 description: "Does a piece of work.".into(),
                 within: self.within,
                 remote: false,
-                bounds: adam_runtime::SessionBounds::default(),
+                bounds,
             },
             SessionAgent {
                 name: "far".into(),
@@ -513,6 +531,11 @@ impl Rig {
         }
         if let Some(ran) = &self.child_source {
             builder = builder.tool_source(Extra { ran: ran.clone() });
+        }
+        if let Some(skills) = &self.helper_skills {
+            builder = builder.skill_catalog(FixedCatalog {
+                all: skills.clone(),
+            });
         }
         builder.build()
     }
@@ -631,6 +654,22 @@ impl adam_runtime::Agent for Queues {
             state,
             wake_at: None,
         })
+    }
+}
+
+/// A catalog that names the skills it is given, one line: the folder's own set for a root, the
+/// session's selection for a narrowed session. The assembly's `PromptCatalog` renders the real
+/// section, and is tested there; here it stands for the names a session's round is offered.
+struct FixedCatalog {
+    all: Vec<String>,
+}
+
+impl adam_llm_agent::SkillCatalog for FixedCatalog {
+    fn section(&self, selected: Option<&[String]>) -> String {
+        match selected {
+            Some(names) => format!("catalog: {}", names.join(", ")),
+            None => format!("catalog: {}", self.all.join(", ")),
+        }
     }
 }
 
@@ -4277,6 +4316,83 @@ mod cases {
         assert!(listed.sessions.is_empty(), "nothing was started");
     }
 
+    /// A `skills` selection the model asks for reaches the header and the round's catalog, not
+    /// only the guide's option list: `config_of` reads it, `admit` holds it to the skills the
+    /// helper's folder selects, and the child's prompt offers only the names it kept (ADR 0054,
+    /// slice 7). A name the folder does not select, and any selection on a remote subagent, are
+    /// refused by name and nothing starts.
+    ///
+    /// [ADR 0054]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md
+    pub async fn a_start_with_skills_narrows_the_sessions_catalog(store: DynStore) {
+        let rig = Rig::new().with_helper_skills(&["alpha", "beta"]);
+        rig.child_mock.push_text("the child answer");
+        let far_mock = Arc::new(MockModel::new());
+        far_mock.push_text("the far answer");
+        let far_model: DynModel = far_mock.clone();
+        let far = LlmAgent::builder("far", far_model, "m").build();
+        let (parent_agent, child_agent) = (rig.parent(), rig.child());
+        let rt = rig
+            .builder(&store, "w")
+            .agent(parent_agent.clone())
+            .agent(child_agent)
+            .agent(far)
+            .build();
+        let conv = conv_id();
+        let parent = rig.start(&rt, &conv).await;
+        let session = child_run_id(parent, "ok");
+        rig.parent_mock
+            .push_tool_calls(vec![
+                call(
+                    "far",
+                    "subagent_start",
+                    json!({"agent": "far", "description": "d", "prompt": "p",
+                           "config": {"skills": ["alpha"]}}),
+                ),
+                start_call_with_config("unlisted", true, json!({"skills": ["gamma"]})),
+                start_call_with_config("ok", true, json!({"skills": ["alpha"]})),
+            ])
+            .push_tool_calls(vec![read_call("r", session, true)])
+            .push_text("done");
+        let worker = spawn_worker(&rt);
+        wait_done(&rt, parent).await;
+        let view = session_until(&rt, &conv, session, |v| v.state == SessionState::Idle).await;
+        worker.stop().await;
+
+        let results = tool_results(&state_of(&rt, parent).await);
+        let (_, text, is_error) = result_of(&results, "far");
+        assert!(
+            *is_error && text.contains("config.skills is not an option of a remote subagent"),
+            "{text}"
+        );
+        let (_, text, is_error) = result_of(&results, "unlisted");
+        assert!(
+            *is_error
+                && text.contains(
+                    "config.skills has \"gamma\", which is not one of the skills this agent \
+                     selects: alpha, beta"
+                ),
+            "{text}"
+        );
+        let (_, text, is_error) = result_of(&results, "ok");
+        assert!(!*is_error, "{text}");
+
+        // The selection is in the header, and a read says it.
+        let config = view.header.expect("a header").config.expect("a config");
+        assert_eq!(config.skills, Some(vec!["alpha".to_owned()]));
+        let (_, read, is_error) = result_of(&results, "r");
+        assert!(!*is_error, "{read}");
+        assert!(read.contains("config: skills alpha"), "{read}");
+        assert!(read.contains("report: done"), "{read}");
+        assert!(read.contains("the child answer"), "{read}");
+
+        // And the round the session ran was offered that name alone.
+        let requests = rig.child_mock.requests();
+        assert_eq!(requests.len(), 1, "only the admitted start ran a round");
+        let system = requests[0].system.clone().unwrap_or_default();
+        assert_eq!(system, "catalog: alpha");
+        assert!(!system.contains("beta"), "{system}");
+    }
+
     /// A value of the wrong type is refused naming its option and never echoing what was written.
     pub async fn a_config_value_of_the_wrong_type_is_refused_naming_the_option(store: DynStore) {
         let rig = Rig::new();
@@ -6455,8 +6571,9 @@ fn specified(specs: &[adam_model::ToolSpec]) -> Vec<(String, Vec<(String, bool)>
         .collect()
 }
 
-/// Every way `guide` and `specs` disagree: a tool, an argument, whether it is required, or an
-/// option of `config`, that one names and the other does not. Empty when they agree.
+/// Every way `guide` and `specs` disagree: a tool, an argument, whether it is required, an option
+/// of `config` the guide and `subagent_start` name differently, or one `subagent_start` and
+/// `subagent_edit` do. Empty when they agree.
 fn drift(guide: &str, specs: &[adam_model::ToolSpec]) -> Vec<String> {
     let (said, made) = (documented(guide), specified(specs));
     let mut found = Vec::new();
@@ -6481,21 +6598,33 @@ fn drift(guide: &str, specs: &[adam_model::ToolSpec]) -> Vec<String> {
             ));
         }
     }
-    let start = specs
-        .iter()
-        .find(|spec| spec.name == "subagent_start")
-        .unwrap();
-    let mut options: Vec<String> = start.parameters["properties"]["config"]["properties"]
-        .as_object()
-        .unwrap()
-        .keys()
-        .cloned()
-        .collect();
-    options.sort();
-    if documented_options(guide) != options {
+    let config_options = |name: &str| -> Option<Vec<String>> {
+        let spec = specs.iter().find(|spec| spec.name == name)?;
+        let mut keys: Vec<String> = spec.parameters["properties"]["config"]["properties"]
+            .as_object()?
+            .keys()
+            .cloned()
+            .collect();
+        keys.sort();
+        Some(keys)
+    };
+    let options = config_options("subagent_start");
+    if let Some(options) = &options
+        && documented_options(guide) != *options
+    {
         found.push(format!(
             "config: the guide has {:?}, the specs {options:?}",
             documented_options(guide)
+        ));
+    }
+    // The two tools that take `config` take the same options: one member accepted by one of them
+    // and refused by the other is half-reachable, since a provider that enforces the schema would
+    // never let the model pass it (ANR-214 added `skills` to both).
+    if let (Some(start), Some(edit)) = (options.as_ref(), config_options("subagent_edit").as_ref())
+        && start != edit
+    {
+        found.push(format!(
+            "config: `subagent_edit` takes {edit:?}, `subagent_start` {start:?}"
         ));
     }
     found
@@ -6528,7 +6657,8 @@ fn the_guide_and_the_specs_name_the_same_tools_and_arguments() {
 }
 
 /// The check can fail: an argument renamed in the guide alone, or in a spec alone, a tool dropped
-/// from either, and an option of `config` renamed are each found.
+/// from either, an option of `config` renamed, and an option one of the two `config` tools takes
+/// and the other refuses are each found.
 #[test]
 fn the_drift_check_finds_each_way_the_guide_and_the_specs_part() {
     let roster = guide_roster();
@@ -6569,6 +6699,23 @@ fn the_drift_check_finds_each_way_the_guide_and_the_specs_part() {
     let renamed_option = guide.replace("`max_rounds`", "`most_rounds`");
     assert_ne!(renamed_option, guide, "the guide lists `max_rounds`");
     assert!(!drift(&renamed_option, &specs).is_empty());
+
+    // An option one tool takes and the other refuses: the model could never pass it to the second.
+    let mut without_skills = specs.clone();
+    let edit = without_skills
+        .iter_mut()
+        .find(|spec| spec.name == "subagent_edit")
+        .unwrap();
+    let properties = edit.parameters["properties"]["config"]["properties"]
+        .as_object_mut()
+        .unwrap();
+    let _ = properties.remove("skills");
+    assert!(
+        drift(&guide, &without_skills)
+            .iter()
+            .any(|why| why.contains("`subagent_edit` takes")),
+        "an option one tool takes and the other refuses is found"
+    );
 }
 
 /// The guide names the tools and the helpers and nothing per session: the same bytes under any
@@ -6723,6 +6870,7 @@ macro_rules! session_suite {
                 a_remote_subagent_refuses_every_option_but_time_limit_and_max_rounds,
                 a_report_schema_is_refused_at_start_when_it_cannot_be_enforced_and_recorded_when_it_can,
                 a_remote_subagent_refuses_a_report_schema,
+                a_start_with_skills_narrows_the_sessions_catalog,
                 a_config_value_of_the_wrong_type_is_refused_naming_the_option,
                 round_two_carries_the_config_clamped_to_the_bounds_of_now,
                 a_hidden_tool_is_not_offered_and_a_call_to_it_is_refused_unrun,
