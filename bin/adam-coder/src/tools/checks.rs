@@ -66,6 +66,11 @@ use super::shell::{
 };
 use super::{Outcome, ToolEnv, non_empty, notes_error, run_error};
 
+/// The most commands one `run_checks` call may take: the tool's time limit grows with the count
+/// (one wave per `MAX_PARALLEL_TOOL_CALLS` commands, plus one re-run per failing command), so an
+/// uncapped list would turn the loop's backstop into no bound at all.
+const MAX_COMMANDS: usize = 16;
+
 /// The name of the artifact `run_checks` emits.
 pub const CHECKS_ARTIFACT: &str = "checks";
 
@@ -698,6 +703,13 @@ fn commands_of(
                     "`commands` is empty: name at least one command, or use `command` for one"
                         .to_owned(),
                 );
+            }
+            if commands.len() > MAX_COMMANDS {
+                return Err(format!(
+                    "`commands` holds {} commands: at most {MAX_COMMANDS} in one call, so that its \
+                     time limit stays a bound (split a longer list into calls)",
+                    commands.len()
+                ));
             }
             let mut list = Vec::with_capacity(commands.len());
             for (n, command) in commands.iter().enumerate() {
@@ -1512,8 +1524,14 @@ mod tests {
 
     #[test]
     fn one_command_hashes_as_it_always_did() {
+        // The literal digest a note written before `commands` existed holds: the reuse must still
+        // find it, so the single-command branch may not change (a restatement of the branch would
+        // pass whatever the branch computed).
         let one = vec!["cargo test".to_owned()];
-        assert_eq!(call_sha(&one), sha256_hex(b"cargo test"));
+        assert_eq!(
+            call_sha(&one),
+            "0031fd18feb55b6b493544de1976b438eeac0b2d1278821b9e4e8eb07e8cf503"
+        );
         // A list is its commands in order, each behind its length: where one ends and the next
         // begins is part of the key.
         assert_ne!(
