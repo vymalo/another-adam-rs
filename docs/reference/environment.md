@@ -142,6 +142,17 @@ run's calls are still signed by the process turn key. The broker's contract is v
 in, `{"v":1,"chain":["<base64 DER>", …]}` out, and the refusals `400` (`Invalid`), `401`/`403`
 (`Unauthenticated`), `429`/`5xx` (`Transient`). Source: [`adam-run-cert-broker`](../../crates/adam-run-cert-broker/README.md).
 
+## Traces (`adam-otel`, not wired yet)
+
+The OTel layer of [ADR 0075](../decisions/0075-metrics-and-traces-are-off-by-default-and-say-nothing-about-a-person.md)
+reads two variables, and **no binary composes the layer yet** (ANR-1385) and `adam-service` does not pass them
+(ANR-1386), so setting either changes nothing today. Source: [`adam-otel`](../../crates/adam-otel/README.md).
+
+| Variable | Meaning | Default |
+|---|---|---|
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | the OTLP/HTTP collector, an absolute `http` or `https` URL with no user, password, query or fragment; unset or blank means no exporter and no thread | unset: off |
+| `OTEL_SERVICE_NAME` | `service.name` of every exported span's resource | `adam` |
+
 ## Cross-process notifications (`adam-notify-postgres`)
 
 `adam-coder`, in every role (`all`, `control-plane`, `worker`): the `notify` component. Both binaries'
