@@ -32,7 +32,7 @@ use async_trait::async_trait;
 use serde_json::{Value, json};
 
 use crate::agent::render_output;
-use crate::conversation::{MESSAGE_KIND, SESSION_TOOLS_CONTEXT_KEY};
+use crate::conversation::{MESSAGE_KIND, MODEL_CONTEXT_KEY, SESSION_TOOLS_CONTEXT_KEY};
 use crate::paging::{
     PAGE_LINES, PageError, clip_item, end_line, escape_text, more_line, page_lines, window,
     window_args,
@@ -948,6 +948,16 @@ fn header_json(header: &SessionHeader) -> Value {
     serde_json::to_value(header).unwrap_or(Value::Null)
 }
 
+/// What a round's context says of the model the session named: `{"model": "<alias>"}` under
+/// [`MODEL_CONTEXT_KEY`], or `None` when the config names none (the agent's own model applies).
+/// The alias was admitted against the set the folder and the deployment declare
+/// (`SessionBounds::models`), so it resolves.
+fn model_context(config: Option<&SessionConfig>) -> Option<Value> {
+    config
+        .and_then(|config| config.model.as_deref())
+        .map(|alias| json!({ "model": alias }))
+}
+
 /// The message that starts or continues a round: the child message of this run with the session's
 /// header in it, and in its context the tools the header's config narrows (ADR 0054 slice 3).
 /// Both `subagent_start` and `subagent_send` make a round's message here, from the config they
@@ -975,6 +985,12 @@ fn round_message(ctx: &ToolCtx, text: &str, header: &SessionHeader) -> Inbound {
                     .as_ref()
                     .map_or_else(|| json!({}), SessionConfig::tools_context),
             );
+            // The alias the session named travels as the run's model, under the same key a
+            // person's message uses: the agent binds that alias and its profile's window and
+            // modalities with it (ADR 0054 slice 11).
+            if let Some(model) = model_context(header.config.as_ref()) {
+                context.insert(MODEL_CONTEXT_KEY.to_owned(), model);
+            }
         }
     }
     message
@@ -2642,6 +2658,20 @@ mod tests {
                 since: None,
             },
         )
+    }
+
+    /// The alias a session names becomes the round's model, under the key the agent reads, and a
+    /// session that names none adds nothing.
+    #[test]
+    fn a_rounds_context_names_the_model_the_session_picked() {
+        let mut named = SessionConfig::default();
+        named.model = Some("coder-small".to_owned());
+        assert_eq!(
+            model_context(Some(&named)),
+            Some(json!({ "model": "coder-small" }))
+        );
+        assert_eq!(model_context(Some(&SessionConfig::default())), None);
+        assert_eq!(model_context(None), None);
     }
 
     /// A member of `config` set to `null` is a reset (ADR 0054, decision 11), not an option the
