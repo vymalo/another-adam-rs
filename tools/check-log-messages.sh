@@ -1,15 +1,22 @@
 #!/bin/sh
-# ANR-1456: a log record's body is the format string its macro wrote, and the collector's allowlist
+# ANR-1456: a log record's body is the message its macro wrote, and the collector's allowlist
 # (`adam_otel::logs::ALLOWED`) cannot drop it — only fields are filtered. A message that interpolates
 # a value therefore puts that value in every exported record: a startup warning's path, a provider's
-# reason, a panic payload. The value belongs in a field, where the allowlist decides, and the message
-# stays static. Run from the repository root (CI's `fmt` job):
+# reason, a panic payload, an agent program's stderr. The value belongs in a field, where the
+# allowlist decides, and the message stays static. Run from the repository root (CI's `fmt` job):
 #
 #   sh tools/check-log-messages.sh
 #
-# It reads every `tracing::trace|debug|info|warn|error!` whose message is on the macro's own line and
-# interpolates. A message written on the next line is not seen (the pattern is line-anchored); that
-# shape is rare and the review of ANR-1456 found none.
+# **What it reads, and what it does not.** The pattern catches a message written as the macro's first
+# argument, interpolating, on the macro's own line:
+#
+#   tracing::warn!("the sign-in ended: {reason}");
+#
+# It does **not** read a bare `warn!` from `use tracing::warn`, a message that follows fields
+# (`warn!(run = %r, "{what}")`), or a message on the next line — the wider shapes need a parser, and
+# a blanket rule would also refuse the interpolations that are meant for a person (a device-code
+# URL). `tools/scan-log-messages.py` finds all of them; its remaining hits are card ANR-1458's, where
+# a person decides which are content and which are a link or a constant.
 set -eu
 
 root=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
@@ -26,8 +33,8 @@ fail() { echo "$1" >&2; failed=1; }
 # A guard that has been narrowed (a lost `\{`, a level dropped from the alternation) passes
 # everything and says nothing, so the pattern is proven on a line it must match first.
 probe_dir=$(mktemp -d)
-probe=$probe_dir/probe.rs
 trap 'rm -rf "$probe_dir"' EXIT
+probe=$probe_dir/probe.rs
 for level in trace debug info warn error; do
   printf 'tracing::%s!("a value: {value}");\n' "$level" > "$probe"
   if ! scan "$probe" >/dev/null; then
@@ -46,4 +53,4 @@ if [ -n "$hits" ]; then
 fi
 
 if [ "$failed" -ne 0 ]; then exit 1; fi
-echo "every tracing message is static; a value goes in a field, where the logs allowlist decides"
+echo "every message-first tracing call is static; a value goes in a field (ANR-1456; see ANR-1458 for the other shapes)"

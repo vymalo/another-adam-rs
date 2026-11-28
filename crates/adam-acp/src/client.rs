@@ -683,7 +683,9 @@ async fn drain_stderr(stderr: ChildStderr, shared: Arc<Shared>) {
             Ok(_) => {
                 let line = String::from_utf8_lossy(&buf);
                 let line = line.trim_end_matches(['\n', '\r']);
-                tracing::info!(target: "adam_acp::agent_stderr", "{line}");
+                // The line is the agent program's stderr: a field the allowlist drops, so the
+                // collector gets the fact and the JSON log the text.
+                tracing::info!(target: "adam_acp::agent_stderr", line = %line, "a line of the agent's stderr");
                 lock(&shared.stderr).push(line);
             }
         }
