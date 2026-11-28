@@ -27,7 +27,7 @@ that integrate adam-rs.
 | `tools/docs-check/` | diagram, link, anchor, crate-README and skill checker (also in CI) |
 | `bench/` | the benchmark harness for adam-coder and OpenCode (ADR 0048): Node ESM, no dependencies, outside the Rust workspace; its configuration (endpoint, model, prices, key) is the owner's and **never in the repository**; `bench/README.md`; the agents are pinned in `bench/pins.json`, the stack is `bench/compose.yaml`, `bench/dry-run.sh` is the docker dry run; CI `bench.yml` (`node --test "bench/test/*.test.mjs"`), the dry run `bench-dry-run.yml` (`workflow_dispatch` only) |
 | `.agents/skills/` | first-party (`adam-*`, `update-vendored-skills`) and vendored skills (`skills-lock.json`); `.claude/skills`, `.goose/skills`, `.kiro/skills` are symlinks |
-| `.github/workflows/` | `ci.yml` (Rust, docs, compose), `coder.yml` (image, chart, e2e, tag bump), `nightly.yml` (live services) |
+| `.github/workflows/` | `ci.yml` (Rust, docs, compose), `coder.yml` (image, chart, e2e, tag bump), `nightly.yml` (live services), `cancel-stale-runs.yml` (cancels a branch's queued and running runs when its pull request closes or the branch is deleted; a newer push is each workflow's own `concurrency`) |
 
 ## Rules — check every change against these
 
