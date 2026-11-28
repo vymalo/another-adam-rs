@@ -379,7 +379,7 @@ jobs:
           "$RUNNER_TEMP/github-mcp-server" --version
           echo "ADAM_TEST_GITHUB_MCP_SERVER=$RUNNER_TEMP/github-mcp-server" >> "$GITHUB_ENV"
       - name: Tests (memory, Postgres, MongoDB, coder end to end)
-        run: cargo nextest run --workspace --locked --profile ci --features adam-llm-agent/schema,adam-assembly/dev,adam/dev,adam-assembly/mcp,adam/mcp
+        run: cargo nextest run --workspace --locked --profile ci --features adam-llm-agent/schema,adam-assembly/dev,adam/dev,adam-assembly/mcp,adam/mcp,adam-store-mongodb/memory
       # Run the database suites a second time: this pass exercises migrate() on
       # an existing schema. The offline suites (coder end to end) do not repeat.
       - name: Database suites again, on the migrated schema

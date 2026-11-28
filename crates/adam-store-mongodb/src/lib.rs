@@ -65,6 +65,8 @@
 //!   sparse indexes, which not every MongoDB-compatible server supports.
 
 pub mod codec;
+#[cfg(feature = "memory")]
+pub mod memory;
 
 use std::collections::HashSet;
 use std::time::Duration;
