@@ -9,8 +9,11 @@ repository.workspace = true
 rust-version.workspace = true
 
 [features]
-# The TLS provider (aws-lc-rs) reqwest and rustls link. On by default; a host that installs its own
-# (ring, the platform's) builds with `default-features = false`.
+# The TLS provider (aws-lc-rs) reqwest and rustls link. The workspace turns it off
+# (`default-features = false` at Cargo.toml's `adam-otel` entry), so a library that depends on this
+# crate never puts a provider into an embedding host's graph (`tools/tls-provider/check.sh`,
+# ANR-118). The binaries that export over HTTPS opt in: `adam-coder` and `adam-agent` name
+# `features = ["aws-lc"]`; `adam-egress` (static musl, ANR-1174) and `adam-git-sandbox` do not.
 default = ["aws-lc"]
 aws-lc = ["reqwest/rustls", "rustls/aws_lc_rs"]
 

@@ -49,7 +49,10 @@ adam-model-oauth = { path = "crates/adam-model-oauth", version = "0.7.0", defaul
 adam-model-openai = { path = "crates/adam-model-openai", version = "0.7.0", default-features = false } # x-release-please-version
 adam-notify-postgres = { path = "crates/adam-notify-postgres", version = "0.7.0" } # x-release-please-version
 adam-notify-testkit = { path = "crates/adam-notify-testkit", version = "0.7.0" } # x-release-please-version
-adam-otel = { path = "crates/adam-otel", version = "0.7.0" } # x-release-please-version
+# The layer links a TLS provider only where a binary exports: a library that depends on it must not
+# put aws-lc-rs into an embedding host's graph (tools/tls-provider/check.sh, ANR-118). The three
+# binaries that call `adam_otel::init` opt in with `features = ["aws-lc"]`.
+adam-otel = { path = "crates/adam-otel", version = "0.7.0", default-features = false } # x-release-please-version
 adam-plugin = { path = "crates/adam-plugin", version = "0.7.0" } # x-release-please-version
 adam-plugin-testkit = { path = "crates/adam-plugin-testkit", version = "0.7.0" } # x-release-please-version
 adam-postgres = { path = "crates/adam-postgres", version = "0.7.0" } # x-release-please-version

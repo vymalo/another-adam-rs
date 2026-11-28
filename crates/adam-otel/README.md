@@ -184,5 +184,8 @@ a deployment imports it.
 versions the card measured on 2026-11-27). `opentelemetry-otlp` depends on `reqwest` 0.13.1 with
 `default-features = false`, so the workspace's `reqwest` is the one in the tree (*verified
 2026-11-28* in its normalized `Cargo.toml`). The crate adds no `-sys` package beyond the
-`aws-lc-sys` the workspace already links through `rustls` — and none at all under `default-features = false`, which is how
-`adam-egress` and `adam-git-sandbox` build it.
+`aws-lc-sys` the workspace already links through `rustls` — and none at all under `default-features = false`. The
+**workspace sets that** for every member (`Cargo.toml`'s `adam-otel` entry), so a library that depends on this crate never
+puts a TLS provider into an embedding host's graph (`tools/tls-provider/check.sh`, ANR-118): only the binaries that export
+over HTTPS opt in with `features = ["aws-lc"]` (`adam-coder`, `adam-agent`), while `adam-egress` (static musl, ANR-1174) and
+`adam-git-sandbox` build it with no provider at all.
