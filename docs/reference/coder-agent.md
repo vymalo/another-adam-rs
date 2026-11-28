@@ -463,9 +463,27 @@ The servers are a **closed table in code** (`table.rs`, never a setting, so a de
 | `.py .pyi` | `pyright-langserver --stdio` (on Node: it sees no interpreter and no installed package) | `pyrightconfig.json`, `pyproject.toml`, `setup.cfg`, `setup.py` |
 | `.go` | `gopls serve` (`GOFLAGS=-mod=readonly`, `GOTOOLCHAIN=local`) | `go.work`, `go.mod` |
 | `.dart` | `dart language-server --protocol=lsp` | `pubspec.yaml` |
+| `.toml` | `taplo lsp stdio` (validates by no schema) | `.taplo.toml`, `taplo.toml` |
+| `.yaml .yml` | `yaml-language-server --stdio` (no Schema Store, no Kubernetes catalog) | none: the slot's root |
+| `.json .jsonc` | `vscode-json-language-server --stdio` (fetches `file:` schemas only) | none |
+| `.sh .bash` | `bash-language-server start` (it runs `shellcheck` when that is on `PATH`) | none |
+| a file named `Dockerfile` or `Containerfile`, or `*.Dockerfile` | `docker-langserver --stdio` | none |
+| `.c .h .cc .cpp .cxx .hpp .hh` | `clangd --background-index=false` | `compile_commands.json`, `compile_flags.txt`, `.clangd` |
+
+The last six are [ADR 0089](../decisions/0089-the-coder-knows-six-more-languages-the-files-every-repository-has.md)'s.
+A file is matched by its **name** first (`Dockerfile`, `Containerfile`, as written) and then by its extension, in any case
+(`api.Dockerfile`, `x.RS`); a directory's name gives no file a language, and a name that is not in the table
+(`Dockerfile.prod`) has none. **No server fetches a schema on its own**: taplo is told `schema.enabled: false` (its
+default catalog is the Schema Store's), the YAML server `schemaStore.enable: false` and `kubernetesCRDStore.enable:
+false`, and the JSON server handles `file:` schemas only and asks the coder for any other, which has none to give. A
+schema a YAML file names itself (`# yaml-language-server: $schema=https://...`) is still fetched by that server, where
+the deployment's network allows it. clangd writes its background index under the project root, the slot, so it is
+off in both modes: references are those of the files it has parsed (the open file and what it includes).
 
 The root is the nearest directory, from the file's own up to the slot's root, that holds one of the markers; the slot's root
-when none does. **The coder image has the four servers**: it is built on the workspace image `1.98.1-8c297d3`, the merge of
+when none does. **The six of ADR 0089 are not in the image yet**: until the workspace image installs them (the ADR's slice
+L2, in vymalo/another-agentic-images), a call on such a file answers that its server is not on `PATH`, as for any
+missing server. **The coder image has the four servers**: it is built on the workspace image `1.98.1-8c297d3`, the merge of
 vymalo/another-agentic-images#15, so `rust-analyzer`, `typescript-language-server`, `pyright-langserver` and `gopls` are on
 `PATH` (the Dart server comes with the base's Flutter SDK). A server that is not there answers
 `No language server for Rust in this environment (`rust-analyzer` is not on PATH in ...). Use `run_checks`
@@ -579,7 +597,9 @@ the server depends on where it runs and on the tier of the run (the tier of the 
 | `edits`, `auto`, `bypass` | a slot it may write | **full** | no |
 
 A **safe** server has the reference settings: for rust-analyzer no build script, no procedural macro, no check on save and a build directory of its own (below);
-for TypeScript the image's own TypeScript (never the project's), no plugin and no automatic type acquisition; for Go `-mod=readonly`; for Dart nothing (it is told no setting). A **full**
+for TypeScript the image's own TypeScript (never the project's), no plugin and no automatic type acquisition; for Go `-mod=readonly`; for Dart nothing (it is told no setting).
+The six of ADR 0089 run no project code to analyse a file, so a safe one is the same as a full one: no schema from the network, and no
+background index for clangd, in both. A **full**
 server runs what the project's own build runs, as `run_checks` there does (a build script, a procedural macro): at a tier that may write, a
 slot may be written by the checks, so it is no wider. A server is never shared between the two modes; a run whose tier changes starts one of the
 other mode (the old one stops when it is idle). Where a server runs, it runs as the same user with the same variables hidden as `run_command`
@@ -624,7 +644,20 @@ definition, references); `typescript-language-server` and `gopls` were not insta
 takes `--protocol=lsp` (*verified* 2026-11-18 in dart-lang/sdk at tag 3.12.2, `pkg/dartdev/lib/src/commands/language_server.dart`); the
 author of the pull request that added it reports the gated suite passing on Dart SDK 3.12.2 in the workspace image (*unverified* here: no Dart
 SDK where it was merged). The `image` job of `.github/workflows/coder.yml` runs the gated suite in the built image
-(`ADAM_TEST_REQUIRE_LANGUAGE_SERVERS=1`: a missing server fails the job).
+(`ADAM_TEST_REQUIRE_LANGUAGE_SERVERS=1`: a missing server fails the job, for the servers the image has; the six of ADR 0089
+are skipped where they are missing until L2 adds them to the list).
+
+For the six of ADR 0089 (*verified* 2026-11-28 by reading the packages on npm, not by running them): `yaml-language-server`
+2.0.0 asks for the section `yaml` when it is initialized and reads `schemaStore.enable` and `kubernetesCRDStore.enable`;
+`vscode-json-language-server` (vscode-langservers-extracted 4.10.0) takes `handledSchemaProtocols` as an initialization
+option and asks the client (`vscode/content`) for a schema of any other scheme, and has no `json.schemaDownload.enable` (VS
+Code's own client reads that one); `bash-language-server` 5.8.1 is started with `start` and calls no endpoint unless given
+`explainshellEndpoint`; `docker-langserver` (dockerfile-language-server-nodejs 0.15.0) takes `--stdio`; taplo (the strings of
+@taplo/cli 0.7.0) reads the section `evenBetterToml` with `schema.enabled`, its default catalog being the Schema Store's.
+*Unverified*: that taplo asks for that section rather than waiting to be pushed it, the `languageId`s of shell
+(`shellscript`) and of C and C++ (`c`, `cpp` for the rest, headers included), and everything about clangd (its
+`--background-index=false` flag and where the index is written). The gated suite has a case for each (`real_taplo_...`,
+`real_clangd_...`); none has been run.
 
 ## Rules in code
 

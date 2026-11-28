@@ -8,6 +8,7 @@
 //! | Key | Does |
 //! |---|---|
 //! | `log` | a file every message it receives is appended to, one JSON line each: `{"method", "params"}` |
+//! | `log_argv` | its arguments are the first line of `log`: `{"argv": [..]}` (what the launch line gave it) |
 //! | `stderr` | text written to stderr at start |
 //! | `pid_file` | its pid is written there (and the child's pid beside it with `.child`, and the grandchild's with `.grandchild`, for `spawn_tree`) |
 //! | `spawn_tree` | starts a child that starts a grandchild, in its process group |
@@ -182,6 +183,10 @@ fn main() {
             .and_then(|bytes| serde_json::from_slice(&bytes).ok())
             .unwrap_or_else(|| json!({})),
     };
+    if script.bool("log_argv") {
+        let argv: Vec<String> = std::env::args().skip(1).collect();
+        log(&script, &json!({ "argv": argv }));
+    }
     if let Some(text) = script.str("stderr") {
         eprintln!("{text}");
     }

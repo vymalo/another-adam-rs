@@ -1,6 +1,6 @@
 {
   "name": "find_references",
-  "description": "Where the symbol on a line of a file is used, by a language server (Rust, TypeScript and JavaScript, Python, Go, Dart): `path:line:col: the source line`, sorted, a page of at most 100 (the last line says `[more: ... offset=N]` or `[end: ...]`); at most 2000 are collected. Give the `line` (from 1) and the `symbol` on it, and `occurrence` when it is there more than once; `include_declaration` (default true) lists the definition too. The first call on a project may wait for the server to index (`wait` seconds, 1 to 120, default 30). Nothing is changed. Example: {\"path\":\"src/main.rs\",\"line\":12,\"symbol\":\"parse_config\"}",
+  "description": "Where the symbol on a line of a file is used, by a language server (Rust, TypeScript and JavaScript, Python, Go, Dart, C and C++, TOML, YAML, JSON, shell, Dockerfile): `path:line:col: the source line`, sorted, a page of at most 100 (the last line says `[more: ... offset=N]` or `[end: ...]`); at most 2000 are collected. Give the `line` (from 1) and the `symbol` on it, and `occurrence` when it is there more than once; `include_declaration` (default true) lists the definition too. The first call on a project may wait for the server to index (`wait` seconds, 1 to 120, default 30). Nothing is changed. Example: {\"path\":\"src/main.rs\",\"line\":12,\"symbol\":\"parse_config\"}",
   "parameters": {
     "type": "object",
     "properties": {

@@ -73,3 +73,44 @@ YAML are part of almost every change.
 * The tool descriptions list more languages, which moves the prompt's stable prefix once.
 * Until L2, the six answer "not installed" in the shipped image, as a missing toolchain does.
 * No `Store`, `Notifier` or `ModelClient` method changes.
+
+## Amended 2026-11-28: L1 is built
+
+The six variants are in the closed table (`Language::Toml`, `Yaml`, `Json`, `Shell`, `Dockerfile`, `C`), with the programs,
+launch lines, files and markers of decision 1, and every `match` on a language names them. The scripted-server tests run
+the production launch lines (`tests/language_servers.rs`), and the gated suite has a case for each
+(`tests/real_language_servers.rs`), which the servers the image lacks skip, even under `ADAM_TEST_REQUIRE_LANGUAGE_SERVERS=1`,
+until L2 adds them to its `IN_THE_IMAGE`. What differs from the decision as written:
+
+* **taplo fetches no schema either.** Its default catalog is the Schema Store's (*verified* 2026-11-28 in the strings of
+  @taplo/cli 0.7.0), so decision 3 is applied to it too: it is told `evenBetterToml.schema.enabled: false`. A `Cargo.toml` is
+  then checked as TOML, not against a schema.
+* **How the JSON server is told.** `vscode-json-language-server` has no `schemaDownload` setting (VS Code's client reads
+  `json.schemaDownload.enable`); it is started with `handledSchemaProtocols: ["file"]` and asks the coder for any other
+  schema, which answers that it has none (*verified* 2026-11-28 in vscode-langservers-extracted 4.10.0).
+* **A YAML file's own `$schema` comment is still fetched** by `yaml-language-server`: no setting turns that off (*verified*
+  2026-11-28 in 2.0.0). It is the deployment's network that decides, as the decision says.
+* **clangd's background index is off in both modes**, in its launch line (`clangd --background-index=false`), because the
+  index is written under the project root, which is the slot (*unverified*). References are then those of the files clangd
+  has parsed.
+* **The Dockerfile matches no other name**: `Dockerfile.prod` has no language, as the closed match of decision 2 says.
+
+### The follow-up for vymalo/another-agentic-images (L2)
+
+To paste as an issue there (the package names were *verified* on the npm registry on 2026-11-28; the rest is *unverified*):
+
+> **Install the six language servers of adam-rs ADR 0089 in the workspace image.** adam-coder now knows TOML, YAML, JSON,
+> shell, Dockerfile and C/C++, and answers "not on PATH" until the image has their programs:
+>
+> | Program | Install |
+> |---|---|
+> | `yaml-language-server` | `npm install -g yaml-language-server` (2.0.0 on 2026-11-28) |
+> | `vscode-json-language-server` | `npm install -g vscode-langservers-extracted` (4.10.0; it also brings the CSS, HTML, ESLint and Markdown servers) |
+> | `bash-language-server` | `npm install -g bash-language-server` (5.8.1), with `shellcheck` from Debian (`apt-get install -y shellcheck`), which it runs for its diagnostics |
+> | `docker-langserver` | `npm install -g dockerfile-language-server-nodejs` (0.15.0) |
+> | `taplo` | the static binary of a release of tamasfe/taplo (`taplo-linux-x86_64.gz`, `taplo-linux-aarch64.gz`), checked against its published checksum, into `/usr/local/bin`; the npm package `@taplo/cli` is a WebAssembly build |
+> | `clangd` | `apt-get install -y clangd` (Debian's) |
+>
+> Node is already in the image. Check with `command -v` for each, then adam-rs moves `WORKSPACE_TAG` in
+> `docker/coder/Dockerfile` and adds the six to `IN_THE_IMAGE` in `bin/adam-coder/tests/real_language_servers.rs`, so the
+> `image` job runs them with `ADAM_TEST_REQUIRE_LANGUAGE_SERVERS=1`.

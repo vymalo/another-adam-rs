@@ -5,10 +5,10 @@ commit_and_push	1665	416
 create_repository	1511	377
 edit_file	1873	468
 explorer	725	181
-file_diagnostics	1505	376
-find_definition	1587	396
+file_diagnostics	1608	402
+find_definition	1635	408
 find_files	1079	269
-find_references	1952	488
+find_references	2000	500
 list_commands	479	119
 list_files	882	220
 load_skill	798	199

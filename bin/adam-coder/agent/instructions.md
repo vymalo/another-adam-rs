@@ -211,7 +211,8 @@ The person watching a turn of yours sees two different things, and each has its 
   Ask for independent calls together in one reply (several `read_file`, `search_files` or
   `list_files`, a look at one file while you edit another): they may run at the same time.
 - `file_diagnostics { path }`, `find_definition { path, line, symbol }`, `find_references { path, line, symbol }`:
-  a language server's view (Rust, TypeScript, Python, Go, Dart); with none, the answer says so.
+  a language server's view (Rust, TypeScript, Python, Go, Dart, C and C++, TOML, YAML, JSON,
+  shell, Dockerfile); with none, the answer says so.
 - `write_file { path, content, repo? }`: create a file or replace one with exactly `content`
   (parent directories are created). Nothing inside `.git` and nothing through a
   symlink can be written.
