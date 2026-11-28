@@ -195,11 +195,12 @@ jobs:
           workspaces: tools/sqlite-probe
       - run: cargo test --manifest-path tools/sqlite-probe/Cargo.toml --locked
 
-  # The required check. It compiles nothing: it fails unless every job above passed, so a clippy, doctest or
-  # rustdoc or embedded-set error cannot merge on a green `lint`. The jobs above are extra checks, not required ones.
+  # The required check. It compiles nothing: it fails unless every job above passed, so a clippy, doctest,
+  # rustdoc, embedded-set or TLS-provider error cannot merge on a green `lint`. The jobs below are extra
+  # checks, not required ones.
   lint:
     name: lint
-    needs: [fmt, clippy-default, clippy-features, doctest-default, doctest-features, rustdoc, embedded, sqlite-probe, phone-targets]
+    needs: [fmt, clippy-default, clippy-features, doctest-default, doctest-features, rustdoc, embedded, sqlite-probe, phone-targets, tls-provider]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -216,7 +217,8 @@ jobs:
             "rustdoc=${{ needs.rustdoc.result }}" \
             "embedded=${{ needs.embedded.result }}" \
             "sqlite-probe=${{ needs['sqlite-probe'].result }}" \
-            "phone-targets=${{ needs['phone-targets'].result }}"
+            "phone-targets=${{ needs['phone-targets'].result }}" \
+            "tls-provider=${{ needs['tls-provider'].result }}"
           do
             name=${pair%%=*}
             result=${pair#*=}
