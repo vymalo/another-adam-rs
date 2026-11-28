@@ -691,10 +691,11 @@ async fn a_removed_subagent_stays_registered_with_its_last_version() {
         [ToolChange {
             agent: name.clone(),
             added: vec![],
-            // The five tools that run a subagent in the background go with its last subagent.
+            // The six tools that run a subagent in the background go with its last subagent.
             removed: [
                 "sub",
                 "subagent_close",
+                "subagent_edit",
                 "subagent_list",
                 "subagent_read",
                 "subagent_send",

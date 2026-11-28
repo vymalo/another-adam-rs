@@ -139,6 +139,7 @@ impl Memory for MongoMemory {
     }
 
     fn recall(&self, audience: &Audience) -> MemoryResult<Vec<Lesson>> {
+        self.scope.validate()?;
         audience.validate()?;
         let mut lessons: Vec<Lesson> = self
             .load(audience)?
@@ -151,6 +152,7 @@ impl Memory for MongoMemory {
     }
 
     fn retire(&self, audience: &Audience, root_cause: &str) -> MemoryResult<Lesson> {
+        self.scope.validate()?;
         audience.validate()?;
         let now = Timestamp::now();
         let (id, mut lesson) = self

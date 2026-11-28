@@ -23,11 +23,12 @@
 //! [`MemoryScope`]; within it a lesson is keyed by its [`Audience`] and its root cause, and two
 //! scopes on one database never see each other's lessons (decision 4). A lesson is `Active` when
 //! served, and `Retired` when its evidence turned: kept, and no longer served (decision 10).
-//! [`InProcessMemory`] is the in-process reference; the PostgreSQL adapter is
+//! [`InProcessMemory`] is the in-process reference. The PostgreSQL adapter is
 //! [`adam-store-postgres`](https://github.com/vymalo/another-adam-rs/tree/main/crates/adam-store-postgres)'s
-//! `memory` feature and the MongoDB one is
-//! [`adam-store-mongodb`](https://github.com/vymalo/another-adam-rs/tree/main/crates/adam-store-mongodb)'s
-//! (M2b and M2c, built); the Redis adapter remains unbuilt. The suite is `adam-memory-testkit`'s
+//! `memory` feature (M2b, ANR-1292); the MongoDB one is `adam-store-mongodb`'s `memory` feature
+//! (ANR-1293) and the Redis one is `adam-memory-redis` (ANR-1294). An adapter builds on the
+//! same rules the reference enforces: [`prepare`] stamps and checks a lesson, and
+//! [`sort_lessons_newest_first`] orders a recall. The suite is `adam-memory-testkit`'s
 //! `memory_conformance!`.
 //!
 //! ```

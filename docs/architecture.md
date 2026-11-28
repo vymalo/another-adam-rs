@@ -211,6 +211,7 @@ classDiagram
     class Memory { <<interface>> }
     Memory <|.. PgMemory
     Memory <|.. MongoMemory
+    Memory <|.. RedisMemory
     Memory <|.. InProcessMemory
 ```
 
@@ -234,7 +235,7 @@ classDiagram
 | `Confine` | `adam-workspace` | `Rlimits`, `SystemdScope` (`adam-confine`, Unix); `best_effort()` picks | `NoConfine`; the suite `confine_conformance!` (`adam-confine-testkit`) is the reference |
 | `DeviceState` | `adam-device-state` | none yet: the host pushes its readings, and `adam_budget::Throttled` lowers the admission by them ([ADR 0065](decisions/0065-resource-governance-admission-pools-and-os-limits.md) decision 8) | `FakeDevice`, the reference of `device_state_conformance!` |
 | `SiMemory` (L1) | `adam-memory` | `FolderSiMemory`, the in-folder store and L1's only one ([ADR 0081](decisions/0081-an-agent-keeps-a-self-improvement-memory-near-it-and-what-holds-becomes-the-deployments-memory.md) decision 2) | `InProcessSiMemory` (reference); `ScopeBlindSiMemory` and `DoubleWritingSiMemory` (testkit, which the suite rejects) |
-| `Memory` (L2) | `adam-memory` | `PgMemory` (`adam-store-postgres`, feature `memory`) and `MongoMemory` (`adam-store-mongodb`, feature `memory`); Redis remains unbuilt (M2b, M2c) | `InProcessMemory` (reference); `ScopeBlindMemory` and `DoubleWritingMemory` (testkit, which the suite rejects) |
+| `Memory` (L2) | `adam-memory` | `PgMemory` (`adam-store-postgres`, feature `memory`), `MongoMemory` (`adam-store-mongodb`, feature `memory`) and `RedisMemory` (`adam-memory-redis`), ADR 0081 M2b/M2c/M2d | `InProcessMemory` (reference); `ScopeBlindMemory` and `DoubleWritingMemory` (testkit, which the suite rejects) |
 | `PermissionPrompt` | `adam-acp` | none (the default policy needs no prompt) | `StaticPrompt` |
 
 `AgentStarter` is the start-only half of `Agent` (`name`, `init`, `init_continuing`): a process that
@@ -1191,7 +1192,8 @@ the table `memory_lesson`, keyed `(scope, audience, root_cause)` with `state`, `
 and `retired_at`, created by **every** migration and read and written by `PgMemory`
 (`adam-store-postgres`, feature `memory`). It is outside the run's cascade: a lesson survives the
 runs that evidenced it, and a retired lesson is kept, never deleted. The MongoDB adapter
-(`MongoMemory`, `adam-store-mongodb`, feature `memory`) is built; the Redis one is not.
+(`MongoMemory`, `adam-store-mongodb`, feature `memory`) and the Redis one
+(`RedisMemory`, `adam-memory-redis`) are built too.
 
 What `state` holds (JSON, versioned `v`; the layout is private to the runtime,
 `crates/adam-runtime/src/envelope.rs`):
@@ -1444,7 +1446,7 @@ The failure interleavings, their tests and what the design refuses are in
 ### Child sessions
 
 A subagent can also run in the background as a **session** ([ADR 0045](decisions/0045-a-subagent-can-run-in-the-background-as-a-session.md)):
-a conversation of child runs ("rounds") in the parent's own conversation, started, read, sent to and closed by five tools
+a conversation of child runs ("rounds") in the parent's own conversation, started, read, sent to, edited and closed by six tools
 that return at once. The parent parks only when a read asks to wait, or when its model answers while a session it started
 still works or a round ended and was not yet reported. A round that ends meanwhile is told to the model by its next call: the
 journaled step `model:<turn>` lists the sessions first and records the reports it appended (`reports`, no new step). A round that ended during the final call is read at the end of the turn with `wait_<turn>`, which answers at once and does not park. The sequence, the states and the interleavings are in [Child runs](reference/child-runs.md#sessions-adr-0045-slices-1-to-4).

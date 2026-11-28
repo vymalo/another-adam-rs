@@ -31,5 +31,12 @@ adam-store-testkit.workspace = true
 adam-memory-testkit.workspace = true
 tokio.workspace = true
 
+# The L2 memory suite imports `adam_store_mongodb::memory`, which exists only with the feature: the
+# target is skipped without it rather than compiled and failing (`clippy --all-targets` builds every
+# test target, whatever the features).
+[[test]]
+name = "memory"
+required-features = ["memory"]
+
 [lints]
 workspace = true

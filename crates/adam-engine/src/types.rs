@@ -70,6 +70,10 @@ pub struct Say {
     /// ([`with_prompt_statement`](Self::with_prompt_statement)); `None`: a steer leaves the run the
     /// ones it has, a new run has none. Its `Debug` holds no value.
     pub prompt_statement: Option<adam_model::PromptStatement>,
+    /// The access tier this message asks its run to work under
+    /// ([`with_tier`](Self::with_tier), `access-tier/v1`, ADR 0036); `None`: the agent's own tier,
+    /// or the one an earlier message of the run named.
+    pub tier: Option<adam_a2a::AccessTier>,
 }
 
 impl Say {
@@ -85,6 +89,7 @@ impl Say {
             text: text.into(),
             model: None,
             prompt_statement: None,
+            tier: None,
         }
     }
 
@@ -99,6 +104,17 @@ impl Say {
     #[must_use]
     pub fn with_model(mut self, alias: impl Into<String>) -> Self {
         self.model = Some(alias.into());
+        self
+    }
+
+    /// Work this message's run under `tier` (`access-tier/v1`, ADR 0036): the agent withholds every
+    /// tool above it for that message and caps every one it keeps, as it does when a served front
+    /// sends a tier. The choice holds for the run until a later message names another; the
+    /// conversation's next run starts on the agent's own tier again. A host that embeds adam sets it
+    /// on the person's message; the engine never raises it on its own.
+    #[must_use]
+    pub fn with_tier(mut self, tier: adam_a2a::AccessTier) -> Self {
+        self.tier = Some(tier);
         self
     }
 

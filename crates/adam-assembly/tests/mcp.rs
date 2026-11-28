@@ -181,6 +181,7 @@ async fn each_agent_gets_its_own_mcp_json() {
             "subagent_start",
             "subagent_send",
             "subagent_read",
+            "subagent_edit",
             "subagent_close",
             "subagent_list"
         ]

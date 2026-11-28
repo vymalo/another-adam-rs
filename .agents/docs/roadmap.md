@@ -22,7 +22,7 @@ tags and workflow runs. GraphQL is not available from a session.
 | ADR 0082 slices | the table in the ADR | P0, P1, P2 built; P3 to P7, S1, S2 to do |
 | Activity listener built | `docs/reference/environment.md` rows `ACTIVITY_LISTEN_ADDR` and `ACTIVITY_BEARER_TOKENS`; `crates/adam-service/src/activity.rs` | built; the README row said "not merged" and was corrected in this change |
 | Hooks | the slice table of ADR 0050; `docs/reference/agent-files.md` `plugins:` | H1 to H9, H6a/b, P1 built; P2a (#517) built; H10, H11, P3 not |
-| Memory | the slice table of ADR 0081 | M1 and M2a built (#497, #521), M2b PostgreSQL built (*2026-11-28*, ANR-1292), M2c MongoDB built (*2026-11-28*, ANR-1293), M3 and M4 tools built (#528); M2d Redis (ANR-1294) and M5 to M11 not |
+| Memory | the slice table of ADR 0081 | M1 and M2a built (#497, #521), M2b PostgreSQL built (*2026-11-28*, ANR-1292), M2c MongoDB built (*2026-11-28*, ANR-1293), M2d Redis built (*2026-11-28*, ANR-1294), M3 and M4 tools built (#528); M5 to M11 not |
 | Spans | `git log --oneline` for ANR-1345 and ANR-1346 | #522 and #524 built; the rest of ADR 0075 not |
 | Deploy risks | `docs/guides/deploy-the-coder.md` "Known risks" | no backups; more than one worker never applied; `flock` on network volumes unverified |
 | Nightly live tests skip | `.github/workflows/nightly.yml` header | each job runs only when its secrets exist |

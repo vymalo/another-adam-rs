@@ -18,8 +18,8 @@
 
 use std::sync::OnceLock;
 
-use adam_memory::MemoryScope;
-use adam_memory_testkit::{DynMemory, LessonPlan};
+use adam_memory::{Audience, Memory, MemoryError, MemoryScope};
+use adam_memory_testkit::{DynMemory, LessonPlan, lesson_draft};
 use adam_store_mongodb::memory::MongoMemory;
 
 /// The collection every case of this process shares.
@@ -190,4 +190,48 @@ fn sixteen_writers_share_one_audience() {
         return;
     };
     adam_memory_testkit::lesson_cases::sixteen_writers_share_one_audience(m0, plan);
+}
+
+/// An adapter configured with an empty scope refuses `record`, `recall` and `retire` before it
+/// touches the database: every key carries the scope, and the port refuses an empty one.
+///
+/// No MongoDB is needed: the refusal comes first, so the address below is never reached.
+#[test]
+fn an_empty_configured_scope_is_refused_by_every_method() {
+    let client =
+        mongodb::sync::Client::with_uri_str("mongodb://127.0.0.1:1").expect("a parseable URI");
+    let memory = MongoMemory::new(
+        &client.database("adam_test"),
+        collection(),
+        LessonPlan::default().settings,
+        scope(""),
+    )
+    .expect("a collection");
+    let audience = Audience::new("empty-scope");
+    let refused = |error: MemoryError| {
+        assert!(
+            matches!(
+                error,
+                MemoryError::EmptyField {
+                    field: "memory scope"
+                }
+            ),
+            "{error}"
+        );
+    };
+    refused(
+        memory
+            .record(lesson_draft(&audience, "the lockfile is stale"))
+            .expect_err("record refuses an empty scope"),
+    );
+    refused(
+        memory
+            .recall(&audience)
+            .expect_err("recall refuses an empty scope"),
+    );
+    refused(
+        memory
+            .retire(&audience, "the lockfile is stale")
+            .expect_err("retire refuses an empty scope"),
+    );
 }
