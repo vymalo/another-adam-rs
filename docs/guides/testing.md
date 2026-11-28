@@ -36,11 +36,14 @@ and a nightly live-model smoke and a live test of `adam-acp` against OpenCode
 (`.github/workflows/nightly.yml`, needs secrets). The CI jobs are the reference:
 `.github/workflows/ci.yml` and `coder.yml`.
 
-Every commit pushed to `main` gets a `ci` run of its own: the concurrency group is the commit sha on a push and
-the branch on a pull request. GitHub cancels a *pending* run as soon as a newer one joins its group, even with
-`cancel-in-progress: false`, so a group shared by a busy `main` left merges without a verdict; a pull request
-still cancels its superseded heads. `coder.yml` keeps the same shape for the runs that must finish
-([ADR 0084](../decisions/0084-releases-are-cut-by-release-please-and-production-pins-a-version.md)).
+Each push to `main` that triggers `ci` gets a run with a concurrency group of its own (the pushed head sha), so a
+later push does not replace it; a pull request's runs share one group per PR (`refs/pull/N/merge`), where a new
+head cancels the run it supersedes. GitHub cancels a *pending* run as soon as a newer one joins its group, even
+with `cancel-in-progress: false`, which is why a group shared by a busy `main` left merges without a verdict
+([ADR 0084](../decisions/0084-releases-are-cut-by-release-please-and-production-pins-a-version.md)). The
+`coverage` job, which opens and closes one issue on `main`, runs one at a time for the same reason. `coder.yml`
+uses a per-sha group only for release commits and manual dispatches; its other pushes to `main` still share a
+group and skip to the newest.
 
 ## Tests that start a binary
 
