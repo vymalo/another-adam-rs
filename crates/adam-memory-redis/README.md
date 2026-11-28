@@ -11,7 +11,7 @@ lessons (decision 4).
 
 The rules that decide what a lesson may hold — the scope validation, the scrub, the redaction
 marker, the address check, the bounds — are `adam-memory`'s own, through
-`LessonSettings::prepare`, so this adapter and the in-process reference enforce the same rules and
+`prepare`, so this adapter and the in-process reference enforce the same rules and
 the same suite proves both. Every call validates the configured scope and the audience first,
 before a key is built or a connection opened: an empty one is refused, not read. A retired lesson
 is kept and no longer served (decision 10): nothing is deleted.

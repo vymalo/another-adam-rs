@@ -107,9 +107,8 @@ pub enum MemoryError {
         /// What is wrong with it.
         reason: String,
     },
-    /// The memory's storage failed: the folder could not be read or written, or a database
-    /// adapter's driver errored. An adapter chooses the class; a storage failure is transient at
-    /// run time (ADR 0081 decision 12).
+    /// The folder could not be read or written. An adapter chooses the class; a local file system
+    /// failure is transient at run time (ADR 0081 decision 12).
     #[error("memory storage failed")]
     Backend {
         /// The file system's own error.
@@ -119,11 +118,9 @@ pub enum MemoryError {
 }
 
 impl MemoryError {
-    /// A storage failure: what an adapter returns for a backend error of its own.
-    ///
-    /// An L2 database adapter wraps its driver's error in this ([`MemoryError::Backend`]), whose
-    /// class is `Transient`: an unreachable memory is a transient tool error and the run goes on
-    /// without it (ADR 0081 decision 12).
+    /// A storage failure.
+    /// A storage failure, for an adapter: the class is the backend's own, and a run treats it as
+    /// transient (ADR 0081 decision 12).
     pub fn backend(error: impl std::error::Error + Send + Sync + 'static) -> Self {
         Self::Backend {
             source: Box::new(error),

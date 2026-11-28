@@ -34,7 +34,7 @@ decisions 2 to 5 and 10; slices M1 and M2a (the L2 port and its kit; the L2 adap
 | `LessonDraft` | What a caller writes; the adapter scrubs it, checks it and stamps it. |
 | `LessonProvenance` | The L1 scopes (opaque labels) whose evidence made the lesson, and the review that approved it. |
 | `LessonState` | `Proposed`, `Active`, `Retired`. A closed set; a recall serves `Active` only. |
-| `LessonSettings`, `LessonLimits` | The injected scrub and the bounds an L2 adapter is built with. `LessonSettings::prepare` is the adapter-facing half of `record`: the scope validation, the scrub, the marker, the address check and the bounds, so a database adapter enforces the same rules as the reference. `sort_lessons_newest_first` is the order a recall serves, exported for an adapter too. |
+| `LessonSettings`, `LessonLimits` | The injected scrub and the bounds an L2 adapter is built with. `prepare` is the adapter-facing half of `record`: the scope validation, the scrub, the marker, the address check and the bounds, so a database adapter enforces the same rules as the reference. `sort_lessons_newest_first` is the order a recall serves, exported for an adapter too. |
 | `InProcessMemory` | The in-process L2 reference the suite and a test use. |
 | `InProcessLessonStore` | The storage several `InProcessMemory` adapters share, so a test can put two scopes on one store. |
 | `MemoryError::backend` | What an adapter wraps its storage failures in: class `Transient` (ADR 0081 decision 12). |

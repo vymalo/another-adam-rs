@@ -48,7 +48,7 @@ flowchart LR
 | Service | Host address | What it is |
 |---|---|---|
 | `postgres` | `127.0.0.1:5432` | PostgreSQL 18.7 (the store's floor, pinned by tag and digest), database `adam_test`, user and password `postgres`; its volume is `postgres-18-data` (a PostgreSQL 16 volume of an earlier stack is not upgraded: remove it when done) |
-| `mongodb` | `127.0.0.1:27017` | MongoDB 7, standalone; used by the store tests only |
+| `mongodb` | `127.0.0.1:27017` | MongoDB 7, standalone; used by the store tests and the L2 memory suite (`adam-store-mongodb`, feature `memory`) |
 | `redis` | `127.0.0.1:6379` | Redis 8.2 (pinned by tag and digest), AOF on (`appendfsync everysec`), `maxmemory-policy noeviction`: the durability a lesson store needs and a deployment's choice to make ([`adam-memory-redis`](../../crates/adam-memory-redis/README.md)); used by the L2 memory suite only |
 | `mock-openai` | `http://127.0.0.1:8081/v1` | WireMock: OpenAI-compatible chat completions (also without `/v1`) and `/v1/models`; the models `mock-coder`, `mock-assistant`, `mock-researcher` and `mock-painter` are scripted ([below](#scripted-models)) |
 | `mock-github` | `http://127.0.0.1:8082` | WireMock: the GitHub REST subset `adam-workspace` uses (list and open pull requests, create a repository, the owner's kind, the login) and the GitHub App token trade (`POST /app/installations/{id}/access_tokens`, a token that lasts four minutes) |

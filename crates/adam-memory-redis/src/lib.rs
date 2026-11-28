@@ -20,7 +20,7 @@
 //! adapters with two scopes over one Redis never share a hash, and the audience is the rest of
 //! the key. The rules that decide what a lesson may hold — the scope validation, the scrub, the
 //! marker, the address check, the bounds — are [`adam_memory`]'s own, through
-//! [`adam_memory::LessonSettings::prepare`], so this adapter and the in-process reference enforce
+//! [`adam_memory::prepare`], so this adapter and the in-process reference enforce
 //! the same rules.
 //!
 //! # Concurrency and connections
@@ -51,7 +51,7 @@ use std::collections::HashMap;
 use adam_core::Timestamp;
 use adam_memory::{
     Audience, Lesson, LessonDraft, LessonSettings, LessonState, Memory, MemoryError, MemoryResult,
-    MemoryScope, sort_lessons_newest_first,
+    MemoryScope, prepare, sort_lessons_newest_first,
 };
 use redis::{Client, Connection, RedisError};
 
@@ -142,9 +142,7 @@ impl RedisMemory {
 
 impl Memory for RedisMemory {
     fn record(&self, draft: LessonDraft) -> MemoryResult<Lesson> {
-        let prepared = self
-            .settings
-            .prepare(&self.scope, draft, Timestamp::now())?;
+        let prepared = prepare(&self.scope, draft, &self.settings, Timestamp::now())?;
         let key = self.key(&prepared.audience);
         let mut conn = self.connection(&key)?;
         let mut attempts = 0;

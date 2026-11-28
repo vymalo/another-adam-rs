@@ -319,13 +319,20 @@ called. A session with no budget spends and is never refused.
 a `*` pattern; `github__*` selects an MCP server). The session is offered only the tools `tools` matches, less the ones `deny_tools`
 matches (the deny-list is applied after the allow-list); `read_output` always stays. A hidden tool is not in the model's request,
 and a call to it anyway is refused without running; this holds even when an oversized message context was dropped, because the session's header, not the
-context, is the truth. At most 32 entries, each at most 200 characters, none blank. **Which names are
+context, is the truth. A lazy MCP server's tools are loaded by a tool of its own, `load__group__<server>` (ADR 0066), so a
+session that names any tool of that server keeps that loader — `tools: ["github__*"]` can load the `github` group — and a
+session that names none of its tools keeps no loader, because a loader that can load nothing is not handed out. The rule is exact for a `when` MCP server's group, whose members are `<server>__<tool>`; a group whose members do not share its name is not covered (none ships today). The loader is a
+means to the tools the list names, never an extra tool the session may use: once the group is loaded its tools are held to the
+same lists, so nothing widens. At most 32 entries, each at most 200 characters, none blank. **Which names are
 checked at the start depends on what the starter knows.** The tool names of a subagent are known where the agent is bound (a
-worker), not on a control plane that only answers A2A; and a worker knows the whole set only when no source adds tools to the
-agent while it runs. **Neither shipped agent has the whole set** (both add tools through sources), so in practice: a concrete
-`deny_tools` name that is none of the subagent's tools is refused with the list (it is almost always a typo; to deny a tool a
-source adds, use a pattern, `name*`), and a `tools` entry or a pattern that selects nothing is admitted and just offers less.
-A remote subagent takes neither. They apply from the next model call; a later round carries them on.
+worker), not on a control plane that only answers A2A; and a worker knows the whole set only when every source declares what
+it can offer. A declaration may name a **shape** (`*__*` for a relayed `<server>__<tool>`): an entry is admitted when it
+selects a concrete declared name with its pattern or a declared shape matches it as a string, so `github__*` and
+`github__search` are admitted on a complete set. **Both shipped agents have the whole set** (they add the thread-tools
+source, which declares the contract's tools and that shape), so there: a `tools` entry or a pattern that selects nothing is
+refused with the list, and a concrete `deny_tools` name that is none of the subagent's tools too. A source that cannot name
+its tools leaves the set incomplete, and there a `tools` entry or a pattern that selects nothing is admitted and just offers
+less. A remote subagent takes neither. They apply from the next model call; a later round carries them on. A pattern weaker than the declared shape (`*_issues`, `github_*`) is refused even though it would select relayed tools: name the family as `github__*`. An entry whose shape half is empty (`github__`, `__`) is refused too, because `*` matches the empty run and it selects nothing at run time.
 
 `report_schema` is a JSON Schema (draft 2020-12, at most 16 KiB, no reference outside itself) that the subagent's final answer
 must match, for a helper that runs here (a remote one refuses it). The subagent is not shown the schema unless its first answer

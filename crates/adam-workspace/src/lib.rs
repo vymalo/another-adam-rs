@@ -96,9 +96,10 @@ pub use confine::{
 pub use credentials::{DynGitCredentials, GitCredentials, HostScoped, ScopedToken, StaticToken};
 pub use disk::{DiskBudget, DiskSpace, FreeSpace, HostDisk, Sweep};
 pub use environment::{
-    BACKGROUND_PREFIX, DynEnvironment, EnvDescription, EnvError, EnvKind, EnvProgress, EnvSession,
-    EnvStep, EnvStepState, Environment, ExecId, ExecSpec, HidingEnvironment, Local, LocalSession,
-    NoProgress, PreparedCommand, Program, SandboxShape, exec_id_for, login_shell,
+    BACKGROUND_PREFIX, DENIED_ENV, DynEnvironment, EnvDescription, EnvError, EnvKind, EnvProgress,
+    EnvSession, EnvStep, EnvStepState, Environment, ExecHook, ExecHookError, ExecId, ExecSpec,
+    HidingEnvironment, HidingHook, HookedEnvironment, Local, LocalSession, NoProgress,
+    PreparedCommand, Program, SandboxShape, exec_id_for, login_shell,
 };
 pub use error::{WorkspaceError, WorkspaceResult};
 pub use git::{

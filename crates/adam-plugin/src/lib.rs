@@ -19,6 +19,13 @@
 //! `tool:<call id>` for `before_tool` (after a source's `withhold` and before the tool) and
 //! `after_tool` (once the tool answered). The verdict is recorded in that step, so a replay that
 //! finds it recorded asks no hook again. A hook gets no `Ctx` and cannot add a step.
+//!
+//! **The command environment is not a plugin point.** A command's environment has its own seam,
+//! `adam_workspace::ExecHook`, composed by `adam_workspace::HookedEnvironment` (ADR 0050,
+//! decision 13, slice H10): it sees an `ExecSpec` and no `Ctx`, store or secret, and
+//! `HidingEnvironment` is one such hook. It is not a method of [`Plugin`] because this crate
+//! depends on neither the loop, the runtime nor the workspace: an `exec.prepare` point would make
+//! every plugin implementer depend on `adam-workspace`. `exec` stays a reserved event namespace.
 
 #![warn(missing_docs)]
 

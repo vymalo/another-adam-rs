@@ -103,13 +103,43 @@ amendment is the owner's to make there.
    that node (`BoundDef::sources_of`: the modes', the node's `when` groups, the deployment's) and sets `tools_complete`
    only when all of them answered `All`. The modes, the groups, the access tier, the references and the screen declare `All`
    (most of them of nothing: they only hold tools back or add words), and the coder's repository-environment source declares
-   its one tool. **The thread-tools source declares `Unknown`**: the endpoint is another system's, it lists per conversation
+   its one tool. **The thread-tools source declares `Unknown`** (superseded by the ANR-1390 amendment below): the endpoint is another system's, it lists per conversation
    (the grant in the run's context; a new grant, a refused call or `LISTING_TTL` lists again) and it relays the tools of the
    servers a person attached as `<server>__<tool>`, so no list made at startup is every name it can offer. The interim is
    therefore **over as a rule** — an agent whose sources all declare has a complete set and decision 4's rule holds as
    written — but the two shipped agents add that one source, so their sets stay incomplete and a `tools` entry, or an entry
    with a `*`, that matches none is still admitted there; a concrete `deny_tools` name is still refused, as the row above
    says. A deployment that does not give an agent the thread-tools source has the strict check on it.
+   *(Amended 2026-11-28 by ANR-1390: the thread-tools source declares its contract's tools and the shape `*__*`, so both
+   shipped agents are complete; see the note below.)*
+
+   *Amended 2026-11-28 (ANR-1304), the `tools` and `deny_tools` rows:* a lazy MCP server's tools are loaded by a tool of its
+   own, `load__group__<server>` (ADR 0066), which an allow-list such as `github__*` does not name: the loader was withheld
+   with the tools it loads, so a session narrowed to a lazy server's tools could never load that server's group. The
+   narrowing now keeps `load__group__<server>` when **every** allow-list names the loader or one of the server's tools
+   (`<server>__<tool>`), and keeps none when they name none of them, because a loader that can load nothing is not handed
+   out. `deny_tools` is still checked first, and once the group is loaded its members go through the same lists, so nothing
+   widens: the loader is a means to the tools the list names, not an extra tool the session may use. The decision reads the
+   header's config, the context's copy of the same lists and the agent's fixed tool set (`LlmAgent::own_names`) — all fixed
+   for the round — so the tools array does not move between the turns of one round (ADR 0044). It is exact for a `when` MCP
+   server's group, whose members are `<server>__<tool>`; a group whose members do not share its name prefix is not covered.
+
+   *Amended 2026-11-28 (ANR-1390), the same rows — a declaration may name a shape:* the owner's answer to ANR-Q155
+   (2026-11-28) is that a source may declare a **shape**, not only concrete names. A declared name may contain `*`, in the
+   folder's syntax (`glob`: `*` stands for any run of characters), and `Declared::All` is then still the whole set: the shapes
+   say what **can** arrive, not what one turn offers. The thread-tools source declares the contract's tools it knows by name
+   (`turn_output`, `ask_agent`, `request_upload`, and `get_ui_catalog` unless it hides it) **plus `*__*`**, the shape of the
+   `<server>__<tool>` tools it relays from the servers a person attached. `SessionBounds::admit` admits an entry when it
+   selects a name the set holds: a concrete declared name its pattern matches (`glob(entry, name)`), or a declared shape that
+   matches the entry as a string (`glob(shape, entry)`), so `*__*` admits `github__*`, `github__search` and `*` (the last
+   through the concrete names beside it). `deny_tools` is held to the same rule and none weaker: an entry that selects
+   neither a declared name nor a declared shape is still refused with the list, because a deny that silently denies nothing
+   is worse than a refusal — the person would believe a tool is blocked while it is offered. Two consequences a person will
+   meet: an entry whose shape half is empty (`github__`, `__`) is refused, because `*` matches the empty run and such a name
+   selects nothing at run time; and a pattern **weaker than the declared shape** (`*_issues`, `github_*`) is refused even
+   though it would select relayed tools, because the set cannot express that family — name it as `github__*` instead. **Both shipped agents are
+   therefore complete** and decision 4's rule holds as written: a `tools` entry that selects nothing is refused there. The
+   interim the 2026-11-27 note described is over.
 
    *Amended 2026-11-21 (ADR 0063)*: for `reasoning_effort` only, the declaration is the **model entry** in
    `MODEL_ALIASES_FILE` (the alias's `reasoning` object: its levels and its wire), not a global variable. A folder or
@@ -364,7 +394,8 @@ where a store is involved (`crates/adam-llm-agent/tests/sessions.rs` holds the s
     **concrete `deny_tools` name** on a worker (refused with the list, and a hint to name a source's tools by pattern), and a
     `tools` entry or a pattern is strict **only on an agent with no sources**; elsewhere a `tools` entry that matches nothing is
     admitted, recorded in the header and offers less, never more. The control plane knows no name and checks the shape. ANR-1319
-    ends the interim; this is a step, not the decision.
+    ends the interim; this is a step, not the decision. *(2026-11-28: ANR-1319 and ANR-1390 end it — both shipped agents are
+    complete, the thread-tools source declaring its contract's tools and the shape `*__*`; see the amendments above.)*
   * **The loop applies it**, not a tool source, so an embedder that builds an agent with `LlmAgentBuilder` has it too:
     `SessionNarrowing` (`crates/adam-llm-agent/src/session_tools.rs`) is consulted in `agent.rs` before every source's holds, at the
     request (`apply_sources`: a hidden tool is not shown) and at the call (`step_work`: a call to one is refused without running),

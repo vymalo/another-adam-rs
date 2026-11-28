@@ -592,3 +592,16 @@ refused, a missed deadline, three deadlines killing the program, the restart aft
 once, an observer that decides refused, and a configuration that may not override a safe variable; and
 `crates/adam-hook-exec/tests/replay.rs` — a replay asks the recorded step once and the unrecorded one twice, the
 program's own log being the evidence, and a run fails when its program never answers.
+
+*Amended 2026-11-28 (slice **H10** built):* the command environment is a list of hooks. `ExecHook::prepare(&mut ExecSpec)`
+and `ExecHookError` live in `adam-workspace`, beside `ExecSpec` — not in `adam-plugin`, which would then depend on git,
+reqwest and rustix and make every plugin implementer carry them — `HookedEnvironment` composes them around an inner
+`Environment`, and `HidingEnvironment` is one such hook. Readings to confirm: a hook that adds a hidden name has the
+addition **dropped, not refused** (the command still runs, without the variable, because the card's proof needs it), and
+the caller's hidden names are **snapshotted before the hooks run**, so a hook may add a hidden name but never lift one — a
+hook that clears `hide` changes nothing. `DENIED_ENV` refuses `PATH`, `LD_*`, `BASH_ENV`, `ENV`, `IFS` and also `HOME`,
+`LANG` and `TMPDIR`: the same list `adam-hook-exec` enforces for a program, and the two must stay equal. Proof:
+`crates/adam-workspace/src/environment.rs` — a hook that adds a hidden name after the hiding hook leaves it hidden (both
+orders), a hook that clears `hide` cannot unhide a caller's name, every refused name fails with `EnvError::Hook` and class
+`Invalid`, a caller's value may be rewritten, a failing hook keeps its class and name, a seam with no hooks prepares what
+`LocalSession` does, and the coder's hiding tests pass unchanged.
