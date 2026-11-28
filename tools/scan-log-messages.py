@@ -25,6 +25,11 @@ CALL = re.compile(r"(?:tracing::)?(?:" + "|".join(LEVELS) + r")!\(")
 def messages(path: Path) -> list[tuple[int, str]]:
     """Every message of a macro call in `path` that contains a `{` (an interpolation)."""
     text = path.read_text(encoding="utf-8", errors="replace")
+    # Production code precedes the tests in every file of this repository, and a fixture renders a
+    # message on purpose; the rule is about what the process logs.
+    cut = text.find("#[cfg(test)]")
+    if cut != -1:
+        text = text[:cut]
     found: list[tuple[int, str]] = []
     for match in CALL.finditer(text):
         i = match.end()

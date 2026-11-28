@@ -196,7 +196,8 @@ pub(crate) async fn decide(
         tracing::warn!(
             tool_call = %request.tool_call_id,
             title = request.title.as_deref().unwrap_or(""),
-            "permission rejected: {why}"
+            reason = %why,
+            "permission rejected"
         );
         request
             .option_of_kind(PermissionKind::RejectOnce)

@@ -204,9 +204,9 @@ async fn build_agent(
             .context("probing for the OS limits of commands")?;
         tracing::info!(
             enforcement = %confine.describe(),
-            "OS limits on commands (memory {} per command, cpu {} millicores)",
-            adam_workspace::human_bytes(budget.command_memory),
-            budget.command_cpu
+            memory = %adam_workspace::human_bytes(budget.command_memory),
+            cpu_millicores = budget.command_cpu,
+            "OS limits on commands"
         );
         settings.governor = Some(adam_code_tools::governor::Governor::from_budget(
             admission, confine, &budget,
