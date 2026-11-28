@@ -138,6 +138,19 @@ mod tests {
         assert_eq!(coded(refused), 78);
     }
 
+    /// The deployment's hook programs (ADR 0050 slice P2b): a program that cannot start is a
+    /// mistake in the deployment's file, 78. Remove the `adam_hook_exec::Error` downcast from
+    /// `class_of` and this test fails: the walk reaches the error, knows no class for it, and
+    /// returns 1.
+    #[test]
+    fn a_hook_program_that_cannot_start_is_78() {
+        let e = adam_hook_exec::Error::Spawn {
+            program: "no-push".into(),
+            message: "No such file or directory".into(),
+        };
+        assert_eq!(coded(e), 78);
+    }
+
     /// A mistake in the agent files, or the files and the code disagreeing, is the deployment's:
     /// 78, so a supervisor does not restart it. An assembly error keeps its own class otherwise.
     #[test]

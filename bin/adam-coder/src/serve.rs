@@ -79,10 +79,10 @@ async fn build_agent(
     let hooks = {
         let redactor = redactor.clone();
         hooks
-            .hook_set_for(AGENT_NAME, move |text: &str| redactor.scrub(text).into_owned())
-            .context(
-                "starting the hook programs ADAM_HOOKS_FILE names (HOOKS_ALLOW_PROGRAMS must be true)",
-            )?
+            .hook_set_for(AGENT_NAME, move |text: &str| {
+                redactor.scrub(text).into_owned()
+            })
+            .context("starting a hook program of ADAM_HOOKS_FILE")?
     };
     let model: DynModel = worker.model.client().context("building the model client")?;
     if worker.commands_can_read_the_app_key() {

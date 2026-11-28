@@ -626,9 +626,13 @@ program (`AgentError::Hooks` in `adam-agent`; `adam_hook_exec::Error` in the cod
 declared a program and cannot run it does not serve. A control plane starts none, and a deployment with no
 `ADAM_HOOKS_FILE` runs exactly as before the slice. Readings to confirm: the filter is the **root** agent's name,
 because a set belongs to the whole assembly — a program whose `agents` names only a subagent declares nothing for
-this process rather than widening to the root — and the file's contents are still parsed by `ServiceConfig`, so a
-file without `HOOKS_ALLOW_PROGRAMS=true` was already exit 78. Proof: `crates/adam-service/src/hooks.rs` — a program
-filtered to another agent starts nothing and an absent one names itself with class `Invalid`; and
+this process rather than widening to the root, and a warning names it at start — and the file's contents are still
+parsed by `ServiceConfig`, so a file without `HOOKS_ALLOW_PROGRAMS=true` was already exit 78. **The set's limits**
+are one retry and the greatest deadline among the programs it started (at least `HookLimits::default`'s): the
+adapter enforces each program's own deadline, and a stock `HookSet::new()` (1 s) would refuse a compliant 2 s
+answer, which is the mistake this slice's review found and `with_limits` fixes. Proof: `crates/adam-service/src/hooks.rs` — a program
+filtered to another agent starts nothing and an absent one names itself with class `Invalid`, and a program that
+answers the hello under a 2 s deadline gives a set whose limit is at least 2 s (the default would not); and
 `dev/hooks-e2e.sh` on the dev stack — a program (`dev/hooks/no-git-push.sh`, `adam-hooks/1`) denies
 `commit_and_push` at `tool.before`, the call's step ends `failed` with the reason, git-server's heads do not move and
 the mock code host sees no pull request. The chart's `hooks.file` and its volume (P3) are separate and not built.

@@ -132,6 +132,10 @@ else
 fi
 
 # --- nothing was pushed or opened -------------------------------------------------
+# The scripted model's next call after the denied push is `open_pull_request`, and it is refused
+# before any request leaves the coder: `publish::open_in` returns as soon as `notes.pushed_sha` is
+# not HEAD (nothing was pushed). So "no POST /pulls" holds whatever the mock's script says next,
+# and it would only change if that early return went away.
 found=$tmp/pulls.json
 curl -s --max-time 30 -X POST "$github/__admin/requests/find" \
   -H 'Content-Type: application/json' \

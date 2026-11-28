@@ -90,9 +90,10 @@ pub async fn serve(
     let parts = match (&config.worker, &config.service.worker) {
         (Some(worker), Some(settings)) => Some(WorkerParts {
             // The deployment's hook programs that apply to the agent this process serves (ADR
-            // 0050, slice P2b), started now: one that cannot start stops the process (exit 78),
-            // as an unreadable key file does. The assembly gives the set to the root and its
-            // subagents.
+            // 0050, slice P2b), started with the workers' parts: one that cannot start stops the
+            // process (exit 78), as an unreadable key file does, and it happens before the model
+            // client is built or any MCP server connects (the memory's folder is opened earlier,
+            // by `for_workers`). The assembly gives the set to the root and its subagents.
             hooks: hooks_of(&config, folder.def.name())?,
             model: worker.model.client().map_err(AgentError::Model)?,
             alias: &worker.model.alias,
