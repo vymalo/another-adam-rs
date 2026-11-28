@@ -29,6 +29,15 @@ pub const RUNS: &str = "adam.runs";
 /// tool or source resolves is not measured, so a model cannot invent a series.
 pub const TOOL_DURATION: &str = "adam.tool.duration";
 
+/// The counter of a model call's tokens, by direction and model (ANR-1462).
+///
+/// Recorded by `adam-llm-agent` where a model call's answer is read: `direction` is `input` or
+/// `output`, and `model` is the alias the call was made to — one the deployment configured.
+pub const LLM_TOKENS: &str = "adam.llm.tokens";
+
+/// The histogram of one model call's latency in seconds, labelled by the model alias (ANR-1462).
+pub const LLM_DURATION: &str = "adam.llm.duration";
+
 /// The kind of an instrument, the three [ADR 0075] uses.
 ///
 /// [ADR 0075]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0075-metrics-and-traces-are-off-by-default-and-say-nothing-about-a-person.md
@@ -90,6 +99,20 @@ pub const EMITTED: &[Instrument] = &[
         kind: Kind::Histogram,
         unit: "s",
         labels: &["tool"],
+        emitted_by: "adam-llm-agent",
+    },
+    Instrument {
+        name: LLM_TOKENS,
+        kind: Kind::Counter,
+        unit: "",
+        labels: &["direction", "model"],
+        emitted_by: "adam-llm-agent",
+    },
+    Instrument {
+        name: LLM_DURATION,
+        kind: Kind::Histogram,
+        unit: "s",
+        labels: &["model"],
         emitted_by: "adam-llm-agent",
     },
 ];

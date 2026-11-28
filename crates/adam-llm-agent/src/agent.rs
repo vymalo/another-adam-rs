@@ -3455,6 +3455,9 @@ impl LlmAgent {
                     // The request races the run's cancellation: a cancel drops it, and with it the
                     // connection, instead of letting the provider finish an answer nobody will read.
                     let span = model_span(&request.model, false);
+                    // ANR-1462: the call's tokens and latency, under the alias it was made to.
+                    let alias = request.model.clone();
+                    let started = std::time::Instant::now();
                     let answer = tokio::select! {
                         biased;
                         () = cancel.cancelled() => return Err(ModelFailure::cancelled()),
@@ -3462,6 +3465,13 @@ impl LlmAgent {
                     };
                     span.record("input_tokens", answer.usage.input_tokens);
                     span.record("output_tokens", answer.usage.output_tokens);
+                    crate::metrics::record_model_call(
+                        &opentelemetry::global::meter(crate::metrics::SCOPE),
+                        &alias,
+                        answer.usage.input_tokens,
+                        answer.usage.output_tokens,
+                        started.elapsed(),
+                    );
                     return Ok(Recorded {
                         response: unthought(&emitter, run, turn, false, answer).await,
                         stream: None,
@@ -4211,6 +4221,8 @@ impl LlmAgent {
                     }
                 }
                 let span = model_span(&request.model, true);
+                let alias = request.model.clone();
+                let started = std::time::Instant::now();
                 let answer = tokio::select! {
                     biased;
                     () = cancel.cancelled() => return Err(ModelFailure::cancelled()),
@@ -4218,6 +4230,13 @@ impl LlmAgent {
                 };
                 span.record("input_tokens", answer.usage.input_tokens);
                 span.record("output_tokens", answer.usage.output_tokens);
+                crate::metrics::record_model_call(
+                    &opentelemetry::global::meter(crate::metrics::SCOPE),
+                    &alias,
+                    answer.usage.input_tokens,
+                    answer.usage.output_tokens,
+                    started.elapsed(),
+                );
                 let text = answer.message.text();
                 Ok(Summarised {
                     summary: (!text.trim().is_empty()).then_some(text),

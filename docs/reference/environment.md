@@ -161,7 +161,9 @@ field outside that list — a prompt, an argument, a token — never reaches it.
 the format string the code wrote, so a call site that formats a value into it exports that value, exactly as
 the JSON log on stdout already does.
 
-Metrics ride the same variable and the same switch (`adam.runs`, a counter of committed transitions labelled by the run's state; `adam.tool.duration`, a histogram of a tool call's latency labelled by the tool's registered name): with an endpoint set, the process's meter exports to
+Metrics ride the same variable and the same switch (`adam.runs`, a counter of committed transitions labelled by the run's state; `adam.tool.duration`, a histogram of a tool call's latency labelled by the tool's registered name; `adam.llm.tokens`
+and `adam.llm.duration`, a model call's tokens by direction and its latency, labelled by the alias the call was
+made to): with an endpoint set, the process's meter exports to
 `{endpoint}/v1/metrics` on a periodic reader (15 s); unset, nothing is built. A label is one of the crate's closed
 sets (`adam_otel::labels`), so a metric names a run's state or a declared tool, never a person, an id or an amount.
 

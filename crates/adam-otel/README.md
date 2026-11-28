@@ -127,9 +127,10 @@ crate that emits a measurement uses `opentelemetry::global::meter(..)` and needs
 layers; where nothing was started that meter is the no-op one. Ask for it per measurement rather than caching it: the global is read at the call, so a meter cached before `init` would stay the no-op one.
 
 **The instruments so far:** `adam.runs` (a counter of committed transitions, labelled by the run's state —
-`adam-runtime`) and `adam.tool.duration` (a histogram of a tool call's latency, labelled by the tool's
-name, recorded only when a tool answered — `adam-llm-agent`). Both are in `catalogue::EMITTED`, the list a
-dashboard is held to.
+`adam-runtime`); `adam.tool.duration` (a histogram of a tool call's latency, labelled by the tool's name,
+recorded only when a tool answered — `adam-llm-agent`); `adam.llm.tokens` (a counter of a model call's
+tokens, by `direction` and the alias it was made to) and `adam.llm.duration` (that call's latency, by alias —
+both `adam-llm-agent`). All four are in `catalogue::EMITTED`, the list a dashboard is held to.
 
 **Labels are types.** [`labels`] holds the closed sets the instruments use: `RunState` (the four states of
 `adam_core::store::RunStatus`, held to them by a test) and a `Name` for the names a deployment declares (a tool, a

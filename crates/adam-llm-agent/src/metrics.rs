@@ -39,6 +39,50 @@ pub fn record_tool_duration(meter: &Meter, tool: &str, elapsed: Duration) {
         );
 }
 
+/// The counter of a model call's tokens, by direction and model.
+pub const LLM_TOKENS: &str = adam_otel::catalogue::LLM_TOKENS;
+
+/// The histogram of one model call's latency, by model.
+pub const LLM_DURATION: &str = adam_otel::catalogue::LLM_DURATION;
+
+/// Records one model call: its tokens by direction, and its latency, under the alias it was made to.
+///
+/// The alias is the one the agent was configured with (the deployment's `MODEL_ALIASES_FILE`, or its
+/// `MODEL`), so the label set is closed by construction; a name the alphabet refuses is not measured
+/// at all, and neither are its tokens — a series the deployment did not declare is never invented.
+pub fn record_model_call(
+    meter: &Meter,
+    alias: &str,
+    input_tokens: u64,
+    output_tokens: u64,
+    elapsed: Duration,
+) {
+    let Ok(model) = Name::new(alias) else {
+        return;
+    };
+    let tokens = meter.u64_counter(LLM_TOKENS).build();
+    for (direction, count) in [
+        (adam_otel::labels::Direction::Input, input_tokens),
+        (adam_otel::labels::Direction::Output, output_tokens),
+    ] {
+        tokens.add(
+            count,
+            &[
+                KeyValue::new("direction", direction.as_str()),
+                KeyValue::new("model", model.as_str().to_owned()),
+            ],
+        );
+    }
+    meter
+        .f64_histogram(LLM_DURATION)
+        .with_unit("s")
+        .build()
+        .record(
+            elapsed.as_secs_f64(),
+            &[KeyValue::new("model", model.as_str().to_owned())],
+        );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -47,6 +91,96 @@ mod tests {
     use opentelemetry_sdk::metrics::periodic_reader_with_async_runtime::PeriodicReader;
     use opentelemetry_sdk::metrics::{SdkMeterProvider, data};
     use opentelemetry_sdk::runtime;
+
+    /// A model call is measured as two token counters (input, output) and one latency, each labelled
+    /// by the alias and nothing else — and an alias the alphabet refuses is not measured at all.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_model_call_is_measured_by_direction_and_alias_and_nothing_else() {
+        let exporter = InMemoryMetricExporter::default();
+        let reader = PeriodicReader::builder(exporter.clone(), runtime::Tokio).build();
+        let provider = SdkMeterProvider::builder().with_reader(reader).build();
+        let meter = provider.meter(SCOPE);
+
+        record_model_call(
+            &meter,
+            "claude-sonnet-5",
+            120,
+            40,
+            Duration::from_millis(900),
+        );
+        record_model_call(&meter, "not an alias", 10, 10, Duration::from_millis(1));
+        provider.force_flush().expect("flush");
+
+        let batches = exporter.get_finished_metrics().expect("metrics");
+        let resource = batches.first().expect("one resource");
+        let scope = resource.scope_metrics().next().expect("one scope");
+        let mut names: Vec<&str> = scope.metrics().map(|m| m.name()).collect();
+        names.sort_unstable();
+        assert_eq!(
+            names,
+            vec![LLM_DURATION, LLM_TOKENS],
+            "the two instruments, once each"
+        );
+
+        for metric in scope.metrics() {
+            match metric.data() {
+                data::AggregatedMetrics::U64(data::MetricData::Sum(sum)) => {
+                    let points: Vec<_> = sum.data_points().collect();
+                    assert_eq!(points.len(), 2, "one point per direction: {points:?}");
+                    // The attributes are sorted by key, not in the order they were written, so
+                    // each point is compared as a map: `direction` and `model`, nothing else.
+                    let mut seen: Vec<(Vec<(String, String)>, u64)> = points
+                        .iter()
+                        .map(|point| {
+                            let mut attributes: Vec<(String, String)> = point
+                                .attributes()
+                                .map(|kv| (kv.key.to_string(), kv.value.as_str().into_owned()))
+                                .collect();
+                            attributes.sort();
+                            (attributes, point.value())
+                        })
+                        .collect();
+                    seen.sort();
+                    assert_eq!(
+                        seen,
+                        vec![
+                            (
+                                vec![
+                                    ("direction".to_owned(), "input".to_owned()),
+                                    ("model".to_owned(), "claude-sonnet-5".to_owned()),
+                                ],
+                                120
+                            ),
+                            (
+                                vec![
+                                    ("direction".to_owned(), "output".to_owned()),
+                                    ("model".to_owned(), "claude-sonnet-5".to_owned()),
+                                ],
+                                40
+                            ),
+                        ]
+                    );
+                }
+                data::AggregatedMetrics::F64(data::MetricData::Histogram(histogram)) => {
+                    let points: Vec<_> = histogram.data_points().collect();
+                    assert_eq!(
+                        points.len(),
+                        1,
+                        "the refused alias was measured: {points:?}"
+                    );
+                    let attributes: Vec<(String, String)> = points[0]
+                        .attributes()
+                        .map(|kv| (kv.key.to_string(), kv.value.as_str().into_owned()))
+                        .collect();
+                    assert_eq!(
+                        attributes,
+                        vec![("model".to_owned(), "claude-sonnet-5".to_owned())]
+                    );
+                }
+                other => panic!("unexpected instrument data: {other:?}"),
+            }
+        }
+    }
 
     /// A call is measured under its tool's name and nothing else, and a name the alphabet refuses is
     /// not measured at all.

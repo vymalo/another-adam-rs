@@ -139,6 +139,11 @@ half:
   code wrote, so a call site that formats a value into it exports that value, as the JSON log on stdout already
   does; eight call sites do that today and moving them into fields is its own card. The coder's redactor holds
   per-run secrets this layer cannot see, which is why the allowlist, and not a scrub, is what makes the record safe.
+- **`adam.model.alias_class` is the deployment's alias** (ANR-1462). Decision 3 names that attribute; nothing in the
+  tree defines a coarser class, so `adam.llm.tokens` and `adam.llm.duration` label by the **alias the call was made
+  to**, which the deployment declares (`MODEL_ALIASES_FILE` or `MODEL`) and the agent therefore cannot invent. A
+  coarser class can replace it later without changing the rule: the label stays a value from a set the deployment
+  chose.
 - **A label is a type, not a string.** `adam_otel::labels` holds the closed sets — `RunState`, held to
   `adam_core::store::RunStatus` by a test, and a shape-checked `Name` for the names a deployment declares. The shape
   check is **not** a secret filter (a token can have a name's shape: `ghp_0123…` is lower-case, digits and `_`), so
