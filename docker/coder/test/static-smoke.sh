@@ -1,10 +1,10 @@
 #!/bin/sh
-# The six binaries of the coder image are static and start in a foreign image.
+# The seven binaries of the coder image are static and start in a foreign image.
 #
 #   static-smoke.sh <image>
 #
 # ADR 0053 decision 11: `adam-coder`, `adam-agent`, `adam-kube-exec`,
-# `adam-egress`, `adam-git-sandbox` and `adam-git` are built for
+# `adam-egress`, `run-signer`, `adam-git-sandbox` and `adam-git` are built for
 # x86_64-unknown-linux-musl and statically linked, so they start in any x86-64
 # Linux image whatever its C library (ADR 0052 decision 10: the bench starts
 # the coder from each task image). This script takes the binaries from the image
@@ -36,7 +36,7 @@ trap cleanup EXIT INT TERM
 
 # The binaries as the image ships them, not as a rebuild would make them.
 container=$(docker create "$image")
-for binary in adam-coder adam-agent adam-kube-exec adam-egress adam-git-sandbox adam-git; do
+for binary in adam-coder adam-agent adam-kube-exec adam-egress run-signer adam-git-sandbox adam-git; do
   docker cp "$container:/usr/local/bin/$binary" "$work/$binary" >/dev/null
   chmod 0755 "$work/$binary"
 done
@@ -52,7 +52,7 @@ exit_code() {
 }
 message() {
   case $1 in
-    adam-coder|adam-egress|adam-git-sandbox) echo "invalid configuration" ;;
+    adam-coder|adam-egress|run-signer|adam-git-sandbox) echo "invalid configuration" ;;
     adam-agent) echo "ADAM_AGENT_DIR is required" ;;
     adam-git) echo "GIT_SANDBOX_SOCKET" ;;
     adam-kube-exec) echo "expected run or shell" ;;
@@ -71,7 +71,7 @@ case $user in
   *) bad "the image's default user is '${user:-root}', expected 10001" ;;
 esac
 
-for binary in adam-coder adam-agent adam-kube-exec adam-egress adam-git-sandbox adam-git; do
+for binary in adam-coder adam-agent adam-kube-exec adam-egress run-signer adam-git-sandbox adam-git; do
   out=$(file -b "$work/$binary")
   case $out in
     *"statically linked"*|*"static-pie linked"*) ok "$binary: $out" ;;
@@ -91,7 +91,7 @@ for base in \
   "debian:bookworm-slim@sha256:c67e92c8099ba22853ab4cfda7cfb494d253d6012ca82dee98ba8976772af018" \
   "alpine:3.22@sha256:9db2934886712d877c932e07249c75a59e6ca27adfbccc05261987a17bef2d63"; do
   docker pull -q "$base" >/dev/null
-  for binary in adam-coder adam-agent adam-kube-exec adam-egress adam-git-sandbox adam-git; do
+  for binary in adam-coder adam-agent adam-kube-exec adam-egress run-signer adam-git-sandbox adam-git; do
     want=$(exit_code "$binary")
     code=0
     # The uid is read inside the container: passing `--user` proves only what the
@@ -124,9 +124,54 @@ for base in \
       *) bad "$binary in $base exited $want but did not say '$(message "$binary")': $out" ;;
     esac
   done
+
+  # `run-signer` is the one binary whose start is worth proving here, not only its configuration
+  # error: it serves on loopback, so this starts it with a run-certificate configuration that needs
+  # no broker (the issuer and the upstream both point at a closed port), waits for its listening
+  # line, and stops it with SIGTERM. What it answers is A4's tests' business (`cargo test -p
+  # adam-run-signer`); this is the image's binary starting where no CA exists.
+  code=0
+  # shellcheck disable=SC2016 # $pid, $?, $i expand in the container's shell.
+  out=$(timeout 60 docker run --rm --user 10001:10001 --network none \
+    --mount "type=bind,src=$work/run-signer,dst=/bin/run-signer,readonly" \
+    --entrypoint /bin/sh "$base" -c '
+      printf "a-projected-token\n" > /tmp/run-cert-token || exit 96
+      RUN_SIGNER_LISTEN=127.0.0.1:8443 \
+      RUN_SIGNER_UPSTREAM=http://127.0.0.1:1 \
+      RUN_CERT_ISSUER=broker \
+      RUN_CERT_ISSUER_URL=http://127.0.0.1:1 \
+      RUN_CERT_TOKEN_FILE=/tmp/run-cert-token \
+      /bin/run-signer >/tmp/run-signer.out 2>&1 &
+      pid=$!
+      i=0
+      while [ "$i" -lt 20 ]; do
+        grep -q "adam-run-signer listening" /tmp/run-signer.out && break
+        kill -0 "$pid" 2>/dev/null || break
+        sleep 1
+        i=$((i+1))
+      done
+      if ! grep -q "adam-run-signer listening" /tmp/run-signer.out; then
+        cat /tmp/run-signer.out
+        exit 90
+      fi
+      kill -TERM "$pid"
+      i=0
+      while [ "$i" -lt 10 ]; do
+        kill -0 "$pid" 2>/dev/null || break
+        sleep 1
+        i=$((i+1))
+      done
+      kill -KILL "$pid" 2>/dev/null || true
+      wait "$pid"
+      echo "exit=$?"
+    ' 2>&1) || code=$?
+  case $out in
+    *"exit=0"*) ok "run-signer in $base: listens on loopback and stops clean on SIGTERM" ;;
+    *) bad "run-signer in $base did not start on loopback and stop clean: $out" ;;
+  esac
 done
 
 if [ "$fail" -ne 0 ]; then
   exit 1
 fi
-echo "ok   the six binaries are static and start in bookworm-slim and alpine"
+echo "ok   the seven binaries are static and start in bookworm-slim and alpine"

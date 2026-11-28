@@ -57,6 +57,12 @@ Written at `ce99d98` plus this change on 2026-11-27, amended the same day for AN
    The gate takes any `coder.yml` run on the commit (`head_sha`, any event, any run conclusion) in which the job named
    above concluded `success`, and waits while a run has not finished that job. A hand `workflow_dispatch` on the tag
    passes it; re-run `release.yml` after it.
+   **`release-please.yml` follows the same rule (ANR-1457):** its group is the commit sha on a push, because
+   release-please must *see every merge* to open or update the release pull request, and a per-ref group replaced the
+   pending run of one merge with the next. Its `cancel-in-progress: false` still keeps a running one from being cut
+   off, which it needs when it force-pushes the release branch. `docs-site.yml` is the deliberate opposite: one group
+   per ref with `cancel-in-progress: true`, because the site publishes the **newest** commit and an older commit's
+   build is meant to be dropped.
 7. **No `latest`, no tag on main.** `release.yml` runs on `push: tags: ["v*"]` only.
 8. **One trigger, one gate, for the binary too** (ANR-1203). The Homebrew jobs are in `release.yml` and `need: gate`: a
    `release: published` workflow would be a second trigger beside the tag push (both follow the App's release), would not

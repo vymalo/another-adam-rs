@@ -13,8 +13,9 @@ use std::time::Duration;
 
 use adam_core::{DynStore, MemoryStore, RunId, RunStatus};
 use adam_llm_agent::{
-    Conversation, HookDecision, HookResult, HookedCall, HookedOutput, LlmAgent, NOT_APPROVABLE,
-    Plugin, Tool, ToolCtx, ToolError, ToolOutput, Verdict, approval_step, approves, user_message,
+    Conversation, Decision, HookDecision, HookResult, HookedCall, HookedOutput, LlmAgent,
+    NOT_APPROVABLE, Plugin, Tool, ToolCtx, ToolError, ToolOutput, approval_step, approves,
+    user_message,
 };
 use adam_model::{Message, MockModel, ToolCall, ToolSpec};
 use adam_runtime::{Inbound, RunView, Runtime, RuntimeBuilder};
@@ -187,10 +188,10 @@ impl Plugin for AsksForEffect {
 
     fn before_tool(&self, call: &mut HookedCall<'_>) -> HookResult {
         if call.tool != "effect" {
-            return Ok(Verdict::Continue);
+            return Ok(Decision::Continue);
         }
         self.asked.fetch_add(1, SeqCst);
-        Ok(Verdict::Ask("may I write the file?".into()))
+        Ok(Decision::Ask("may I write the file?".into()))
     }
 }
 
@@ -207,7 +208,7 @@ impl Plugin for Marks {
         if let Some(object) = call.arguments.as_object_mut() {
             object.insert("marked".into(), Value::Bool(true));
         }
-        Ok(Verdict::Continue)
+        Ok(Decision::Continue)
     }
 }
 

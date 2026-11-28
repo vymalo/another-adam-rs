@@ -148,7 +148,7 @@ async fn build_agent(
             .with_extra_mcp_file(file)
             .context("adding the extra MCP servers (ADAM_EXTRA_MCP_FILE)")?;
         for warning in &warnings {
-            tracing::warn!("{warning}");
+            tracing::warn!(warning = %warning, "a warning while adding the extra MCP servers");
         }
         tracing::info!(file = %file.display(), "extra MCP servers added to the agent's own");
         def = extended;
@@ -204,9 +204,9 @@ async fn build_agent(
             .context("probing for the OS limits of commands")?;
         tracing::info!(
             enforcement = %confine.describe(),
-            "OS limits on commands (memory {} per command, cpu {} millicores)",
-            adam_workspace::human_bytes(budget.command_memory),
-            budget.command_cpu
+            memory = %adam_workspace::human_bytes(budget.command_memory),
+            cpu_millicores = budget.command_cpu,
+            "OS limits on commands"
         );
         settings.governor = Some(adam_code_tools::governor::Governor::from_budget(
             admission, confine, &budget,
@@ -414,7 +414,7 @@ pub async fn serve(
         } else {
             "the coder no longer uses OpenCode (ADR 0038)"
         };
-        tracing::warn!(variable = %name, "{name} is set and ignored: {why}; remove it");
+        tracing::warn!(variable = %name, reason = why, "a variable is set and ignored");
     }
 
     // What a person may open a session on (`child-sessions/v1`): the root's helpers with the

@@ -2192,18 +2192,22 @@ mod tests {
             vec!["maxTurns", "maxOutputTokens"],
             "a member returned to the folder's is named too"
         );
-        let base = SessionConfig {
-            max_turns: Some(20),
-            max_output_tokens: Some(2048),
-            ..SessionConfig::default()
-        };
+        // `SessionConfig` is `#[non_exhaustive]`: another crate sets its fields one by one.
+        #[allow(clippy::field_reassign_with_default)]
+        let mut base = SessionConfig::default();
+        base.max_turns = Some(20);
+        base.max_output_tokens = Some(2048);
         let merged = patch.apply(Some(&base));
         assert_eq!(
-            merged.max_turns,
-            Some(20),
-            "an absent member is not touched"
+            merged.max_turns, None,
+            "a member set to null returns to the folder's: the session keeps none, and the folder's \
+             applies at run time (ADR 0054 decision 11)"
         );
-        assert_eq!(merged.max_output_tokens, Some(512));
+        assert_eq!(
+            merged.max_output_tokens,
+            Some(512),
+            "a member with a value is the session's"
+        );
         let reset = config_of(&json!({"max_turns": null})).unwrap();
         assert_eq!(reset.apply(Some(&base)).max_turns, None, "null resets");
         assert!(config_of(&json!({"turbo": 1})).is_err(), "unknown refused");

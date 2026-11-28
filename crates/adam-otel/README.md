@@ -72,6 +72,9 @@ sequenceDiagram
 | `Settings::endpoint()`, `service_name()`, `is_enabled()` | what was read |
 | `Otel::start(&settings)` | `Ok(None)` when off; otherwise the provider, the bounded queue and the batch task, built inside the process's Tokio runtime |
 | `Otel::layer()` | the layer to compose beside `tracing_subscriber::fmt()` |
+| `Otel::meter()` | the meter a run's instruments are created from; its labels come from `labels` |
+| `labels::RunState`, `labels::Name` | the closed label sets: a value outside a set cannot be built |
+| `catalogue::EMITTED`, `catalogue::emitted(name)` | the instruments the workspace records — name, kind, unit, labels — and the list a dashboard panel is held to |
 | `init(filter)` | installs the process's subscriber — JSON `fmt()` and, when an endpoint is set, the OTel layer
   beside it — and returns the running `Otel` (or `None` when off); every adam binary calls it |
 | `Otel::shutdown()` | flush and stop, bounded by `SHUTDOWN_TIMEOUT` |
@@ -111,6 +114,63 @@ if let Some(otel) = adam_otel::Otel::start(&settings)? {
 
 Both run inside the process's async `main` (Tokio): `Otel::start` builds a task on that runtime and
 answers `StartError::NoRuntime` elsewhere.
+
+## Metrics
+
+The same `Otel` carries the metrics half (ANR-1448). `Otel::meter()` gives the meter a run's instruments are created
+from; a periodic reader on the process's runtime posts to `{endpoint}/v1/metrics` every [`METRICS_INTERVAL`] (15 s),
+with [`EXPORT_TIMEOUT`] for one export. Recording a measurement is the SDK's own aggregation in the process, so it
+never blocks a run, and a failed export is the SDK's internal log line. With no endpoint nothing is built at all.
+A dropped `Otel` without `shutdown()` leaves the reader's interval task on the runtime; `shutdown()` is what
+stops it, and every adam binary calls it before exit. Starting installs the meter provider **globally**, so a
+crate that emits a measurement uses `opentelemetry::global::meter(..)` and needs no handle threaded through the
+layers; where nothing was started that meter is the no-op one. Ask for it per measurement rather than caching it: the global is read at the call, so a meter cached before `init` would stay the no-op one.
+
+**Labels are types.** [`labels`] holds the closed sets the instruments use: `RunState` (the four states of
+`adam_core::store::RunStatus`, held to them by a test) and a `Name` for the names a deployment declares (a tool, a
+model alias, a pool), which accepts only `[a-z0-9._-]`, at most 64 bytes. A value outside a set cannot be built, so a
+backend's cardinality is what the deployment planned for, and no id, token or amount can travel as a label by
+accident. The shape check is not a secret filter — a token can have a name's shape — so what keeps a secret out is the
+set, never a value at hand.
+
+## Logs
+
+The process's `tracing` events become OTLP log records on the same switch (ANR-1348): with an endpoint set, a
+batch processor posts them to `{endpoint}/v1/logs`, and with none nothing is built.
+
+**A record is allowlisted.** It carries its target, its severity, the message the macro wrote, and only the fields
+named in [`logs::ALLOWED`] — an error's class, a run's state, a count, a declared tool or model, a worker id, an
+attempt number. Every other field the event carries (a prompt, a tool's arguments, a path, a token) is dropped before
+the record exists, so it cannot reach an exporter even by accident. The test emits an event with a prompt, an
+argument and a token beside a class, and asserts the exporter saw the class and neither of the other three.
+
+**No trace context.** A record carries no span's trace id, so a collector cannot join it to the traces this same
+`Otel` exports; the JSON log on stdout remains the join. Whether to inject the current span's context is ADR 0075
+open question 2's decision, not this card's.
+
+The coder's redactor holds per-run secrets this process-level layer cannot see; the allowlist is what makes that
+unnecessary, and it is why the log bridge is adam's own layer rather than a copy-everything appender.
+
+**The message is not filtered.** It is the format string the macro wrote, so a call site that formats a value into
+it puts that value in the record: eight sites do today (a startup warning, a panic payload, an OAuth error), and
+moving those values into fields — where the allowlist decides — is its own card. Until then the allowlist covers
+the fields, not the message.
+
+## Dashboards
+
+[`catalogue`](src/catalogue.rs) is the list of instruments this workspace creates from an OTel meter
+— today `adam.runs`, with its kind, its unit and the labels it may carry. It is data, not a doc
+comment, so `crates/adam-otel/tests/dashboards.rs` can read it: the test loads
+`deploy/dashboards/*.json` and fails when a panel queries a metric that is not in the list, or names
+a label the instrument does not declare — in any form PromQL has for one (`by`, `without`, `on`,
+`ignoring`, `group_left`, `group_right`, the four matchers), or in a templating variable's
+`label_values(…)`. A form the test does not read (`label_replace`, `label_join`) fails it outright.
+A metric a deployment cannot scrape cannot become a graph that quietly draws nothing.
+
+The dashboards are generated, not hand-written: `tools/dashboards/<name>.py` (standard library only)
+writes `deploy/dashboards/<name>.json`, `sh tools/dashboards/regenerate.sh` runs them all, and CI
+regenerates and fails on a difference. `deploy/dashboards/README.md` says what each one shows and how
+a deployment imports it.
 
 ## Versions
 

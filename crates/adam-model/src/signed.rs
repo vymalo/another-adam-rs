@@ -443,15 +443,16 @@ mod tests {
     /// key set. The process source is the default; a run source is chosen by name.
     #[tokio::test]
     async fn a_run_key_signs_with_its_certificate_chain() {
-        use adam_core::turn::run_cert::testkit::FakeRunCertIssuer;
+        use adam_core::turn::run_cert::testkit::{FakeRunCertIssuer, request_for};
         use adam_core::turn::testkit::Certified;
-        use adam_core::turn::{CertificateRequest, Ed25519TurnKeys, RunCertIssuer};
+        use adam_core::turn::{Ed25519TurnKeys, RunCertIssuer};
         use base64::Engine as _;
         use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 
         let issuer = FakeRunCertIssuer::new();
-        let request = CertificateRequest::new(b"run-root-1/csr".to_vec()).unwrap();
-        let chain = issuer.issue(&request).await.unwrap();
+        // A real request: the fake parses a PKCS#10 CSR since A2, so hand-written bytes are
+        // refused before a leaf is minted.
+        let chain = issuer.issue(&request_for("run-root-1")).await.unwrap();
         let run = Certified::new(Ed25519TurnKeys::ephemeral().unwrap(), chain);
         let set = run.key_set().await.unwrap();
         let signed = SignedRequests::with_key_source(

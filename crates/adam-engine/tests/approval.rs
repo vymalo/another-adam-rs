@@ -19,8 +19,8 @@ use adam_engine::adam_assembly::AgentDef;
 use adam_engine::adam_core::{DynStore, MemoryStore, RunId};
 use adam_engine::adam_error::{Classify, ErrorClass};
 use adam_engine::adam_llm_agent::{
-    FnTool, HookResult, HookedCall, Plugin, REDACTED_MARKER, StepIo, ToolError, ToolOutput,
-    ToolSet, Verdict,
+    Decision as PluginDecision, FnTool, HookResult, HookedCall, Plugin, REDACTED_MARKER, StepIo,
+    ToolError, ToolOutput, ToolSet,
 };
 use adam_engine::adam_model::{
     DynModel, InputModalities, Message as ModelMessage, MockModel, ModelClient, ModelDelta,
@@ -78,10 +78,10 @@ impl Plugin for AsksBeforeEffect {
 
     fn before_tool(&self, call: &mut HookedCall<'_>) -> HookResult {
         if call.tool != "effect" {
-            return Ok(Verdict::Continue);
+            return Ok(PluginDecision::Continue);
         }
         self.0.fetch_add(1, SeqCst);
-        Ok(Verdict::Ask(QUESTION.into()))
+        Ok(PluginDecision::Ask(QUESTION.into()))
     }
 }
 

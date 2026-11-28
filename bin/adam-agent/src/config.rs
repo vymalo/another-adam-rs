@@ -64,10 +64,17 @@ pub struct WorkerConfig {
     /// (`AgentDef::si_memory_ceiling`, ADR 0081 decision 11). It only narrows the folder's
     /// `si_memory:` key, never widens it.
     pub si_memory: SiMemoryCeiling,
+    /// `SI_MEMORY_DIR`: the folder L1 keeps its problems in (ADR 0081 decision 2, one folder per
+    /// process). No default: memory on with no directory means L1 is absent, and the process says
+    /// so once instead of inventing a path.
+    pub si_memory_dir: Option<PathBuf>,
 }
 
 /// The variable that is the deployment's ceiling on the self-improvement memory.
 pub const SI_MEMORY_ENV: &str = "SI_MEMORY";
+
+/// The variable that names the folder L1 keeps its problems in.
+pub const SI_MEMORY_DIR_ENV: &str = "SI_MEMORY_DIR";
 
 /// The variable that lets a remote subagent be at a plain `http` URL on another machine.
 pub const ALLOW_INSECURE_REMOTES_ENV: &str = "A2A_ALLOW_INSECURE_REMOTES";
@@ -90,6 +97,7 @@ impl std::fmt::Debug for WorkerConfig {
             .field("extra_mcp_file", &self.extra_mcp_file)
             .field("allow_insecure_remotes", &self.allow_insecure_remotes)
             .field("si_memory", &self.si_memory)
+            .field("si_memory_dir", &self.si_memory_dir)
             .finish()
     }
 }
@@ -152,6 +160,11 @@ impl Config {
             ),
             si_memory: parse_si_memory(
                 &|name: &str| lookup(name).filter(|v| !v.trim().is_empty()),
+                &mut problems,
+            ),
+            si_memory_dir: adam_service::parse_dir(
+                &|name: &str| lookup(name).filter(|v| !v.trim().is_empty()),
+                SI_MEMORY_DIR_ENV,
                 &mut problems,
             ),
         });
@@ -400,6 +413,41 @@ mod tests {
             "{error}"
         );
         assert_eq!(adam_service::exit_code(&error), 78);
+        vars.insert("ROLE".into(), "control-plane".into());
+        assert!(parse(&vars).unwrap().worker.is_none());
+    }
+
+    /// `SI_MEMORY_DIR` names the folder L1 keeps its problems in (ADR 0081 decision 2): unset is
+    /// absent — no default, so memory on with no folder means no L1 — and a path that is not an
+    /// existing directory stops the start with 78.
+    #[test]
+    fn the_memory_folder_is_read_by_the_workers_and_must_be_a_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut vars = full(dir.path());
+        assert_eq!(parse(&vars).unwrap().worker.unwrap().si_memory_dir, None);
+        vars.insert(SI_MEMORY_DIR_ENV.into(), dir.path().display().to_string());
+        assert_eq!(
+            parse(&vars).unwrap().worker.unwrap().si_memory_dir,
+            Some(dir.path().to_path_buf())
+        );
+        let file = dir.path().join("a-file");
+        std::fs::write(&file, "x").unwrap();
+        for bad in [
+            file.display().to_string(),
+            dir.path().join("nowhere").display().to_string(),
+        ] {
+            vars.insert(SI_MEMORY_DIR_ENV.into(), bad);
+            let error = parse(&vars).unwrap_err();
+            assert!(
+                error
+                    .problems
+                    .iter()
+                    .any(|p| p.contains("SI_MEMORY_DIR") && p.contains("is not a directory")),
+                "{error}"
+            );
+            assert_eq!(adam_service::exit_code(&error), 78);
+        }
+        // A control plane binds no agent and does not read it.
         vars.insert("ROLE".into(), "control-plane".into());
         assert!(parse(&vars).unwrap().worker.is_none());
     }

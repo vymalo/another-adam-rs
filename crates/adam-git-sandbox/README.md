@@ -145,9 +145,12 @@ The server reads these once at startup, every problem at once (`invalid configur
 | `GIT_SANDBOX_GIT` | the server | the `git` to run: an absolute path of an executable file | the first `git` on `PATH`, found once at startup |
 | `GIT_SANDBOX_MAX_COMMANDS` | the server | commands run at once (1 to 4096); the next waits | `64` |
 | `RUST_LOG` | the server | log filter; JSON logs on stdout | `info` |
-| `OTEL_EXPORTER_OTLP_ENDPOINT` | the server | the OTLP/HTTP collector, an absolute `http` or `https` URL with no user, password, query or fragment: the spans this process writes are exported beside the JSON log ([ADR 0075](../../docs/decisions/0075-metrics-and-traces-are-off-by-default-and-say-nothing-about-a-person.md)); unset or blank means no exporter and no thread; a refused value is one warning at startup and tracing stays off | unset: off | This binary links **no TLS provider**, so the endpoint must be plain `http` (an in-cluster collector); the `aws-lc` feature on `adam-otel` adds `https`.
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | the server | the OTLP/HTTP collector, an absolute `http` or `https` URL with no user, password, query or fragment: the spans this process writes are exported beside the JSON log ([ADR 0075](../../docs/decisions/0075-metrics-and-traces-are-off-by-default-and-say-nothing-about-a-person.md)); unset or blank means no exporter and no thread; a refused value is one warning at startup and tracing stays off | unset: off |
 | `OTEL_SERVICE_NAME` | the server | `service.name` of every exported span's resource | `adam` |
 | `GIT_SANDBOX_SOCKET` | the relay, and the coder | the server's socket, an absolute path | required by the relay; optional for the coder (unset: no sandbox) |
+
+This binary links **no TLS provider**, so `OTEL_EXPORTER_OTLP_ENDPOINT` must be a plain `http` URL (an in-cluster
+collector); the `aws-lc` feature on `adam-otel` is what adds `https`.
 
 A socket path that exists and is **not a socket** (a file, a link) is never replaced (exit 71). A socket that a server answers on is
 not either. One that nobody answers on (a server that died) is replaced. The socket is made under a `0177` umask and set to `0600`: the

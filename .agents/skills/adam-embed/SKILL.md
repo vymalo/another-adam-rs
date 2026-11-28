@@ -151,7 +151,7 @@ https://github.com/vymalo/another-adam-rs/blob/main/docs/guides/embed-in-an-app.
   `schedules/` fired, which `get`, `events` and `cancel` reach too), `helpers`, `start_session`, `sessions` and
   `close_session` (child sessions of the local subagents, `child-sessions/v1`) and `shutdown`; decide from `EngineError`'s class
   (`adam_error::Classify`), and match `RunState` and `EngineEvent` with a `_` arm (both `#[non_exhaustive]`). `events(run)` is bounded: a slow reader gets `Behind`, then a `Snapshot` read from the store.
-* **Approvals** (ADR 0047 slice 5): install a `Plugin` whose `before_tool` returns `Verdict::Ask(question)` with
+* **Approvals** (ADR 0047 slice 5): install a `Plugin` whose `before_tool` returns `Decision::Ask(question)` with
   `EngineBuilder::plugin` (or a `HookSet` with `.hooks(..)`); it runs in every agent the engine runs. The run then
   waits in `RunState::AwaitingApproval` (not `Waiting`), `RunInfo::approval` is the `ApprovalRequest` (`call_id`, `tool`,
   `question`, `arguments` as the call's step shows them, through `EngineBuilder::step_io`'s redactor), and the stream
@@ -160,6 +160,23 @@ https://github.com/vymalo/another-adam-rs/blob/main/docs/guides/embed-in-an-app.
   in the journaled step `tool:<call id>:approved`, and neither a restart nor a replay asks again. Another call's id,
   or a run that awaits none, is `EngineError::NotAwaitingApproval` (`Rejected`). Typed text through `answer` or `send`
   approves only on a clear yes (`yes`, `ok`): show buttons. Approvals are not announced to A2A clients yet.
+* **A local agent over the person's directory** (ADR 0047 slice 7 part 2): `EngineBuilder::local_agent(dir)` opens
+  `dir` once at `start` (a missing path, a file, or a symlink is `EngineError::Invalid`) and gives the agent the file and
+  command tools of [`adam-code-tools`] over a `PersonDir` (`read_file`, `read_files`, `write_file`, `edit_file`,
+  `apply_patch`, `run_command`, `run`), with a host-side hook that asks before every write or command (reads are never
+  asked; the five mutating tools return `Decision::Ask` always — a missing or empty argument still asks, fail-closed, so
+  the run never bypasses the approval). The directory is **never owned, cleaned or restored**: a write stays, a
+  command's changes stay, and the run's listing tells the model what changed. `PersonDir::guard` is exclusive: a
+  second guard for the same place is refused with the message the tool appends to its error result, leaving the
+  first guard's entry untouched so its report settles as it would have. The hook's question names the path (or the
+  patch's paths — `+++ <component>/<path>` or `+++ <path>`, the first component dropped as `git apply -p1` does —
+  up to 8 then "and N more"), or the shell line (and, when set, the `cwd`). The host answers with the same
+  `Engine::approve` as for any other hook; the call's tool and arguments are shown through
+  `EngineBuilder::step_io`'s redactor. A host that wants its own composition registers the pieces by hand:
+  `adam_engine::local_agent::tool_set()` is the `ToolSet`, `adam_engine::local_agent::plugin()` is the asking
+  hook. The seven tools use the same `adam-code-tools` bodies and schemas the coder uses, with the coder's `repo`
+  (slot/repo) argument dropped — `PersonDir` is one place. The example `crates/adam-engine/examples/chat` takes the
+  directory as `--dir <path>`.
 * **Keep the embedded set**: anything else you depend on takes `adam-a2a` without `server`, `adam-a2a-runtime` without
   `push`, `adam-assembly` (and `adam`) without `remote`, and `adam-ui` without `thread-tools`, or Cargo turns them back
   on. adam-rs checks the engine's own tree with `tools/embedded-deps/check.sh`
@@ -169,7 +186,7 @@ https://github.com/vymalo/another-adam-rs/blob/main/docs/guides/embed-in-an-app.
 * **The worked example** is `crates/adam-engine/examples/chat` (`main.rs` builds the engine, `app.rs` is the loop a
   test drives): https://github.com/vymalo/another-adam-rs/tree/main/crates/adam-engine/examples/chat. The API and its
   refusals: https://github.com/vymalo/another-adam-rs/blob/main/crates/adam-engine/README.md.
-* **Not yet**: the file and command tools, MCP
+* **Not yet**: MCP
   servers and remote subagents (`start` refuses an agent that names them).
 
 ## Verify

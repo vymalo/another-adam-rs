@@ -14,9 +14,9 @@ use std::time::Duration;
 
 use adam_core::{DynStore, MemoryStore, RunId, RunStatus};
 use adam_llm_agent::{
-    Conversation, HookDecision, HookResult, HookSet, HookedCall, HookedModelRequest, HookedOutput,
-    HookedText, LlmAgent, Plugin, RecordedEvent, Tool, ToolAccess, ToolCtx, ToolError, ToolOutput,
-    Verdict, user_message,
+    Conversation, Decision, HookDecision, HookResult, HookSet, HookedCall, HookedModelRequest,
+    HookedOutput, HookedText, LlmAgent, Plugin, RecordedEvent, Tool, ToolAccess, ToolCtx,
+    ToolError, ToolOutput, user_message,
 };
 use adam_model::{Message, MockModel, ToolCall, ToolSpec};
 use adam_runtime::{RunView, Runtime, RuntimeBuilder};
@@ -213,7 +213,7 @@ impl Plugin for Counts {
             .unwrap()
             .entry(call.tool.to_owned())
             .or_default() += 1;
-        Ok(Verdict::Continue)
+        Ok(Decision::Continue)
     }
 
     fn after_tool(&self, call: &HookedCall<'_>, _output: &mut HookedText<'_>) -> HookResult {
@@ -223,7 +223,7 @@ impl Plugin for Counts {
             .unwrap()
             .entry(call.tool.to_owned())
             .or_default() += 1;
-        Ok(Verdict::Continue)
+        Ok(Decision::Continue)
     }
 }
 
@@ -239,18 +239,18 @@ impl Plugin for Marks {
         if let Some(object) = call.arguments.as_object_mut() {
             object.insert("marked".into(), Value::Bool(true));
         }
-        Ok(Verdict::Continue)
+        Ok(Decision::Continue)
     }
 
     fn after_tool(&self, _call: &HookedCall<'_>, output: &mut HookedText<'_>) -> HookResult {
         output.text.push('!');
-        Ok(Verdict::Continue)
+        Ok(Decision::Continue)
     }
 }
 
 /// A plugin that refuses, or stops, with a fixed reason.
 struct Refuses {
-    verdict: fn(String) -> Verdict,
+    verdict: fn(String) -> Decision,
     reason: &'static str,
 }
 
@@ -276,7 +276,7 @@ impl Plugin for RewritesUse {
         if let Some(object) = call.arguments.as_object_mut() {
             object.insert("use".into(), Value::String(self.0.to_owned()));
         }
-        Ok(Verdict::Continue)
+        Ok(Decision::Continue)
     }
 }
 
@@ -653,7 +653,7 @@ async fn a_denial_is_the_calls_result_and_the_run_goes_on() {
             calls: calls.clone(),
         })
         .plugin(Refuses {
-            verdict: Verdict::Deny,
+            verdict: Decision::Deny,
             reason: "not from this machine",
         })
         .build();
@@ -692,7 +692,7 @@ async fn a_stop_answers_the_call_and_fails_the_run() {
             calls: calls.clone(),
         })
         .plugin(Refuses {
-            verdict: Verdict::Stop,
+            verdict: Decision::Stop,
             reason: "enough of this",
         })
         .build();
@@ -746,7 +746,7 @@ async fn an_ask_parks_the_run_and_observers_read_the_approval() {
             calls: calls.clone(),
         })
         .plugin(Refuses {
-            verdict: Verdict::Ask,
+            verdict: Decision::Ask,
             reason: "may I?",
         })
         .plugin(SharedWatches(watches.clone()))
@@ -1003,7 +1003,7 @@ async fn a_denied_call_is_a_denied_event_with_its_reason() {
         .agent()
         .tool(echo)
         .plugin(Refuses {
-            verdict: Verdict::Deny,
+            verdict: Decision::Deny,
             reason: "not from here",
         })
         .plugin(SharedWatches(watches.clone()))
@@ -1034,12 +1034,12 @@ impl Plugin for ModelHook {
     fn model_request(&self, request: &mut HookedModelRequest<'_>) -> HookResult {
         self.asked.fetch_add(1, SeqCst);
         if self.stop {
-            return Ok(Verdict::Stop("no more model calls".into()));
+            return Ok(Decision::Stop("no more model calls".into()));
         }
         *request.temperature = Some(0.25);
         *request.max_output_tokens = Some(321);
         request.metadata.insert("tenant".into(), "t-1".into());
-        Ok(Verdict::Continue)
+        Ok(Decision::Continue)
     }
 }
 
@@ -1101,7 +1101,7 @@ impl Plugin for ModelHookB {
         let mut body = serde_json::Map::new();
         body.insert("seed".into(), json!(7));
         *request.extra_body = Some(body);
-        Ok(Verdict::Continue)
+        Ok(Decision::Continue)
     }
 }
 

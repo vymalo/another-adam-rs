@@ -34,7 +34,7 @@ pub fn log(folder: &AgentFolder) {
         "agent files"
     );
     for warning in &folder.warnings {
-        tracing::warn!("{warning}");
+        tracing::warn!(warning = %warning, "a warning while reading the agent folder");
     }
     if !folder.def.manifest().frontmatter.references.is_empty() {
         tracing::warn!(

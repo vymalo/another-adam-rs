@@ -66,6 +66,17 @@ pub struct Scope {
 }
 
 impl Scope {
+    /// The same scope with another caller.
+    ///
+    /// A tool builds its scope per call from the run's caller (ADR 0081 decision 4: no L1 entry
+    /// crosses a caller), so the handle carries the deployment, the agent and the kind and this
+    /// sets the one part that is the message's.
+    #[must_use]
+    pub fn with_caller(mut self, caller: impl Into<String>) -> Self {
+        self.caller = caller.into();
+        self
+    }
+
     /// An agent-scoped key.
     #[must_use]
     pub fn agent(
