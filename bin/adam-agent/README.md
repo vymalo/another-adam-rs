@@ -12,6 +12,12 @@ A2A_BEARER_TOKENS=dev-token PUBLIC_URL=http://127.0.0.1:8080/ \
   cargo run -p adam-agent
 ```
 
+Installed with Homebrew (`brew install vymalo/tap/adam-agent`, one binary for Linux (static) and macOS, arm64 and x86_64,
+built from each release) it is the same process: `adam-agent --version` (`adam-agent X.Y.Z`, no build revision) and `adam-agent --help` answer before any
+configuration is read; every other invocation is configured by its environment alone, and no configuration is exit 78.
+A laptop needs the folder, a model endpoint, a bearer token, a `PUBLIC_URL` and `DATABASE_URL=sqlite://<file>` (no
+database server): [the quick start](../../README.md#install-adam-agent).
+
 It is the second binary over [`adam-service`](../../crates/adam-service/README.md), the first being
 [`adam-coder`](../adam-coder/README.md); the process (the store, the roles, the notifications, the exit
 codes) is the same code. What is different is the agent: `adam-coder` has an embedded one and nine tools of its own
