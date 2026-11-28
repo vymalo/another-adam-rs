@@ -102,3 +102,32 @@ pull requests merged within minutes of the release commit, so its run was replac
    writing. If the newer commit's image job fails, the chart keeps the older tag until the next good build.
 4. `ci.yml` is not read by the gate; its group is unchanged. `coder.yml` has no tag trigger: a tag's commit is reached
    by the main push or by a dispatch.
+
+## Amended 2026-11-27: the release also ships `adam-agent` through Homebrew (ANR-1203)
+
+The owner: *"We'll release adam agent and aapctl via homebrew. ... We'll release only when release-please's PR merge."*
+A release is now also a binary. The decisions:
+
+1. **The jobs are in `release.yml`, behind `gate`; there is no second workflow on `release: published`.** The tag push and
+   the release event both follow the one App-made release; a second workflow would run beside the gate and not behind it,
+   and cosign's identity is the workflow file, so the binaries would need a second identity to verify. The price is that
+   the tag's push can arrive before the release is published, so `adam-agent-preflight` waits for it (30 minutes) and
+   requires a published release authored by the release App itself (`<app-slug>[bot]`, the slug read from the App's token,
+   so there is no variable to forget and nothing is accepted by default). A tag pushed by hand has no release and ships
+   no binary. A published asset is never replaced: the archives and the signed checksums all present means a re-run builds
+   and attaches nothing and tests what is there; some present stops the run for a person.
+2. **Four native builds**, not cross-compiled: `x86_64` and `aarch64` `unknown-linux-musl` (static, `file` checked) on
+   `ubuntu-24.04` and `ubuntu-24.04-arm`; `aarch64` and `x86_64` `apple-darwin` on `macos-26` and `macos-26-intel`,
+   GitHub-hosted, because Apple's targets cannot be linked from Linux. Archives are `adam-agent_X.Y.Z_<os>_<arch>.tar.gz`.
+   macOS binaries are not notarized (out of scope until the owner asks); Linux's are static, macOS's link system libraries only.
+3. **`SHA256SUMS` is signed**, `cosign sign-blob` keyless with a bundle, under the identity of the image
+   (`release.yml@refs/tags/vX.Y.Z`); the archives are checked through it.
+4. **The formula is generated and proposed, never pushed**: the release App opens or updates one pull request on
+   `vymalo/homebrew-tap` (`bot/adam-agent`), after Homebrew installed the formula on four platforms. A person merges it.
+   Monotonic: a version older than the tap's is not proposed. The job's concurrency is `queue: max` with
+   `cancel-in-progress: false`: no pending update is dropped, and an older release that arrives last is a no-op.
+5. **`adam-agent` gains `--version` and `--help`**, answered before any configuration is read. Before, any argument
+   was ignored and the process tried to start (exit 78 without a folder), so the formula's `test do` could not pass.
+6. `aapctl` (another-agentic-platform) takes the same shape in its own repository; it is not decided here.
+
+Unverified until a release: every runner step (see the agent page).

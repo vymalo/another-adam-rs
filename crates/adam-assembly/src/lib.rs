@@ -168,7 +168,7 @@ mod suggest;
 mod template;
 
 pub use assembly::{AgentInfo, Assembly, BoundDef, RemoteInfo};
-pub use def::{AgentDef, IntoManifest};
+pub use def::{AgentDef, IntoManifest, SiMemoryCeiling, SiMemorySetting};
 #[cfg(feature = "dev")]
 pub use dev::{
     DEFAULT_DEBOUNCE, LiveAssembly, LiveBuilder, ReloadError, Reloaded, ToolChange, Watch,

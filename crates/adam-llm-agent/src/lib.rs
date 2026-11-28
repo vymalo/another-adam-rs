@@ -158,6 +158,7 @@ mod schedule;
 mod schema;
 mod session_tools;
 mod sessions;
+mod si_memory;
 mod signing;
 mod source;
 mod state;
@@ -242,6 +243,7 @@ pub use sessions::{
     MAX_WORKING_ROUNDS, SESSION_TOOL_TIME_LIMIT, SESSION_TOOLS, SUBAGENT_CLOSE, SUBAGENT_LIST,
     SUBAGENT_READ, SUBAGENT_SEND, SUBAGENT_START, SessionAgent, SessionTools,
 };
+pub use si_memory::{SI_MEMORY_GROUP, SI_RECALL, SI_RECORD, SiMemoryHandle, SiRecall, SiRecord};
 pub use source::{
     DynToolSource, Listing, MAX_SOURCE_TOOLS, SourceCtx, ToolNote, ToolSource, Withheld,
 };

@@ -478,6 +478,55 @@ impl PluginRef {
     }
 }
 
+/// The `si_memory:` key: the agent's self-improvement memory (ADR 0081 decision 11), as the folder
+/// writes it — `on`, `off`, or a map of options that tunes it.
+///
+/// It is **not** `memory:`, which is Claude Code's key and is ignored. The deployment's ceiling
+/// (`SI_MEMORY`) is read elsewhere and can only narrow this: `off` there is off whatever the folder
+/// says ([`AgentDef::si_memory`](https://docs.rs/adam-assembly)).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum SiMemoryKey {
+    /// `on` or `off`.
+    Word(SiMemoryWord),
+    /// The options that tune it; naming any of them turns it on.
+    Options(SiMemoryOptions),
+}
+
+/// The two words `si_memory:` takes on its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SiMemoryWord {
+    /// On, with the deployment's bounds.
+    On,
+    /// Off: the agent runs no self-improvement memory at all.
+    Off,
+}
+
+/// The options a folder's `si_memory:` map may name (ADR 0081 decision 11).
+///
+/// A key this schema does not know is a **load error**, not a warning: memory on with a misspelt
+/// option would run with bounds nobody wrote (decision 12, fail closed).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default)]
+pub struct SiMemoryOptions {
+    /// `recall`: whether `si_recall` is offered to the run.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recall: Option<bool>,
+    /// `record`: whether `si_record` is offered.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub record: Option<bool>,
+    /// `preload_kib`: how much of the memory is read into the first request, in KiB.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub preload_kib: Option<u32>,
+    /// `scopes`: the scopes the agent's memory serves, by name.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scopes: Option<Vec<String>>,
+    /// Keys this schema does not know: the loader refuses every one of them.
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, Value>,
+}
+
 /// The YAML frontmatter of an agent or subagent file.
 ///
 /// Everything is optional at this level; which keys are required depends on the role of the
@@ -526,6 +575,10 @@ pub struct AgentFrontmatter {
     /// Skills whose full body is put into the prompt instead of the catalog.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub preload_skills: Option<Vec<String>>,
+    /// The agent's self-improvement memory (ADR 0081): `off` turns it off, `on` or a map of
+    /// options tunes it. Absent: the deployment's `SI_MEMORY` ceiling decides.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub si_memory: Option<SiMemoryKey>,
     /// The limits of the loop, with Claude Code's `maxTurns` folded into `max_turns`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub limits: Option<Limits>,
