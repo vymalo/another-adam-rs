@@ -41,9 +41,9 @@ later push does not replace it; a pull request's runs share one group per PR (`r
 head cancels the run it supersedes. GitHub cancels a *pending* run as soon as a newer one joins its group, even
 with `cancel-in-progress: false`, which is why a group shared by a busy `main` left merges without a verdict
 ([ADR 0084](../decisions/0084-releases-are-cut-by-release-please-and-production-pins-a-version.md)). The
-`coverage` job, which opens and closes one issue on `main`, runs one at a time for the same reason. `coder.yml`
-uses a per-sha group only for release commits and manual dispatches; its other pushes to `main` still share a
-group and skip to the newest.
+`coverage` job runs one at a time because its runs share that one issue on `main`, with `queue: max` so the waiting
+runs are kept and each commit's run still gets its verdict. `coder.yml` uses a per-sha group only for release
+commits and manual dispatches; its other pushes to `main` still share a group and skip to the newest.
 
 ## Tests that start a binary
 

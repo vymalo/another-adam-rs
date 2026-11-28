@@ -410,11 +410,12 @@ jobs:
     # ANR-1360: one coverage run at a time. Its steps open, comment on and close a
     # single issue, so two commits' runs must not interleave — an older run
     # finishing after a newer one would close the issue of a red `main`, or open
-    # one for a green `main`. A *pending* run is still replaced by a newer one,
-    # which is what the issue wants: it should describe the newest commit.
+    # one for a green `main`. `queue: max` keeps the waiting runs instead of
+    # replacing one, so each commit's run still reaches a verdict (up to 100 wait).
     concurrency:
       group: ci-coverage
       cancel-in-progress: false
+      queue: max
     runs-on: ubuntu-latest
     timeout-minutes: 60
     # The gate is main-only, so a red main needs a follow-up: the last step opens an issue.
