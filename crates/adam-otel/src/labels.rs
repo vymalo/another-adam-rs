@@ -91,6 +91,49 @@ impl adam_error::Classify for LabelError {
     }
 }
 
+/// The direction of a token count: what a model call was charged for.
+///
+/// Closed, like the run states: two values, and an instrument cannot report a third.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum Direction {
+    /// Prompt tokens: every token the call was charged for, cached ones included.
+    Input,
+    /// Generated tokens, reasoning included.
+    Output,
+}
+
+impl Direction {
+    /// Every direction.
+    pub const ALL: [Direction; 2] = [Self::Input, Self::Output];
+
+    /// The label value.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Input => "input",
+            Self::Output => "output",
+        }
+    }
+}
+
+impl fmt::Display for Direction {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl TryFrom<&str> for Direction {
+    type Error = LabelError;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        Self::ALL
+            .into_iter()
+            .find(|direction| direction.as_str() == value)
+            .ok_or_else(|| LabelError::OutsideTheSet {
+                value: value.to_owned(),
+            })
+    }
+}
+
 /// The longest label value the sets accept. A tool name or a model alias is a name, not a sentence.
 pub const MAX_LABEL_LEN: usize = 64;
 

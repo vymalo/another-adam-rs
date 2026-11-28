@@ -230,6 +230,9 @@ coder's Secret, or mount it, although the template uses `MODEL_API_KEY` only; th
 * **The package cache is writable by every run** (ADR 0040), and other users' builds read it. One run can write into
   what another person's `npm ci` or `cargo build` takes: a cross-tenant integrity risk. ADR 0040 called the volume "one
   trust domain: every run on it is the owner's"; that holds only while the runs are. Left as it is (open decision 2).
+  *Amended 2026-11-26:* this limit is closed. The chart mounts no cache, so no run pod shares a writable tree with
+  another run; a deployment that gives its own runs a claim admits it in `cache.allowedClaims`, one trust domain of that
+  deployment's runs alone. ADR 0040 is amended the same day.
 * **An embedded repository in the working tree runs its own configuration in the coder's git.** Pinning decides which
   repository the coder's git works on, not what is inside its working tree. A directory with a `.git` of its own (a
   nested repository, a submodule checkout; `modules/` of the worktree's directory holds the gitdirs of submodules) that the
@@ -383,6 +386,9 @@ coder's Secret, or mount it, although the template uses `MODEL_API_KEY` only; th
 2. **The shared package cache** (ADR 0040) stays as decided and stays a cross-tenant integrity risk. Open: **a cache for each
    person, or read-only in run pods** (a writer outside them, or the pull-through proxy of ADR 0040). Until then, share it
    only among runs that trust each other.
+   *Amended 2026-11-26:* the owner decided: no shared writable cache is provided to run pods. The chart mounts none, and a
+   deployment's own claim reaches its runs through the platform (`AgentConfig.environment.cache.existingClaim`), admitted
+   by `cache.allowedClaims`; see the amendment at the end of this record and ADR 0040's.
 3. **A mirror for each person**, instead of for each repository, closes the shared refs and worktree directories. It needs
    the person's identity in the coder.
 4. **A new repository waits for a running command** (or makes the pod again when none runs) instead of ending the command.
@@ -426,6 +432,14 @@ coder's Secret, or mount it, although the template uses `MODEL_API_KEY` only; th
 
 ## Amended
 
+* **2026-11-26, the cache is not mounted in a run pod at all (owner decision, ANR-313; row 124 of `decisions-2026-11-26`).** The
+  owner's decision: *"No shared writable cache is provided to run pods. The user configures their own cache volume through the
+  platform: `AgentConfig.environment.cache.existingClaim`, admitted only if the operator's `cache.allowedClaims` lists it."* What
+  this record said about the cache is superseded: [ADR 0040](0040-a-shared-package-cache-at-cache.md) is amended the same day, the
+  chart mounts no cache, and the admission policy of decision 7 (below) admits the work claim and the claims the deployment names
+  in `cache.allowedClaims` and refuses any other claim. The read-only-cache option of 2026-11-24 is not built; a run pod has no
+  cache volume of the chart's, and a cache a deployment gives its own runs is one trust domain of that deployment's runs alone.
+  What a run pod sees (decisions 1 and 2, the workspace mounts) is unchanged.
 * **2026-11-19, [ADR 0052](0052-no-podman-a-repositorys-own-environment-is-a-run-pod-of-its-image.md) (not built yet).** A run pod may run the repository's own image (`use_repository_environment`): only
   the `run` container's image changes, to one that starts with a prefix the deployment allows. What a run pod mounts and sees, and every
   other refusal of the admission policy, are unchanged; ADR 0010, which this record builds on for "a path means the same in every

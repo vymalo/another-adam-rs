@@ -328,13 +328,15 @@ with one warning at startup that names it. A repository that needs its own tools
 
 :::
 
-## A package cache shared by pods
+## A package cache per run, admitted by the platform
 
-By default every pod starts with an empty home and downloads its packages again. `cache.existingClaim` (a
-ReadWriteMany claim you manage, shared with other releases) or `cache.create` mounts one volume at `/cache` in the
-coder pods and the run pods, where npm, pnpm and cargo keep their caches
-([ADR 0040](../decisions/0040-a-shared-package-cache-at-cache.md)). Off by default, and then invisible. It is one
-trust domain, cargo takes no lock on NFS, and the volume's root must be writable by uid 10001:
+The chart mounts no cache. The image keeps npm, pnpm and cargo's caches under `/cache`, and `/cache` is a directory of
+each container's own file system, lost with the pod. A deployment that wants them to survive a pod gives each run its
+own claim through the platform (`AgentConfig.environment.cache.existingClaim`), and the operator admits it only when its
+`cache.allowedClaims` lists it ([ADR 0040](../decisions/0040-a-shared-package-cache-at-cache.md), amended 2026-11-26).
+The coder chart's `cache.allowedClaims` (empty by default) is the same list for the run pods this chart's admission
+policy admits: the work claim and those names, and no other. A claim is one trust domain, cargo takes no lock on NFS,
+and its root must be writable by uid 10001:
 [chart README, "The package cache"](../../deploy/coder/README.md#the-package-cache).
 
 ## A folder agent instead of the coder
