@@ -1940,32 +1940,32 @@ mod tests {
     #[test]
     fn a_say_carries_its_access_tier_into_the_run() {
         let say = Say::new("hello").with_tier(adam_a2a::AccessTier::Plan);
-        let message = message(&say);
-        let metadata = message.metadata.as_ref().expect("a tier is metadata");
+        let msg = message(&say);
+        let metadata = msg.metadata.as_ref().expect("a tier is metadata");
         assert_eq!(metadata[ACCESS_TIER_KEY], json!({ "tier": "plan" }));
-        let inbound = inbound(&message).expect("an inbound");
+        let got = inbound(&msg).expect("an inbound");
         assert_eq!(
-            inbound.payload["context"][ACCESS_TIER_KEY],
+            got.payload["context"][ACCESS_TIER_KEY],
             json!({ "tier": "plan" })
         );
 
         let both = Say::new("hello")
             .with_model("small")
             .with_tier(adam_a2a::AccessTier::Auto);
-        let inbound = inbound(&message(&both)).expect("an inbound");
+        let got = inbound(&message(&both)).expect("an inbound");
         assert_eq!(
-            inbound.payload["context"][MODEL_KEY],
+            got.payload["context"][MODEL_KEY],
             json!({ "model": "small" })
         );
         assert_eq!(
-            inbound.payload["context"][ACCESS_TIER_KEY],
+            got.payload["context"][ACCESS_TIER_KEY],
             json!({ "tier": "auto" })
         );
 
         let plain = Say::new("hello");
         assert!(message(&plain).metadata.is_none());
-        let inbound = inbound(&message(&plain)).expect("an inbound");
-        assert!(inbound.payload.get("context").is_none());
+        let got = inbound(&message(&plain)).expect("an inbound");
+        assert!(got.payload.get("context").is_none());
     }
 
     /// The page token of `firings` reads back what it wrote: a timestamp to the nanosecond, a
