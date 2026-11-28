@@ -7,7 +7,7 @@
 //! | `RUN_SIGNER_UPSTREAM_CA_FILE` | a PEM bundle the client trusts for the gateway, beside the platform's roots | the CA bundle the caller passed |
 //!
 //! The CA the **run certificate** comes from is not read here: it is the run certificate
-//! deployment's (`RUN_CERT_CA_FILE` in the image), and the code that starts the sidecar reads the
+//! deployment's (`RUN_CERT_CA_FILE` in the image), and [`crate::broker::from_process_env`] reads the
 //! file and passes the bytes as [`SignerConfig::from_env`]'s `ca_pem`. Those bytes are also the
 //! upstream client's trust anchors by default, because the gateway and the broker are one trust
 //! domain today; `RUN_SIGNER_UPSTREAM_CA_FILE` names the anchors separately so that a reader does
@@ -81,7 +81,11 @@ pub struct Limits {
     pub max_body: usize,
     /// How long connecting to the gateway may take (10 s).
     pub connect_timeout: Duration,
-    /// How many runs' keyrings are kept; the oldest is dropped beyond it (1024).
+    /// How long the gateway may take to answer at all (300 s): a black-holed gateway frees the
+    /// request instead of pinning it until the process stops. Above any healthy server-sent event
+    /// gap, and above [`shutdown_grace`](Self::shutdown_grace), so a drain is never cut by it.
+    pub read_timeout: Duration,
+    /// How many runs' keyrings are kept; the least recently used is dropped beyond it (1024).
     pub max_runs: usize,
     /// How long a shutdown waits for the requests in flight (25 s).
     pub shutdown_grace: Duration,
@@ -92,6 +96,7 @@ impl Default for Limits {
         Self {
             max_body: 16 * 1024 * 1024,
             connect_timeout: Duration::from_secs(10),
+            read_timeout: Duration::from_secs(300),
             max_runs: 1024,
             shutdown_grace: Duration::from_secs(25),
         }
@@ -297,7 +302,7 @@ fn anchors(
         };
     };
     let path = PathBuf::from(path.trim());
-    match read_ca_file(&path) {
+    match read_ca_file(UPSTREAM_CA_FILE, &path) {
         Ok(pem) => Anchors::Pem {
             label: UPSTREAM_CA_FILE,
             pem,
@@ -309,29 +314,25 @@ fn anchors(
     }
 }
 
-/// The bytes of the CA file at `path`, at most [`MAX_CA_PEM_BYTES`]. The problem names the variable
-/// and the file, never a byte of it.
-fn read_ca_file(path: &std::path::Path) -> Result<Vec<u8>, String> {
+/// The bytes of the CA file at `path`, at most [`MAX_CA_PEM_BYTES`]. `variable` is the setting the
+/// file came from (`RUN_SIGNER_UPSTREAM_CA_FILE`, `RUN_CERT_CA_FILE`): the problem names it and the
+/// file, never a byte of it.
+///
+/// # Errors
+///
+/// A problem line naming `variable`: the file cannot be read, or it is over [`MAX_CA_PEM_BYTES`].
+pub fn read_ca_file(variable: &str, path: &std::path::Path) -> Result<Vec<u8>, String> {
     use std::io::Read as _;
 
-    let file = std::fs::File::open(path).map_err(|error| {
-        format!(
-            "{UPSTREAM_CA_FILE} {} cannot be read: {error}",
-            path.display()
-        )
-    })?;
+    let file = std::fs::File::open(path)
+        .map_err(|error| format!("{variable} {} cannot be read: {error}", path.display()))?;
     let mut bytes = Vec::new();
     file.take(MAX_CA_PEM_BYTES as u64 + 1)
         .read_to_end(&mut bytes)
-        .map_err(|error| {
-            format!(
-                "{UPSTREAM_CA_FILE} {} cannot be read: {error}",
-                path.display()
-            )
-        })?;
+        .map_err(|error| format!("{variable} {} cannot be read: {error}", path.display()))?;
     if bytes.len() > MAX_CA_PEM_BYTES {
         return Err(format!(
-            "{UPSTREAM_CA_FILE} {} is larger than {MAX_CA_PEM_BYTES} bytes",
+            "{variable} {} is larger than {MAX_CA_PEM_BYTES} bytes",
             path.display()
         ));
     }
@@ -347,8 +348,13 @@ fn client(
 ) -> Option<(reqwest::Client, usize)> {
     let mut builder = reqwest::Client::builder()
         .connect_timeout(limits.connect_timeout)
+        // A black-holed gateway frees the request rather than pinning it until the process stops.
+        .read_timeout(limits.read_timeout)
         // Never follow a redirect with a signed request: the signature covers this path, not another.
         .redirect(reqwest::redirect::Policy::none())
+        // A signed request carries the prompt, the person's envelope and a valid `Turn-Signature`:
+        // a proxy from the environment would hand all three to another host.
+        .no_proxy()
         .user_agent(concat!("adam-run-signer/", env!("CARGO_PKG_VERSION")));
     let mut roots = 0;
     if let Some((label, pem)) = ca {
@@ -430,8 +436,12 @@ mod tests {
         assert_eq!(c.limits, Limits::default());
         assert_eq!(c.limits.max_body, 16 * 1024 * 1024);
         assert_eq!(c.limits.connect_timeout, Duration::from_secs(10));
+        assert_eq!(c.limits.read_timeout, Duration::from_secs(300));
         assert_eq!(c.limits.max_runs, 1024);
         assert_eq!(c.limits.shutdown_grace, Duration::from_secs(25));
+        // A drain is never cut short by the read timeout, and a healthy stream is never cut by it.
+        assert!(c.limits.read_timeout > c.limits.shutdown_grace);
+        assert!(c.limits.read_timeout > c.limits.connect_timeout);
         assert_eq!(c.upstream_ca, NO_CA);
         assert_eq!(c.upstream_ca_roots, 0);
     }

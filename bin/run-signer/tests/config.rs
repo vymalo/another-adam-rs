@@ -1,10 +1,10 @@
 //! `SignerConfig::from_env`, as a configuration: what it refuses, with which class and exit code,
 //! what it shows, and which CA bundle the upstream client trusts.
 //!
-//! The crate has no `[[bin]]` yet, so these are assertions on the configuration rather than on a
-//! process. The CA bundle is a real one: the fake run certificate issuer (`FakeRunCertIssuer`)
-//! mints leaves and its own certificate, and the test PEM-encodes them, so "the file is used" is
-//! proved by the number of roots the client was given, not by a stub.
+//! The process itself — its exit codes and its logs — is `tests/binary.rs`. The CA bundle is a real
+//! one: the fake run certificate issuer (`FakeRunCertIssuer`) mints leaves and its own certificate,
+//! and the test PEM-encodes them, so "the file is used" is proved by the number of roots the client
+//! was given, not by a stub.
 #![allow(clippy::unwrap_used, clippy::expect_used)] // integration tests assert by unwrapping
 
 use std::collections::HashMap;

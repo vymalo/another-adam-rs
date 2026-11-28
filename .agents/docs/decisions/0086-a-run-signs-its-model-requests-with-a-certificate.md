@@ -165,6 +165,25 @@ workspace clippy with the feature list, `cargo nextest run --workspace`, `cargo 
 MSRV job, and CI. CI judges them. `cargo tree -p adam-core -i ring`/`-i aws-lc-rs` is empty (*checked
 2026-11-28*), which is what the embedded check would assert.
 
+### What ran, and what did not
+
+Run in the worktree under `heavy` (`CARGO_TARGET_DIR=/run/media/selast/ai-ide-v2/claude/target-anr-1311`,
+`CARGO_BUILD_BUILD_DIR=/run/media/selast/ai-ide-v2/claude/cargo-build-anr-1311`, `CARGO_BUILD_JOBS=4`):
+
+| Command | Exit |
+|---|---|
+| `cargo metadata` (once, to write the lock for the new dev-dependency), then `cargo metadata --locked` | 0 |
+| `cargo fmt --all` | 0 |
+| `cargo clippy -p adam-run-signer --all-targets -- -D warnings` | 0 |
+| `cargo test -p adam-run-signer` | 0 (41 lib, 10 `config`, 14 `proxy`, 4 `binary`, 1 `proxy_env`) |
+| `node tools/docs-check/check-docs.mjs` | 0 (`docs OK`, 19 people/agent page pairs) |
+
+**Not run locally:** the workspace clippy with the feature list, `cargo nextest run --workspace`, the
+workspace's doc tests beyond this crate, `cargo test -p adam --test ui`, the MSRV job, CI, and — the
+one that matters most for A4 — the image build and `docker/coder/test/static-smoke.sh`, which is what
+would prove `run-signer` is one of the seven binaries the image starts with no configuration. CI
+judges them.
+
 ### What the next slice must add
 
 1. The HTTP adapter (R2b): the CSR over `RUN_CERT_ISSUER_URL`, the token from `RUN_CERT_ISSUER_TOKEN_FILE`,
@@ -260,3 +279,231 @@ Not run locally: the workspace clippy with the feature list, `cargo nextest run 
    the person the SAN names taken from the run's prompt statement.
 2. A keyring-level test of the whole path over the broker adapter (the conformance suite proves the adapter; R3
    proves the request path chooses it).
+
+## A4: the sidecar (2026-11-28)
+
+Built at `opencode/anr-1311-run-signer` from `origin/main` `06d6e7c5` on 2026-11-28. Paths are at that
+commit; re-read them before a later slice.
+
+| Piece | Where | What it promises |
+|---|---|---|
+| `Signer`, `run`, `serve` | `bin/run-signer/src/proxy.rs` | one fallback route for every method and path; the order run → statement → target → body → keyring → signature → gateway, so a request refused early is never signed and never forwarded; `serve` bounds the **drain** only (a shutdown starts a grace timer), so a 50 ms grace does not stop a server that has run for 200 ms |
+| `SignerConfig`, `Limits` | `bin/run-signer/src/config.rs` | `RUN_SIGNER_*`: loopback-only listen, an upstream URL with no query, fragment or credentials, and the client — no proxy from the environment, no redirect, the connect and read timeouts, the merged anchors; `Debug` shows the scheme, host, port and a CA name, never a path, a credential or a certificate byte |
+| `Broker`, `from_process_env` | `bin/run-signer/src/broker.rs` | both halves from one environment, **every** problem in one `ConfigError`; one broker issuer per run from `RunCertSettings`, carrying its `RUN_CERT_RENEW_FRACTION` |
+| `IssuerFactory` | `bin/run-signer/src/issuer.rs` | one issuer per run; `renew_fraction()` defaulted to two thirds; the `Arc` blanket impl forwards it |
+| `Keyrings` | `bin/run-signer/src/keyrings.rs` | one `RunKeyring` per run, with the factory's fraction; a run keeps its person; the registry is LRU-bounded, so the hot run is the last to go |
+| `statement::person_and_jti` | `bin/run-signer/src/statement.rs` | the person and the prompt id read through `adam_model::PromptStatement`, the same form check the agent applies (a compact JWS, three base64url segments with a non-empty header and signature, at most 8 KiB); its own JWS parser is gone |
+| `PromptStatement::person` | `crates/adam-model/src/prompt.rs` | the statement payload's `sub` as a non-empty string, `NoPerson` (documented, no content quoted) when there is no statement or no `sub` |
+| `main` | `bin/run-signer/src/main.rs` | tracing, `from_process_env()`, `run()`, `fail()`: 0 a clean shutdown, 78 the configuration, 71 the port |
+
+### What the tests prove
+
+| Acceptance | Test |
+|---|---|
+| the signature verifies against the leaf the sidecar really signed with, over the exact bytes the gateway received | `a_signature_it_adds_verifies_against_the_runs_leaf` (`tests/proxy.rs`) |
+| no `X-Run-Id` means no signature and nothing forwarded, and the 400 body holds neither the run id nor the statement | `a_request_without_a_run_id_is_refused_and_nothing_is_forwarded` |
+| a target `Url::parse` would rewrite (`..`, `%2e%2e`, `\`) or that is not `/`-rooted (`OPTIONS *`) is 400, and nothing is forwarded; a normal target with a query is forwarded unchanged | `a_target_the_url_would_rewrite_is_refused_and_nothing_is_forwarded`, `a_normal_target_is_forwarded_unchanged` |
+| the process exits 78 for an empty environment, naming both halves | `an_empty_environment_exits_78_naming_both_halves` (`tests/binary.rs`) |
+| the process exits 78 for a non-loopback bind and 71 for a taken port | `a_non_loopback_listen_exits_78`, `a_port_that_cannot_be_bound_exits_71` |
+| the token file's content reaches no line of stdout or stderr, and SIGTERM is exit 0 | `the_token_is_on_no_line` |
+| a `503` carries `type: unavailable`, a `400` `about:blank` | `a_503_is_typed_unavailable_and_a_400_is_not` |
+| a run or a statement named twice is 400 and nothing is forwarded; the validated headers go out once each and only the first envelope | `a_request_that_names_its_run_twice_is_refused`, `…_its_statement_twice_…`, `the_validated_headers_go_out_once` |
+| a renewal between the key and the signature is retried once, and a surviving conflict is 503 | `a_renewal_between_the_key_and_the_signature_is_retried_once`, `a_surviving_conflict_is_a_503` |
+| `RUN_CERT_RENEW_FRACTION` reaches the keyring | `a_factorys_renew_fraction_reaches_its_keyring` |
+| at the cap, a hit keeps its run | `a_hit_makes_the_run_the_most_recently_used` |
+| a proxy in the environment is not used for a signed request | `a_proxy_in_the_environment_is_not_used` (`tests/proxy_env.rs`) |
+| the drain, not the serving, is bounded by the grace; a request in flight finishes | `the_shutdown_grace_bounds_the_drain_not_the_serving`, `a_request_in_flight_finishes_inside_the_grace` |
+
+### What the tests do not prove
+
+* **The real broker and the real gateway.** The sidecar's issuer is a fake CA in every test here; the
+  broker's HTTP round trip, its token and its refusals are `adam-run-cert-broker`'s (A3), and no
+  gateway verifies a signature this sidecar made. A signature the gateway rejects would still be a
+  200 from this process.
+* **The deployment.** No chart value, no projected token, no anchor volume, no pod: nothing here
+  proves the sidecar runs beside an agent, that `MODEL_BASE_URL`/`MODEL_AUTH=injector` point at it,
+  or that loopback-only holds in a namespace.
+* **The in-process path.** A worker choosing `KeySource::Run` per run (R3) is not built; the sidecar
+  is a separate process in front of the model.
+* **`sub` is the person.** Nothing verifies the statement: the first request for a run fixes its
+  person (see the sidecar's README), and a test can only show the sidecar believes what it is told.
+* **A real clock.** Expiry and renewal at a real leaf's dates are the keyring's tests, not these.
+
+### No deliberate failure was recorded for this slice
+
+Unlike A1 to A3, no mutation was run for A4: the failures recorded below are first runs of new tests
+against the code as it was, not a hand-made mutation. Each was re-run green after the change.
+
+| Case | The red seen first, with the pre-fix code |
+|---|---|
+| R1, the grace | `a request 200 ms after start against a 50 ms grace` panicked with `reqwest::Error { kind: Request, …, ConnectError("tcp connect error", 127.0.0.1:…, Os { code: 111, kind: ConnectionRefused, message: "Connection refused" }) }`: the whole server sat in a timeout counted from startup, so it stopped serving and exited 0 fifty milliseconds in |
+| R2, the target | `a_target_the_url_would_rewrite_is_refused_and_nothing_is_forwarded`: `assertion left == right failed: /v1/../admin/keys: 0`, `left: 404`, `right: 400` — the rewritten path was forwarded to the gateway, which answered 404 for a route it has no mock on |
+| R5, the type | `a_503_is_typed_unavailable_and_a_400_is_not`: `left: String("about:blank")`, `right: "unavailable"`, over `{"type":"about:blank","title":"Service Unavailable","status":503,…}` — a refusal `adam-model` reads as having no type, so the run was never parked |
+| R7, the headers | `a_request_that_names_its_run_twice_is_refused`: `left: 404`, `right: 400` — two `X-Run-Id` headers were accepted, the first read and forwarded, the request signed and sent |
+| R13, the process | `an_empty_environment_exits_78_naming_both_halves`: `RUN_SIGNER_UPSTREAM is named by none: reading the configuration: invalid configuration:\n  - run certificates are required: …` — the certificate half was parsed first, so the signer's half was never read |
+
+### What the next slice must add
+
+1. The HTTP adapter (R2b): the CSR over `RUN_CERT_ISSUER_URL`, the token from `RUN_CERT_ISSUER_TOKEN_FILE`,
+   the anchor from `RUN_CERT_ISSUER_CA_FILE`, a refusal `Refused`, an outage `Unavailable`.
+2. The wiring (R3): one `RunKeyring` per run, `KeySource::Run` chosen by the request path, the process
+   `TurnKeys` still signing the history, and the person the SAN names taken from the run's prompt statement.
+3. A backoff that survives a restart, if the deployment needs one: the retry window is in memory, so a
+   restarted process asks the CA at once.
+
+## A3: the broker adapter and the config (2026-11-28)
+
+Built at `opencode/anr-1310-broker-adapter` from `origin/main` `7fd99b9b` on 2026-11-28. Paths are at that
+commit; re-read them before a later slice.
+
+| Piece | Where | What it promises |
+|---|---|---|
+| `BrokerIssuer` | `crates/adam-run-cert-broker/src/lib.rs` | the `RunCertIssuer` of **one run** over the broker's contract v1: `POST {url}/internal/runs/{run}/certificate`, `{"v":1,"csr":"<base64 DER>"}` in, `{"v":1,"chain":[...]}` out, the projected token from the file **re-read on every call**, the anchors of `RUN_CERT_CA_FILE` beside the system roots |
+| `http_client` | same | one client a host builds once: no redirect, 30 s, `tls_certs_merge` for the anchors; a bad PEM is `BrokerError::CaFile` (`Invalid`) at startup |
+| `BrokerError`, `TokenError`, `AnswerError` | same | the URL/anchors (`Invalid`), the token (`Unauthenticated`; it carries the path, never the contents), the answer (version, size, JSON, base64, chain, status) |
+| `RunCertSettings`, `RunCertIssuerKind` | `crates/adam-service/src/config.rs` | `RUN_CERT_*`: off when all unset, a problem naming the variable when half-set, `broker` built and `openbao` refused until A6, the fraction parsed as `n/d`; `issuer(run)` and `keyring(subject)` |
+| `RenewFraction`, `BadRenewFraction` | `crates/adam-core/src/turn/run_cert/keyring.rs` | the renewal point as an exact fraction (default `TWO_THIRDS`), `RunKeyring::with_renew_fraction` |
+
+**Why a new crate.** `adam-core` is the port and must stay free of an HTTP client and a TLS stack:
+`tools/embedded-deps/check.sh` forbids `reqwest`, `rustls`, `aws-lc-rs` and `ring` in `adam-engine`'s tree, and
+the A2 notes record that `x509-cert` was chosen so no crypto provider enters `adam-core`. The adapter is a crate
+of its own (`adam-run-cert-broker`) on the `reqwest`/rustls-on-aws-lc-rs already in the tree — the model client's
+stack, not a second one — and `adam-service` depends on it only for `RunCertSettings`. The port is unchanged: no
+driver type in a trait signature.
+
+**The token.** `issue` opens `RUN_CERT_TOKEN_FILE` every time, trims the trailing whitespace of a mounted secret,
+and refuses an empty or unreadable file without sending. The header is marked sensitive; the token is never in
+`Debug` (the issuer shows the endpoint's origin, the run and the file's path), never in a log line, and never in
+an error. The sentinel test captures our target's log and asserts the sentinel is absent while the mock asserts it
+was presented.
+
+**The refusals.** `400` → `Invalid`, `401`/`403` → `Refused` (`Unauthenticated`), `429`/`5xx` → `Unavailable`
+(`Transient`), another status → `Internal`. The answer's problem document is never echoed: an error carries the
+status, not the body. A wrong `v` is `Internal` (`AnswerError::Version`).
+
+**The contract fixtures.** ANR-1306's v1 fixtures (the system's `docs/api/fixtures/run-certificate-v1/`) are
+copied into `crates/adam-run-cert-broker/tests/fixtures/run-certificate-v1/` — the JSON bodies only, no README —
+so the request and the answer cross the wire byte for byte and the six refusals are tested for their class. The
+fixed answer cannot pass the conformance suite's `two_requests_get_two_chains`, so that mock mints a leaf per CSR
+with `FakeRunCertIssuer`; the fixed answer is the shape test.
+
+**A contract gap.** v1 allows up to 8 certificates; `CertificateChain::MAX_CERTIFICATES` is 4. A longer chain is
+`Internal`; real chains are 2 or 3. Raising the port's bound is a later change, not a silent truncation.
+
+### The deliberate failures (each seen red once)
+
+1. **Half-set config.** The required-variable loop no longer pushed its problem: `RUN_CERT_ISSUER is not named: []`,
+   exit 101 (`a_half_set_run_certificate_names_the_variable_and_is_78`). The process would have started with run
+   certificates silently off.
+2. **Token sentinel.** `issue` logged `tracing::debug!(token = %token.expose_secret(), …)`: `a rendering leaks the
+   token: 2026-11-28T00:10:44Z DEBUG adam_run_cert_broker: RED 2: the broker presents its token
+   token=anr1310-projected-token-SENTINEL-do-not-log`, exit 101.
+3. **The `v` check.** `answer.v != CONTRACT_VERSION` became `answer.v == 0`: the case panicked with
+   "called `Result::unwrap_err()` on an `Ok` value: CertificateChain { kid: …, certificates: 2 }"
+   (`a_wrong_version_is_refused`), exit 101.
+
+Restored, the three crates' suites are green except the pre-existing `hooks::tests::an_unknown_member_is_refused`
+(below).
+
+### What ran, and what did not
+
+Crate-scoped with `CARGO_TARGET_DIR=/run/media/selast/ai-ide-v2/claude/opencode/anr1310-target` and
+`CARGO_BUILD_BUILD_DIR=/run/media/selast/ai-ide-v2/claude/opencode/anr1310-build`, no `heavy`, no workspace build:
+
+| Command | Exit |
+|---|---|
+| `cargo fmt --all --check` | 0 |
+| `cargo check -p adam-core -p adam-service -p adam-run-cert-broker --all-targets` | 0 |
+| `cargo check -p adam-agent --all-targets` | 0 (its `ModelConfig` literal gains `run_cert: None`) |
+| `cargo test -p adam-core -p adam-run-cert-broker -p adam-service` | red on `hooks::tests::an_unknown_member_is_refused`, pre-existing |
+| `cargo test -p adam-core -p adam-run-cert-broker -p adam-service -- --skip hooks::tests::an_unknown_member_is_refused` | 0 |
+| `cargo clippy -p adam-core -p adam-service -p adam-run-cert-broker --all-targets -- -D warnings` | 0 |
+| `cargo metadata --locked` | 0 |
+| `node tools/docs-check/check-docs.mjs` | 0 |
+
+**The pre-existing red.** `an_unknown_member_is_refused` writes a hooks file with `"alow"` and expects the problem
+to name it; `parse_file` in `crates/adam-service/src/hooks.rs` formats only "a member is wrong at line … column …".
+The same code and test are at `7fd99b9b` (`git show 7fd99b9b:crates/adam-service/src/hooks.rs`), so it is not A3's;
+it is a separate ticket.
+
+Not run locally: the workspace clippy with the feature list, `cargo nextest run --workspace`, `cargo test -p adam
+--test ui`, `tools/embedded-deps/check.sh` (it builds `adam-engine`'s tree), the MSRV job, and CI. CI judges them.
+`cargo tree -p adam-core -i ring` and `-i aws-lc-rs` are empty (*checked 2026-11-28*); the broker crate brings
+`reqwest` with rustls on aws-lc-rs, which is the model client's stack.
+
+### What the next slice must add
+
+1. The wiring (R3): `ModelConfig::run_cert` → one `RunKeyring` per run, `KeySource::Run` on the request path, and
+   the person the SAN names taken from the run's prompt statement.
+2. A keyring-level test of the whole path over the broker adapter (the conformance suite proves the adapter; R3
+   proves the request path chooses it).
+
+## A4: the sidecar (2026-11-28)
+
+Built at `opencode/anr-1311-run-signer` from `origin/main` `06d6e7c5` on 2026-11-28. Paths are at that
+commit; re-read them before a later slice.
+
+| Piece | Where | What it promises |
+|---|---|---|
+| `Signer`, `run`, `serve` | `bin/run-signer/src/proxy.rs` | one fallback route for every method and path; the order run → statement → target → body → keyring → signature → gateway, so a request refused early is never signed and never forwarded; `serve` bounds the **drain** only (a shutdown starts a grace timer), so a 50 ms grace does not stop a server that has run for 200 ms |
+| `SignerConfig`, `Limits` | `bin/run-signer/src/config.rs` | `RUN_SIGNER_*`: loopback-only listen, an upstream URL with no query, fragment or credentials, and the client — no proxy from the environment, no redirect, the connect and read timeouts, the merged anchors; `Debug` shows the scheme, host, port and a CA name, never a path, a credential or a certificate byte |
+| `Broker`, `from_process_env` | `bin/run-signer/src/broker.rs` | both halves from one environment, **every** problem in one `ConfigError`; one broker issuer per run from `RunCertSettings`, carrying its `RUN_CERT_RENEW_FRACTION` |
+| `IssuerFactory` | `bin/run-signer/src/issuer.rs` | one issuer per run; `renew_fraction()` defaulted to two thirds; the `Arc` blanket impl forwards it |
+| `Keyrings` | `bin/run-signer/src/keyrings.rs` | one `RunKeyring` per run, with the factory's fraction; a run keeps its person; the registry is LRU-bounded, so the hot run is the last to go |
+| `statement::person_and_jti` | `bin/run-signer/src/statement.rs` | the person and the prompt id read through `adam_model::PromptStatement`, the same form check the agent applies (a compact JWS, three base64url segments with a non-empty header and signature, at most 8 KiB); its own JWS parser is gone |
+| `PromptStatement::person` | `crates/adam-model/src/prompt.rs` | the statement payload's `sub` as a non-empty string, `NoPerson` (documented, no content quoted) when there is no statement or no `sub` |
+| `main` | `bin/run-signer/src/main.rs` | tracing, `from_process_env()`, `run()`, `fail()`: 0 a clean shutdown, 78 the configuration, 71 the port |
+
+### What the tests prove
+
+| Acceptance | Test |
+|---|---|
+| the signature verifies against the leaf the sidecar really signed with, over the exact bytes the gateway received | `a_signature_it_adds_verifies_against_the_runs_leaf` (`tests/proxy.rs`) |
+| no `X-Run-Id` means no signature and nothing forwarded, and the 400 body holds neither the run id nor the statement | `a_request_without_a_run_id_is_refused_and_nothing_is_forwarded` |
+| a target `Url::parse` would rewrite (`..`, `%2e%2e`, `\`) or that is not `/`-rooted (`OPTIONS *`) is 400, and nothing is forwarded; a normal target with a query is forwarded unchanged | `a_target_the_url_would_rewrite_is_refused_and_nothing_is_forwarded`, `a_normal_target_is_forwarded_unchanged` |
+| the process exits 78 for an empty environment, naming both halves | `an_empty_environment_exits_78_naming_both_halves` (`tests/binary.rs`) |
+| the process exits 78 for a non-loopback bind and 71 for a taken port | `a_non_loopback_listen_exits_78`, `a_port_that_cannot_be_bound_exits_71` |
+| the token file's content reaches no line of stdout or stderr, and SIGTERM is exit 0 | `the_token_is_on_no_line` |
+| a `503` carries `type: unavailable`, a `400` `about:blank` | `a_503_is_typed_unavailable_and_a_400_is_not` |
+| a run or a statement named twice is 400 and nothing is forwarded; the validated headers go out once each and only the first envelope | `a_request_that_names_its_run_twice_is_refused`, `…_its_statement_twice_…`, `the_validated_headers_go_out_once` |
+| a renewal between the key and the signature is retried once, and a surviving conflict is 503 | `a_renewal_between_the_key_and_the_signature_is_retried_once`, `a_surviving_conflict_is_a_503` |
+| `RUN_CERT_RENEW_FRACTION` reaches the keyring | `a_factorys_renew_fraction_reaches_its_keyring` |
+| at the cap, a hit keeps its run | `a_hit_makes_the_run_the_most_recently_used` |
+| a proxy in the environment is not used for a signed request | `a_proxy_in_the_environment_is_not_used` (`tests/proxy_env.rs`) |
+| the drain, not the serving, is bounded by the grace; a request in flight finishes | `the_shutdown_grace_bounds_the_drain_not_the_serving`, `a_request_in_flight_finishes_inside_the_grace` |
+
+### What the tests do not prove
+
+* **The real broker and the real gateway.** The sidecar's issuer is a fake CA in every test here; the
+  broker's HTTP round trip, its token and its refusals are `adam-run-cert-broker`'s (A3), and no
+  gateway verifies a signature this sidecar made. A signature the gateway rejects would still be a
+  200 from this process.
+* **The deployment.** No chart value, no projected token, no anchor volume, no pod: nothing here
+  proves the sidecar runs beside an agent, that `MODEL_BASE_URL`/`MODEL_AUTH=injector` point at it,
+  or that loopback-only holds in a namespace.
+* **The in-process path.** A worker choosing `KeySource::Run` per run (R3) is not built; the sidecar
+  is a separate process in front of the model.
+* **`sub` is the person.** Nothing verifies the statement: the first request for a run fixes its
+  person (see the sidecar's README), and a test can only show the sidecar believes what it is told.
+* **A real clock.** Expiry and renewal at a real leaf's dates are the keyring's tests, not these.
+
+### No deliberate failure was recorded for this slice
+
+Unlike A1 to A3, no mutation was run for A4: the failures recorded below are first runs of new tests
+against the code as it was, not a hand-made mutation. Each was re-run green after the change.
+
+| Case | The red seen first |
+|---|---|
+| R1, the grace | a request 200 ms after start against a 50 ms grace: `connection refused` — the first cut wrapped the whole server, so it stopped serving 50 ms in and exited 0 |
+| R2, the target | `POST /v1/../admin/keys` reached the gateway as `/admin/keys` (200 from the mock): signed over one path, sent over another |
+| R5, the type | the 503 body's `type` was `about:blank`, which `adam-model` reads as no type at all, so the run was never parked |
+| R7, the headers | two `X-Run-Id` headers were accepted, and both were forwarded, though only the first was signed over |
+| R13, the process | the empty environment exited 78 naming only the certificate half: `RUN_SIGNER_UPSTREAM` was named by no line |
+
+### What the next slice must add
+
+1. **R3, the in-process path.** A worker that chooses `KeySource::Run` per run, keeps one `RunKeyring`
+   per run, and still signs its history with the process `TurnKeys`.
+2. **The deployment that runs the sidecar.** `deploy/coder`: a value and a volume for the projected
+   `RUN_CERT_TOKEN_FILE` and for the anchor, the `RUN_SIGNER_*` variables, and `MODEL_BASE_URL` at
+   the sidecar with `MODEL_AUTH=injector` — then the parity row's ❌ gap becomes a link.

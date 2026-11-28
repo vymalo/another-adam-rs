@@ -23,14 +23,16 @@ adam-error.workspace = true
 adam-model.workspace = true
 adam-run-cert-broker.workspace = true
 # `RunCertSettings`: the `RUN_CERT_*` names are read once, by the agents' own parser, so the sidecar
-# and an agent can never disagree on them.
+# and an agent can never disagree on them. Its default features stay on (the store adapters): the
+# workspace and the image unify features with the agents beside it, so a lone `-p` build is the only
+# one that could differ, and `default-features = false` would be a configuration nothing exercises.
 adam-service.workspace = true
 axum.workspace = true
 base64.workspace = true
 mimalloc.workspace = true
 # `rustls` (aws-lc-rs) rather than the workspace's `rustls-no-provider`: the client this crate builds
 # needs an installed TLS provider to exist at all (`reqwest::Client::build` panics without one), and
-# the coder image already links aws-lc-rs.
+# `adam-run-cert-broker` — through `adam-service` — already links aws-lc-rs, as the coder image does.
 reqwest = { workspace = true, features = ["rustls"] }
 serde.workspace = true
 serde_json.workspace = true
@@ -42,6 +44,7 @@ url.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+async-trait.workspace = true
 bytes.workspace = true
 futures.workspace = true
 tempfile.workspace = true

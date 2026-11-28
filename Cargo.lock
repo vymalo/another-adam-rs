@@ -896,6 +896,7 @@ dependencies = [
  "adam-model",
  "adam-run-cert-broker",
  "adam-service",
+ "async-trait",
  "axum",
  "base64 0.22.1",
  "bytes",

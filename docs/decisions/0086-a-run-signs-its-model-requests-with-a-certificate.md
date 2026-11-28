@@ -110,8 +110,11 @@ run key cannot sign is not sent", for an agent that holds no key. It listens on 
 and the prompt statement (the statement's `sub` is the person the leaf's SAN names), forwards the call to
 `RUN_SIGNER_UPSTREAM`, and adds `Turn-Signature` from the run's `RunKeyring`. Its upstream client trusts
 `RUN_SIGNER_UPSTREAM_CA_FILE`, which defaults to `RUN_CERT_CA_FILE`: one trust domain today, two names so a future
-gateway can present its own chain. Still not built: the in-process request path (a worker choosing `KeySource::Run`
-per run, R3) and the deployment that runs the sidecar.
+gateway can present its own chain. The statement's `sub` is **not** verified there — the gateway is the only verifier
+— so the first request for a run fixes that run's person, and a wrong `sub` both mints a leaf for an unproven person
+and can deny that run's calls until the entry is evicted (the sidecar's README states the trust this assumes). Still
+not built: the in-process request path (a worker choosing `KeySource::Run` per run, R3) and the deployment that runs
+the sidecar.
 
 ## What it protects, and what it does not
 

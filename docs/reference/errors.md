@@ -452,8 +452,8 @@ its status and class.
 
 `run-signer` (the sidecar that signs a run's model requests, [its README](../../bin/run-signer/README.md)) ends with 0
 after SIGTERM, 78 for its configuration — a listen address that is not loopback, a missing `RUN_SIGNER_UPSTREAM`, an
-unusable `RUN_SIGNER_UPSTREAM_CA_FILE`, or `RUN_CERT_*` that are unset or half-set — and 71 when it cannot bind
-`RUN_SIGNER_LISTEN`
+unusable `RUN_SIGNER_UPSTREAM_CA_FILE`, or `RUN_CERT_*` that are unset or half-set — and 71 when it cannot bind or
+serve `RUN_SIGNER_LISTEN`
 (`bin/run-signer/src/error.rs`); it logs `run-signer failed` in the same way. What it refuses per request is an HTTP
 status, not an exit: see [the environment page](environment.md#the-run-signer-run-signer).
 

@@ -8,9 +8,10 @@
 //!   ([`Refusal::RunAlreadyBoundToAnotherPerson`]) and never re-keyed: re-keying would certify the
 //!   second person's key under the first person's run, which is exactly what the certificate is
 //!   supposed to prevent.
-//! * **The registry is bounded.** Beyond `max_runs` entries the oldest inserted is dropped, so a
+//! * **The registry is bounded.** Beyond `max_runs` entries the least recently used is dropped, so a
 //!   long-lived sidecar does not keep every run it has ever seen. A run whose keyring was dropped
-//!   gets a new one, with a new key, on its next call.
+//!   gets a new one, with a new key, on its next call. The hot run — the long-lived one that calls
+//!   steadily — is the last to go, not the first.
 //!
 //! The mutex is held across the factory call, which is **synchronous**: it builds an issuer (a value,
 //! not an I/O round trip) and the key itself is made lazily by the keyring on its first signature.
@@ -112,7 +113,7 @@ pub struct Keyrings {
 #[derive(Default)]
 struct State {
     entries: HashMap<RunId, Arc<RunKeyring>>,
-    /// The runs, oldest inserted first: what is dropped beyond the cap.
+    /// The runs, least recently used first: what is dropped beyond the cap.
     order: VecDeque<RunId>,
 }
 
@@ -127,7 +128,9 @@ impl Keyrings {
         }
     }
 
-    /// The keyring of `run`, made now when it is the run's first call, for `person`.
+    /// The keyring of `run`, made now when it is the run's first call, for `person`. A run that
+    /// answers from the registry becomes the most recently used, so the hot run is the last to be
+    /// dropped.
     ///
     /// # Errors
     ///
@@ -136,21 +139,27 @@ impl Keyrings {
     /// [`Refusal::Issuer`] when the factory cannot build the run's issuer.
     pub async fn keyring(&self, run: RunId, person: &str) -> Result<Arc<RunKeyring>, Refusal> {
         let mut state = self.state.lock().await;
-        if let Some(existing) = state.entries.get(&run) {
-            return if existing.subject().person() == person {
-                Ok(Arc::clone(existing))
-            } else {
-                Err(Refusal::RunAlreadyBoundToAnotherPerson)
-            };
+        // The lookup ends before the order is touched: a hit is the run's, and moves it to the back.
+        let held = match state.entries.get(&run) {
+            Some(existing) if existing.subject().person() == person => Some(Arc::clone(existing)),
+            Some(_) => return Err(Refusal::RunAlreadyBoundToAnotherPerson),
+            None => None,
+        };
+        if let Some(held) = held {
+            state.order.retain(|held| *held != run);
+            state.order.push_back(run);
+            return Ok(held);
         }
         let subject = RunSubject::new(person, run).map_err(Refusal::BadSubject)?;
         let issuer = self.factory.issuer(run).map_err(Refusal::Issuer)?;
-        let keyring = Arc::new(RunKeyring::new(issuer, subject));
+        let keyring = Arc::new(
+            RunKeyring::new(issuer, subject).with_renew_fraction(self.factory.renew_fraction()),
+        );
         while state.entries.len() >= self.max_runs {
-            let Some(oldest) = state.order.pop_front() else {
+            let Some(least_recent) = state.order.pop_front() else {
                 break;
             };
-            state.entries.remove(&oldest);
+            state.entries.remove(&least_recent);
         }
         state.order.push_back(run);
         state.entries.insert(run, Arc::clone(&keyring));
@@ -184,6 +193,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use adam_core::turn::run_cert::DynRunCertIssuer;
+    use adam_core::turn::run_cert::RenewFraction;
     use adam_core::turn::run_cert::testkit::FakeRunCertIssuer;
     use adam_error::BoxError;
 
@@ -202,6 +212,19 @@ mod tests {
     impl IssuerFactory for Failing {
         fn issuer(&self, _run: RunId) -> Result<DynRunCertIssuer, BoxError> {
             Err("no CA configured".into())
+        }
+    }
+
+    /// A factory that asks for the renewal at one half, `RUN_CERT_RENEW_FRACTION=1/2`.
+    struct Halves(Arc<FakeRunCertIssuer>);
+
+    impl IssuerFactory for Halves {
+        fn issuer(&self, _run: RunId) -> Result<DynRunCertIssuer, BoxError> {
+            Ok(self.0.clone())
+        }
+
+        fn renew_fraction(&self) -> RenewFraction {
+            RenewFraction::new(1, 2).unwrap()
         }
     }
 
@@ -284,6 +307,41 @@ mod tests {
         let registry = keyrings(0);
         registry.keyring(RunId::new(), "person-1").await.unwrap();
         assert_eq!(registry.len().await, 1);
+    }
+
+    /// `RUN_CERT_RENEW_FRACTION`: the factory's fraction reaches the keyring it signs with.
+    #[tokio::test]
+    async fn a_factorys_renew_fraction_reaches_its_keyring() {
+        let registry = Keyrings::new(Arc::new(Halves(Arc::new(FakeRunCertIssuer::new()))), 4);
+        let keyring = registry.keyring(RunId::new(), "person-1").await.unwrap();
+        assert_eq!(keyring.renew_fraction(), RenewFraction::new(1, 2).unwrap());
+        // A factory that does not say gets two thirds.
+        let default = keyrings(4);
+        let keyring = default.keyring(RunId::new(), "person-1").await.unwrap();
+        assert_eq!(keyring.renew_fraction(), RenewFraction::TWO_THIRDS);
+    }
+
+    /// At the cap, a hit keeps its run: the least recently used one is dropped, not the oldest.
+    #[tokio::test]
+    async fn a_hit_makes_the_run_the_most_recently_used() {
+        let registry = keyrings(2);
+        let hot = RunId::new();
+        let cold = RunId::new();
+        let newest = RunId::new();
+        let hot_key = registry.keyring(hot, "person-1").await.unwrap();
+        let cold_key = registry.keyring(cold, "person-1").await.unwrap();
+        // The hot run is used again: `cold` is now the least recently used.
+        registry.keyring(hot, "person-1").await.unwrap();
+        registry.keyring(newest, "person-1").await.unwrap();
+        assert_eq!(registry.len().await, 2);
+        let again = registry.keyring(hot, "person-1").await.unwrap();
+        assert!(
+            Arc::ptr_eq(&hot_key, &again),
+            "the hot run was evicted by a hit"
+        );
+        // `cold` went, and comes back as a new keyring.
+        let cold_again = registry.keyring(cold, "person-1").await.unwrap();
+        assert!(!Arc::ptr_eq(&cold_key, &cold_again));
     }
 
     #[test]

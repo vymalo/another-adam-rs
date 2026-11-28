@@ -12,7 +12,7 @@ use std::fmt;
 use std::sync::Arc;
 
 use adam_core::RunId;
-use adam_core::turn::run_cert::DynRunCertIssuer;
+use adam_core::turn::run_cert::{DynRunCertIssuer, RenewFraction};
 use adam_error::BoxError;
 
 /// The issuer of each run's certificate.
@@ -34,6 +34,13 @@ pub trait IssuerFactory: Send + Sync + 'static {
     /// without it, so it must not carry a secret.
     fn issuer(&self, run: RunId) -> Result<DynRunCertIssuer, BoxError>;
 
+    /// When each run's keyring replaces its run's key, as a fraction of the leaf's life
+    /// (`RUN_CERT_RENEW_FRACTION`). A factory that does not say gets the keyring's own default,
+    /// two thirds.
+    fn renew_fraction(&self) -> RenewFraction {
+        RenewFraction::TWO_THIRDS
+    }
+
     /// What this factory is, for `Debug` and the startup log. Never an address, a token or a key.
     fn kind(&self) -> &'static str {
         "host"
@@ -43,6 +50,10 @@ pub trait IssuerFactory: Send + Sync + 'static {
 impl<T: IssuerFactory + ?Sized> IssuerFactory for Arc<T> {
     fn issuer(&self, run: RunId) -> Result<DynRunCertIssuer, BoxError> {
         (**self).issuer(run)
+    }
+
+    fn renew_fraction(&self) -> RenewFraction {
+        (**self).renew_fraction()
     }
 
     fn kind(&self) -> &'static str {
@@ -78,8 +89,13 @@ mod tests {
         assert!(factory.issuer(RunId::new()).is_err());
         assert_eq!(factory.kind(), "none");
         assert_eq!(format!("{factory:?}"), "IssuerFactory(none)");
+        assert_eq!(factory.renew_fraction(), RenewFraction::TWO_THIRDS);
         // Through the blanket implementation, on the shared value itself.
         assert!(IssuerFactory::issuer(&factory, RunId::new()).is_err());
         assert_eq!(IssuerFactory::kind(&factory), "none");
+        assert_eq!(
+            IssuerFactory::renew_fraction(&factory),
+            RenewFraction::TWO_THIRDS
+        );
     }
 }

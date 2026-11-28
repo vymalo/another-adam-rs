@@ -247,13 +247,20 @@ signature)*). Source: `bin/run-signer/src/config.rs`. Problems are reported all 
 | Variable | Meaning | Default |
 |---|---|---|
 | `RUN_SIGNER_LISTEN` | the address to listen on. **Loopback only**: anything else is exit 78, because the proxy signs a caller's request with the run's key | `127.0.0.1:8443` |
-| `RUN_SIGNER_UPSTREAM` | **required**: the model gateway's base URL, absolute `http` or `https` with a host, no query and no fragment. The request's own path and query are appended to it | required |
+| `RUN_SIGNER_UPSTREAM` | **required**: the model gateway's base URL, absolute `http` or `https` with a host, no query, no fragment and no credentials. The request's own path and query are appended to it, and a target `Url::parse` would rewrite (`..`, `%2e%2e`, `\`, `{}`) is refused `400` rather than signed over one path and sent over another | required |
 | `RUN_SIGNER_UPSTREAM_CA_FILE` | the PEM anchors the upstream client trusts beside the default roots. A file that cannot be read, is empty, is over 1 MiB or holds no certificate is exit 78 | `RUN_CERT_CA_FILE`'s bytes: the broker and the gateway are one trust domain by design today |
-| `RUN_CERT_ISSUER`, `RUN_CERT_ISSUER_URL`, `RUN_CERT_TOKEN_FILE`, `RUN_CERT_CA_FILE`, `RUN_CERT_RENEW_FRACTION` | **required here**, unlike the agents: a signer with no issuer cannot sign, so every one of them unset is exit 78 naming the three required ones, and a half-set configuration is exit 78 with the same problems the agents report ([their rows](#turn-signing)). `RUN_CERT_CA_FILE` is trusted for **both** the broker and the gateway. The token file is re-read on every call, never cached and never logged | required |
+| `RUN_CERT_ISSUER`, `RUN_CERT_ISSUER_URL`, `RUN_CERT_TOKEN_FILE`, `RUN_CERT_CA_FILE`, `RUN_CERT_RENEW_FRACTION` | **required here**, unlike the agents ([their rows](#turn-signing)): a signer with no issuer cannot sign, so every one of them unset is exit 78 naming the three required ones, and a half-set configuration is exit 78 with the same problems the agents report, beside this binary's own. `RUN_CERT_CA_FILE` is trusted for **both** the broker and the gateway. The token file is re-read on every call, never cached and never logged | required |
+| `RUST_LOG` | log filter; JSON logs on stdout | `info` |
 
 A request it refuses is an HTTP status, not an exit: `400` for a missing or malformed `X-Run-Id` or `Prompt-Statement`
-(a run certificate names the person, so the statement is required), `413` for a body over 16 MiB, `503` when the issuer
-or the gateway cannot be reached, and `502` for any other signing failure.
+(a run certificate names the person, so the statement is required), for one named twice, or for a target it would not
+forward unchanged; `413` for a body over 16 MiB; `503` when the issuer or the gateway cannot be reached, or a renewal
+outlived its one retry; and `502` for any other signing failure. A `503` carries `type: unavailable` so the run parks on
+a timer; the others carry `about:blank`.
+
+Not variables: the body limit (16 MiB), the connect timeout (10 s), the read timeout (300 s: a black-holed gateway
+frees the request, and it stays above the shutdown grace), the number of runs kept in memory (1024, least recently
+used dropped first) and the shutdown grace (25 s) — `Limits` values, so a test can shorten them.
 
 ## Egress proxy (`adam-egress`)
 

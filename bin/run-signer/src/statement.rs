@@ -9,21 +9,21 @@
 //! * `jti`, the prompt's id. It is what the request signature binds (`prompt_jti`), so a signature
 //!   cannot be moved to another prompt.
 //!
-//! `adam_model::PromptStatement` reads the second one ([`prompt_jti`]) and deliberately not the
-//! first: the orchestrator's job there is to carry the value byte for byte, and only a verifier in
-//! front of the model needs the person. This module is that verifier's reader. It does not modify
-//! `adam-model`.
+//! The value itself is read by `adam_model::PromptStatement`, the same type the agent carries: the
+//! form (three base64url segments, at most [`MAX_PROMPT_JWS_BYTES`]) is checked there, so the sidecar
+//! declines exactly what the agent declines, and [`person`] and [`prompt_jti`] read the two members.
 //!
 //! Nothing is verified here: a signature is the gateway's to check, against the CA the sidecar
-//! trusts. What is read here is only what the sidecar's own key needs.
+//! trusts. What is read here is only what the sidecar's own key needs. In particular `sub` is
+//! **not** verified: the gateway is the only verifier, and see the README on what that means.
 //!
+//! [`MAX_PROMPT_JWS_BYTES`]: adam_model::MAX_PROMPT_JWS_BYTES
+//! [`person`]: adam_model::PromptStatement::person
 //! [`prompt_jti`]: adam_model::PromptStatement::prompt_jti
 
 use adam_core::turn::RunSubject;
 use adam_error::{Classify, ErrorClass};
-use base64::Engine as _;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use serde_json::Value;
+use adam_model::PromptStatement;
 
 /// The two values the sidecar reads from a prompt statement.
 #[derive(Clone, PartialEq, Eq)]
@@ -48,45 +48,21 @@ impl std::fmt::Debug for PromptIdentity {
 ///
 /// # Errors
 ///
-/// [`StatementError`]: it is not a compact JWS of three non-empty segments, its payload is not
-/// base64url JSON, it names no `sub` or no `jti`, or the person is longer than
-/// [`RunSubject::MAX_PERSON_LEN`]. No error repeats a value.
+/// [`StatementError`]: it is not a compact JWS of three non-empty segments and at most
+/// [`MAX_PROMPT_JWS_BYTES`](adam_model::MAX_PROMPT_JWS_BYTES), its payload is not base64url JSON, it
+/// names no `sub` or no `jti`, or the person is longer than [`RunSubject::MAX_PERSON_LEN`]. No error
+/// repeats a value.
 pub fn person_and_jti(statement: &str) -> Result<PromptIdentity, StatementError> {
-    let mut segments = statement.split('.');
-    let (Some(header), Some(payload), Some(signature), None) = (
-        segments.next(),
-        segments.next(),
-        segments.next(),
-        segments.next(),
-    ) else {
-        return Err(StatementError::NotAStatement);
-    };
-    if header.is_empty() || signature.is_empty() {
-        return Err(StatementError::NotAStatement);
-    }
-    let bytes = URL_SAFE_NO_PAD
-        .decode(payload)
-        .map_err(|_| StatementError::NotAStatement)?;
-    let Ok(Value::Object(map)) = serde_json::from_slice::<Value>(&bytes) else {
-        return Err(StatementError::NotAStatement);
-    };
-    let person = map
-        .get("sub")
-        .and_then(Value::as_str)
-        .filter(|person| !person.is_empty())
-        .ok_or(StatementError::NoPerson)?;
+    let parsed =
+        PromptStatement::new(statement, None).map_err(|_| StatementError::NotAStatement)?;
+    let person = parsed.person().map_err(|_| StatementError::NoPerson)?;
     if person.len() > RunSubject::MAX_PERSON_LEN {
         return Err(StatementError::PersonTooLong);
     }
-    let jti = map
-        .get("jti")
-        .and_then(Value::as_str)
-        .filter(|jti| !jti.is_empty())
-        .ok_or(StatementError::NoPromptId)?;
-    Ok(PromptIdentity {
-        person: person.to_owned(),
-        jti: jti.to_owned(),
-    })
+    let jti = parsed
+        .prompt_jti()
+        .map_err(|_| StatementError::NoPromptId)?;
+    Ok(PromptIdentity { person, jti })
 }
 
 /// Why a `Prompt-Statement` does not name a person and a prompt. Carries no value. Classified as
@@ -134,14 +110,18 @@ impl Classify for StatementError {
 
 #[cfg(test)]
 mod tests {
+    use adam_model::MAX_PROMPT_JWS_BYTES;
+    use base64::Engine as _;
+    use serde_json::{Value, json};
+
     use super::*;
-    use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
-    use serde_json::json;
 
     fn statement(payload: Value) -> String {
-        let header = B64.encode(br#"{"alg":"EdDSA","typ":"prompt-statement/v1"}"#);
-        let payload = B64.encode(serde_json::to_vec(&payload).unwrap());
-        let signature = B64.encode(b"a signature");
+        let header = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(br#"{"alg":"EdDSA","typ":"prompt-statement/v1"}"#);
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(serde_json::to_vec(&payload).unwrap());
+        let signature = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b"a signature");
         format!("{header}.{payload}.{signature}")
     }
 
@@ -198,9 +178,6 @@ mod tests {
             format!("header.{payload}."),
             format!("header.{payload}"),
             "header.%%%.signature".to_owned(),
-            // A payload that decodes but is not a JSON object.
-            format!("header.{}.signature", B64.encode(b"not json")),
-            format!("header.{}.signature", B64.encode(b"[1,2]")),
         ] {
             assert_eq!(
                 person_and_jti(&bad),
@@ -208,6 +185,31 @@ mod tests {
                 "{bad:?}"
             );
         }
+        // A payload that is a compact JWS's but not a JSON object names no person: the form is
+        // `adam-model`'s now, and it does not read the payload.
+        for payload in ["bm90IGpzb24", "WzEsMl0"] {
+            let bad = format!("header.{payload}.signature");
+            assert_eq!(
+                person_and_jti(&bad),
+                Err(StatementError::NoPerson),
+                "{bad:?}"
+            );
+        }
+    }
+
+    /// The bound `adam-model` sets, which the README states: a longer statement is refused here too.
+    #[test]
+    fn an_oversized_statement_is_refused() {
+        let oversized = format!("{}.b.c", "a".repeat(MAX_PROMPT_JWS_BYTES));
+        assert_eq!(
+            person_and_jti(&oversized),
+            Err(StatementError::NotAStatement)
+        );
+        // An empty header segment, which `adam-model` refuses: not a compact JWS.
+        assert_eq!(person_and_jti("..sig"), Err(StatementError::NotAStatement));
+        // An empty payload is a detached payload (RFC 7515 Appendix F), which `adam-model` admits
+        // and which names no person here.
+        assert_eq!(person_and_jti("e30..c2ln"), Err(StatementError::NoPerson));
     }
 
     #[test]

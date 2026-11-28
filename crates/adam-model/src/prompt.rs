@@ -116,6 +116,29 @@ impl PromptStatement {
             .ok_or(NoPromptId)
     }
 
+    /// The person the statement is for: `sub`, a member of the statement's attached payload, as a
+    /// non-empty string.
+    ///
+    /// A device sends the person's envelope alone ([`envelope`](Self::envelope)), which names no
+    /// person a certificate can carry: it answers [`NoPerson`]. Nothing is verified here: `sub` is
+    /// the value the statement carries, and whether it is the person's is the verifier's check.
+    ///
+    /// # Errors
+    ///
+    /// [`NoPerson`] when there is no statement, or its payload has no non-empty string `sub`. It
+    /// quotes nothing.
+    pub fn person(&self) -> Result<String, NoPerson> {
+        let statement = self.statement.as_deref().ok_or(NoPerson)?;
+        statement
+            .split('.')
+            .nth(1)
+            .and_then(base64url_decode)
+            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+            .and_then(|value| value.get("sub")?.as_str().map(str::to_owned))
+            .filter(|person| !person.is_empty())
+            .ok_or(NoPerson)
+    }
+
     /// The person's envelope, byte for byte as it came; `None` when the message carried none.
     pub fn user(&self) -> Option<&str> {
         self.user.as_deref()
@@ -175,6 +198,13 @@ pub enum NotAPromptStatement {
     "the prompt statement names no prompt id (the statement's `jti`, or the envelope's `nonce`)"
 )]
 pub struct NoPromptId;
+
+/// A prompt statement that names no person ([`PromptStatement::person`]): there is no statement (a
+/// device's envelope alone), or its payload has no non-empty string `sub`. It quotes nothing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+#[error("the prompt statement names no person (the statement's `sub`)")]
+pub struct NoPerson;
 
 /// RFC 4648 §5 without padding, the alphabet [`is_compact_jws`] admits.
 fn base64url_decode(text: &str) -> Option<Vec<u8>> {
@@ -277,5 +307,48 @@ mod tests {
         let err = serde_json::from_value::<PromptStatement>(serde_json::json!({"statement": "x"}))
             .unwrap_err();
         assert!(!err.to_string().contains("\"x\""), "{err}");
+    }
+
+    /// A statement whose attached payload is `payload`, the rest shaped like a compact JWS.
+    fn statement_of(payload: serde_json::Value) -> String {
+        use base64::Engine as _;
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(serde_json::to_vec(&payload).unwrap());
+        format!("eyJhbGciOiJFZERTQSJ9.{payload}.c2lnbmF0dXJl")
+    }
+
+    #[test]
+    fn the_person_is_the_statements_sub() {
+        let statement = statement_of(serde_json::json!({"jti": "jti-1", "sub": "person-1"}));
+        let parsed = PromptStatement::new(statement, None).unwrap();
+        assert_eq!(parsed.person(), Ok("person-1".to_owned()));
+    }
+
+    #[test]
+    fn a_device_envelope_names_no_person() {
+        let envelope =
+            PromptStatement::envelope(statement_of(serde_json::json!({"nonce": "n"}))).unwrap();
+        assert_eq!(envelope.person(), Err(NoPerson));
+    }
+
+    #[test]
+    fn a_missing_or_blank_sub_names_no_person_and_no_value_is_quoted() {
+        for payload in [
+            serde_json::json!({"jti": "jti-1"}),
+            serde_json::json!({"jti": "jti-1", "sub": ""}),
+            serde_json::json!({"jti": "jti-1", "sub": 7}),
+            serde_json::json!({"jti": "jti-1", "sub": null}),
+            serde_json::json!([1, 2]),
+            serde_json::json!("sub"),
+        ] {
+            let parsed = PromptStatement::new(statement_of(payload.clone()), None).unwrap();
+            let err = parsed.person().unwrap_err();
+            assert_eq!(err, NoPerson, "{payload}");
+            assert!(!err.to_string().contains("person-1"), "{err}");
+            assert!(!format!("{err:?}").contains("person-1"), "{err:?}");
+        }
+        // A payload that is not JSON at all.
+        let parsed = PromptStatement::new("eyJhbGciOiJFZERTQSJ9.bm90IGpzb24.c2ln", None).unwrap();
+        assert_eq!(parsed.person(), Err(NoPerson));
     }
 }
