@@ -96,6 +96,10 @@
         },
         {
           "type": "generic",
+          "path": "crates/adam-git-sandbox/Cargo.toml"
+        },
+        {
+          "type": "generic",
           "path": "crates/adam-llm-agent/Cargo.toml"
         },
         {
@@ -121,6 +125,10 @@
         {
           "type": "generic",
           "path": "bin/adam-coder/Cargo.toml"
+        },
+        {
+          "type": "generic",
+          "path": "bin/adam-egress/Cargo.toml"
         },
         {
           "type": "generic",

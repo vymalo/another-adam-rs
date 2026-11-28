@@ -40,14 +40,20 @@ async fn main() -> ExitCode {
     }
 
     // `RUST_LOG` when set, else `info` with the MCP client library quiet (`adam_service::logging`).
-    let logger = tracing_subscriber::fmt()
-        .json()
-        .with_env_filter(adam_service::logging::env_filter());
+    // `adam-agent export` writes its records to standard output, so its log goes to standard error,
+    // and a short offline command exports no traces; serving gets the OTel layer when
+    // `OTEL_EXPORTER_OTLP_ENDPOINT` is set, and nothing is built when it is not.
     if export.is_some() {
-        logger.with_writer(std::io::stderr).init();
-    } else {
-        logger.init();
+        tracing_subscriber::fmt()
+            .json()
+            .with_env_filter(adam_service::logging::env_filter())
+            .with_writer(std::io::stderr)
+            .init();
     }
+    let telemetry = match export {
+        Some(_) => None,
+        None => adam_otel::init(adam_service::logging::env_filter()),
+    };
 
     // Before anything else is read: a same-user child (an MCP server's command) cannot read this
     // process's `/proc/<pid>/environ`, where the model key and the database URL are.
@@ -57,6 +63,16 @@ async fn main() -> ExitCode {
         return export_runs(args).await;
     }
 
+    let code = run().await;
+    // Flush the batch queue before the process exits, so the spans of the last runs are not lost.
+    if let Some(otel) = telemetry {
+        otel.shutdown();
+    }
+    code
+}
+
+/// The process's work, once the logger and the hardening are in place.
+async fn run() -> ExitCode {
     // Its errors name variables, never their values.
     let config = match Config::from_env().context("reading the configuration") {
         Ok(config) => config,

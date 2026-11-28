@@ -27,6 +27,10 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+mod install;
+
+pub use install::init;
+
 use std::fmt;
 use std::time::Duration;
 

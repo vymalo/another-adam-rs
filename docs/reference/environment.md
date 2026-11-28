@@ -143,16 +143,27 @@ run's calls are still signed by the process turn key. The broker's contract is v
 in, `{"v":1,"chain":["<base64 DER>", …]}` out, and the refusals `400` (`Invalid`), `401`/`403`
 (`Unauthenticated`), `429`/`5xx` (`Transient`). Source: [`adam-run-cert-broker`](../../crates/adam-run-cert-broker/README.md).
 
-## Traces (`adam-otel`, not wired yet)
+## Traces (`adam-otel`)
 
-The OTel layer of [ADR 0075](../decisions/0075-metrics-and-traces-are-off-by-default-and-say-nothing-about-a-person.md)
-reads two variables, and **no binary composes the layer yet** (ANR-1385) and `adam-service` does not pass them
-(ANR-1386), so setting either changes nothing today. Source: [`adam-otel`](../../crates/adam-otel/README.md).
+The OTel layer of [ADR 0075](../decisions/0075-metrics-and-traces-are-off-by-default-and-say-nothing-about-a-person.md):
+OTLP/HTTP spans, **off unless an endpoint is set**. `adam-coder`, `adam-agent`, `adam-egress` and
+`adam-git-sandbox` compose the layer beside their JSON log layer (ANR-1412); `adam-service` does not pass the
+variables and the chart has no `otel.*` value yet (ANR-1386, ADR 0075 decision 7), so a deployment sets them
+through `config.extraEnv`. Source: [`adam-otel`](../../crates/adam-otel/README.md).
 
 | Variable | Meaning | Default |
 |---|---|---|
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | the OTLP/HTTP collector, an absolute `http` or `https` URL with no user, password, query or fragment; unset or blank means no exporter and no thread | unset: off |
 | `OTEL_SERVICE_NAME` | `service.name` of every exported span's resource | `adam` |
+
+A value the crate refuses is **one warning line and tracing stays off**, never an exit: a trace is not a reason
+an agent fails. With the endpoint set, the spans the runtime writes (`adam.run`, `adam.child`) are exported; a
+failed export is the SDK's own log line and never a run's failure. `adam-egress` and `adam-git-sandbox` write
+events, not spans, so their log lines stay in the JSON layer.
+
+`adam-egress` and `adam-git-sandbox` link **no TLS provider** (they take `adam-otel` with `default-features = false`),
+so their exporter speaks plain `http` — an in-cluster collector. Exporting to an `https` collector from either
+needs the `aws-lc` feature on its `adam-otel` dependency, which adds `reqwest`/`rustls`/`aws-lc` to a small binary.
 
 ## Cross-process notifications (`adam-notify-postgres`)
 

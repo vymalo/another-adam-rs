@@ -2290,6 +2290,15 @@ devcontainer path ([ADR 0052](../../docs/decisions/0052-no-podman-a-repositorys-
 (the deployment asked for the removed path). The checks and commands do not see `GITHUB_TOKEN`,
 `GITHUB_APP_PRIVATE_KEY`, `DATABASE_URL`, `A2A_BEARER_TOKENS` or `MODEL_API_KEY`.
 
+### Traces
+
+`OTEL_EXPORTER_OTLP_ENDPOINT` turns on OTLP/HTTP traces ([ADR 0075](../../docs/decisions/0075-metrics-and-traces-are-off-by-default-and-say-nothing-about-a-person.md)):
+the runtime's `adam.run` and `adam.child` spans are exported beside the JSON log, and `OTEL_SERVICE_NAME` names
+the service (`adam` when unset). Unset or blank: no exporter and no thread, and the log is exactly what it was. A
+value the layer refuses is one warning at startup and tracing stays off; a failed export is the SDK's own log line,
+never a run's failure. The batch is flushed before the process exits. Source: [`adam-otel`](../../crates/adam-otel/README.md)
+(`adam_otel::init`), which composes the subscriber for every binary.
+
 ### Workspace placement
 
 `WORKSPACE_PLACEMENT` is parsed with `adam_host::Placement` (case-insensitive; unset or blank means
@@ -2742,6 +2751,8 @@ database of its own, so the role needs `CREATEDB`):
   `tests/binary.rs` `export_over_an_empty_store_writes_nothing_and_exits_0`: only `DATABASE_URL`, a fresh SQLite file,
   exit 0 with nothing on stdout, the summary and the random key said on stderr, an unknown `--agent` 78,
   `--current-tools` 64). The parser itself is tested in `adam-service`.
+* **The subscriber** is `adam_otel::init`; its two cases (no endpoint builds nothing; one reaches a loopback
+  collector) are tested in [`adam-otel`](../../crates/adam-otel/README.md), once for every binary.
 * **Language servers** (`tests/language_servers.rs`, real processes of the scripted server `adam-lsp-script`; `tests/real_language_servers.rs`, gated):
   no server on `PATH` (nothing started, the program named), diagnostics pushed and pulled and only errors and warnings, UTF-16 and UTF-8 columns,
   a secret in a diagnostic and in stderr, indexing past `wait` (a partial result, then the same pid answers), a crash (the scrubbed stderr tail, then a new

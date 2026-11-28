@@ -29,14 +29,20 @@ async fn main() -> ExitCode {
     // `adam-coder export ...` writes records to standard output, so its log goes to standard error.
     let export = adam_coder::export::subcommand(std::env::args_os().skip(1));
     // `RUST_LOG` when set, else `info` with the MCP client library quiet (`adam_service::logging`).
-    let logger = tracing_subscriber::fmt()
-        .json()
-        .with_env_filter(adam_service::logging::env_filter());
+    // A short offline command exports no traces, and its records are on standard output; serving
+    // gets the OTel layer when `OTEL_EXPORTER_OTLP_ENDPOINT` is set, and nothing is built when it
+    // is not.
     if export.is_some() {
-        logger.with_writer(std::io::stderr).init();
-    } else {
-        logger.init();
+        tracing_subscriber::fmt()
+            .json()
+            .with_env_filter(adam_service::logging::env_filter())
+            .with_writer(std::io::stderr)
+            .init();
     }
+    let telemetry = match export {
+        Some(_) => None,
+        None => adam_otel::init(adam_service::logging::env_filter()),
+    };
 
     adam_service::harden::make_non_dumpable();
 
@@ -44,6 +50,16 @@ async fn main() -> ExitCode {
         return export_runs(args).await;
     }
 
+    let code = run().await;
+    // Flush the batch queue before the process exits, so the spans of the last runs are not lost.
+    if let Some(otel) = telemetry {
+        otel.shutdown();
+    }
+    code
+}
+
+/// The process's work, once the logger and the hardening are in place.
+async fn run() -> ExitCode {
     // Nothing is known to be secret until the configuration is read; its errors name variables,
     // never their values.
     let config = match Config::from_env().context("reading the configuration") {
