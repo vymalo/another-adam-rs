@@ -2604,6 +2604,8 @@ mod tests {
             vec!["maxTurns", "maxOutputTokens"],
             "a member returned to the folder's is named too"
         );
+        // `SessionConfig` is `#[non_exhaustive]`: another crate sets its fields one by one.
+        #[allow(clippy::field_reassign_with_default)]
         let mut base = SessionConfig::default();
         base.max_turns = Some(20);
         base.max_tool_calls = Some(7);
