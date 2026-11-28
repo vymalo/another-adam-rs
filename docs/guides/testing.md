@@ -1,9 +1,10 @@
 # Testing
 
 ```sh
-docker compose up -d --wait        # postgres, mongodb and the mocks
+docker compose up -d --wait        # postgres, mongodb, redis and the mocks
 export ADAM_TEST_POSTGRES_URL=postgres://postgres:postgres@127.0.0.1:5432/adam_test
 export ADAM_TEST_MONGODB_URI=mongodb://127.0.0.1:27017
+export ADAM_TEST_REDIS_URL=redis://127.0.0.1:6379
 export ADAM_TEST_MOCK_OPENAI_URL=http://127.0.0.1:8081      # the root of the mock, no /v1
 export ADAM_TEST_MOCK_GITHUB_URL=http://127.0.0.1:8082
 cargo test --workspace
@@ -28,7 +29,7 @@ cargo test --workspace --doc --locked
 cargo nextest run --workspace --locked --features adam-llm-agent/schema,adam-assembly/dev,adam/dev,adam-assembly/mcp,adam/mcp   # CI adds --profile ci
 cargo test -p adam --test ui                                  # #[tool] compile tests (trybuild)
 npm --prefix tools/docs-check ci && node tools/docs-check/check-docs.mjs   # diagrams, links, anchors, crate READMEs, skills
-```
+sh tools/check-workflow-pins.sh   # every action a workflow uses is at or above the floor recorded in tools/workflow-pins.txt```
 
 CI also runs the MSRV build (`rust-version` in `Cargo.toml`), `cargo deny`, line coverage
 (`cargo llvm-cov nextest --workspace`, on main: the two conformance arms run the suite on every pull request),
@@ -164,6 +165,7 @@ docker compose --profile app up -d --build --wait postgres mock-openai mock-gith
 | `sh dev/agent-e2e.sh` | the general agent answers "hi" in role; a restart on an edited folder changes the card and the answer |
 | `sh dev/agent-cards-e2e.sh` | the researcher folder answers with a surface of cards and a graph on a screen that has them, words only on one that has not (catalog 9, and the checklist subset, which has no `Cards`) |
 | `sh dev/painter-e2e.sh` | the painter folder: the instructions of its image MCP server reach the model, the picture is a shared `image/png` file the words name, and the server's prompt is the command `images__scene` (it starts `mock-image-mcp` and restarts `agent` on a copy of the folder with `AGENT_MCP_ALLOW_INSECURE=true`) |
+| `sh dev/resume-e2e.sh` | the coder's resume budget from a fresh start (spec row A3 of `docs/architecture/05-runtime.md` §21a): `/healthz` 200 and the first claim of a waiting run both under `READY_CEILING_MS` and `CLAIM_CEILING_MS` (defaults `5000`; the brief's floor of ~5 s). Asserts A2's invariant first (the run is `runnable` and the lease is NULL after the SIGTERM), so a violation of A2 is not misread as a violation of A3 |
 
 How the scripted models and mocks work, and how to change a script: [the local stack](../reference/dev-stack.md).
 Exit and assertion details are in each script's header.

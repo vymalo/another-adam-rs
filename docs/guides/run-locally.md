@@ -14,7 +14,7 @@ minutes; later starts take seconds. To skip the build, set `CODER_IMAGE` to a pu
 ## Start it
 
 ```sh
-docker compose --profile app up -d --build --wait   # postgres, the mocks, a git server, the coder, the general agent
+docker compose --profile app up -d --build --wait   # postgres, mongodb, redis, the mocks, a git server, the coder, the general agent
 docker compose up -d --wait                         # or only the databases and mocks, to run `cargo test`
 docker compose down -v                              # stop and forget all state (volumes included)
 ```
@@ -23,7 +23,7 @@ docker compose down -v                              # stop and forget all state 
 |---|---|---|
 | `coder` | `http://127.0.0.1:8080/` | the coder agent, bearer token `dev-token` |
 | `agent` | `http://127.0.0.1:8084/` | the general agent (`adam-agent`), same image, same token |
-| `postgres`, `mongodb` | `127.0.0.1:5432`, `:27017` | the databases |
+| `postgres`, `mongodb`, `redis` | `127.0.0.1:5432`, `:27017`, `:6379` | the databases |
 | `mock-openai`, `mock-github`, `mock-github-mcp`, `mock-image-mcp`, `git-server` | `:8081`, `:8082`, `:8085`, `:8086`, `:8083` | the mocks (`mock-image-mcp` is the painter's image server) |
 
 All services and mocks: [the local stack](../reference/dev-stack.md).

@@ -210,6 +210,8 @@ classDiagram
     SiMemory <|.. InProcessSiMemory
     class Memory { <<interface>> }
     Memory <|.. InProcessMemory
+    Memory <|.. RedisMemory
+    Memory <|.. MongoMemory
 ```
 
 | Port | Defined in | Real implementations | Doubles |
@@ -232,7 +234,7 @@ classDiagram
 | `Confine` | `adam-workspace` | `Rlimits`, `SystemdScope` (`adam-confine`, Unix); `best_effort()` picks | `NoConfine`; the suite `confine_conformance!` (`adam-confine-testkit`) is the reference |
 | `DeviceState` | `adam-device-state` | none yet: the host pushes its readings, and `adam_budget::Throttled` lowers the admission by them ([ADR 0065](decisions/0065-resource-governance-admission-pools-and-os-limits.md) decision 8) | `FakeDevice`, the reference of `device_state_conformance!` |
 | `SiMemory` (L1) | `adam-memory` | `FolderSiMemory`, the in-folder store and L1's only one ([ADR 0081](decisions/0081-an-agent-keeps-a-self-improvement-memory-near-it-and-what-holds-becomes-the-deployments-memory.md) decision 2) | `InProcessSiMemory` (reference); `ScopeBlindSiMemory` and `DoubleWritingSiMemory` (testkit, which the suite rejects) |
-| `Memory` (L2) | `adam-memory` | none yet (M2b: PostgreSQL, MongoDB, Redis) | `InProcessMemory` (reference); `ScopeBlindMemory` and `DoubleWritingMemory` (testkit, which the suite rejects) |
+| `Memory` (L2) | `adam-memory` | `RedisMemory` (`adam-memory-redis`) and `MongoMemory` (`adam-store-mongodb`, feature `memory`), both [ADR 0081](decisions/0081-an-agent-keeps-a-self-improvement-memory-near-it-and-what-holds-becomes-the-deployments-memory.md) M2b; PostgreSQL remains (ANR-1292) | `InProcessMemory` (reference); `ScopeBlindMemory` and `DoubleWritingMemory` (testkit, which the suite rejects) |
 | `PermissionPrompt` | `adam-acp` | none (the default policy needs no prompt) | `StaticPrompt` |
 
 `AgentStarter` is the start-only half of `Agent` (`name`, `init`, `init_continuing`): a process that
