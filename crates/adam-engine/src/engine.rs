@@ -15,6 +15,7 @@ use adam_a2a_runtime::{Commands, RuntimeTaskBackend, default_inbound, task_id_fo
 use adam_agent_fs::{AgentManifest, Command, Subagent};
 use adam_assembly::AgentDef;
 use adam_budget::{DeviceRules, DynAdmission, Throttled};
+use adam_code_tools::PersonDir;
 use adam_core::{
     ConversationScope, DynSecretSource, DynStore, DynTurnKeys, RunId, RunQuery, RunStatus, TurnKeys,
 };
@@ -163,6 +164,9 @@ pub struct EngineBuilder {
     turn_keys: Option<DynTurnKeys>,
     hooks: HookSet,
     step_io: Option<StepIo>,
+    /// The directory the local agent works in ([`local_agent`](Self::local_agent)); opened at
+    /// [`start`](Self::start).
+    person_dir: Option<std::path::PathBuf>,
 }
 
 impl std::fmt::Debug for EngineBuilder {
@@ -175,6 +179,10 @@ impl std::fmt::Debug for EngineBuilder {
             .field("reasoning_effort", &self.reasoning_effort)
             .field("hooks", &self.hooks)
             .field("step_io", &self.step_io)
+            .field(
+                "person_dir",
+                &self.person_dir.as_ref().map(|p| p.display().to_string()),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -273,6 +281,28 @@ impl EngineBuilder {
         self
     }
 
+    /// A local agent over the person's directory `dir` (ADR 0047 slice 7): adds the file and
+    /// command tools of [`adam-code-tools`](https://github.com/vymalo/another-adam-rs/blob/main/crates/adam-code-tools)
+    /// to the catalog (every read, write, edit, patch,
+    /// `run_command` and `run` over a [`PersonDir`]), and a hook that asks the person before every
+    /// write or command — reads are never asked. The host answers with the existing
+    /// [`Engine::approve`](crate::Engine::approve); the call's tool and the arguments the request
+    /// shows are taken through [`step_io`](Self::step_io).
+    ///
+    /// `dir` is opened once at [`start`](Self::start); an unreadable directory is
+    /// [`EngineError::Invalid`] (the only error path). The directory is **never owned, cleaned or
+    /// restored** by the run: a write stays, a command's changes stay, and the run's report names
+    /// what changed.
+    ///
+    /// Additive: the screen's tools of an embedded agent (`ask_user`, `show`, `ui_catalog`, the
+    /// plan tools) are still there, and the host's own tools given with [`tools`](Self::tools) are
+    /// too. The tools a run actually sees are the union, and the file a folder agent's `tools:`
+    /// lists (when it lists any).
+    pub fn local_agent(mut self, dir: impl Into<std::path::PathBuf>) -> Self {
+        self.person_dir = Some(dir.into());
+        self
+    }
+
     /// The limits the engine runs within. Default [`Limits::default`].
     pub fn limits(mut self, limits: Limits) -> Self {
         self.limits = limits;
@@ -334,6 +364,8 @@ impl EngineBuilder {
     ///   limit (the folder's, the builder's and the profile's values, ADR 0063 and ADR 0064);
     /// * [`EngineError::Schedules`] when the scheduler runs cannot be made to match the folder, with
     ///   the reconcile's class: on a retryable one, call `start` again (what was done is kept).
+    /// * [`EngineError::Invalid`] when the directory of [`EngineBuilder::local_agent`] cannot be
+    ///   opened.
     pub async fn start(self) -> Result<Engine, EngineError> {
         let handle = tokio::runtime::Handle::try_current().map_err(|_| EngineError::NoRuntime)?;
         let Self {
@@ -352,6 +384,7 @@ impl EngineBuilder {
             turn_keys,
             hooks,
             step_io,
+            person_dir,
         } = self;
         if limits.lease_ttl.is_zero() {
             return Err(EngineError::Invalid(
@@ -389,15 +422,49 @@ impl EngineBuilder {
             Some(effort) => agent.reasoning_effort(Some(effort)),
             None => agent,
         };
-        let bound = agent
-            .secrets(secrets)
-            .session_limits(limits.sessions)
-            .bind(ui.tools().extend(tools))
-            .map_err(|e| EngineError::Agent(Box::new(e)))?
-            .tool_source(ui.screen())
-            .max_parallel(limits.max_parallel_tools)
-            .model_profiles(profiles)
-            .allow_model_choice();
+        // The local agent's directory (ADR 0047 slice 7): opened once, here, or refused. Its
+        // tools and hook are gathered alongside the host's, so `bind` sees both.
+        let person = person_dir
+            .map(|path| {
+                PersonDir::new(&path, std::iter::empty::<&str>()).map_err(|e| {
+                    EngineError::Invalid(format!(
+                        "the local agent's directory `{}` cannot be opened: {e}",
+                        path.display()
+                    ))
+                })
+            })
+            .transpose()?;
+        let mut tools = tools;
+        let mut hooks = hooks;
+        let bound = if let Some(person) = person {
+            // The local agent's tools (file + command) on top of the host's; the hook that asks
+            // before every write or command is appended to the host's hook set below.
+            tools = tools.extend(crate::local_agent::tool_set());
+            hooks = hooks.with(crate::local_agent::plugin());
+            // The directory the tools read is the same one `EngineBuilder::local_agent` opened;
+            // shared through `State<PersonDir>`, which is `Arc<PersonDir>`.
+            let person: Arc<PersonDir> = Arc::new(person);
+            agent
+                .secrets(secrets)
+                .session_limits(limits.sessions)
+                .bind(ui.tools().extend(tools))
+                .map_err(|e| EngineError::Agent(Box::new(e)))?
+                .tool_source(ui.screen())
+                .state(person)
+                .max_parallel(limits.max_parallel_tools)
+                .model_profiles(profiles)
+                .allow_model_choice()
+        } else {
+            agent
+                .secrets(secrets)
+                .session_limits(limits.sessions)
+                .bind(ui.tools().extend(tools))
+                .map_err(|e| EngineError::Agent(Box::new(e)))?
+                .tool_source(ui.screen())
+                .max_parallel(limits.max_parallel_tools)
+                .model_profiles(profiles)
+                .allow_model_choice()
+        };
         // The host's hooks reach every agent, before the plugins its file names (ADR 0047 slice 5:
         // the hook that asks the person is the host's).
         let bound = if hooks.is_empty() {
@@ -855,6 +922,7 @@ impl Engine {
             turn_keys: None,
             hooks: HookSet::new(),
             step_io: None,
+            person_dir: None,
         }
     }
 
