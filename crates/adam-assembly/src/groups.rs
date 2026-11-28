@@ -342,6 +342,11 @@ impl ToolSource for Groups {
     /// until its group is loaded) and every group's loader (an own tool too). It reads nothing of the
     /// run, so a group the task loads and one it does not answer the same names, and a session's set
     /// of tools is complete (ADR 0054 decision 4).
+    ///
+    /// Today this repeats what the node already binds — the members are filtered to its own tools
+    /// and the loaders are added to them — so it adds no name. It must stay that way: a name here
+    /// that the node cannot offer would make the set look complete while the check accepts a tool
+    /// that never arrives.
     fn declared(&self) -> Declared {
         let mut names: Vec<String> = Vec::new();
         for group in &self.groups {

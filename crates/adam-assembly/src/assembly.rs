@@ -7,9 +7,8 @@ use std::time::Duration;
 use adam_agent_fs::{AgentManifest, ModelRef, RemoteAgent, ToolsLoading};
 use adam_budget::DynAdmission;
 use adam_llm_agent::{
-    Declared, DynTool, DynToolSource, Limits, LlmAgent, LlmAgentBuilder, ModelBinding,
-    ModelParking, SESSION_TOOLS, SessionAgent, SessionTools, StepIo, ToolSource,
-    WINDOW_MARGIN_TOKENS,
+    DynTool, DynToolSource, Limits, LlmAgent, LlmAgentBuilder, ModelBinding, ModelParking,
+    SESSION_TOOLS, SessionAgent, SessionTools, StepIo, ToolSource, WINDOW_MARGIN_TOKENS,
 };
 use adam_model::{DEFAULT_MAX_OUTPUT_TOKENS, DynModel, ModelProfiles, Preset, ReasoningEffort};
 use adam_runtime::{RuntimeBuilder, SessionBounds, SessionLimits};
@@ -835,7 +834,7 @@ impl BoundDef {
     /// ([`ToolSource::declared`]).
     ///
     /// The set is **incomplete** when a source cannot name its tools before a run calls it
-    /// ([`Declared::Unknown`]): an endpoint whose listing is another system's and may change with the
+    /// ([`adam_llm_agent::Declared::Unknown`]): an endpoint whose listing is another system's and may change with the
     /// conversation. A remote target, and a name no node has, give no names.
     fn bound_tool_names(&self, target: &SessionTarget) -> (Vec<String>, bool) {
         if target.remote {
@@ -847,15 +846,15 @@ impl BoundDef {
         let mut names: Vec<String> = node.tools.iter().map(|(name, _)| name.clone()).collect();
         let mut complete = true;
         for source in self.sources_of(node) {
-            match source.declared() {
-                Declared::All(declared) => {
+            match source.declared().names() {
+                Some(declared) => {
                     for name in declared {
-                        if !names.contains(&name) {
-                            names.push(name);
+                        if !names.contains(name) {
+                            names.push(name.clone());
                         }
                     }
                 }
-                Declared::Unknown => complete = false,
+                None => complete = false,
             }
         }
         (names, complete)

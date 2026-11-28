@@ -248,8 +248,13 @@ impl ToolSource for RepositoryEnvironmentSource {
 
     /// The one tool this source can offer, whether or not this turn withholds it: the set is what a
     /// session's `tools` and `deny_tools` are checked against, and the withholding of a turn says
-    /// nothing about the names (ADR 0054 decision 4).
+    /// nothing about the names (ADR 0054 decision 4). A deployment that can never offer it — no run
+    /// pods, or no repository image allowed — declares nothing, so a `tools:` entry naming it is
+    /// refused instead of being silently ignored.
     fn declared(&self) -> Declared {
+        if self.unavailable().is_some() {
+            return Declared::All(Vec::new());
+        }
         Declared::All(vec![USE_REPOSITORY_ENVIRONMENT.to_owned()])
     }
 

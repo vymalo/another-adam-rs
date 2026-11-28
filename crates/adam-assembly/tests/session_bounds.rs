@@ -590,8 +590,9 @@ impl adam_llm_agent::ToolSource for Declares {
 /// and an entry naming a declared tool is admitted. The declaration joins the bound node's names,
 /// each once.
 ///
-/// **This test is red before ANR-1319**, at the completeness line of
-/// `BoundDef::bound_tool_names` in `crates/adam-assembly/src/assembly.rs`, which answered
+/// **This test is red before ANR-1319**, first at the names assertion below (the old
+/// `BoundDef::bound_tool_names` returned the node's own names and never joined a source's
+/// declaration), and then at the completeness line it ended with,
 /// `self.sources.is_empty() && node.sources.is_empty()`: any source at all made the set incomplete,
 /// whatever it declared, so `tools_complete` was `false` here and `a_typo` was admitted.
 #[test]
