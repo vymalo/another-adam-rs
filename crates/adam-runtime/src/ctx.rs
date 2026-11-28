@@ -8,7 +8,7 @@ use futures::{StreamExt, TryStreamExt};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
-use adam_core::{BlobId, DynStore, JournalEntry, RunId, RunRecord, StoreError};
+use adam_core::{BlobId, DynStore, JournalEntry, RunId, RunRecord, StoreError, storable_owned};
 
 use crate::agent::{AgentError, Inbound};
 use crate::blob::BlobWriter;
@@ -18,6 +18,7 @@ use crate::clock::DynClock;
 use crate::events::{Artifact, DynEventSink, RunEvent};
 use crate::retry::RetryPolicy;
 use crate::runtime::{Runtime, RuntimeError};
+use crate::seal::{Sealer, SignatureCache, refused_entry};
 
 /// Journal name of [`Ctx::now_journaled`].
 const NOW_STEP: &str = "ctx.now";
@@ -56,6 +57,9 @@ pub struct Ctx {
     cancel: CancelToken,
     emitter: Emitter,
     runtime: Runtime,
+    /// The key set and the journal's signedness, read at most once per transition: a `Ctx` spans
+    /// many steps, and a key set can be remote (see [`SignatureCache`]).
+    signatures: SignatureCache,
 }
 
 /// A cloneable, owned handle for emitting [`RunEvent`]s of one run.
@@ -206,6 +210,7 @@ impl Ctx {
             clock: p.clock,
             cancel: p.cancel,
             runtime: p.runtime,
+            signatures: SignatureCache::default(),
             emitter: Emitter {
                 run: p.run,
                 agent: Arc::from(p.agent),
@@ -329,7 +334,8 @@ impl Ctx {
     {
         let seq = self.seq;
         let recorded = self.recorded_at(seq, name).await?;
-        let outcome = settle(&self.store, self.run, seq, name, recorded, f).await?;
+        let sealing = Sealing::of(self.runtime.inner.sealer.as_ref(), &self.signatures);
+        let outcome = settle(&self.store, sealing, self.run, seq, name, recorded, f).await?;
         self.seq = seq + 1;
         Ok(outcome)
     }
@@ -403,6 +409,8 @@ impl Ctx {
                 name: name.clone(),
                 recorded,
                 store: self.store.clone(),
+                sealer: self.runtime.inner.sealer.clone(),
+                signatures: SignatureCache::default(),
             });
         }
         self.seq += names.len() as u64;
@@ -536,7 +544,66 @@ impl Ctx {
                 "run {} step {seq}: journal has {:?}, code asked for {name:?}",
                 self.run, entry.name
             ))),
-            other => Ok(other),
+            Some(entry) => {
+                // A replay reads the store: a signed entry that does not verify was altered there
+                // (ADR 0068 decision 4), and an unsigned one is adopted only when no entry of the
+                // run is signed (decisions 5 and 11).
+                self.check_entry(&entry).await?;
+                Ok(Some(entry))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Check the signature a journal entry carries, when the runtime signs (ADR 0068): a signed
+    /// entry must verify against the key set, and an unsigned one is adopted (decision 11, release
+    /// N) **only when no entry of the run carries a signature**. A run signed once stays signed, as
+    /// decision 5 says of turns: an entry whose signature was stripped in the store would otherwise
+    /// replay a forged payload as a legacy one.
+    async fn check_entry(&self, entry: &JournalEntry) -> Result<(), AgentError> {
+        let Some(sealer) = self.runtime.inner.sealer.as_ref() else {
+            return Ok(());
+        };
+        if entry.signature.is_none() {
+            if self.run_is_signed().await? {
+                return Err(sealed(refused_entry(
+                    self.run,
+                    entry.seq,
+                    "it is unsigned over a signed run",
+                )));
+            }
+            return Ok(());
+        }
+        let set = self
+            .signatures
+            .key_set(sealer)
+            .await
+            .map_err(|e| sealed(RuntimeError::from(e)))?;
+        Sealer::check_entry_with(set, self.run, entry).map_err(sealed)?;
+        // A signed entry that verified is the run's answer: an unsigned one later in this
+        // transition may not be adopted, and no `journal_list` is needed to say so.
+        self.signatures.remember_signed();
+        Ok(())
+    }
+
+    /// Whether any entry of the run's journal carries a signature, so an unsigned one may not be
+    /// adopted. One `journal_list` per transition, and only a transition that replays an unsigned
+    /// entry pays for it: a journal written before the feature is the only one with such entries.
+    async fn run_is_signed(&self) -> Result<bool, AgentError> {
+        if let Some(signed) = self.signatures.signed() {
+            return Ok(signed);
+        }
+        let entries = self
+            .store
+            .journal_list(self.run)
+            .await
+            .map_err(store_error)?;
+        if entries.iter().any(|entry| entry.signature.is_some()) {
+            self.signatures.remember_signed();
+            Ok(true)
+        } else {
+            self.signatures.remember_listed();
+            Ok(false)
         }
     }
 
@@ -862,10 +929,25 @@ impl Ctx {
     }
 }
 
+/// The runtime's keys and the cache a transition reads them through: `Some` when the runtime signs
+/// its journal (ADR 0068), `None` when it has no turn keys.
+#[derive(Clone, Copy)]
+struct Sealing<'a> {
+    sealer: &'a Sealer,
+    cache: &'a SignatureCache,
+}
+
+impl<'a> Sealing<'a> {
+    fn of(sealer: Option<&'a Sealer>, cache: &'a SignatureCache) -> Option<Self> {
+        sealer.map(|sealer| Self { sealer, cache })
+    }
+}
+
 /// The outcome of the step `name` at `seq`: `recorded` if the journal had it, else `f`'s, written
 /// first. If two workers race, the first recording wins and both see it.
 async fn settle<T, E, F, Fut>(
     store: &DynStore,
+    sealing: Option<Sealing<'_>>,
     run: RunId,
     seq: u64,
     name: &str,
@@ -889,12 +971,46 @@ where
                 AgentError::permanent(format!("step {name:?} result is not serializable"))
                     .with_source(e)
             })?;
-            let entry = if ok {
+            let mut entry = if ok {
                 JournalEntry::ok(seq, name, payload)
             } else {
                 JournalEntry::err(seq, name, payload)
             };
-            store.journal_put(run, entry).await.map_err(store_error)?
+            if let Some(sealing) = sealing {
+                // Sign what the store will keep: it applies `storable` before it writes (ADR 0051),
+                // and a replay verifies the entry it reads.
+                entry.payload = storable_owned(entry.payload);
+                entry.signature = Some(
+                    sealing
+                        .sealer
+                        .sign_entry(run, &entry)
+                        .await
+                        .map_err(|e| sealed(RuntimeError::from(e)))?,
+                );
+            }
+            let stored = store.journal_put(run, entry).await.map_err(store_error)?;
+            if let Some(sealing) = sealing {
+                // Another writer may have won the race, so the entry decoded is the one a replay
+                // reads: a signed one must verify wherever it came from. One that came back
+                // unsigned lost its signature in the store (a dropped column, a writer that nulled
+                // it), and a run signed once stays signed (ADR 0068 decision 5): that is `Corrupt`,
+                // never an entry to adopt.
+                if stored.signature.is_none() {
+                    return Err(sealed(refused_entry(
+                        run,
+                        stored.seq,
+                        "it is unsigned over a signed run",
+                    )));
+                }
+                sealing.cache.remember_signed();
+                let set = sealing
+                    .cache
+                    .key_set(sealing.sealer)
+                    .await
+                    .map_err(|e| sealed(RuntimeError::from(e)))?;
+                Sealer::check_entry_with(set, run, &stored).map_err(sealed)?;
+            }
+            stored
         }
     };
     decode::<T, E>(entry).map_err(|e| {
@@ -903,6 +1019,17 @@ where
         ))
         .with_source(e)
     })
+}
+
+/// A signature check's failure as the agent loop's: a `Corrupt` entry fails the run (ADR 0068
+/// decision 6), and a key set that cannot be read keeps its own class (a retry when transient).
+fn sealed(e: RuntimeError) -> AgentError {
+    match e {
+        RuntimeError::Corrupt { reason, .. } => AgentError::Store(StoreError::Corrupt(reason)),
+        other => {
+            AgentError::from_classified("the journal entry's signature could not be checked", other)
+        }
+    }
 }
 
 /// Run `contenders` at the same time, each with its own child of `parent`: the first `Ok` wins and
@@ -965,6 +1092,12 @@ pub struct ReservedStep {
     name: String,
     recorded: Option<JournalEntry>,
     store: DynStore,
+    /// The runtime's keys, so the step it records is signed and a recorded one is checked
+    /// (ADR 0068); `None`: nothing is signed or required.
+    sealer: Option<Sealer>,
+    /// What this step reads once to check a signature (its own: a reserved step runs on its own,
+    /// beside the `Ctx`).
+    signatures: SignatureCache,
 }
 
 impl std::fmt::Debug for ReservedStep {
@@ -1009,8 +1142,10 @@ impl ReservedStep {
         F: FnOnce() -> Fut + Send,
         Fut: Future<Output = Result<T, E>> + Send,
     {
+        let sealing = Sealing::of(self.sealer.as_ref(), &self.signatures);
         settle(
             &self.store,
+            sealing,
             self.run,
             self.seq,
             &self.name,

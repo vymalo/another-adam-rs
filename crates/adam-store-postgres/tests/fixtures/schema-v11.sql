@@ -1,5 +1,5 @@
--- The schema version 10 that adam-store-postgres emits.
--- Regenerate with ADAM_WRITE_FIXTURE=1 cargo test -p adam-store-postgres --lib the_statements_equal_the_version_10_fixture
+-- The schema version 11 that adam-store-postgres emits.
+-- Regenerate with ADAM_WRITE_FIXTURE=1 cargo test -p adam-store-postgres --lib the_statements_equal_the_version_11_fixture
 CREATE TABLE IF NOT EXISTS adam_meta (
                     key   TEXT PRIMARY KEY,
                     value TEXT NOT NULL
@@ -73,8 +73,11 @@ CREATE TABLE IF NOT EXISTS adam_journal (
                     ok          BOOLEAN     NOT NULL,
                     payload     JSONB       NOT NULL,
                     recorded_at TIMESTAMPTZ NOT NULL,
+                    signature   TEXT,
                     PRIMARY KEY (run_id, seq)
                 );
+
+ALTER TABLE adam_journal ADD COLUMN IF NOT EXISTS signature TEXT;
 
 CREATE TABLE IF NOT EXISTS adam_blob (
                     digest      TEXT        NOT NULL CHECK (digest ~ '^[0-9a-f]{64}$'),
@@ -166,6 +169,6 @@ CREATE TABLE IF NOT EXISTS adam_memory_lesson (
 CREATE INDEX IF NOT EXISTS adam_memory_lesson_active ON adam_memory_lesson (scope, audience, updated DESC, root_cause)
              WHERE state = 'active';
 
-INSERT INTO adam_meta (key, value) VALUES ('schema_version', '10')
+INSERT INTO adam_meta (key, value) VALUES ('schema_version', '11')
              ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
               WHERE adam_meta.value::INT < EXCLUDED.value::INT;

@@ -7,7 +7,8 @@
 //! * `adam_runs`: one document per run. `_id` is the run's UUID (BSON binary
 //!   subtype 4), `state` is a real BSON document (see [`codec`] for how keys
 //!   like `$ref` are escaped), so runs are queryable from `mongosh`.
-//! * `adam_journal`: one document per recorded step, `_id` = `"<run>:<seq>"`.
+//! * `adam_journal`: one document per recorded step, `_id` = `"<run>:<seq>"`, with `signature` a
+//!   string or `null` (the runtime's `adam-step/v1` signature, ADR 0068).
 //! * `adam_push` (schema version 3): one document per A2A push-notification configuration,
 //!   `_id` = `"<run>:<config id>"` (a run id is 36 characters, so the join is unambiguous).
 //!   `config` holds the webhook **with its credentials, as the client gave them**; `cursor` is how
@@ -699,6 +700,13 @@ fn entry_from_doc(d: &Document) -> StoreResult<JournalEntry> {
         ok: d.get_bool("ok").map_err(|_| bad("ok"))?,
         payload: bson_to_json(d.get("payload").ok_or_else(|| bad("payload"))?)?,
         recorded_at: get_date(d, "recorded_at")?.ok_or_else(|| bad("recorded_at"))?,
+        signature: match d.get("signature") {
+            // A document written before the feature carries no member, and the writer stores
+            // `null` for an entry without a signature (ADR 0068).
+            None | Some(Bson::Null) => None,
+            Some(Bson::String(signature)) => Some(signature.clone()),
+            Some(_) => return Err(bad("signature")),
+        },
     })
 }
 
@@ -1270,6 +1278,7 @@ impl Store for MongoStore {
             ok,
             payload,
             recorded_at,
+            signature,
         } = entry;
         let entry = JournalEntry {
             seq,
@@ -1277,6 +1286,7 @@ impl Store for MongoStore {
             ok,
             payload: storable_owned(payload),
             recorded_at: truncate_ms(recorded_at),
+            signature,
         };
         let id = journal_id(run, entry.seq);
         let doc = doc! {
@@ -1287,6 +1297,8 @@ impl Store for MongoStore {
             "ok": entry.ok,
             "payload": json_to_bson(&entry.payload)?,
             "recorded_at": date(entry.recorded_at),
+            // Kept byte for byte, or `null`: the store never signs or checks it (ADR 0068).
+            "signature": entry.signature.as_deref(),
         };
         // Insert first: the write is one round trip, and a duplicate key means an earlier writer
         // won and their entry is the one to return. (A pre-read would add a round trip to every

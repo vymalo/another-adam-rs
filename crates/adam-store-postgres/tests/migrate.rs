@@ -84,6 +84,34 @@ async fn has_owner_column(pool: &Pool, p: &str) -> bool {
     .await
 }
 
+/// Whether the journal table has the signature column schema version 11 adds (ADR 0068).
+async fn has_journal_signature_column(pool: &Pool, p: &str) -> bool {
+    support::scalar(
+        pool,
+        "SELECT EXISTS (SELECT 1 FROM information_schema.columns
+                         WHERE table_name = $1 AND column_name = 'signature')",
+        &[&format!("{p}journal")],
+    )
+    .await
+}
+
+/// The journal's columns, in the order the table has them.
+async fn journal_columns(pool: &Pool, table: &str) -> Vec<String> {
+    let table = table.to_owned();
+    let client = pool.get().await.unwrap();
+    client
+        .query(
+            "SELECT column_name::text FROM information_schema.columns
+              WHERE table_name = $1 ORDER BY ordinal_position",
+            &[&table],
+        )
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|row| row.get::<_, String>(0))
+        .collect()
+}
+
 #[tokio::test]
 async fn a_version_1_schema_migrates_to_the_current_one_and_keeps_its_runs() {
     let Some(url) = support::test_url() else {
@@ -118,8 +146,27 @@ async fn a_version_1_schema_migrates_to_the_current_one_and_keeps_its_runs() {
         .unwrap();
     store.migrate().await.unwrap();
     assert!(has_owner_column(&pool, &p).await, "the column was added");
+    assert!(
+        has_journal_signature_column(&pool, &p).await,
+        "the journal's signature column was added (ADR 0068)"
+    );
+    // It is the **last** column, as in a fresh database: `ADD COLUMN` appends, so the `CREATE
+    // TABLE` names it last and a fresh and an upgraded table end the same way (ADR 0068, T3a-4).
+    assert_eq!(
+        journal_columns(&pool, &format!("{p}journal")).await,
+        [
+            "run_id",
+            "seq",
+            "name",
+            "ok",
+            "payload",
+            "recorded_at",
+            "signature"
+        ],
+        "an upgraded journal has a fresh one's columns, in order"
+    );
     assert_eq!(version(&pool, &p).await, SCHEMA_VERSION.to_string());
-    assert_eq!(SCHEMA_VERSION, 10);
+    assert_eq!(SCHEMA_VERSION, 11);
     // The push table exists now (a missing table would be a backend error), and so does the L2
     // memory table schema version 10 adds to every migration (ADR 0081).
     assert!(has_table(&pool, &format!("{p}memory_lesson")).await);
@@ -141,6 +188,23 @@ async fn a_version_1_schema_migrates_to_the_current_one_and_keeps_its_runs() {
         .expect("the legacy run survived");
     assert_eq!(run.version, 7);
     assert_eq!(run.state, json!({"turn": 3}));
+
+    // The journal table the version 1 process made takes an entry, with no signature of its own:
+    // the column is there and nullable (ADR 0068).
+    let entry = store
+        .journal_put(
+            adam_core::RunId(id),
+            adam_core::JournalEntry::ok(0, "legacy-step", json!({"n": 1})),
+        )
+        .await
+        .unwrap();
+    assert_eq!(entry.signature, None);
+    let read = store
+        .journal_get(adam_core::RunId(id), 0)
+        .await
+        .unwrap()
+        .expect("the entry was written");
+    assert_eq!(read.signature, None);
 
     // The legacy run has no owner: the first pinned claimant gets it, and keeps it.
     let ttl = Duration::from_secs(30);

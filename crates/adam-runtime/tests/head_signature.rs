@@ -13,10 +13,11 @@ use std::time::{Duration, Instant};
 
 use adam_core::turn::{
     ChainHash, ConversationHash, CurrentKey, DynTurnKeys, KeyId, KeySet, Signature, TurnKeyError,
-    TurnKeys, TurnPosition, set_turn_signature, sign_turn, turn_signature, verify_head,
+    TurnKeys, TurnPosition, set_turn_signature, sign_step, sign_turn, step_payload, turn_signature,
+    verify_head, verify_step,
 };
 use adam_core::{
-    BodyRow, BodyWrite, DynStore, MemoryStore, RunId, RunStatus, RunUpdate, head_body,
+    BodyRow, BodyWrite, DynStore, JournalEntry, MemoryStore, RunId, RunStatus, RunUpdate, head_body,
 };
 use adam_error::{Classify, ErrorClass};
 use adam_runtime::{Agent, AgentError, Ctx, Inbound, Runtime, RuntimeError, Transition};
@@ -1095,4 +1096,352 @@ async fn a_tampered_finished_child_is_not_passed_to_its_parent() {
         }
         assert!(!told.to_string().contains("forged"), "{told}");
     }
+}
+
+// ---------------------------------------------------------------------------
+// The journal's entries (ADR 0068, `adam-step/v1`)
+// ---------------------------------------------------------------------------
+
+/// An agent that takes `each` journaled steps per transition and parks, so a test can read the
+/// entries the runtime signed and seed some before a replay. `ran` counts the steps' effects: a
+/// replayed entry returns its recorded outcome without running it.
+#[derive(Clone)]
+struct StepAgent {
+    name: String,
+    /// What the step returns.
+    value: u32,
+    /// Steps taken per transition.
+    each: u32,
+    /// Transitions taken.
+    steps: Arc<AtomicUsize>,
+    /// Times a step's effect ran.
+    ran: Arc<AtomicUsize>,
+}
+
+impl StepAgent {
+    fn new(prefix: &str, value: u32) -> Self {
+        Self::each(prefix, value, 1)
+    }
+
+    /// An agent that takes `each` steps in one transition.
+    fn each(prefix: &str, value: u32, each: u32) -> Self {
+        Self {
+            name: format!("{prefix}-{}", Uuid::new_v4().simple()),
+            value,
+            each,
+            steps: Arc::new(AtomicUsize::new(0)),
+            ran: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    fn runtime(&self, store: &DynStore, keys: &DynTurnKeys) -> Runtime {
+        Runtime::builder(store.clone())
+            .agent(self.clone())
+            .worker_id(format!("w-{}", Uuid::new_v4().simple()))
+            .poll_interval(Duration::from_millis(10))
+            .lease_ttl(Duration::from_secs(10))
+            .turn_keys(keys.clone())
+            .build()
+    }
+}
+
+#[async_trait]
+impl Agent for StepAgent {
+    type State = u32;
+
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn init(&self, _input: Inbound) -> Result<u32, AgentError> {
+        Ok(0)
+    }
+
+    async fn step(&self, ctx: &mut Ctx, state: u32) -> Result<Transition<u32>, AgentError> {
+        self.steps.fetch_add(1, SeqCst);
+        for _ in 0..self.each {
+            let (value, ran) = (self.value, self.ran.clone());
+            let _: Result<u32, String> = ctx
+                .step("call", || async move {
+                    ran.fetch_add(1, SeqCst);
+                    Ok(value)
+                })
+                .await?;
+        }
+        Ok(Transition::Park {
+            state: state + 1,
+            wake_at: None,
+        })
+    }
+}
+
+/// Every entry the runtime records is signed over the documented payload, and it verifies.
+#[tokio::test]
+async fn a_journaled_step_is_signed_and_verifies() {
+    let store = memory();
+    let keys = keys();
+    let agent = StepAgent::new("step-sign", 7);
+    let rt = agent.runtime(&store, &keys);
+    let run = rt
+        .start(&agent.name, hello("hi"), None)
+        .await
+        .expect("start");
+    let worker = spawn_worker(&rt);
+    wait_for(&rt, run, "the run to park", |v| {
+        v.status == RunStatus::Parked
+    })
+    .await;
+    worker.stop().await;
+
+    let entries = store.journal_list(run).await.unwrap();
+    assert_eq!(entries.len(), 1, "{entries:#?}");
+    let entry = &entries[0];
+    let jws = entry.signature.as_deref().expect("the entry is signed");
+    let set = keys.key_set().await.unwrap();
+    verify_step(&set, run, entry).expect("the entry verifies");
+
+    // The payload is the documented one, taken by hand: `{typ, run, seq, name, ok, payload}`.
+    assert_eq!(entry.seq, 0);
+    assert_eq!(entry.name, "call");
+    assert!(entry.ok);
+    assert_eq!(entry.payload, json!(7));
+    assert_eq!(
+        step_payload(run, entry.seq, &entry.name, entry.ok, &entry.payload),
+        step_payload(run, 0, "call", true, &json!(7))
+    );
+    assert!(jws.starts_with("ey"), "a base64url header: {jws}");
+
+    // Each member is bound: what a store attacker would have to change.
+    for altered in [
+        JournalEntry {
+            seq: 1,
+            ..entry.clone()
+        },
+        JournalEntry {
+            name: "other".into(),
+            ..entry.clone()
+        },
+        JournalEntry {
+            ok: false,
+            ..entry.clone()
+        },
+        JournalEntry {
+            payload: json!(8),
+            ..entry.clone()
+        },
+    ] {
+        assert!(
+            verify_step(&set, run, &altered).is_err(),
+            "{altered:?} must not verify"
+        );
+    }
+}
+
+/// An entry signed by a key the runtime does not hold was altered in the store: the replay refuses
+/// it, class `Corrupt`, before the step's effect runs (ADR 0068 decisions 4 and 6).
+#[tokio::test]
+async fn an_altered_journal_entry_fails_the_run_on_replay() {
+    let store = memory();
+    let keys = keys();
+    let attacker = keys();
+    let agent = StepAgent::new("step-forged", 1);
+    let rt = agent.runtime(&store, &keys);
+    let run = rt
+        .start(&agent.name, hello("hi"), None)
+        .await
+        .expect("start");
+
+    // The entry the replay will read, signed by another key over the same content.
+    let mut forged = JournalEntry::ok(0, "call", json!(1));
+    forged.signature = Some(
+        sign_step(attacker.as_ref(), run, &forged)
+            .await
+            .expect("the attacker signs"),
+    );
+    store
+        .journal_put(run, forged)
+        .await
+        .expect("seed the journal");
+
+    let worker = spawn_worker(&rt);
+    wait_for(&rt, run, "the run to fail", |v| {
+        v.status == RunStatus::Failed
+    })
+    .await;
+    worker.stop().await;
+
+    let view = rt.view(run).await.unwrap().unwrap();
+    let error = view.error.expect("an error");
+    assert!(
+        error.contains("journal entry 0") && error.contains("does not verify"),
+        "{error}"
+    );
+    assert_eq!(agent.steps.load(SeqCst), 1, "the transition ran once");
+    assert_eq!(
+        agent.ran.load(SeqCst),
+        0,
+        "the refused step's effect never ran"
+    );
+}
+
+/// An entry with no signature is adopted in this release (ADR 0068 decision 11): the replay takes
+/// its recorded outcome and the entry stays unsigned.
+#[tokio::test]
+async fn an_unsigned_journal_entry_is_adopted_and_replayed() {
+    let store = memory();
+    let keys = keys();
+    let agent = StepAgent::new("step-legacy", 5);
+    let rt = agent.runtime(&store, &keys);
+    let run = rt
+        .start(&agent.name, hello("hi"), None)
+        .await
+        .expect("start");
+    store
+        .journal_put(run, JournalEntry::ok(0, "call", json!(5)))
+        .await
+        .expect("seed a journal from before the feature");
+
+    let worker = spawn_worker(&rt);
+    wait_for(&rt, run, "the run to park", |v| {
+        v.status == RunStatus::Parked
+    })
+    .await;
+    worker.stop().await;
+
+    assert_eq!(agent.ran.load(SeqCst), 0, "the recorded step is replayed");
+    let entry = store.journal_get(run, 0).await.unwrap().unwrap();
+    assert_eq!(entry.payload, json!(5));
+    assert_eq!(entry.signature, None, "adoption does not rewrite the entry");
+}
+
+/// An entry whose signature was stripped is **not** a legacy entry when the run holds a signed one:
+/// the replay refuses it `Corrupt` and neither step's effect runs (ADR 0068 decision 5, a run signed
+/// once stays signed). The stripped entry is the **first** one the transition reads, so the refusal
+/// comes from the `journal_list` that finds the run's signed entry. The testkit's altered cases change
+/// a local clone, so only a store that answers stripped entries exercises the check a replay makes.
+#[tokio::test]
+async fn an_entry_stripped_of_its_signature_is_not_adopted_over_a_signed_one() {
+    let keys = keys();
+    // The wrapper answers seq 0 unsigned; seeding writes through it, which does not strip.
+    let store: DynStore = Arc::new(common::stripping::Stripping::new(memory(), Some(0)));
+    let agent = StepAgent::each("step-stripped", 4, 2);
+    let rt = agent.runtime(&store, &keys);
+    let run = rt
+        .start(&agent.name, hello("hi"), None)
+        .await
+        .expect("start");
+    // A transition that wrote both entries and crashed before its commit: the state still starts
+    // at seq 0, so the next transition replays them.
+    for seq in 0..2 {
+        let entry = JournalEntry::ok(seq, "call", json!(4));
+        let jws = sign_step(keys.as_ref(), run, &entry)
+            .await
+            .expect("the runtime's keys sign");
+        store
+            .journal_put(
+                run,
+                JournalEntry {
+                    signature: Some(jws),
+                    ..entry
+                },
+            )
+            .await
+            .expect("seed a signed journal");
+    }
+
+    let worker = spawn_worker(&rt);
+    wait_for(&rt, run, "the run to fail", |v| {
+        v.status == RunStatus::Failed
+    })
+    .await;
+    worker.stop().await;
+
+    let view = rt.view(run).await.unwrap().unwrap();
+    let error = view.error.expect("an error");
+    assert!(
+        error.contains("journal entry 0") && error.contains("unsigned over a signed run"),
+        "{error}"
+    );
+    assert_eq!(agent.steps.load(SeqCst), 1, "the transition ran once");
+    assert_eq!(
+        agent.ran.load(SeqCst),
+        0,
+        "neither the stripped step's effect nor the one behind it ran"
+    );
+}
+
+/// A journal whose entries are **all** unsigned is a journal written before the feature: it is
+/// adopted, entry by entry, even when the store stripped every signature. That is release N's
+/// exposure (decision 11: nothing in the store can mark the cutoff), and it is why the mixed case
+/// above is refused instead.
+#[tokio::test]
+async fn a_journal_whose_every_entry_is_unsigned_is_adopted() {
+    let keys = keys();
+    let store: DynStore = Arc::new(common::stripping::Stripping::new(memory(), None));
+    let agent = StepAgent::each("step-stripped-all", 6, 2);
+    let rt = agent.runtime(&store, &keys);
+    let run = rt
+        .start(&agent.name, hello("hi"), None)
+        .await
+        .expect("start");
+    for seq in 0..2 {
+        let entry = JournalEntry::ok(seq, "call", json!(6));
+        let jws = sign_step(keys.as_ref(), run, &entry)
+            .await
+            .expect("the runtime's keys sign");
+        store
+            .journal_put(
+                run,
+                JournalEntry {
+                    signature: Some(jws),
+                    ..entry
+                },
+            )
+            .await
+            .expect("seed a signed journal");
+    }
+
+    let worker = spawn_worker(&rt);
+    wait_for(&rt, run, "the run to park", |v| {
+        v.status == RunStatus::Parked
+    })
+    .await;
+    worker.stop().await;
+
+    assert_eq!(
+        agent.ran.load(SeqCst),
+        0,
+        "both unsigned entries are replayed"
+    );
+}
+
+/// A store that drops the signature of the entry it stores is refused at once: the write path
+/// checks the entry `journal_put` answered, so a run is never carried on a journal a replay would
+/// read unsigned (ADR 0068 decision 5). The effect ran — a step's effect is at-least-once — but its
+/// outcome is never adopted.
+#[tokio::test]
+async fn a_store_that_drops_the_signature_of_a_write_fails_the_run() {
+    let store: DynStore = Arc::new(common::stripping::Stripping::new(memory(), None).on_write());
+    let keys = keys();
+    let agent = StepAgent::new("step-dropped", 3);
+    let rt = agent.runtime(&store, &keys);
+    let run = rt
+        .start(&agent.name, hello("hi"), None)
+        .await
+        .expect("start");
+
+    let worker = spawn_worker(&rt);
+    wait_for(&rt, run, "the run to fail", |v| {
+        v.status == RunStatus::Failed
+    })
+    .await;
+    worker.stop().await;
+
+    let view = rt.view(run).await.unwrap().unwrap();
+    let error = view.error.expect("an error");
+    assert!(
+        error.contains("journal entry 0") && error.contains("unsigned over a signed run"),
+        "{error}"
+    );
+    assert_eq!(agent.ran.load(SeqCst), 1, "the effect ran before the write");
 }

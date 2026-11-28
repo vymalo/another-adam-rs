@@ -14,14 +14,16 @@ dependency.
 
 ## API at a glance
 
-* `store_conformance!(make)` generates one `#[tokio::test]` per case (50
+* `store_conformance!(make)` generates one `#[tokio::test]` per case (51
   cases: create/load, the millisecond precision of every timestamp (`.120` survives, finer truncates),
   `run_header` against `load_run` + `lease_until`, state round trip, a message whose state, commit and
   journal payload canonicalize (RFC 8785) to the bytes written, with numbers either side of 2^53, `i64`'s extremes, floats in
   exponent form, `-0` and names that sort differently by UTF-16 (what a turn signature of
   [ADR 0068](../../docs/decisions/0068-adam-signs-its-own-history.md) covers; a `u64` above `i64::MAX` is left out, MongoDB
   refuses it), CAS
-  conflicts, concurrent commits, journal ordering and first-writer-wins, claim rules and
+  conflicts, concurrent commits, journal ordering and first-writer-wins, a journal entry's signature
+  (`adam-step/v1`) stored and returned byte for byte with an unsigned one as `None`, an entry
+  changed after it was signed refused by `verify_step`, claim rules and
   exclusivity, busy runs that a claim leaves alone, lease expiry/renew/release, what `lease_until` reports, pinned claims and the
   run owner, one open run per conversation, purge, the listing of a caller's runs (scoped, ordered, keyset pages, status and time filters, literal prefixes including ones that hold or end in `/`, `count_runs`; two creates with different ids in one conversation leave one open run), and the push-notification configs: put/replace, list, delete, claim rules, exclusive claims under concurrency, commit, stale versions, removal with the run).
   `make` is a path to `async fn() -> Option<DynStore>`; `None` skips the suite.

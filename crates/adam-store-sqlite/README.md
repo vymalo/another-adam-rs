@@ -43,7 +43,7 @@ WAL, and is not durable.
   lock. `:memory:` is an in-memory database.
 * `with_table_prefix(prefix)`: table names prefixed (default `adam_`, only `[a-z0-9_]`, at most 40
   characters), so two stores can share a file (they still share the one process lock).
-* `path()`: the file. `ping()`: `SELECT 1`. `SCHEMA_VERSION` (1).
+* `path()`: the file. `ping()`: `SELECT 1`. `SCHEMA_VERSION` (2).
 * The `Store` implementation: `create_run` and `commit_run` return the record with `state` set to
   `null`; `load_run`, `load_head`, `claim_due`, `open_run_for_conversation` and the listings return
   the same document — the head when `head_version == version` (or when the state is the tombstone),
@@ -69,13 +69,17 @@ that replaced it; `gc_body` and `purge_finished` collect the rest.
 ## Schema and versions
 
 The tables are the PostgreSQL ones with SQLite types: `<prefix>runs` (`state` and `head` are JSON
-text, timestamps are whole milliseconds since the epoch), `<prefix>journal`, `<prefix>push`,
+text, timestamps are whole milliseconds since the epoch), `<prefix>journal` (with `signature TEXT`,
+the runtime's `adam-step/v1` signature of the entry, nullable, schema version 2), `<prefix>push`,
 `<prefix>blob`, `<prefix>run_blob`, `<prefix>body` and `<prefix>meta`. One open run per
 conversation is a partial unique index. A listing is a keyset page on `(updated_at, id)`.
 
 `SCHEMA_VERSION` is in `<prefix>meta`. `migrate` is idempotent and refuses a file stamped with a
 **newer** version (`StoreError::InvalidInput`, exit 78) instead of reading a schema this binary
-does not know. It never lowers the stamp.
+does not know. It never lowers the stamp. Version 2 adds the journal's `signature` column
+([ADR 0068](../../docs/decisions/0068-adam-signs-its-own-history.md) decision 2): SQLite has no
+`ADD COLUMN IF NOT EXISTS`, so the upgrade asks `PRAGMA table_info` and runs the `ALTER TABLE` only
+when the column is missing; a fresh file gets it from its `CREATE TABLE`.
 
 Time is truncated to milliseconds with `adam_core::truncate_ms` before it is written, as every
 store does; a value before 1970 is floored, never rounded toward zero. Every JSON value goes

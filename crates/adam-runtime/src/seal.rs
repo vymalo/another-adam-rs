@@ -29,13 +29,26 @@
 //! Without keys nothing here runs: no signature is written, none is required and an existing one is
 //! not read (a write without keys drops it).
 //!
+//! **The journal** ([`Sealer::sign_entry`], [`Sealer::check_entry_with`]): the runtime signs each
+//! entry it records (`adam-step/v1`, the run and the entry's `seq`, `name`, `ok` and `payload`) and
+//! checks every entry it replays, in `Ctx`. Entries are not chained: each is checked on its own. An
+//! entry with no signature is adopted in this release (decision 11) **only when no entry of the run
+//! carries one**: a run signed once stays signed, as decision 5 says of turns, so an entry whose
+//! signature was stripped is refused as `Corrupt` rather than downgraded to a legacy one. The write
+//! path refuses the same thing after `journal_put`: a signed entry that comes back unsigned lost it
+//! in the store.
+//!
 //! [ADR 0068]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0068-adam-signs-its-own-history.md
+
+use std::cell::OnceCell;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use adam_core::turn::{
     ChainHash, ConversationHash, DynTurnKeys, KeySet, TurnKeyError, TurnKeys, TurnPosition,
-    TurnSignatureError, sign_head, turn_signature, verify_head, verify_turn,
+    TurnSignatureError, sign_head, sign_step, turn_signature, verify_head, verify_step,
+    verify_turn,
 };
-use adam_core::{RunId, storable};
+use adam_core::{JournalEntry, RunId, storable};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -113,6 +126,16 @@ fn refused(run: RunId, reason: &str, cause: Option<TurnSignatureError>) -> Runti
         run,
         reason: format!("the run's head is refused (ADR 0068): {reason}"),
         source: cause.map(|e| Box::new(e) as _),
+    }
+}
+
+/// Why a journal entry is refused: a [`RuntimeError::Corrupt`] that names the entry and holds
+/// nothing of what it recorded (ADR 0068 decisions 4 and 6).
+pub(crate) fn refused_entry(run: RunId, seq: u64, reason: &str) -> RuntimeError {
+    RuntimeError::Corrupt {
+        run,
+        reason: format!("the journal entry {seq} is refused (ADR 0068): {reason}"),
+        source: None,
     }
 }
 
@@ -252,6 +275,59 @@ impl Sealer {
         self.check(run, conversation, len, &chain, doc).await
     }
 
+    /// The signature of a journal entry the runtime is about to write (`adam-step/v1`, ADR 0068
+    /// decision 2): the detached JWS of the entry's `{typ, run, seq, name, ok, payload}`.
+    ///
+    /// # Errors
+    ///
+    /// [`TurnKeyError`] from the keys.
+    pub(crate) async fn sign_entry(
+        &self,
+        run: RunId,
+        entry: &JournalEntry,
+    ) -> Result<String, TurnKeyError> {
+        sign_step(self.keys.as_ref(), run, entry).await
+    }
+
+    /// Check the signature a journal entry the store returned carries, against a key set already
+    /// read: one read of the set for every entry a transition replays, as [`check_read`] does for
+    /// the head and its turns (a key set can be remote).
+    ///
+    /// An entry with **no** signature is not decided here: adopting one is the caller's, and only
+    /// while no entry of the run carries a signature (ADR 0068 decisions 5 and 11).
+    ///
+    /// # Errors
+    ///
+    /// [`RuntimeError::Corrupt`] (class `Corrupt`) naming the entry's `seq` for one that does not
+    /// verify.
+    pub(crate) fn check_entry_with(
+        set: &KeySet,
+        run: RunId,
+        entry: &JournalEntry,
+    ) -> Result<(), RuntimeError> {
+        verify_step(set, run, entry)
+            .map(drop)
+            .map_err(|cause| RuntimeError::Corrupt {
+                run,
+                reason: format!(
+                    "the journal entry {} is refused (ADR 0068): {cause}",
+                    entry.seq
+                ),
+                source: Some(Box::new(cause)),
+            })
+    }
+
+    /// The key set this runtime verifies against: the one read a transition takes, and the one-off
+    /// form for a caller that checks a single entry.
+    ///
+    /// # Errors
+    ///
+    /// [`TurnKeyError`] from the keys.
+    pub(crate) async fn key_set(&self) -> Result<KeySet, TurnKeyError> {
+        let set = self.keys.key_set().await?;
+        Ok((*set).clone())
+    }
+
     /// Check the head of a record read with its rows: the rows are chained and the one signature
     /// is verified. A document with **no** signature is adopted (decision 11, release N) unless a
     /// row carries a turn signature, which a run that was signed once must keep.
@@ -351,6 +427,63 @@ impl Sealer {
             prv = prv.next(&stored);
         }
         Ok(())
+    }
+}
+
+/// What a transition reads at most once to check its journal's signatures: the key set (a key set
+/// can be remote, and [`Sealer::check_read`] reads it once for a head and its turns) and whether
+/// the run's journal holds any signed entry.
+///
+/// One per transition, not per runtime: a key set is read at start and a revocation is a rollout
+/// (ADR 0068 decision 8), so a worker that cached one across transitions would go on accepting a
+/// key the others refuse.
+#[derive(Default)]
+pub(crate) struct SignatureCache {
+    set: OnceCell<KeySet>,
+    /// A signed entry is in the run's journal: one this transition wrote, or one a list found.
+    /// Only ever raised.
+    signed: AtomicBool,
+    /// The journal was listed once, and held no signed entry then.
+    listed: AtomicBool,
+}
+
+impl SignatureCache {
+    /// The key set, read on the first entry that needs one and shared by every later entry of the
+    /// transition.
+    ///
+    /// # Errors
+    ///
+    /// [`TurnKeyError`] from the keys.
+    pub(crate) async fn key_set(&self, sealer: &Sealer) -> Result<&KeySet, TurnKeyError> {
+        if let Some(set) = self.set.get() {
+            return Ok(set);
+        }
+        let set = sealer.key_set().await?;
+        Ok(self.set.get_or_init(|| set))
+    }
+
+    /// Whether the run's journal is known to hold a signed entry, or `None` when it has not been
+    /// listed yet.
+    pub(crate) fn signed(&self) -> Option<bool> {
+        if self.signed.load(Ordering::Relaxed) {
+            Some(true)
+        } else if self.listed.load(Ordering::Relaxed) {
+            Some(false)
+        } else {
+            None
+        }
+    }
+
+    /// Record that the run's journal holds a signed entry: the one this transition wrote, or one a
+    /// list found. A run signed once stays signed (ADR 0068 decision 5), so this is never undone.
+    pub(crate) fn remember_signed(&self) {
+        self.signed.store(true, Ordering::Relaxed);
+    }
+
+    /// Record that the journal was listed and held no signed entry: a journal written before the
+    /// feature, whose unsigned entries are adopted (decision 11).
+    pub(crate) fn remember_listed(&self) {
+        self.listed.store(true, Ordering::Relaxed);
     }
 }
 

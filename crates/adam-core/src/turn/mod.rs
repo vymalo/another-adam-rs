@@ -12,6 +12,8 @@
 //!   `{"alg":"EdDSA","kid":"…","typ":"adam-turn/v1"}` ([`sign_detached`], [`verify_detached`]); the
 //!   turn's payload `{typ, run, cnv, idx, prv, msg}` ([`turn_payload`]) and the chain `prv`
 //!   ([`ChainHash`]); every byte string signed is RFC 8785 ([`crate::jcs`]).
+//! * A journal entry's signature (`adam-step/v1`, [`sign_step`], [`verify_step`]): the same form over
+//!   `{typ, run, seq, name, ok, payload}` ([`step_payload`]), detached and not chained.
 //! * The request signature: adam's signature of one model request as it sends it
 //!   (`adam-request/v1`, [`sign_request`], [`verify_request`]), its payload attached
 //!   ([`sign_attached`]) and carried in the header [`TURN_SIGNATURE_HEADER`].
@@ -22,7 +24,10 @@
 //!   [`run_cert_issuer_conformance!`](crate::run_cert_issuer_conformance).
 //!
 //! Slice T1 of the ADR builds the history's form; the turns are signed by the agent loop (T3a-1)
-//! and the head by the runtime (T3a-2, [`head_payload`]); nothing verifies a turn on its own yet. Every model request is signed when the host gives keys (`adam_model::SignedRequests`).
+//! and verified on re-entry (T3a-3), the head by the runtime (T3a-2, [`head_payload`]), and a
+//! journal entry by the runtime's `Ctx` when it writes one, checked when it replays one
+//! ([`sign_step`], [`verify_step`]). Every model request is signed when the host gives keys
+//! (`adam_model::SignedRequests`).
 //!
 //! [ADR 0068]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0068-adam-signs-its-own-history.md
 //! [ADR 0086]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0086-a-run-signs-its-model-requests-with-a-certificate.md
@@ -33,6 +38,7 @@ mod form;
 mod key_set;
 mod request;
 pub mod run_cert;
+mod step;
 pub mod testkit;
 
 use std::fmt;
@@ -64,6 +70,7 @@ pub use run_cert::{
     DynRunKeys, RENEW_RETRY_SECS, RenewFraction, RunCertError, RunCertIssuer, RunClock,
     RunKeyError, RunKeyring, RunKeys, RunSubject, SystemClock,
 };
+pub use step::{sign_step, step_payload, verify_step};
 
 /// Signs with the turn key and gives the keys a turn signature is verified with ([ADR 0068]
 /// decision 7). The host provides it, adam asks: as `ModelCredentials` does for a model call, and

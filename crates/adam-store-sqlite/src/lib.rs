@@ -66,7 +66,12 @@ use uuid::Uuid;
 ///
 /// * 1: the first schema, the same tables as PostgreSQL's schema version 6 (runs with their head
 ///   and version, the journal, push configurations, blobs and their references, and the body).
-pub const SCHEMA_VERSION: i32 = 1;
+/// * 2: `<prefix>journal.signature`, the runtime's signature of a journal entry ([ADR
+///   0068](../../docs/decisions/0068-adam-signs-its-own-history.md), decision 2), nullable so a
+///   journal written before it replays as it is. SQLite has no `ADD COLUMN IF NOT EXISTS`, so a
+///   file of an earlier version gets the column from an `ALTER TABLE` when it is missing; a fresh
+///   file gets it from its `CREATE TABLE`.
+pub const SCHEMA_VERSION: i32 = 2;
 
 /// How old a foreign attempt's body row must be before a commit may collect it: the insert→CAS gap
 /// is milliseconds, and the runtime's default lease is 30 s, so five minutes separates a dead
@@ -387,6 +392,7 @@ impl Sql {
                     ok          INTEGER NOT NULL CHECK (ok IN (0, 1)),
                     payload     TEXT    NOT NULL,
                     recorded_at INTEGER NOT NULL,
+                    signature   TEXT,
                     PRIMARY KEY (run_id, seq)
                 )"
             ),
@@ -497,6 +503,18 @@ impl Store for SqliteStore {
             }
             for statement in sql.migrate_statements() {
                 tx.execute_batch(&statement).map_err(classify)?;
+            }
+            // Schema version 2 (ADR 0068): a journal entry's signature. SQLite has no `ADD COLUMN
+            // IF NOT EXISTS`, and a file of an earlier version has the table without the column (a
+            // fresh one gets it from its `CREATE TABLE`, **last**, because `ADD COLUMN` appends:
+            // both end with the same columns in the same order), so the column is asked for and
+            // added only when it is missing.
+            if !has_column(&tx, &sql.journal, "signature")? {
+                execute(
+                    &tx,
+                    &format!("ALTER TABLE {} ADD COLUMN signature TEXT", sql.journal),
+                    &[],
+                )?;
             }
             execute(
                 &tx,
@@ -834,7 +852,7 @@ impl Store for SqliteStore {
             query_optional(
                 conn,
                 &format!(
-                    "SELECT seq, name, ok, payload, recorded_at FROM {}
+                    "SELECT seq, name, ok, payload, signature, recorded_at FROM {}
                       WHERE run_id = ? AND seq = ?",
                     sql.journal
                 ),
@@ -857,8 +875,8 @@ impl Store for SqliteStore {
             let inserted = execute_raw(
                 &tx,
                 &format!(
-                    "INSERT INTO {} (run_id, seq, name, ok, payload, recorded_at)
-                     VALUES (?, ?, ?, ?, ?, ?)",
+                    "INSERT INTO {} (run_id, seq, name, ok, payload, signature, recorded_at)
+                     VALUES (?, ?, ?, ?, ?, ?, ?)",
                     sql.journal
                 ),
                 &[
@@ -867,6 +885,10 @@ impl Store for SqliteStore {
                     Value::Text(name.clone()),
                     Value::Integer(i64::from(entry.ok)),
                     Value::Text(payload.clone()),
+                    match &entry.signature {
+                        Some(signature) => Value::Text(signature.clone()),
+                        None => Value::Null,
+                    },
                     Value::Integer(to_ms(recorded_at)),
                 ],
             );
@@ -878,6 +900,7 @@ impl Store for SqliteStore {
                         ok: entry.ok,
                         payload: json_value(&payload)?,
                         recorded_at,
+                        signature: entry.signature.clone(),
                     };
                     tx.commit().map_err(classify)?;
                     return Ok(stored);
@@ -889,7 +912,7 @@ impl Store for SqliteStore {
             let existing = query_optional(
                 &tx,
                 &format!(
-                    "SELECT seq, name, ok, payload, recorded_at FROM {}
+                    "SELECT seq, name, ok, payload, signature, recorded_at FROM {}
                       WHERE run_id = ? AND seq = ?",
                     sql.journal
                 ),
@@ -916,7 +939,7 @@ impl Store for SqliteStore {
             query_all(
                 conn,
                 &format!(
-                    "SELECT seq, name, ok, payload, recorded_at FROM {}
+                    "SELECT seq, name, ok, payload, signature, recorded_at FROM {}
                       WHERE run_id = ? ORDER BY seq",
                     sql.journal
                 ),
@@ -1771,6 +1794,7 @@ fn entry_from_row(row: &Row) -> StoreResult<JournalEntry> {
         ok: row.get::<_, i64>("ok").map_err(classify)? != 0,
         payload: json_value(&row.get::<_, String>("payload").map_err(classify)?)?,
         recorded_at: time_col(row, "recorded_at")?,
+        signature: row.get("signature").map_err(classify)?,
     })
 }
 
@@ -1788,6 +1812,22 @@ fn version_col(row: &Row, column: &str) -> StoreResult<u64> {
 fn time_col(row: &Row, column: &str) -> StoreResult<Timestamp> {
     let value: i64 = row.get(column).map_err(classify)?;
     from_ms(value)
+}
+
+/// Whether `table` has `column`, asked of SQLite's own catalogue: the one way to add a column to a
+/// file of an earlier version without an `ADD COLUMN IF NOT EXISTS` it does not have.
+fn has_column(conn: &Connection, table: &str, column: &str) -> StoreResult<bool> {
+    let mut statement = conn
+        .prepare(&format!("PRAGMA table_info({table})"))
+        .map_err(classify)?;
+    let mut rows = statement.query([]).map_err(classify)?;
+    while let Some(row) = rows.next().map_err(classify)? {
+        let name: String = row.get("name").map_err(classify)?;
+        if name == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn opt_time_col(row: &Row, column: &str) -> StoreResult<Option<Timestamp>> {

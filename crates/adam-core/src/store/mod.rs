@@ -490,6 +490,15 @@ pub struct JournalEntry {
     /// Serialized step output (or error).
     pub payload: Value,
     pub recorded_at: Timestamp,
+    /// The runtime's signature of this entry ([ADR 0068] decision 2, `adam-step/v1`), or `None` for
+    /// an entry written before the feature or by a runtime without turn keys.
+    ///
+    /// A detached compact JWS (RFC 7515 appendix F) over `{typ, run, seq, name, ok, payload}`
+    /// ([`step_payload`](crate::turn::step_payload)); the store keeps the string byte for byte and
+    /// never signs or checks it. `recorded_at` is not covered.
+    ///
+    /// [ADR 0068]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0068-adam-signs-its-own-history.md
+    pub signature: Option<String>,
 }
 
 impl JournalEntry {
@@ -500,6 +509,7 @@ impl JournalEntry {
             ok: true,
             payload,
             recorded_at: now(),
+            signature: None,
         }
     }
 
@@ -770,7 +780,8 @@ pub trait Store: Send + Sync + 'static {
     ///
     /// The entry returned is the stored one, payload included: the payload went through
     /// [`storable`], and the loop decodes the step's outcome from what is returned, so it must be
-    /// the bytes a replay will read.
+    /// the bytes a replay will read. Its [`signature`](JournalEntry::signature) is stored and
+    /// returned byte for byte: the store never signs or checks it (ADR 0068).
     async fn journal_put(&self, run: RunId, entry: JournalEntry) -> StoreResult<JournalEntry>;
 
     /// All journal entries of a run, ordered by `seq`.

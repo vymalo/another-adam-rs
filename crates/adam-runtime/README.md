@@ -588,7 +588,8 @@ slice T3a-2) makes the runtime sign what it commits as a run's state and check i
   as its output. `Runtime::view`, `view_from_record` and A2A `GetTask` and `ListTasks` check nothing.
 * **Mixed fleets.** A worker without keys drops head signatures when it writes, so a signed turn later makes that head
   refused; and release N gives an agent that does not sign its turns no downgrade resistance (stripping `signature` passes
-  adoption).
+  adoption). For the journal the run's own entries decide: a worker without keys writes them unsigned, and a later replay
+  with keys refuses them over the run's signed ones, while a journal written entirely before the feature is adopted.
 * **The turns** (slice T3a-3). After the head, every row that is a turn (`role` `assistant` or `tool`) of a **signed** run is
   verified at its position over the rows before it (`Sealer::check_turns`, in `check_read`): it must carry a turn signature
   whose key is in the key set and not revoked. Unsigned, forged, moved, spliced or revoked-key: `RuntimeError::Corrupt`,
@@ -614,8 +615,17 @@ slice T3a-2) makes the runtime sign what it commits as a run's state and check i
   session round). A client polling `GetTask` still sees the status. **To retire a key without losing history, rotate:**
   add the new key and keep the old one in the set (not revoked), so old runs verify while new commits are signed with the new
   one; revoke only a key you consider compromised, knowing what it takes with it.
-* **Not done** (T2 and later): the journal is not signed, and no host sets the keys yet (the engine and the service), so
-  only an embedder that calls `turn_keys` is affected.
+* **The journal's entries** (slice T3a-4, 2026-11-28). `Ctx::step` (and every `ReservedStep`) signs the entry it records
+  (`adam-step/v1`: the run and the entry's `seq`, `name`, `ok` and `payload`) and checks every entry it replays, when the
+  runtime has turn keys. The payload is signed as the store keeps it (`storable`); `recorded_at` is not covered. Entries are
+  not chained: each is checked on its own, and the key set is read **once per transition** rather than once per entry (a key
+  set can be remote). The entry a write comes back with is checked too: one the store answered unsigned, from a write the
+  runtime signed, fails the run `Corrupt`. A signed entry that does not verify fails the run `Corrupt` before the step's
+  effect runs. An entry with no signature is adopted only when no entry of its run carries one (decision 11, release N): a
+  journal written before the feature replays as it is, and a run signed once stays signed, so an entry whose signature was
+  stripped over a signed run is refused. A store keeps the string byte for byte and never signs or checks it.
+* **Not done** (T2 and later): no host sets the keys yet (the engine and the service), so only an embedder that calls
+  `turn_keys` is affected.
 
 Tests: `tests/head_signature.rs`; `src/seal.rs` (`turn_tests`); and, with a real `LlmAgent`, `adam-llm-agent`'s `tests/turn_reentry.rs`.
 
