@@ -677,7 +677,7 @@ The skills a repository ships reach the model the same way its instructions do: 
 
 Code: `src/tools/skills.rs` (`RepoSkills`, the `RunSkills` of the coder), `src/agent.rs` (it is given to the agent unless the folder says `skills: []`); tests: `tests/tools.rs`, `tests/project_instructions.rs`, `tests/tiers.rs`.
 
-**The coder's own skills.** The shipped folder has two, in `agent/skills/` (embedded by `build.rs` like the rest of `agent/`): `discover-checks` (where a repository declares its checks, how to read a CI workflow, how to choose the commands for `run_checks`) and `pull-request-text` (the title and body of a pull request: the repository's template and title style, a verification section with the exact commands, failures that were already there). They are in the catalog of the prompt, and **no line was added to `instructions.md` and no rule moved out of it**: the prompt is longer than the body by the catalog and the fixed sentence (pinned by `tests/fixtures/agent/skills.txt`) and by the *Child sessions* section that tells the model what the five session tools do, for the helpers `explorer` and `reviewer` ([ADR 0054](../../docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md) decision 9; pinned by `tests/fixtures/agent/sessions.txt`), and the 30,000 characters above which the loader warns count the body alone. A folder of a deployment may add skills of its own, or turn all of it off with `skills: []`.
+**The coder's own skills.** The shipped folder has two, in `agent/skills/` (embedded by `build.rs` like the rest of `agent/`): `discover-checks` (where a repository declares its checks, how to read a CI workflow, how to choose the commands for `run_checks`) and `pull-request-text` (the title and body of a pull request: the repository's template and title style, a verification section with the exact commands, failures that were already there). They are in the catalog of the prompt, and **no line was added to `instructions.md` and no rule moved out of it**: the prompt is longer than the body by the catalog and the fixed sentence (pinned by `tests/fixtures/agent/skills.txt`) and by the *Child sessions* section that tells the model what the six session tools do, for the helpers `explorer` and `reviewer` ([ADR 0054](../../docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md) decision 9; pinned by `tests/fixtures/agent/sessions.txt`), and the 30,000 characters above which the loader warns count the body alone. A folder of a deployment may add skills of its own, or turn all of it off with `skills: []`.
 
 ### Paged reads: `read_file`, `list_files`, `find_files`, `search_files`
 
@@ -896,13 +896,15 @@ opened on (see *Sessions a person opens*). Per place:
 
 The janitor and the run pods look at the root's directory and run only: a child never has a workspace of its own.
 
-**In the background.** Because the coder has subagents, its assembly also gives it the five session tools of
+**In the background.** Because the coder has subagents, its assembly also gives it the six session tools of
 [ADR 0045](../../docs/decisions/0045-a-subagent-can-run-in-the-background-as-a-session.md) slice 2 (`subagent_start`,
-`subagent_send`, `subagent_read`, `subagent_close`, `subagent_list`, after `explorer` and `reviewer`), so that it can start a helper,
-keep working and read the report, and send a kept-open helper another question. They are made by the assembly, not by
+`subagent_send`, `subagent_read`, `subagent_edit`, `subagent_close`, `subagent_list`, after `explorer` and `reviewer`), so that it
+can start a helper, keep working and read the report, send a kept-open helper another question, and edit a session's config
+within the same bounds a start has ([ADR 0054](../../docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md)
+decision 11). They are made by the assembly, not by
 `coder_tools`, so `Gated` and `Redacting` do not wrap them: they are **`plan` tier** in `tier::known` (the helpers are read-only
 and keep to the tier of the run they serve), and `AgentDef::bind(..).scrub(..)` gives them the coder's redactor, so a report
-passes through it like any tool result. They are not in the coder's tool-spec goldens (those pin `coder_tools`); the five specs
+passes through it like any tool result. They are not in the coder's tool-spec goldens (those pin `coder_tools`); the six specs
 are pinned in `crates/adam-llm-agent/tests/fixtures/session-tools.json`. A round is a child of the **task that started it**,
 so it works in that task's worktree and, in a later task of the conversation, `subagent_send` starts the next round in the
 worktree of the later task. The prompt is not changed: the descriptions carry the guidance, and `explorer` and `reviewer` stay
@@ -914,7 +916,7 @@ The card also lists `child-sessions/v1` ([ADR 0045](../../docs/decisions/0045-a-
 slice 6 part c; [`a2a-server.md`](../../docs/reference/a2a-server.md#child-sessions-child-sessionsv1)): `explorer` and `reviewer` are offered
 to a person as sessions they open, talk to and close from their client, with `maxOpen` the effective `SESSION_MAX_OPEN` (16 by default;
 `limits.max_open_sessions` of the folder's root may lower it, never raise it). `serve` reads it from the files alone, with
-`config.service.sessions.limits`, so `all` and `control-plane` list and serve the same (and, with `config.service.sessions.max_parallel_tool_calls`, the same **bounds** for a person's `start.config`: the control plane gets them from `AgentDef::session_bounds`, a worker from its assembly, one function: every number is the same, the tool names are not, since a control plane knows none and a worker's set is known but never complete: the coder adds the thread-tools source, whose tools are another system's and are listed per conversation (`Declared::Unknown`), while its references, tier and environment sources declare theirs); the control plane registers the helpers' starters
+`config.service.sessions.limits`, so `all` and `control-plane` list and serve the same (and, with `config.service.sessions.max_parallel_tool_calls`, the same **bounds** for a person's `start.config`: the control plane gets them from `AgentDef::session_bounds`, a worker from its assembly, one function: every number is the same, the tool names are not, since a control plane knows none and checks the shape only, while a worker's set is complete: the coder adds the thread-tools source, which declares the contract's tools it knows by name and the shape `*__*` of the tools it relays from a server a person attached, and its references, tier and environment sources declare theirs, so a `tools` entry that selects nothing is refused there and `github__*` is admitted); the control plane registers the helpers' starters
 (`coder/explorer`, `coder/reviewer`) beside `CoderStarter` and a worker steps the rounds. `app.rs` (`Coder::new_with`, the control-plane
 constructors) is unchanged. The card entry is not in `tests/fixtures/agent/card.json`: that is `agent_card_for`'s card, which `serve` extends.
 

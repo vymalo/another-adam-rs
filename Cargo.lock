@@ -731,6 +731,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "adam-memory-redis"
+version = "0.7.0"
+dependencies = [
+ "adam-core",
+ "adam-error",
+ "adam-memory",
+ "adam-memory-testkit",
+ "redis",
+ "serde_json",
+]
+
+[[package]]
 name = "adam-memory-testkit"
 version = "0.7.0"
 dependencies = [
@@ -1004,6 +1016,8 @@ version = "0.7.0"
 dependencies = [
  "adam-core",
  "adam-error",
+ "adam-memory",
+ "adam-memory-testkit",
  "adam-store-testkit",
  "async-trait",
  "futures",
@@ -1243,6 +1257,12 @@ checksum = "c049c0be4daef0b145cb3555416b3b8ef5b7888a38aea1a3a155801fe7b0810b"
 dependencies = [
  "rustversion",
 ]
+
+[[package]]
+name = "arcstr"
+version = "1.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "03918c3dbd7701a85c6b9887732e2921175f26c350b4563841d0958c21d57e6d"
 
 [[package]]
 name = "arraydeque"
@@ -4699,6 +4719,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "redis"
+version = "1.8.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c85db9332bbc47e826283f0a6058d747c478ed2278976279cefd22154d541b98"
+dependencies = [
+ "arcstr",
+ "combine",
+ "itoa",
+ "percent-encoding",
+ "rustls",
+ "rustls-native-certs",
+ "ryu",
+ "socket2",
+ "url",
+ "webpki-roots",
+ "xxhash-rust",
+]
+
+[[package]]
 name = "redox_syscall"
 version = "0.5.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6939,6 +6978,12 @@ dependencies = [
  "spki 0.8.1",
  "tls_codec",
 ]
+
+[[package]]
+name = "xxhash-rust"
+version = "0.8.21"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "40de123dbb523ebcc00d61ec01840ad192578afc378d859f3429caa38308fad5"
 
 [[package]]
 name = "yoke"

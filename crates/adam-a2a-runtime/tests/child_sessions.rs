@@ -1,7 +1,7 @@
 //! `child-sessions/v1` on the A2A backend, by a real `LlmAgent` helper on a real `Runtime`: a
-//! person starts a session, follows its rounds as tasks, talks to it, stops a round and closes it;
-//! the parent task says its sessions; and every request that is not the caller's, not activated or
-//! malformed is refused before anything is written.
+//! person starts a session, follows its rounds as tasks, talks to it, edits its config, stops a
+//! round and closes it; the parent task says its sessions; and every request that is not the
+//! caller's, not activated or malformed is refused before anything is written.
 //!
 //! Run against `MemoryStore` always and against PostgreSQL when `ADAM_TEST_POSTGRES_URL` is set.
 //! Nothing sleeps for a fixed time: the helper's model call is held at a gate, and the few polls
@@ -26,8 +26,8 @@ use adam_model::{
     ToolCall, Usage,
 };
 use adam_runtime::{
-    BroadcastSink, ManualClock, Runtime, SessionBounds, SessionHeader, SessionLimits,
-    parse_session_conversation_id,
+    BroadcastSink, ManualClock, Runtime, SessionBounds, SessionEditor, SessionHeader,
+    SessionLimits, parse_session_conversation_id,
 };
 use async_trait::async_trait;
 use futures::StreamExt;
@@ -449,6 +449,305 @@ fn close_message(context: &str, cancel: bool) -> Message {
         json!({"close": {"cancel": cancel}}),
     )]));
     message
+}
+
+fn edit_message(context: &str, config: Value) -> Message {
+    let mut message = said("edit", Some(context));
+    message.metadata = Some(HashMap::from([(
+        CHILD_SESSIONS_EXTENSION.to_owned(),
+        json!({"edit": {"config": config}}),
+    )]));
+    message
+}
+
+/// The session id of a round's child context.
+fn session_of(context_id: &str) -> RunId {
+    parse_session_conversation_id(context_id)
+        .expect("a child context")
+        .1
+}
+
+/// A person's `edit` (ADR 0054, decision 11) of an idle session: a round that calls no model, in
+/// the same child context, which writes the config into the header and records the edit as the
+/// person's; the next message runs with it.
+#[tokio::test]
+async fn an_edit_of_an_idle_session_is_a_round_that_calls_no_model() {
+    for store in stores().await {
+        let rig = Rig::with(
+            &store,
+            Options {
+                bounds: Some(SessionBounds::default()),
+                ..Options::new()
+            },
+        );
+        rig.helper_mock
+            .push_text("a plan")
+            .push_text("a second plan");
+        let one = rig.start(&alice(), None, "plan it", true).await;
+        rig.until(&alice(), &one.id, TaskState::Completed).await;
+        let session = session_of(&one.context_id);
+
+        let edited = rig
+            .submit(
+                &alice(),
+                edit_message(
+                    &one.context_id,
+                    json!({"maxTurns": 10, "tokenBudget": 5_000}),
+                ),
+                None,
+            )
+            .await
+            .expect("an edit within the bounds");
+        assert_ne!(edited.id, one.id, "a round of its own");
+        assert_eq!(edited.context_id, one.context_id);
+        assert_eq!(object(&edited)["round"], 2);
+        assert_eq!(object(&edited)["by"], "person");
+        assert_eq!(
+            object(&edited)["config"],
+            json!({"maxTurns": 10, "tokenBudget": 5_000}),
+            "the session object says what it now runs with"
+        );
+        rig.until(&alice(), &edited.id, TaskState::Completed).await;
+        assert_eq!(
+            rig.helper_mock.requests().len(),
+            1,
+            "the edit called no model"
+        );
+        let header = rig.round_header(session).await;
+        assert_eq!(header.round, 2);
+        assert!(header.editing, "the round only edited the session");
+        let config = header.config.expect("the header holds the edit");
+        assert_eq!(config.max_turns, Some(10));
+        assert_eq!(config.token_budget, Some(5_000));
+        assert_eq!(header.edits.len(), 1);
+        assert_eq!(header.edits[0].by, SessionEditor::Person);
+        assert_eq!(header.edits[0].round, 2, "the round it was delivered to");
+        assert_eq!(
+            header.edits[0].members,
+            vec!["maxTurns".to_owned(), "tokenBudget".to_owned()]
+        );
+
+        // The session is idle again, and the next round runs with the edit.
+        let two = rig
+            .submit(&alice(), said("go on", Some(&one.context_id)), None)
+            .await
+            .expect("a message after an edit");
+        assert_eq!(object(&two)["round"], 3);
+        rig.until(&alice(), &two.id, TaskState::Completed).await;
+        assert_eq!(rig.helper_mock.requests().len(), 2);
+        assert_eq!(
+            object(&rig.task(&alice(), &two.id).await)["config"],
+            json!({"maxTurns": 10, "tokenBudget": 5_000})
+        );
+        rig.stop().await;
+    }
+}
+
+/// A person's `edit` of a working session is delivered into the open round: no new task, no second
+/// model call, and the round's header (read by the next reader) carries the edit.
+#[tokio::test]
+async fn an_edit_of_a_working_session_is_delivered_into_its_round() {
+    for store in stores().await {
+        let rig = Rig::with(
+            &store,
+            Options {
+                bounds: Some(SessionBounds::default()),
+                hold_helper_on: Some(0),
+                ..Options::new()
+            },
+        );
+        rig.helper_mock.push_text("one");
+        let one = rig.start(&alice(), None, "work", true).await;
+        rig.gate.reached.notified().await;
+
+        let edited = rig
+            .submit(
+                &alice(),
+                edit_message(&one.context_id, json!({"maxTurns": 10})),
+                None,
+            )
+            .await
+            .expect("an edit of a working session");
+        assert_eq!(edited.id, one.id, "delivered into the open round");
+
+        rig.gate.release.notify_one();
+        rig.until(&alice(), &one.id, TaskState::Completed).await;
+        assert_eq!(
+            rig.helper_mock.requests().len(),
+            1,
+            "the edit started no round"
+        );
+        let session = session_of(&one.context_id);
+        let header = rig.round_header(session).await;
+        assert_eq!(header.round, 1);
+        assert_eq!(
+            header.config.and_then(|config| config.max_turns),
+            Some(10),
+            "the edit a round ended before reading is applied by its reader"
+        );
+        assert_eq!(header.edits.len(), 1);
+        assert_eq!(header.edits[0].by, SessionEditor::Person);
+        assert_eq!(header.edits[0].round, 1);
+        rig.stop().await;
+    }
+}
+
+/// A person's `edit` past a bound is `InvalidParams` naming `edit.config.<member>`, and the session
+/// is left as it was: no round, no edit in the history.
+#[tokio::test]
+async fn an_edit_past_a_bound_is_refused_and_changes_nothing() {
+    for store in stores().await {
+        let rig = Rig::with(
+            &store,
+            Options {
+                bounds: Some(SessionBounds::default()),
+                ..Options::new()
+            },
+        );
+        rig.helper_mock.push_text("a plan");
+        let one = rig.start(&alice(), None, "plan it", true).await;
+        rig.until(&alice(), &one.id, TaskState::Completed).await;
+
+        match rig
+            .submit(
+                &alice(),
+                edit_message(&one.context_id, json!({"maxTurns": 51})),
+                None,
+            )
+            .await
+        {
+            Err(BackendError::InvalidParams(why)) => assert!(
+                why.contains("edit.config.maxTurns is 51; at most 50"),
+                "{why}"
+            ),
+            other => panic!("expected InvalidParams, got {other:?}"),
+        }
+        let header = rig.round_header(session_of(&one.context_id)).await;
+        assert_eq!(header.round, 1, "a refused edit starts no round");
+        assert!(header.config.is_none(), "nothing of it is kept");
+        assert!(header.edits.is_empty());
+        assert_eq!(rig.helper_mock.requests().len(), 1);
+        rig.stop().await;
+    }
+}
+
+/// A message asks one of `start`, `close` and `edit`, and an empty `edit.config` names no option:
+/// both are `InvalidParams` before anything is written.
+#[tokio::test]
+async fn an_edit_that_asks_two_things_or_names_no_option_is_refused() {
+    for store in stores().await {
+        let rig = Rig::with(
+            &store,
+            Options {
+                bounds: Some(SessionBounds::default()),
+                ..Options::new()
+            },
+        );
+        rig.helper_mock.push_text("a plan");
+        let one = rig.start(&alice(), None, "plan it", true).await;
+        rig.until(&alice(), &one.id, TaskState::Completed).await;
+
+        // An edit and a close on one message.
+        let mut both = edit_message(&one.context_id, json!({"maxTurns": 3}));
+        both.metadata = Some(HashMap::from([(
+            CHILD_SESSIONS_EXTENSION.to_owned(),
+            json!({"edit": {"config": {"maxTurns": 3}}, "close": {"cancel": false}}),
+        )]));
+        match rig.submit(&alice(), both, None).await {
+            Err(BackendError::InvalidParams(why)) => {
+                assert!(why.contains("starts, closes or edits a session"), "{why}")
+            }
+            other => panic!("expected InvalidParams, got {other:?}"),
+        }
+
+        // An edit and a start on one message.
+        let mut started = edit_message(&one.context_id, json!({"maxTurns": 3}));
+        started.metadata = Some(HashMap::from([(
+            CHILD_SESSIONS_EXTENSION.to_owned(),
+            json!({"edit": {"config": {"maxTurns": 3}},
+                   "start": {"agent": "planner", "description": "Plan it"}}),
+        )]));
+        assert!(invalid(rig.submit(&alice(), started, None).await));
+
+        // An edit of nothing.
+        match rig
+            .submit(&alice(), edit_message(&one.context_id, json!({})), None)
+            .await
+        {
+            Err(BackendError::InvalidParams(why)) => {
+                assert!(why.contains("names no option"), "{why}")
+            }
+            other => panic!("expected InvalidParams, got {other:?}"),
+        }
+
+        let header = rig.round_header(session_of(&one.context_id)).await;
+        assert_eq!(header.round, 1);
+        assert!(header.config.is_none());
+        assert!(header.edits.is_empty());
+        assert_eq!(rig.helper_mock.requests().len(), 1);
+        rig.stop().await;
+    }
+}
+
+/// An edit may raise the budget of a session that spent it (ADR 0054, decision 6): the front's
+/// spent check refuses a message, not an edit, as it refuses neither a close.
+#[tokio::test]
+async fn an_edit_raises_the_budget_of_a_session_that_spent_it() {
+    for store in stores().await {
+        let rig = Rig::with(
+            &store,
+            Options {
+                bounds: Some(SessionBounds::default()),
+                ..Options::new()
+            },
+        );
+        // 1,100 tokens of a 1,000 budget: the round answered once, and the budget is spent.
+        let mut answer = ModelResponse::text("a plan");
+        answer.usage = Usage::new(600, 500);
+        rig.helper_mock
+            .push_response(answer)
+            .push_text("a second plan");
+        let mut start = said("plan it", None);
+        start.metadata = Some(HashMap::from([(
+            CHILD_SESSIONS_EXTENSION.to_owned(),
+            json!({"start": {"agent": "planner", "description": "Plan it", "keepOpen": true,
+                             "config": {"tokenBudget": 1_000}}}),
+        )]));
+        let one = rig.submit(&alice(), start, None).await.expect("a start");
+        rig.until(&alice(), &one.id, TaskState::Completed).await;
+        assert!(
+            unsupported(
+                rig.submit(&alice(), said("more", Some(&one.context_id)), None)
+                    .await
+            ),
+            "a session that spent its budget takes no message"
+        );
+
+        let edited = rig
+            .submit(
+                &alice(),
+                edit_message(&one.context_id, json!({"tokenBudget": 5_000})),
+                None,
+            )
+            .await
+            .expect("an edit may raise the budget of a spent session");
+        rig.until(&alice(), &edited.id, TaskState::Completed).await;
+        let header = rig.round_header(session_of(&one.context_id)).await;
+        assert_eq!(
+            header.token_budget(),
+            Some(5_000),
+            "the header carries the raised budget"
+        );
+        assert!(!header.is_spent(), "1,100 of 5,000");
+
+        let two = rig
+            .submit(&alice(), said("more", Some(&one.context_id)), None)
+            .await
+            .expect("the session goes on");
+        rig.until(&alice(), &two.id, TaskState::Completed).await;
+        assert_eq!(rig.helper_mock.requests().len(), 2);
+        rig.stop().await;
+    }
 }
 
 /// A person starts a session: round 1 comes back in a new child context, no parent task runs, the

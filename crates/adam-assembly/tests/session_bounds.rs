@@ -1,7 +1,7 @@
 //! The bounds of a session on one of a root's subagents ([ADR 0054], slice 1 part 2): what the
 //! subagent's folder declares, what the deployment allows, and the one-way rule between them. The
 //! bounds are computed once, at startup, from the same files and settings the agents are built
-//! from, and handed to the five session tools, where `SessionBounds::admit` holds every
+//! from, and handed to the six session tools, where `SessionBounds::admit` holds every
 //! `subagent_start` request to them.
 //!
 //! [ADR 0054]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md
@@ -652,5 +652,79 @@ fn a_source_that_declares_its_tools_makes_the_set_complete_and_catches_an_allow_
                 json!({"tools": ["read_file"], "denyTools": ["write_file"]})
             ))
             .is_ok()
+    );
+}
+
+/// ADR 0054 decision 4, amended 2026-11-28 (ANR-1390, the owner's answer to ANR-Q155): a
+/// declaration may name a **shape**, and `*__*` is the shape of the tools the thread-tools source
+/// relays from a server a person attached (`<server>__<tool>`). Both shipped agents add that
+/// source, so their helpers' sets are complete: a `tools` entry that selects nothing is refused
+/// with the list (the shape among the names), and one naming a relayed server's tools is admitted.
+/// The shape is joined as a name, once, like a concrete one.
+#[test]
+fn a_source_that_declares_a_shape_makes_the_set_complete_and_admits_a_servers_tools() {
+    let definition = def(&[
+        (
+            "agent/instructions.md",
+            &instructions("name: coder", "You are the root."),
+        ),
+        (
+            "agent/subagents/reviewer.md",
+            &instructions(
+                "description: Reviews a change.\ntools: [read_file, write_file]",
+                "You review.",
+            ),
+        ),
+    ]);
+    let worker = definition
+        .bind(tools(&["read_file", "write_file"]))
+        .unwrap()
+        // `read_file` again: a declaration that names a tool the node already has adds it once, and
+        // a shape is joined the same way.
+        .tool_source(Declares(&["turn_output", "*__*", "read_file"]))
+        .model(Arc::new(MockModel::new()), "m")
+        .unwrap();
+    let bound = bound_of(&worker);
+    assert_eq!(
+        bound.tools,
+        ["read_file", "write_file", "turn_output", "*__*"],
+        "the node's names, then what the source declares, each once"
+    );
+    assert!(bound.tools_complete, "every source names what it can offer");
+
+    let asked = |value| SessionConfig::from_value(value).expect("a config");
+    for entry in ["github__*", "github__search", "*"] {
+        assert!(
+            bound.admit(asked(json!({"tools": [entry]}))).is_ok(),
+            "{entry} selects a declared name or the shape"
+        );
+    }
+    let why = bound
+        .admit(asked(json!({"tools": ["a_typo"]})))
+        .expect_err("an allow entry selecting no name and no shape");
+    assert_eq!(why.option(), Some("tools"));
+    assert!(
+        why.message()
+            .contains("matches none of its tools: read_file, write_file, turn_output, *__*"),
+        "{why}"
+    );
+    assert!(
+        !why.message().contains("may get more tools"),
+        "a complete set has no hint about tools a source may add: {why}"
+    );
+    // A deny entry is held to the same rule: a relayed server's pattern is admitted, a typo is not.
+    assert!(
+        bound
+            .admit(asked(json!({"denyTools": ["github__*"]})))
+            .is_ok()
+    );
+    let why = bound
+        .admit(asked(json!({"denyTools": ["write_fil"]})))
+        .expect_err("a typo of a concrete deny name");
+    assert_eq!(why.option(), Some("deny_tools"));
+    assert!(
+        why.message()
+            .contains("matches none of its tools: read_file, write_file, turn_output, *__*"),
+        "{why}"
     );
 }

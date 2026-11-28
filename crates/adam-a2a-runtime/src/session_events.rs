@@ -810,6 +810,8 @@ mod tests {
             visible: false,
             config: None,
             spent: 0,
+            editing: false,
+            edits: Vec::new(),
         };
         a_session_with(
             store,

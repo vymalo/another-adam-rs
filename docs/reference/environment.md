@@ -182,7 +182,7 @@ cross-process listener: SQLite's notifier is always in-process, and MongoDB has 
 | `ADAM_EXTRA_MCP_FILE` | a file of extra MCP servers in the shape of `mcp.json`, **added** to the agent's own (a name clash is exit 78) | unset |
 | `ADAM_REFERENCES_FILE` | `adam-coder`, roles that run workers: a file `{"references": [{"name", "url", "branch"?, "description"}]}` of repositories the coder may **read** beside the one it works on and never write, **added** to the `references:` of the agent's files; it must be an existing file of valid references whose addresses the workspaces' policy accepts (an allowed host, an owner a GitHub App acts for), and a name the agent already declares is exit 78. See [References](workspace-and-environments.md#references) | unset |
 | `A2A_ALLOW_INSECURE_REMOTES` | `adam-agent`, roles that run workers: let a remote subagent (`a2a:`) be at plain `http` on another machine, such as a service of the same cluster; without it such a URL is exit 78. **The messages and the bearer then cross the pod network in clear text**: protect it with a NetworkPolicy that admits only the caller, or mesh mTLS. Plain `http` goes only to the card's own host, and never from an `https` card. Its token is the environment's too: `auth: bearer:VAR` names the variable ([remote subagents](agent-files.md#remote-subagents-a2a)) | `false` |
-| `SI_MEMORY` | the deployment's ceiling on the self-improvement memory (ADR 0081 decision 11), `on` or `off`; anything else is exit 78. It only **narrows** a folder's `si_memory:` key: `off` here is off whatever the folder says, and a folder's `off` is off whatever this says ([the key](agent-files.md#the-self-improvement-memory-si_memory)). Read by the roles that run workers | `on` |
+| `SI_MEMORY` | the deployment's ceiling on the self-improvement memory (ADR 0081 decision 11), `on` or `off`; anything else is exit 78. It only **narrows** a folder's `si_memory:` key: `off` here is off whatever the folder says, and a folder's `off` is off whatever this says ([the key](agent-files.md#the-self-improvement-memory-si_memory)). Read by `adam-agent`'s worker roles; **`adam-coder` does not read it yet** — it serves an embedded agent whose `si_memory` key nothing wires, so `on`/`off` there has no effect until that wiring lands (ANR-1370) | `on` |
 
 ## The coder (`adam-coder`)
 
@@ -306,7 +306,7 @@ Put these in a `.env` next to `compose.yaml`.
 
 | Variable | Meaning |
 |---|---|
-| `ADAM_TEST_POSTGRES_URL`, `ADAM_TEST_MONGODB_URI` | the database suites; skipped when unset |
+| `ADAM_TEST_POSTGRES_URL`, `ADAM_TEST_MONGODB_URI`, `ADAM_TEST_REDIS_URL` | the database suites; skipped when unset |
 | `ADAM_TEST_TABLE_PREFIX`, `ADAM_TEST_MONGO_COLLECTION_PREFIX` | the Postgres table prefix (`adam_test_`) and the MongoDB collection prefix (`adam_`) the store suite and the transcript measurement write to; set the same value on `dev/p2-measure.sh` |
 | `ADAM_TEST_REQUIRE_DB=1` | a suite whose variable is unset **fails** instead of skipping (CI sets it) |
 | `ADAM_TEST_MOCK_OPENAI_URL`, `ADAM_TEST_MOCK_GITHUB_URL`, `ADAM_TEST_MOCK_GITHUB_MCP_URL` | the tests of the real clients against the compose mocks |

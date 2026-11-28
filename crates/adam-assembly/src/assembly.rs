@@ -293,7 +293,7 @@ impl BoundDef {
     }
 
     /// Scrub secrets out of what the tools that run a subagent in the background give the model:
-    /// the report of a session, and every error. The five session tools (`subagent_start` and the
+    /// the report of a session, and every error. The six session tools (`subagent_start` and the
     /// others, given to an agent that has subagents) are made here, not by the deployment, so the
     /// deployment's own wrapper around its tools never sees them; this is the same hook for them,
     /// and `scrub` is what that wrapper would apply (the coder's redactor). Without it the report is
@@ -334,7 +334,7 @@ impl BoundDef {
     /// * [`Error::Build`] when a tool needs state that [`state`](Self::state) did not give.
     pub fn model(self, model: DynModel, alias: impl Into<String>) -> Result<Assembly, Error> {
         let default_alias = alias.into();
-        // The five session tools are made once, here, because their bounds need what `bind` does
+        // The six session tools are made once, here, because their bounds need what `bind` does
         // not know: the deployment's `MAX_PARALLEL_TOOL_CALLS` (ADR 0054 slice 1 part 2). The root
         // is the only agent that has them, and the root is built first.
         let session_tools = match self.nodes.first() {
@@ -400,7 +400,7 @@ impl BoundDef {
                 tools: {
                     let mut tools: Vec<String> =
                         node.tools.iter().map(|(name, _)| name.clone()).collect();
-                    // The five session tools are built at `model`, not at `bind` (ADR 0054
+                    // The six session tools are built at `model`, not at `bind` (ADR 0054
                     // slice 1 part 2): they come after everything `bind` made, as they always
                     // have.
                     if node.parent.is_none() && !node.session_targets.is_empty() {
@@ -788,7 +788,7 @@ impl BoundDef {
         Ok(cap)
     }
 
-    /// The five session tools of `node`, or `None` when it has no subagent (ADR 0054 slice 1
+    /// The six session tools of `node`, or `None` when it has no subagent (ADR 0054 slice 1
     /// part 2): each subagent's [`SessionBounds`], made here because the deployment's
     /// `MAX_PARALLEL_TOOL_CALLS` is known and `bind` did not know it. The names and order are the
     /// ones `bind` fixed.
@@ -831,7 +831,9 @@ impl BoundDef {
     /// be checked against (ADR 0054 decision 4), and whether they are **every** tool it can have: the
     /// node whose registered name is the target's, its own tools (its `tools:` and the `mcp.json`
     /// servers' as `server__tool`), and what every source of that node declares
-    /// ([`ToolSource::declared`]).
+    /// ([`ToolSource::declared`]). A declared name may be a **shape** (`*__*` for a relayed
+    /// `<server>__<tool>`): it is joined as a name, once, like a concrete one (ADR 0054, amended
+    /// 2026-11-28).
     ///
     /// The set is **incomplete** when a source cannot name its tools before a run calls it
     /// ([`adam_llm_agent::Declared::Unknown`]): an endpoint whose listing is another system's and may change with the
@@ -954,7 +956,7 @@ impl BoundDef {
         for (name, tool) in &node.tools {
             builder = builder.dyn_tool(self.guarded(name, tool));
         }
-        // The five session tools come after everything `bind` made, as they always have: they are
+        // The six session tools come after everything `bind` made, as they always have: they are
         // made at `model`, where each subagent's bounds are known (ADR 0054 slice 1 part 2).
         if let Some(sessions) = sessions {
             for tool in sessions.tools() {
