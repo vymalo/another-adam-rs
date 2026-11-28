@@ -34,9 +34,13 @@ on:
     branches: [main]
   workflow_dispatch: {}
 
-# Never cancel a run that may be force-pushing the release branch and then pushing onto it.
+# Never cancel a run that may be force-pushing the release branch and then pushing onto it, and never
+# let a later merge replace a pending one (ANR-1457): release-please's job is to **see every merge**,
+# and GitHub replaces a *pending* run in the same group even with `cancel-in-progress: false`. So a
+# push gets a group per commit (the shape `ci.yml` uses since ANR-1360); a dispatch on a ref keeps
+# the ref's group, which is the same commit's push group anyway.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.event_name == 'push' && github.sha || github.ref }}
   cancel-in-progress: false
 
 # The App token carries every write; GITHUB_TOKEN only reads.
