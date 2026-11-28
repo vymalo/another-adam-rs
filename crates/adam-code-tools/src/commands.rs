@@ -84,9 +84,10 @@ pub trait CommandWorkspace: CodeWorkspace {
         guarding: Guarding,
     ) -> Result<Box<dyn CommandGuard>, String>;
 
-    /// After a command that makes things (`run`) ran in `place`, before its guard is settled: what
-    /// the workspace does. Returns text the tool appends to its result when the command changed
-    /// files: empty, or starting with '\n'. `run_command`, which only looks, never calls it.
+    /// After a command that makes things (`run`) ran in `place`, **after** its guard is settled
+    /// (ANR-1455: the report a `Make` guard records at settle is what this reads): what the workspace
+    /// does. Returns text the tool appends to its result when the command changed files: empty, or
+    /// starting with '\n'. `run_command`, which only looks, never calls it.
     ///
     /// **Required**, as [`after_write`](CodeWorkspace::after_write) is. The coder moves its run's
     /// check epoch (a check may read a file the command made, ignored ones included) and, in a
@@ -94,9 +95,11 @@ pub trait CommandWorkspace: CodeWorkspace {
     ///
     /// # Errors
     ///
-    /// A [`ToolError`] when what follows cannot be done or recorded: the tool returns it, once the
-    /// guard is settled ([`make::run`](crate::make::run)), so a command that changed git is undone
-    /// all the same (for the coder, its files with it); one that only changed files keeps them.
+    /// A [`ToolError`] when what follows cannot be done or recorded: the tool returns it. The guard
+    /// has already settled ([`make::run`](crate::make::run)), so a command that changed git is
+    /// undone all the same (for the coder, its files with it); one that only changed files keeps
+    /// them. A workspace whose `Make` guard leaves its report for this to read must not fail here,
+    /// or must clear that report itself before returning `Err`: nothing else does.
     async fn after_run(&self, ctx: &ToolCtx, place: &Place) -> Result<String, ToolError>;
 
     /// A note the tool appends to a refusal of its guard (one from [`guard`](Self::guard), or a

@@ -53,8 +53,8 @@ both with `ran: ...`; a run that touched git (`undid a change to git made by: ..
 (`could not check git after: ...; undid it`) is refused with the note, restored or not, and without the text of
 `after_run`; a refusal of the guard is the answer with the note and nothing runs; the refusals before the guard (also a
 place that may only be read) have no note, take no guard and call no `after_run`; for every run that ran, the calls are
-the guard, `after_run` once, then `settle`, in that order; a failing `after_run` is the tool's error once the guard is
-settled; a missing tool is the workspace's answer or the result; the command is scrubbed and a failed
+the guard, `settle`, then `after_run` once, in that order (ANR-1455); a failing `after_run` is the tool's error with
+the guard already settled; a missing tool is the workspace's answer or the result; the command is scrubbed and a failed
 one carries its repeat key.
 `cargo test -p adam-code-tools-testkit` (needs `git`); nothing needs a database.
 
