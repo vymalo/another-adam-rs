@@ -93,23 +93,29 @@
 //!
 //! # Subagents
 //!
-//! Each local subagent is an agent of its own, `<parent>/<name>`, that inherits nothing, and its
-//! parent gets a [`SubagentTool`] named after it: a call runs the subagent as a durable child run
-//! of the parent's run and the child's final text is the result. A subagent may have a tool that
-//! asks the person ([`Tool::asks_user`](adam_llm_agent::Tool::asks_user)): whether it may ask is
-//! decided per run by the loop (ADR 0045 decision 9), not here. Its name may not clash with a tool
-//! of its parent, which is an error at [`AgentDef::bind`]. The tool needs no runtime handle:
-//! [`Assembly::register`] registers every agent, and that is all it needs.
+//! Each local subagent is an agent of its own, `<parent>/<name>`, that inherits nothing. Its
+//! parent delegates to it through the five session tools of `adam-llm-agent` (`subagent_start`,
+//! `subagent_send`, `subagent_read`, `subagent_close`, `subagent_list`), which [`AgentDef::bind`]
+//! gives every agent that has a subagent: every child is a session ([ADR 0089]), and
+//! `subagent_start` with `mode: one_shot` and `wait: true` is the one-shot call (the child's first
+//! report is the result and the parent parks until then). There is no tool named after a subagent.
+//! A subagent may have a tool that asks the person
+//! ([`Tool::asks_user`](adam_llm_agent::Tool::asks_user)): whether it may ask is decided per run by
+//! the loop (ADR 0045 decision 9), not here. Its name may not clash with a tool of its parent, which
+//! is an error at [`AgentDef::bind`]. The tools need no runtime handle: [`Assembly::register`]
+//! registers every agent, and that is all they need.
+//!
+//! [ADR 0089]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0089-every-child-is-a-session-and-the-one-shot-subagent-tool-goes.md
 //!
 //! # Remote subagents
 //!
-//! A subagent file with `a2a:` is a tool of the same shape whose call is a journaled A2A
-//! `SendMessage` to another agent. The parent then waits on the remote task and looks at it with
-//! `GetTask` each time its wait timer fires ([`BoundDef::wait_poll`]); the answer is the text of the
-//! task's artifacts, and a failed, canceled or input-required task is an error result. `auth:
-//! bearer:VAR` reads a token from the environment variable `VAR` at [`AgentDef::bind`] (see
-//! [`AgentDef::env`]) and fails closed; the URL must be https unless it is local
-//! ([`AgentDef::allow_insecure_remotes`]); the token is never logged or journaled. See the README.
+//! A subagent file with `a2a:` is a subagent whose rounds are runs of a `RemoteRoundAgent`: each
+//! sends the round's message to the other agent as a journaled A2A `SendMessage`, looks at the task
+//! with `GetTask` on a timer ([`BoundDef::wait_poll`]), and reports the text of the task's
+//! artifacts. `auth: bearer:VAR` reads a token from the environment variable `VAR` at
+//! [`AgentDef::bind`] (see [`AgentDef::env`]) and fails closed; the URL must be https unless it is
+//! local ([`AgentDef::allow_insecure_remotes`]); the token is never logged or journaled. See the
+//! README.
 //!
 //! Remote subagents need the feature `remote`, on by default: it brings the A2A client, an HTTP
 //! client and TLS. A build without it (an application that embeds adam, ADR 0047) carries none of
@@ -163,12 +169,11 @@ mod remote;
 mod remote_session;
 mod scrub;
 mod skills;
-mod subagent;
 mod suggest;
 mod template;
 
 pub use assembly::{AgentInfo, Assembly, BoundDef, RemoteInfo};
-pub use def::{AgentDef, IntoManifest, SiMemoryCeiling, SiMemorySetting};
+pub use def::{AgentDef, DEFAULT_SUBAGENT_MINUTES, IntoManifest, SiMemoryCeiling, SiMemorySetting};
 #[cfg(feature = "dev")]
 pub use dev::{
     DEFAULT_DEBOUNCE, LiveAssembly, LiveBuilder, ReloadError, Reloaded, ToolChange, Watch,
@@ -193,7 +198,6 @@ pub use remote_session::{RemoteRoundAgent, RemoteRoundStarter};
 pub use skills::{
     LOAD_SKILL, READ_SKILL_FILE, RunSkills, SkillError, SkillFiles, run_skills_conformance,
 };
-pub use subagent::{DEFAULT_SUBAGENT_MINUTES, SubagentTool};
 pub use template::TemplateProblem;
 
 /// The URL type of [`Assembly::card`], so a caller needs no `url` dependency of its own.

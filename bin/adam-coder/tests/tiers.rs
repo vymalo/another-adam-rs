@@ -36,9 +36,9 @@ use adam_workspace::{CodeHost, DynCodeHost, MemoryCodeHost, NewPullRequest, Repo
 use common::Fixture;
 use serde_json::{Value, json};
 
-/// The tools of the coder in the order they are offered, with the two subagents, as the model is
+/// The tools of the coder in the order they are offered, with the five session tools, as the model is
 /// shown them at the highest tier.
-const ALL: [&str; 45] = [
+const ALL: [&str; 43] = [
     "prepare_workspace",
     "start_scratch",
     "publish_scratch",
@@ -76,8 +76,6 @@ const ALL: [&str; 45] = [
     "plan_add",
     "load_skill",
     "read_skill_file",
-    "explorer",
-    "reviewer",
     "subagent_start",
     "subagent_send",
     "subagent_read",
@@ -201,8 +199,6 @@ async fn the_model_is_shown_only_the_tools_the_tier_of_the_message_allows() {
         "plan_add",
         "load_skill",
         "read_skill_file",
-        "explorer",
-        "reviewer",
         "subagent_start",
         "subagent_send",
         "subagent_read",
@@ -2423,7 +2419,8 @@ async fn a_subagent_keeps_a_servers_tools_to_the_tier_of_the_root_run() {
     impl Tool for Spawn {
         fn spec(&self) -> ToolSpec {
             ToolSpec {
-                name: "explorer".into(),
+                // A host's tool that waits on a child, under a name of the `plan` tier.
+                name: "subagent_start".into(),
                 description: "starts the kid".into(),
                 parameters: json!({"type": "object", "properties": {}}),
             }
@@ -2439,7 +2436,7 @@ async fn a_subagent_keeps_a_servers_tools_to_the_tier_of_the_root_run() {
     let ran = Arc::new(AtomicUsize::new(0));
     let (top_model, kid_model) = (Arc::new(MockModel::new()), Arc::new(MockModel::new()));
     top_model
-        .push_tool_calls(vec![call("t1", "explorer", json!({}))])
+        .push_tool_calls(vec![call("t1", "subagent_start", json!({}))])
         .push_text("top done");
     kid_model
         .push_tool_calls(vec![

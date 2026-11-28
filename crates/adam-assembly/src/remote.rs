@@ -1,40 +1,31 @@
-//! [`RemoteSubagentTool`]: the tool a parent calls to run a subagent that lives on another A2A
-//! agent, and the bind-time checks that make it safe to build.
+//! [`RemoteEndpoint`]: the connection to a subagent that lives on another A2A agent, and the
+//! bind-time checks that make it safe to build.
 //!
-//! The call is a journaled `SendMessage`; the parent then waits on the remote task and looks at it
-//! with `GetTask` each time its wait timer fires ([`ToolError::AwaitRemote`] and
-//! [`Tool::poll_remote`]). Everything that is a fact about the files or the deployment (the URL, the
-//! token, the limits) is decided at [`RemoteSubagentTool::bind`]; the network is touched only when a
-//! call needs it.
+//! The agent that works the rounds of a session on it
+//! ([`RemoteRoundAgent`](crate::RemoteRoundAgent)) holds one: everything that is a fact about the
+//! files or the deployment (the URL, the token) is decided at [`RemoteEndpoint::bind`], and the
+//! network is touched only when a round needs it. There is no tool named after a remote subagent
+//! ([ADR 0089] slice C4): a parent starts it with `subagent_start`.
+//!
+//! [ADR 0089]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0089-every-child-is-a-session-and-the-one-shot-subagent-tool-goes.md
 
-use adam_llm_agent::ToolAccess;
 use std::sync::Arc;
 use std::time::Duration;
 
-use a2a::{
-    A2AError, AgentCard, GetTaskRequest, Message, Part, PartContent, Role,
-    SendMessageConfiguration, SendMessageRequest, SendMessageResponse, Task, TaskState, error_code,
-};
+use a2a::{A2AError, AgentCard, Message, Part, PartContent, Task, TaskState, error_code};
 use a2a_client::auth::AuthInterceptor;
 use a2a_client::jsonrpc::JsonRpcTransportFactory;
 use a2a_client::rest::RestTransportFactory;
 use a2a_client::{A2AClient, A2AClientFactory, Transport};
 use adam_agent_fs::{RemoteAgent, RemoteAuth};
 use adam_core::SecretError;
-use adam_llm_agent::{
-    RemotePoll, StepIcon, StepKind, StepStyle, Tool, ToolCtx, ToolError, ToolOutput,
-};
-use adam_model::ToolSpec;
-use adam_runtime::ReceivedFiles;
-use async_trait::async_trait;
+use adam_llm_agent::ToolError;
 use secrecy::{ExposeSecret, SecretString};
-use serde_json::Value;
 use tokio::sync::RwLock;
 use url::{Host, Url};
 
 use crate::def::{RemoteSettings, Secrets};
 use crate::error::{Error, Origin, RemoteAuthProblem, RemoteUrlProblem};
-use crate::subagent::{subagent_spec, title_of};
 
 /// The most bytes of a remote agent's answer that reach the model. What comes back is text a
 /// stranger wrote, and it goes into a context window: it is cut here, on a character boundary,
@@ -104,8 +95,8 @@ fn shown(url: &Url) -> String {
     url.to_string()
 }
 
-/// The A2A client of the agent: the connection and the rules about where it may go. A remote
-/// subagent tool and a remote session share one per `a2a:` subagent.
+/// The A2A client of the agent: the connection and the rules about where it may go. The sessions on
+/// one `a2a:` subagent share one.
 ///
 /// The client is built on the first call that needs it and kept: it fetches the agent card, picks
 /// an interface, and adds `Authorization: Bearer <token>` to each request. Nothing here logs or
@@ -117,8 +108,6 @@ pub(crate) struct RemoteEndpoint {
     /// The token, when the agent has `auth: bearer:VAR`.
     token: Option<SecretString>,
     allow_insecure: bool,
-    /// `files: true` in the file: the file parts of the answer are shared, not described.
-    files: bool,
     client: RwLock<Option<Arc<Client>>>,
     /// One dial at a time, so a dial does not hold the lock the other sessions read the client under.
     dialing: tokio::sync::Mutex<()>,
@@ -184,7 +173,6 @@ impl RemoteEndpoint {
             card_url,
             token,
             allow_insecure: settings.allow_insecure,
-            files: agent.files,
             client: RwLock::new(None),
             dialing: tokio::sync::Mutex::new(()),
         })
@@ -363,18 +351,9 @@ impl RemoteEndpoint {
         }
     }
 
-    /// Where a task stands, as the result of the call, or "still going".
-    pub(crate) fn outcome(&self, task: &Task, files_left: u64) -> Outcome {
-        let name = self.name();
-        self.outcome_with(
-            task,
-            self.files.then(|| ReceivedFiles::new(name, files_left)),
-        )
-    }
-
-    /// [`outcome`](Self::outcome) with `files` given: `Some` shares the file parts of the answer,
-    /// `None` describes each in a line.
-    pub(crate) fn outcome_with(&self, task: &Task, mut files: Option<ReceivedFiles>) -> Outcome {
+    /// Where a task stands: its answer once it is over, or "still going". A file of the answer is
+    /// described in a line, never shared.
+    pub(crate) fn outcome(&self, task: &Task) -> Outcome {
         let said = task
             .status
             .message
@@ -405,78 +384,52 @@ impl RemoteEndpoint {
                     .artifacts
                     .iter()
                     .flatten()
-                    .map(|a| {
-                        let one_part = a.parts.len() == 1;
-                        let artifact_name = a.name.as_deref().filter(|_| one_part);
-                        parts_text_sharing(&a.parts, files.as_mut(), artifact_name)
-                    })
+                    .map(|a| parts_text(&a.parts))
                     .filter(|text| !text.trim().is_empty())
                     .collect();
-                // Files of the status message are shared too when nothing else answered.
                 let text = if artifacts.is_empty() {
-                    match (&task.status.message, files.as_mut()) {
-                        (Some(message), Some(files)) => {
-                            parts_text_sharing(&message.parts, Some(files), None)
-                        }
-                        _ => said,
-                    }
+                    said
                 } else if artifacts_have_words || said.trim().is_empty() {
                     artifacts.join("\n\n")
                 } else {
                     format!("{said}\n\n{}", artifacts.join("\n\n"))
                 };
-                let text = if text.trim().is_empty() {
+                Outcome::Completed(if text.trim().is_empty() {
                     "(the remote agent finished without output)".to_owned()
                 } else {
                     cap_text(text, MAX_RESULT_BYTES)
-                };
-                Outcome::Done(Box::new(with_files(text, files)))
+                })
             }
-            TaskState::Failed => Outcome::Done(Box::new(ToolOutput::error(format!(
-                "the remote agent `{name}` failed{}",
-                with(&said)
-            )))),
-            TaskState::Canceled => Outcome::Done(Box::new(ToolOutput::error(format!(
+            TaskState::Failed => {
+                Outcome::Failed(format!("the remote agent `{name}` failed{}", with(&said)))
+            }
+            TaskState::Canceled => Outcome::Failed(format!(
                 "the remote task of `{name}` was canceled{}",
                 with(&said)
-            )))),
-            TaskState::Rejected => Outcome::Done(Box::new(ToolOutput::error(format!(
+            )),
+            TaskState::Rejected => Outcome::Failed(format!(
                 "the remote agent `{name}` rejected the task{}",
                 with(&said)
-            )))),
-            TaskState::InputRequired => Outcome::Done(Box::new(ToolOutput::error(format!(
-                "the remote agent `{name}` needs more input{}. A subagent cannot ask the user, so \
-                 the task is over: call `{name}` again with a `message` that has everything the \
-                 agent needs",
+            )),
+            TaskState::InputRequired => Outcome::Failed(format!(
+                "the remote agent `{name}` needs more input{}",
                 with(&said)
-            )))),
-            TaskState::AuthRequired => Outcome::Done(Box::new(ToolOutput::error(format!(
+            )),
+            TaskState::AuthRequired => Outcome::Failed(format!(
                 "the remote agent `{name}` needs authorization{} that this deployment cannot give \
                  it: tell the user",
                 with(&said)
-            )))),
+            )),
         }
     }
 
-    /// A plain message that answered the call at once, as its result: its text, and with
-    /// `files: true` its `raw` parts shared within `files_left` bytes.
-    pub(crate) fn reply(&self, reply: &Message, files_left: u64) -> ToolOutput {
-        let files = self
-            .files
-            .then(|| ReceivedFiles::new(self.name(), files_left));
-        Self::reply_with(reply, files)
-    }
-
-    /// [`reply`](Self::reply) with `files` given: `None` describes the file parts in lines.
-    pub(crate) fn reply_with(reply: &Message, mut files: Option<ReceivedFiles>) -> ToolOutput {
-        let text = match cap_text(
-            parts_text_sharing(&reply.parts, files.as_mut(), None),
-            MAX_RESULT_BYTES,
-        ) {
+    /// A plain message that answered a send at once, as text: its parts, a file described in a
+    /// line.
+    pub(crate) fn reply(reply: &Message) -> String {
+        match cap_text(parts_text(&reply.parts), MAX_RESULT_BYTES) {
             text if text.trim().is_empty() => "(the remote agent answered without text)".to_owned(),
             text => text,
-        };
-        with_files(text, files)
+        }
     }
 }
 
@@ -489,123 +442,37 @@ fn lists_steer(card: &AgentCard) -> bool {
         .any(|extension| extension.uri == STEER_EXTENSION_URI)
 }
 
-/// The tool that runs a subagent on another A2A agent, one per remote subagent, named after it.
-///
-/// `AgentDef::bind` adds one to the parent of every remote subagent (`a2a:` in the frontmatter) with
-/// the same shape as [`SubagentTool`](crate::SubagentTool): input `{ "message": string }`, the
-/// same description suffix, and no questions to the user. What differs is what a call does:
-///
-/// 1. one journaled `SendMessage` to the agent, with `returnImmediately`, whose message id is
-///    derived from the parent's run and the tool call (`adam_runtime::child_run_id`), so a retry or
-///    a replay sends the same id and a server that recognises a repeated message id (as
-///    `adam-a2a-runtime` does) hands back the task it already made;
-/// 2. an answer that is already final (a task in a final state, or a plain message) is the result;
-///    otherwise the parent parks on the remote task id ([`ToolError::AwaitRemote`]) and looks at it
-///    with `GetTask` each time its wait timer fires ([`Tool::poll_remote`]), each look a journaled
-///    step, until the task is over or the wait passes the limit.
-pub(crate) struct RemoteSubagentTool {
-    spec: ToolSpec,
-    endpoint: Arc<RemoteEndpoint>,
-    max_wait: Duration,
-}
-
-impl std::fmt::Debug for RemoteSubagentTool {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("RemoteSubagentTool")
-            .field("name", &self.spec.name)
-            .field("endpoint", &self.endpoint)
-            .finish_non_exhaustive()
-    }
-}
-
-impl RemoteSubagentTool {
-    /// Check a remote subagent against the deployment's rules and build its tool. `origin` is the
-    /// subagent (`coder/billing`) and its file.
-    ///
-    /// # Errors
-    ///
-    /// See [`RemoteEndpoint::bind`].
-    pub(crate) fn bind(
-        origin: &Origin,
-        agent: &RemoteAgent,
-        settings: &RemoteSettings,
-        secrets: &Secrets,
-    ) -> Result<Self, Error> {
-        let endpoint = Arc::new(RemoteEndpoint::bind(origin, agent, settings, secrets)?);
-        let description = [agent.description.trim(), agent.note.trim()]
-            .into_iter()
-            .filter(|part| !part.is_empty())
-            .collect::<Vec<_>>()
-            .join("\n\n");
-        Ok(Self {
-            spec: subagent_spec(&agent.name, &description),
-            endpoint,
-            max_wait: settings.max_wait,
-        })
-    }
-
-    /// The connection, shared with the remote session of the same subagent.
-    pub(crate) fn endpoint(&self) -> &Arc<RemoteEndpoint> {
-        &self.endpoint
-    }
-
-    fn name(&self) -> &str {
-        &self.spec.name
-    }
-}
-
-/// A task's state, from the tool's side.
+/// A task's state, as a round reads it.
 pub(crate) enum Outcome {
     Working,
-    /// The result, boxed: a `ToolOutput` is the size of the run's own record, and `Working` holds
-    /// nothing (a `RemotePoll` keeps it by value, where the tool hands its result over once).
-    Done(Box<ToolOutput>),
+    /// The task completed: the answer, as text.
+    Completed(String),
+    /// The task is over without an answer (failed, canceled, rejected, or waiting for what this
+    /// deployment cannot give): what to say, as text.
+    Failed(String),
 }
 
 /// The text of the parts of a message or an artifact, one per line. Data parts are their JSON; a
-/// file is named, never included.
+/// file is described in a line, never included: a `raw` part by its name, size and media type, a
+/// `url` part by its address, which is never fetched.
 fn parts_text(parts: &[Part]) -> String {
-    parts_text_sharing(parts, None, None)
-}
-
-/// [`parts_text`], except that with `files` (a remote subagent with `files: true`) a `raw` part is
-/// shared as a file artifact of the calling run, its line saying so ([`ReceivedFiles`]): the
-/// sender's filename and media type, checked against the bytes, and `artifact_name` when the part is
-/// its artifact's only one. A file at a `url` is not fetched: it stays a line.
-fn parts_text_sharing(
-    parts: &[Part],
-    mut files: Option<&mut ReceivedFiles>,
-    artifact_name: Option<&str>,
-) -> String {
     parts
         .iter()
         .map(|part| match &part.content {
             PartContent::Text(text) => text.clone(),
             PartContent::Data(value) => value.to_string(),
-            PartContent::Raw(bytes) => match files.as_deref_mut() {
-                // Every cap is checked on the length before the bytes are copied.
-                Some(files) => match files.admit(part.media_type.as_deref(), bytes.len()) {
-                    Ok(()) => files.share(
-                        part.media_type.as_deref(),
-                        part.filename.as_deref(),
-                        artifact_name,
-                        bytes.clone(),
-                    ),
-                    Err(line) => line,
-                },
-                None => format!(
-                    "[file{} not included: {} bytes{}]",
-                    part.filename
-                        .as_deref()
-                        .map(|n| format!(" `{n}`"))
-                        .unwrap_or_default(),
-                    bytes.len(),
-                    part.media_type
-                        .as_deref()
-                        .map(|m| format!(", {m}"))
-                        .unwrap_or_default()
-                ),
-            },
+            PartContent::Raw(bytes) => format!(
+                "[file{} not included: {} bytes{}]",
+                part.filename
+                    .as_deref()
+                    .map(|n| format!(" `{n}`"))
+                    .unwrap_or_default(),
+                bytes.len(),
+                part.media_type
+                    .as_deref()
+                    .map(|m| format!(", {m}"))
+                    .unwrap_or_default()
+            ),
             PartContent::Url(url) => format!(
                 "[file{} at {url}]",
                 part.filename
@@ -620,18 +487,6 @@ fn parts_text_sharing(
 
 pub(crate) fn message_text(message: &Message) -> String {
     parts_text(&message.parts)
-}
-
-/// `text` as the result, with the files shared on the way; an error result when one was refused.
-fn with_files(text: String, files: Option<ReceivedFiles>) -> ToolOutput {
-    let (artifacts, refused) = files.map_or((Vec::new(), false), ReceivedFiles::into_parts);
-    let mut output = if refused {
-        ToolOutput::error(text)
-    } else {
-        ToolOutput::text(text)
-    };
-    output.artifacts = artifacts;
-    output
 }
 
 /// `text`, cut to at most `max` bytes on a character boundary, with a note when it was cut.
@@ -652,102 +507,11 @@ fn cap_text(mut text: String, max: usize) -> String {
     text
 }
 
-#[async_trait]
-impl Tool for RemoteSubagentTool {
-    /// A remote subagent can park the run on its task: it runs alone (ADR 0049 decision 14).
-    fn access(&self, _args: &serde_json::Value) -> ToolAccess {
-        ToolAccess::Alone
-    }
-
-    fn spec(&self) -> ToolSpec {
-        self.spec.clone()
-    }
-
-    /// A call is an agent, on another system, working for this one: a `subagent` step drawn as an
-    /// agent.
-    fn step_style(&self) -> StepStyle {
-        StepStyle::new(StepKind::Subagent)
-            .with_label(title_of(&self.spec.name))
-            .with_icon(StepIcon::Agent)
-    }
-
-    async fn call(&self, ctx: &ToolCtx, args: Value) -> Result<ToolOutput, ToolError> {
-        let text = match args.get("message") {
-            Some(Value::String(text)) if !text.trim().is_empty() => text,
-            _ => {
-                return Ok(ToolOutput::error(format!(
-                    "`{}` needs `message`, a non-empty string with the whole task",
-                    self.name()
-                )));
-            }
-        };
-        let client = self.endpoint.client().await?;
-        let mut message = Message::new(Role::User, vec![Part::text(text.as_str())]);
-        // The same id for the same call of the same run, on every retry and replay: what lets a
-        // server that recognises repeated messages hand back the task it already made.
-        message.message_id = ctx.child_run_id().to_string();
-        let request = SendMessageRequest {
-            message,
-            configuration: Some(SendMessageConfiguration {
-                accepted_output_modes: None,
-                task_push_notification_config: None,
-                history_length: Some(0),
-                return_immediately: Some(true),
-            }),
-            metadata: None,
-            tenant: None,
-        };
-        let response = client
-            .send_message(&request)
-            .await
-            .map_err(|e| self.endpoint.failure("send the message to", &e))?;
-        match response {
-            SendMessageResponse::Message(reply) => {
-                let mut output = self.endpoint.reply(&reply, ctx.files_left());
-                ctx.spend_files_of(&mut output);
-                Ok(output)
-            }
-            SendMessageResponse::Task(task) => match self.endpoint.outcome(&task, ctx.files_left())
-            {
-                Outcome::Done(mut output) => {
-                    ctx.spend_files_of(&mut output);
-                    Ok(*output)
-                }
-                Outcome::Working => {
-                    tracing::debug!(tool = %self.name(), task = %task.id, "remote task started");
-                    Err(ToolError::AwaitRemote {
-                        task: task.id,
-                        timeout_ms: Some(
-                            u64::try_from(self.max_wait.as_millis()).unwrap_or(u64::MAX),
-                        ),
-                    })
-                }
-            },
-        }
-    }
-
-    async fn poll_remote(&self, ctx: &ToolCtx, task: &str) -> Result<RemotePoll, ToolError> {
-        let client = self.endpoint.client().await?;
-        let task = client
-            .get_task(&GetTaskRequest {
-                id: task.to_owned(),
-                history_length: Some(0),
-                tenant: None,
-            })
-            .await
-            .map_err(|e| self.endpoint.failure("look at the task on", &e))?;
-        Ok(match self.endpoint.outcome(&task, ctx.files_left()) {
-            Outcome::Working => RemotePoll::Working,
-            Outcome::Done(output) => RemotePoll::Ready(*output),
-        })
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use a2a::Role;
 
-    const RUN: u64 = adam_runtime::MAX_RUN_FILE_BYTES as u64;
+    use super::*;
 
     fn origin() -> Origin {
         Origin::new("coder/billing", "agent/subagents/billing.md")
@@ -797,12 +561,8 @@ mod tests {
         }
     }
 
-    fn bind(
-        origin: &Origin,
-        agent: &RemoteAgent,
-        given: &Given,
-    ) -> Result<RemoteSubagentTool, Error> {
-        RemoteSubagentTool::bind(origin, agent, &given.settings, &given.secrets)
+    fn bind(origin: &Origin, agent: &RemoteAgent, given: &Given) -> Result<RemoteEndpoint, Error> {
+        RemoteEndpoint::bind(origin, agent, &given.settings, &given.secrets)
     }
 
     fn url_problem(url: &str, settings: &Given) -> Option<RemoteUrlProblem> {
@@ -870,13 +630,13 @@ mod tests {
     fn the_token_comes_from_the_settings_and_is_checked_without_ever_being_shown() {
         let a = agent("https://billing.example.com/card", Some("BILLING_TOKEN"));
         let good = settings(&[("BILLING_TOKEN", "  s3cret-token \n")]);
-        let tool = bind(&origin(), &a, &good).unwrap();
+        let endpoint = bind(&origin(), &a, &good).unwrap();
         assert_eq!(
-            tool.endpoint.token.as_ref().unwrap().expose_secret(),
+            endpoint.token.as_ref().unwrap().expose_secret(),
             "s3cret-token",
             "surrounding whitespace is trimmed"
         );
-        let debug = format!("{tool:?}");
+        let debug = format!("{endpoint:?}");
         assert!(!debug.contains("s3cret"), "{debug}");
         assert!(debug.contains("[REDACTED]"), "{debug}");
 
@@ -940,55 +700,20 @@ mod tests {
         // A value given in code is given: the source is asked only for the others.
         let mut given = settings(&[("PATH", "tok")]);
         given.secrets.source = Arc::new(adam_core::NoSecrets);
-        let tool = bind(&origin(), &a, &given).unwrap();
-        assert_eq!(tool.endpoint.token.as_ref().unwrap().expose_secret(), "tok");
-    }
-
-    #[test]
-    fn the_spec_has_the_shape_of_a_subagent_and_the_note_extends_the_description() {
-        let mut a = agent("https://billing.example.com/card", None);
-        a.note = "  Send invoice numbers.  ".into();
-        let tool = bind(&origin(), &a, &settings(&[])).unwrap();
-        let spec = tool.spec();
-        assert_eq!(spec.name, "billing");
-        assert_eq!(
-            spec.description,
-            "Answers billing questions.\n\nSend invoice numbers. The agent does not see this \
-             conversation; put everything it needs in `message`."
-        );
-        assert_eq!(spec.parameters["required"], serde_json::json!(["message"]));
-        assert!(!tool.asks_user());
+        let endpoint = bind(&origin(), &a, &given).unwrap();
+        assert_eq!(endpoint.token.as_ref().unwrap().expose_secret(), "tok");
     }
 
     #[test]
     fn a_token_goes_only_to_the_origin_it_was_configured_for() {
         let a = agent("https://billing.example.com/card", Some("T"));
         let with = bind(&origin(), &a, &settings(&[("T", "x")])).unwrap();
-        assert!(
-            with.endpoint
-                .interface_is_safe("https://billing.example.com/rpc")
-        );
-        assert!(
-            !with
-                .endpoint
-                .interface_is_safe("https://evil.example.net/rpc")
-        );
-        assert!(
-            !with
-                .endpoint
-                .interface_is_safe("https://billing.example.com:8443/rpc")
-        );
-        assert!(
-            !with
-                .endpoint
-                .interface_is_safe("http://billing.example.com/rpc")
-        );
-        assert!(
-            !with
-                .endpoint
-                .interface_is_safe("https://u:p@billing.example.com/rpc")
-        );
-        assert!(!with.endpoint.interface_is_safe("not a url"));
+        assert!(with.interface_is_safe("https://billing.example.com/rpc"));
+        assert!(!with.interface_is_safe("https://evil.example.net/rpc"));
+        assert!(!with.interface_is_safe("https://billing.example.com:8443/rpc"));
+        assert!(!with.interface_is_safe("http://billing.example.com/rpc"));
+        assert!(!with.interface_is_safe("https://u:p@billing.example.com/rpc"));
+        assert!(!with.interface_is_safe("not a url"));
         // Without a token the origin may differ, but not the transport rules.
         let without = bind(
             &origin(),
@@ -996,36 +721,20 @@ mod tests {
             &settings(&[]),
         )
         .unwrap();
-        assert!(
-            without
-                .endpoint
-                .interface_is_safe("https://api.example.net/rpc")
-        );
-        assert!(
-            !without
-                .endpoint
-                .interface_is_safe("http://api.example.net/rpc")
-        );
+        assert!(without.interface_is_safe("https://api.example.net/rpc"));
+        assert!(!without.interface_is_safe("http://api.example.net/rpc"));
         // A remote card never points at this machine; a card on this machine may.
-        assert!(!without.endpoint.interface_is_safe("http://127.0.0.1:1/rpc"));
-        assert!(!without.endpoint.interface_is_safe("https://localhost/rpc"));
-        assert!(!without.endpoint.interface_is_safe("http://[::1]:1/rpc"));
+        assert!(!without.interface_is_safe("http://127.0.0.1:1/rpc"));
+        assert!(!without.interface_is_safe("https://localhost/rpc"));
+        assert!(!without.interface_is_safe("http://[::1]:1/rpc"));
         let local = bind(
             &origin(),
             &agent("http://127.0.0.1:8080/card", None),
             &settings(&[]),
         )
         .unwrap();
-        assert!(
-            local
-                .endpoint
-                .interface_is_safe("http://127.0.0.1:9090/rpc")
-        );
-        assert!(
-            local
-                .endpoint
-                .interface_is_safe("http://localhost:9090/rpc")
-        );
+        assert!(local.interface_is_safe("http://127.0.0.1:9090/rpc"));
+        assert!(local.interface_is_safe("http://localhost:9090/rpc"));
     }
 
     /// Plain http that the deployment allowed (`A2A_ALLOW_INSECURE_REMOTES`) is for the card's own
@@ -1040,44 +749,19 @@ mod tests {
             &lax,
         )
         .unwrap();
-        assert!(
-            !https
-                .endpoint
-                .interface_is_safe("http://browser.example.com/rpc")
-        );
-        assert!(
-            !https
-                .endpoint
-                .interface_is_safe("http://evil.example.net/rpc")
-        );
-        assert!(
-            https
-                .endpoint
-                .interface_is_safe("https://api.example.net/rpc")
-        );
+        assert!(!https.interface_is_safe("http://browser.example.com/rpc"));
+        assert!(!https.interface_is_safe("http://evil.example.net/rpc"));
+        assert!(https.interface_is_safe("https://api.example.net/rpc"));
         let http = bind(
             &origin(),
             &agent("http://browser.agents.svc:8080/card", None),
             &lax,
         )
         .unwrap();
-        assert!(
-            http.endpoint
-                .interface_is_safe("http://browser.agents.svc:8080/")
-        );
-        assert!(
-            http.endpoint
-                .interface_is_safe("http://browser.agents.svc:9090/rpc")
-        );
-        assert!(
-            !http
-                .endpoint
-                .interface_is_safe("http://evil.example.net/rpc")
-        );
-        assert!(
-            http.endpoint
-                .interface_is_safe("https://api.example.net/rpc")
-        );
+        assert!(http.interface_is_safe("http://browser.agents.svc:8080/"));
+        assert!(http.interface_is_safe("http://browser.agents.svc:9090/rpc"));
+        assert!(!http.interface_is_safe("http://evil.example.net/rpc"));
+        assert!(http.interface_is_safe("https://api.example.net/rpc"));
     }
 
     fn task(state: TaskState, status: Option<&str>, artifacts: &[&str]) -> Task {
@@ -1107,7 +791,7 @@ mod tests {
         }
     }
 
-    fn tool() -> RemoteSubagentTool {
+    fn endpoint() -> RemoteEndpoint {
         bind(
             &origin(),
             &agent("https://billing.example.com/card", None),
@@ -1117,37 +801,36 @@ mod tests {
     }
 
     #[test]
-    fn a_call_is_a_subagent_step_drawn_as_an_agent() {
-        let style = tool().step_style();
-        assert_eq!(style.kind, StepKind::Subagent);
-        assert_eq!(style.icon, Some(StepIcon::Agent));
-    }
-
-    #[test]
-    fn every_state_maps_to_a_result_or_to_more_waiting() {
-        let tool = tool();
+    fn every_state_maps_to_an_answer_a_failure_or_more_waiting() {
+        let endpoint = endpoint();
         for state in [
             TaskState::Unspecified,
             TaskState::Submitted,
             TaskState::Working,
         ] {
             assert!(matches!(
-                tool.endpoint.outcome(&task(state, None, &[]), RUN),
+                endpoint.outcome(&task(state, None, &[])),
                 Outcome::Working
             ));
         }
-        let done = |t: Task| match tool.endpoint.outcome(&t, RUN) {
-            Outcome::Done(output) => output,
+        let answer = |t: Task| match endpoint.outcome(&t) {
+            Outcome::Completed(text) => text,
+            Outcome::Failed(text) => panic!("failed: {text}"),
+            Outcome::Working => panic!("still working"),
+        };
+        let failure = |t: Task| match endpoint.outcome(&t) {
+            Outcome::Failed(text) => text,
+            Outcome::Completed(text) => panic!("completed: {text}"),
             Outcome::Working => panic!("still working"),
         };
 
         // The artifacts are the answer; the status message only when there are none.
-        let out = done(task(TaskState::Completed, Some("Done."), &["one", "two"]));
-        assert_eq!((out.content.as_str(), out.is_error), ("one\n\ntwo", false));
-        let out = done(task(TaskState::Completed, Some("Done."), &[]));
-        assert_eq!(out.content, "Done.");
-        let out = done(task(TaskState::Completed, None, &[]));
-        assert_eq!(out.content, "(the remote agent finished without output)");
+        let out = answer(task(TaskState::Completed, Some("Done."), &["one", "two"]));
+        assert_eq!(out, "one\n\ntwo");
+        let out = answer(task(TaskState::Completed, Some("Done."), &[]));
+        assert_eq!(out, "Done.");
+        let out = answer(task(TaskState::Completed, None, &[]));
+        assert_eq!(out, "(the remote agent finished without output)");
 
         for (state, needle) in [
             (TaskState::Failed, "failed: out of budget"),
@@ -1159,18 +842,11 @@ mod tests {
                 "needs authorization: out of budget",
             ),
         ] {
-            let out = done(task(state.clone(), Some("out of budget"), &[]));
-            assert!(out.is_error, "{state:?}");
-            assert!(out.content.contains(needle), "{state:?}: {}", out.content);
+            let out = failure(task(state.clone(), Some("out of budget"), &[]));
+            assert!(out.contains(needle), "{state:?}: {out}");
         }
-        let out = done(task(TaskState::Failed, None, &[]));
-        assert_eq!(out.content, "the remote agent `billing` failed");
-        let out = done(task(TaskState::InputRequired, None, &[]));
-        assert!(
-            out.content.contains("cannot ask the user"),
-            "{}",
-            out.content
-        );
+        let out = failure(task(TaskState::Failed, None, &[]));
+        assert_eq!(out, "the remote agent `billing` failed");
     }
 
     #[test]
@@ -1205,204 +881,56 @@ mod tests {
         );
     }
 
-    /// With `files: true`, the `raw` parts of a completed task are files of the calling run: the
-    /// sender's filename and type (checked against the bytes), the artifact's name when the part is
-    /// its only one, a line each for the model; a `url` part stays a line. Without it, nothing is kept.
+    /// A file of an answer, in a task's artifacts, beside the status message or in a plain message
+    /// that answered at once, is a line for the model: nothing of it is kept (ADR 0089 slice C4:
+    /// `files: true` is not honoured by a round).
     #[test]
-    fn with_files_the_raw_parts_of_a_completed_task_are_shared() {
+    fn the_files_of_an_answer_are_described_and_never_kept() {
         const PNG: &[u8] = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR";
         let mut shot = Part::raw(PNG.to_vec());
         shot.filename = Some("page.png".into());
         shot.media_type = Some("image/png".into());
-        let mut pdf = Part::raw(b"%PDF-1.7".to_vec());
-        pdf.media_type = Some("application/pdf".into());
-        let artifact = |name: Option<&str>, parts: Vec<Part>| a2a::Artifact {
-            artifact_id: a2a::new_artifact_id(),
-            name: name.map(str::to_owned),
-            description: None,
-            parts,
-            metadata: None,
-            extensions: None,
-        };
-        let mut done = task(TaskState::Completed, Some("Done."), &[]);
-        done.artifacts = Some(vec![
-            artifact(Some("The page"), vec![shot]),
-            artifact(
-                Some("two parts"),
-                vec![
-                    Part::text("and a PDF:"),
-                    pdf,
-                    Part::url("https://x.example.com/f"),
-                ],
-            ),
-        ]);
-
-        let mut a = agent("https://billing.example.com/card", None);
-        a.files = true;
-        let sharing = bind(&origin(), &a, &settings(&[])).unwrap();
-        let Outcome::Done(out) = sharing.endpoint.outcome(&done, RUN) else {
-            panic!("the task is over");
-        };
-        assert!(!out.is_error, "{}", out.content);
-        let names: Vec<(&str, &str)> = out
-            .artifacts
-            .iter()
-            .map(|a| (a.name.as_str(), a.file.as_ref().unwrap().filename.as_str()))
-            .collect();
-        // The sender's base name and the extension of the checked type, made unique by a hash of
-        // the bytes; the remote artifact's name stays the artifact's.
-        let (page, pdf) = (names[0].1, names[1].1);
-        assert_eq!(names[0].0, "The page");
-        assert!(
-            page.starts_with("page-") && page.ends_with(".png"),
-            "{page}"
-        );
-        assert!(
-            pdf.starts_with("billing-") && pdf.ends_with(".pdf"),
-            "{pdf}"
-        );
-        assert_eq!(names[1].0, pdf);
-        let hash = out.artifacts[0].file_sha256().unwrap();
-        assert_eq!(
-            out.content,
-            format!(
-                "Shared {page} (16 bytes, image/png). To show it in your answer, write \
-                 ![description]({page}). To use it as the picture of an `ask_user` option, pass image {{sha256: \"{hash}\", alt}}. \
-                 In a `show` block, an `Image` names it: {{component: \"Image\", artifact: \"{hash}\", alt}}.\n\nand a PDF:\nShared {pdf} (8 bytes, application/pdf).\n\
-                 [file at https://x.example.com/f]"
-            )
-        );
-        assert_eq!(out.artifacts[0].file.as_ref().unwrap().bytes, PNG);
-
-        // The same task to a subagent without the key: described, nothing kept.
-        let Outcome::Done(plain) = tool().endpoint.outcome(&done, RUN) else {
-            panic!("the task is over");
-        };
-        assert!(plain.artifacts.is_empty());
-        assert!(
-            plain
-                .content
-                .starts_with("[file `page.png` not included: 16 bytes, image/png]")
-        );
-
-        // An adam agent's answer: its words in the status message, its screenshot the only
-        // artifact. The words stay, then the file's line.
-        let mut adam = task(TaskState::Completed, Some("The code is LH-7731."), &[]);
-        let mut png = Part::raw(PNG.to_vec());
-        png.filename = Some("shot.png".into());
-        png.media_type = Some("image/png".into());
-        adam.artifacts = Some(vec![artifact(None, vec![png])]);
-        let Outcome::Done(out) = sharing.endpoint.outcome(&adam, RUN) else {
-            panic!("the task is over");
-        };
-        let shot = &out.artifacts[0].file.as_ref().unwrap().filename;
-        assert!(
-            out.content.starts_with("The code is LH-7731.\n\nShared ")
-                && out.content.contains(shot.as_str()),
-            "{}",
-            out.content
-        );
-    }
-
-    /// A remote that answers with a plain message, not a task: its file parts are shared the same
-    /// way, within what the run may still share.
-    #[test]
-    fn with_files_the_raw_parts_of_a_message_reply_are_shared_too() {
-        let mut shot = Part::raw(b"\x89PNG\r\n\x1a\nmore".to_vec());
-        shot.filename = Some("evil.html".into());
-        shot.media_type = Some("image/png".into());
-        let reply = Message::new(Role::Agent, vec![Part::text("Here:"), shot.clone()]);
-        let mut a = agent("https://billing.example.com/card", None);
-        a.files = true;
-        let sharing = bind(&origin(), &a, &settings(&[])).unwrap();
-        let out = sharing.endpoint.reply(&reply, RUN);
-        assert!(!out.is_error, "{}", out.content);
-        let name = &out.artifacts[0].file.as_ref().unwrap().filename;
-        // A real PNG keeps its base name and gets the extension of what it is.
-        assert!(
-            name.starts_with("evil-") && name.ends_with(".png"),
-            "{name}"
-        );
-        assert!(
-            out.content.starts_with("Here:\nShared evil-"),
-            "{}",
-            out.content
-        );
-        // With no room left, the file is refused before it is copied.
-        let full = sharing.endpoint.reply(&reply, 3);
-        assert!(full.is_error && full.artifacts.is_empty());
-        assert!(
-            full.content
-                .contains("is over what this run may still share"),
-            "{}",
-            full.content
-        );
-        // Without the key, described.
-        let plain = tool().endpoint.reply(&reply, RUN);
-        assert!(plain.artifacts.is_empty());
-        assert!(
-            plain.content.contains("[file `evil.html` not included"),
-            "{}",
-            plain.content
-        );
-    }
-
-    #[test]
-    fn a_remote_file_over_the_cap_is_not_shared_and_the_result_says_so() {
-        let mut big = Part::raw(vec![0; adam_runtime::MAX_ARTIFACT_FILE_BYTES + 1]);
-        big.media_type = Some("application/zip".into());
-        let mut done = task(TaskState::Completed, None, &[]);
+        let mut done = task(TaskState::Completed, Some("The code is LH-7731."), &[]);
         done.artifacts = Some(vec![a2a::Artifact {
             artifact_id: a2a::new_artifact_id(),
-            name: None,
+            name: Some("The page".into()),
             description: None,
-            parts: vec![big],
+            parts: vec![shot.clone()],
             metadata: None,
             extensions: None,
         }]);
         let mut a = agent("https://billing.example.com/card", None);
         a.files = true;
-        let tool = bind(&origin(), &a, &settings(&[])).unwrap();
-        let Outcome::Done(out) = tool.endpoint.outcome(&done, RUN) else {
-            panic!("the task is over");
-        };
-        assert!(out.is_error);
-        assert!(out.artifacts.is_empty());
-        assert!(
-            out.content
-                .starts_with("Not shared: a file (application/zip) of 4194305 bytes is over"),
-            "{}",
-            out.content
-        );
-    }
-
-    /// A remote subagent can park the run on its task, so it never runs beside another call
-    /// (ADR 0049 decision 14).
-    #[test]
-    fn a_remote_subagent_runs_alone() {
-        use adam_llm_agent::Tool;
-        assert_eq!(tool().access(&serde_json::json!({})), ToolAccess::Alone);
+        let asked = bind(&origin(), &a, &settings(&[])).unwrap();
+        for endpoint in [endpoint(), asked] {
+            let Outcome::Completed(out) = endpoint.outcome(&done) else {
+                panic!("the task is over");
+            };
+            // An adam agent's answer: its words in the status message, its screenshot the only
+            // artifact. The words stay, then the file's line.
+            assert_eq!(
+                out,
+                "The code is LH-7731.\n\n[file `page.png` not included: 16 bytes, image/png]"
+            );
+        }
+        let reply = Message::new(Role::Agent, vec![Part::text("Here:"), shot]);
         assert_eq!(
-            tool().access(&serde_json::json!({"message": "invoice 7"})),
-            ToolAccess::Alone
+            RemoteEndpoint::reply(&reply),
+            "Here:\n[file `page.png` not included: 16 bytes, image/png]"
         );
     }
 
     #[test]
     fn errors_from_the_remote_are_transient_only_when_trying_again_can_help() {
-        let tool = tool();
-        let internal = tool
-            .endpoint
-            .failure("connect to", &A2AError::internal("HTTP request failed"));
+        let endpoint = endpoint();
+        let internal = endpoint.failure("connect to", &A2AError::internal("HTTP request failed"));
         assert!(matches!(internal, ToolError::Transient(_)), "{internal:?}");
         for code in [
             error_code::TASK_NOT_FOUND,
             error_code::INVALID_PARAMS,
             -32000, // unauthorized
         ] {
-            let error = tool
-                .endpoint
-                .failure("send the message to", &A2AError::new(code, "no"));
+            let error = endpoint.failure("send the message to", &A2AError::new(code, "no"));
             assert!(matches!(error, ToolError::Permanent(_)), "{code}");
         }
     }

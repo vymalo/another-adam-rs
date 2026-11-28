@@ -39,7 +39,7 @@ both. `Role` is a closed enum (`all`, `control-plane`, `worker`) and `adam-host`
 
 **`#[tool]`, skills and subagents.** A Rust function marked `#[tool]` (the `adam-macros` crate) becomes a tool the model
 can call. A *skill* is an Agent Skills `SKILL.md` the model loads when it needs it. A *subagent* is another agent file the
-parent calls as a tool, and it runs as a durable child run of its own. See [the `#[tool]` contract](reference/agent-files.md#the-tool-contract),
+parent starts with `subagent_start`, and it runs as a durable child run of its own, a round of a session. See [the `#[tool]` contract](reference/agent-files.md#the-tool-contract),
 [skills at run time](reference/agent-files.md#skills-at-run-time), [subagents at run time](reference/agent-files.md#subagents-at-run-time)
 and [child runs](reference/child-runs.md).
 
@@ -64,6 +64,6 @@ URI (steps, streamed text, usage, ...) and a client activates; a client that doe
 | Agent folder | An agent as files, `AgentDef` in `crates/adam-assembly/src/def.rs` | [0004](decisions/0004-agent-folders-at-run-time.md) |
 | `#[tool]` | The attribute that makes a function a tool, `crates/adam-macros/src/lib.rs` | none of its own; [agent files](reference/agent-files.md#the-tool-contract) |
 | Skill | A `SKILL.md` loaded on demand, `crates/adam-assembly/src/skills.rs` | [0044](decisions/0044-paged-tools-a-stable-prompt-prefix-a-plan-skills-commands-and-project-context.md) |
-| Subagent | An agent called as a tool, `crates/adam-assembly/src/subagent.rs` | [0045](decisions/0045-a-subagent-can-run-in-the-background-as-a-session.md) |
+| Subagent | An agent the parent starts with `subagent_start`, as a session (`crates/adam-llm-agent/src/sessions.rs`) | [0045](decisions/0045-a-subagent-can-run-in-the-background-as-a-session.md) |
 | TaskBackend | What the A2A server calls, `crates/adam-a2a/src/backend.rs` | [0006](decisions/0006-a2ui-and-the-vymalo-extensions-in-adam-rs.md) |
 | Extension | An optional card feature by URI, `crates/adam-a2a/src/extensions.rs` | [0006](decisions/0006-a2ui-and-the-vymalo-extensions-in-adam-rs.md) |

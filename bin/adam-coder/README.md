@@ -138,7 +138,7 @@ by its name; [ADR 0027](../../docs/decisions/0027-every-tool-has-a-title-for-its
 | `commit_and_push` | Commit and push | `open_pull_request` | Open a pull request |
 | `ask_user` | Ask you | `show`, `ui_catalog` | Show on your screen, List what the screen can draw |
 | `plan_work` | Write the plan | `plan_check`, `plan_add` | Update the plan, Add to the plan |
-| `turn_output` (the endpoint's) | Send the answer | a subagent (`explorer`) | its name capitalised (Explorer) |
+| `turn_output` (the endpoint's) | Send the answer | `subagent_start` and the four others | their own titles (`adam-llm-agent`) |
 
 `tests/agent_files.rs` (`every_tool_of_the_coder_has_a_title_for_its_step`) fails for a tool with none, so a new tool must
 bring its title.
@@ -906,8 +906,14 @@ stateDiagram-v2
 `explorer` answers where and how questions about a repository with file paths and line numbers; `reviewer` reads
 `git diff origin/<base>...HEAD` and returns findings by severity with file and line. The prompt says when to use them
 (a large or unfamiliar repository; once before `open_pull_request`), and what they say is advice: the gates decide.
-They run one at a time: the agent loop runs a turn's tool calls in order (`crates/adam-llm-agent/src/agent.rs`), so two
-subagent calls never overlap, and no subagent edits. The prompt says so.
+**They are started with `subagent_start`** ([ADR 0089](../../docs/decisions/0089-every-child-is-a-session-and-the-one-shot-subagent-tool-goes.md)
+slice C4): the coder has no tool named `explorer` or `reviewer`, and the prompt names `subagent_start { agent, description,
+prompt, wait? }`, with `wait: true` to have the answer as the call's result (the one-shot call; the round's park on the
+model shows on the root and stops its commands as a child run's did). No subagent edits. **Breaking:** the coder's tool
+list is 42 and not 44 (`tests/agent_files.rs`, `tiers.rs`, `e2e.rs`), the plan mode lists no `explorer` or `reviewer`,
+`tier::known` no longer knows the two names (an old journal's call of one needs `auto`), the prompt's tool line and
+*Helpers* changed (its snapshot `prompt.txt` too, 29,957 characters at the most cycles), and `tool-tokens.txt` lost two
+rows and `subagent_start`'s shrank.
 
 A child run has an id of its own, so the tools key by the **root run** (`ToolCtx::root_run_id()`, carried down by
 `ToolCtx::start_child`: [ADR 0021](../../docs/decisions/0021-the-coder-is-adam-a-general-agent-that-can-code.md)) and, for
@@ -927,17 +933,16 @@ The janitor and the run pods look at the root's directory and run only: a child 
 
 **In the background.** Because the coder has subagents, its assembly also gives it the six session tools of
 [ADR 0045](../../docs/decisions/0045-a-subagent-can-run-in-the-background-as-a-session.md) slice 2 (`subagent_start`,
-`subagent_send`, `subagent_read`, `subagent_edit`, `subagent_close`, `subagent_list`, after `explorer` and `reviewer`), so that it
-can start a helper, keep working and read the report, send a kept-open helper another question, and edit a session's config
-within the same bounds a start has ([ADR 0054](../../docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md)
+`subagent_send`, `subagent_read`, `subagent_edit`, `subagent_close`, `subagent_list`, after the skill tools), so that it can
+start a helper, wait for it or keep working and read the report, send a kept-open helper another question, and edit a
+session's config within the same bounds a start has ([ADR 0054](../../docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md)
 decision 11). They are made by the assembly, not by
 `coder_tools`, so `Gated` and `Redacting` do not wrap them: they are **`plan` tier** in `tier::known` (the helpers are read-only
 and keep to the tier of the run they serve), and `AgentDef::bind(..).scrub(..)` gives them the coder's redactor, so a report
 passes through it like any tool result. They are not in the coder's tool-spec goldens (those pin `coder_tools`); the six specs
 are pinned in `crates/adam-llm-agent/tests/fixtures/session-tools.json`. A round is a child of the **task that started it**,
 so it works in that task's worktree and, in a later task of the conversation, `subagent_send` starts the next round in the
-worktree of the later task. The prompt is not changed: the descriptions carry the guidance, and `explorer` and `reviewer` stay
-the way to ask and wait.
+worktree of the later task. The prompt names `subagent_start`; the descriptions carry the rest.
 
 ### Sessions a person opens
 

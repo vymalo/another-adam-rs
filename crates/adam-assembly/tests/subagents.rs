@@ -1,5 +1,6 @@
-//! Subagents: each is a child run of its parent, called through a tool named after it. Run end to end
-//! on `MockModel` through the runtime, on the memory store always and on PostgreSQL when
+//! Subagents: each is a child run of its parent, a round of a session the parent starts with
+//! `subagent_start` (ADR 0089 slice C4: no tool is named after a subagent; the one-shot call is
+//! `mode: one_shot` and `wait: true`). Run end to end on `MockModel` through the runtime, on the memory store always and on PostgreSQL when
 //! `ADAM_TEST_POSTGRES_URL` is set. Every case has agent names of its own, so cases that share a
 //! database never claim each other's runs.
 #![allow(clippy::unwrap_used, clippy::expect_used)] // integration tests assert by unwrapping
@@ -12,10 +13,10 @@ use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
 #[cfg(feature = "remote")]
 use adam_agent_fixture::AGENT;
 use adam_agent_fs::Subagent;
-use adam_assembly::{AgentDef, Assembly, Error, SubagentTool, ToolClash};
+use adam_assembly::{AgentDef, Assembly, Error, ToolClash};
 use adam_core::{DynStore, MemoryStore, RunId, RunStatus, Store};
 use adam_llm_agent::{
-    FnTool, LlmStarter, SessionTools, Tool, ToolError, ToolOutput, ToolSet, user_message,
+    FnTool, LlmStarter, SESSION_TOOLS, SessionTools, ToolError, ToolOutput, ToolSet, user_message,
 };
 use adam_model::{Message, MockModel, ModelRequest, ToolCall};
 use adam_runtime::{
@@ -25,9 +26,6 @@ use common::{
     def, instructions, manifests, plain, runtime_on, spawn_worker, stub, tools, wait_done, wait_for,
 };
 use serde_json::{Value, json};
-
-const NOTE: &str =
-    "The agent does not see this conversation; put everything it needs in `message`.";
 
 // --- harness -------------------------------------------------------------------------------
 
@@ -127,6 +125,42 @@ fn call(id: &str, name: &str, args: Value) -> ToolCall {
     }
 }
 
+/// The one-shot call of before ADR 0089 slice C4, as a model writes it now: `subagent_start` on
+/// `agent` with `prompt`, `mode: one_shot` and `wait: true`, so the call's result is the child's
+/// first report and the parent parks until then.
+fn delegate(id: &str, agent: &str, prompt: &str) -> ToolCall {
+    call(
+        id,
+        "subagent_start",
+        json!({
+            "agent": agent,
+            "description": "the task",
+            "prompt": prompt,
+            "mode": "one_shot",
+            "wait": true,
+        }),
+    )
+}
+
+/// `own`, then the five session tools, as an agent with subagents is offered them.
+fn with_sessions(own: &[&str]) -> Vec<String> {
+    own.iter()
+        .chain(SESSION_TOOLS.iter())
+        .map(|name| (*name).to_owned())
+        .collect()
+}
+
+/// The report a `subagent_start` that waited answered with, for the call `id` in the last message
+/// of the request: the session's header line, `report: done` and the child's text. Panics on an
+/// error result or another status.
+fn answer(request: &ModelRequest, id: &str) -> String {
+    let (text, is_error) = last_tool_result(request, id);
+    assert!(!is_error, "{text}");
+    assert!(text.starts_with("session "), "{text}");
+    assert!(text.contains("\nreport: done\n"), "{text}");
+    text
+}
+
 fn assemble(files: &Files, tools: ToolSet, model: &Arc<MockModel>) -> Assembly {
     def_of(files)
         .bind(tools)
@@ -169,17 +203,9 @@ async fn a_parent_calls_its_subagent_which_calls_its_own_and_the_parent_goes_on(
         let root = uniq("root");
         let model = Arc::new(MockModel::new());
         model
-            .push_tool_calls(vec![call(
-                "c1",
-                "researcher",
-                json!({"message": "find the release date"}),
-            )])
+            .push_tool_calls(vec![delegate("c1", "researcher", "find the release date")])
             .push_tool_calls(vec![call("f1", "fetch", json!({}))])
-            .push_tool_calls(vec![call(
-                "s1",
-                "summarizer",
-                json!({"message": "the page text"}),
-            )])
+            .push_tool_calls(vec![delegate("s1", "summarizer", "the page text")])
             .push_text("ten lines")
             .push_text("report: ten lines")
             .push_text("the answer is in the report");
@@ -209,37 +235,36 @@ async fn a_parent_calls_its_subagent_which_calls_its_own_and_the_parent_goes_on(
         let [r0, r1, r2, r3, r4, r5] = &requests[..] else {
             unreachable!()
         };
-        // The parent: its own tool, and one for the subagent, described by the subagent's file.
+        // The parent: its own tool and the session tools, whose roster is the subagent described
+        // by its file. No tool is named after the subagent.
         // The root's instructions, then the section about the session tools (ADR 0054 decision 9).
         let root_system = format!(
             "You are the root.\n\n{}",
             SessionTools::guide_for(["researcher"])
         );
         assert_eq!(plain(&r0.system).as_deref(), Some(root_system.as_str()));
-        assert_eq!(
-            offered(r0),
-            [
-                "parent_only",
-                "researcher",
-                "subagent_start",
-                "subagent_send",
-                "subagent_read",
-                "subagent_edit",
-                "subagent_close",
-                "subagent_list"
-            ]
+        assert_eq!(offered(r0), with_sessions(&["parent_only"]));
+        assert!(
+            r0.tools[1]
+                .description
+                .ends_with("Subagents:\n- researcher: Researches a topic."),
+            "{}",
+            r0.tools[1].description
         );
         assert_eq!(
-            r0.tools[1].description,
-            format!("Researches a topic. {NOTE}")
+            r0.tools[1].parameters["properties"]["agent"]["enum"],
+            json!(["researcher"])
         );
-        assert_eq!(r0.tools[1].parameters["required"], json!(["message"]));
         assert_eq!(user_texts(r0), ["Find it"]);
-        // The child: its own prompt, its own tools (and its own subagent), and a history that
-        // starts with `message`, not with the parent's conversation.
+        // The child: its own prompt, its own tools (and the session tools for its own subagent),
+        // and a history that starts with `prompt`, not with the parent's conversation.
         for r in [r1, r2] {
             assert_eq!(plain(&r.system).as_deref(), Some("You research."));
-            assert_eq!(offered(r), ["fetch", "summarizer"]);
+            assert_eq!(offered(r), with_sessions(&["fetch"]));
+            assert_eq!(
+                r.tools[1].parameters["properties"]["agent"]["enum"],
+                json!(["summarizer"])
+            );
             assert_eq!(user_texts(r), ["find the release date"]);
             assert_eq!(r.model, "big", "a subagent inherits the parent's alias");
         }
@@ -251,27 +276,32 @@ async fn a_parent_calls_its_subagent_which_calls_its_own_and_the_parent_goes_on(
         assert_eq!(r3.messages.len(), 1);
         assert_eq!(user_texts(r3), ["the page text"]);
         // Each answer comes back as the result of the call that started it.
-        assert_eq!(last_tool_result(r4, "s1"), ("ten lines".into(), false));
-        assert_eq!(
-            last_tool_result(r5, "c1"),
-            ("report: ten lines".into(), false)
-        );
+        assert!(answer(r4, "s1").contains("ten lines"));
+        assert!(answer(r5, "c1").contains("report: ten lines"));
         assert_eq!(plain(&r5.system).as_deref(), Some(root_system.as_str()));
         // Only the child used `fetch`; the parent's tool was not called by anyone.
         assert_eq!(fetch_calls.load(SeqCst), 1);
         assert_eq!(parent_calls.load(SeqCst), 0);
 
-        // The children are runs of their own, recorded under their parents, and done.
+        // The children are runs of their own, recorded under their parents, and done: each a
+        // round of a session of its parent's conversation, the grandchild's in its parent's.
         let researcher = child_run_id(run, "c1");
         let child = store.load_run(researcher).await.unwrap().unwrap();
         assert_eq!(child.agent, format!("{root}/researcher"));
         assert_eq!(child.parent_id, Some(run));
         assert_eq!(child.status, RunStatus::Done);
+        let researching = session_conversation_id(&format!("run:{run}"), researcher);
+        assert_eq!(child.conversation_id.as_deref(), Some(researching.as_str()));
         let summarizer = child_run_id(researcher, "s1");
         let grandchild = store.load_run(summarizer).await.unwrap().unwrap();
         assert_eq!(grandchild.agent, format!("{root}/researcher/summarizer"));
         assert_eq!(grandchild.parent_id, Some(researcher));
         assert_eq!(grandchild.status, RunStatus::Done);
+        assert_eq!(
+            grandchild.conversation_id,
+            Some(session_conversation_id(&researching, summarizer)),
+            "{backend}"
+        );
 
         worker.stop().await;
     }
@@ -283,11 +313,7 @@ async fn a_parent_calls_its_subagent_which_calls_its_own_and_the_parent_goes_on(
 async fn the_embedded_fixture_runs_a_subagent_end_to_end() {
     let model = Arc::new(MockModel::new());
     model
-        .push_tool_calls(vec![call(
-            "c1",
-            "reviewer",
-            json!({"message": "Review this diff"}),
-        )])
+        .push_tool_calls(vec![delegate("c1", "reviewer", "Review this diff")])
         .push_text("LGTM")
         .push_text("Reviewed: LGTM");
     let assembly = common::with_fixture_mcp(common::with_fixture_token(
@@ -332,7 +358,7 @@ async fn a_child_cannot_call_a_tool_only_its_parent_has() {
     let root = uniq("root");
     let model = Arc::new(MockModel::new());
     model
-        .push_tool_calls(vec![call("c1", "helper", json!({"message": "go"}))])
+        .push_tool_calls(vec![delegate("c1", "helper", "go")])
         // The helper tries the parent's tool.
         .push_tool_calls(vec![call("x1", "parent_only", json!({}))])
         .push_text("I could not")
@@ -347,8 +373,8 @@ async fn a_child_cannot_call_a_tool_only_its_parent_has() {
             .tool(counting("fetch", &fetch_calls)),
         &model,
     );
-    // The bound tool lists: the parent has its tool and one for the helper; the helper has only
-    // what it lists.
+    // The bound tool lists: the parent has its tool and the session tools, which start the helper;
+    // the helper has only what it lists.
     let tools_of = |name: &str| {
         assembly
             .info()
@@ -358,19 +384,7 @@ async fn a_child_cannot_call_a_tool_only_its_parent_has() {
             .tools
             .clone()
     };
-    assert_eq!(
-        tools_of(&root),
-        [
-            "parent_only",
-            "helper",
-            "subagent_start",
-            "subagent_send",
-            "subagent_read",
-            "subagent_edit",
-            "subagent_close",
-            "subagent_list"
-        ]
-    );
+    assert_eq!(tools_of(&root), with_sessions(&["parent_only"]));
     assert_eq!(tools_of(&format!("{root}/helper")), ["fetch"]);
 
     let rt = runtime_on(&assembly, Arc::new(MemoryStore::new()));
@@ -380,19 +394,7 @@ async fn a_child_cannot_call_a_tool_only_its_parent_has() {
 
     let requests = model.requests();
     // What the model was offered.
-    assert_eq!(
-        offered(&requests[0]),
-        [
-            "parent_only",
-            "helper",
-            "subagent_start",
-            "subagent_send",
-            "subagent_read",
-            "subagent_edit",
-            "subagent_close",
-            "subagent_list"
-        ]
-    );
+    assert_eq!(offered(&requests[0]), with_sessions(&["parent_only"]));
     assert_eq!(offered(&requests[1]), ["fetch"]);
     // The refusal the child's model got, and that the tool did not run.
     let (text, is_error) = last_tool_result(&requests[2], "x1");
@@ -401,10 +403,7 @@ async fn a_child_cannot_call_a_tool_only_its_parent_has() {
     assert_eq!(parent_calls.load(SeqCst), 0);
     assert_eq!(fetch_calls.load(SeqCst), 0);
     // The parent got the child's answer all the same.
-    assert_eq!(
-        last_tool_result(&requests[3], "c1"),
-        ("I could not".into(), false)
-    );
+    assert!(answer(&requests[3], "c1").contains("I could not"));
     worker.stop().await;
 }
 
@@ -415,20 +414,7 @@ fn a_subagent_does_not_inherit_a_tool_unless_it_lists_it() {
     // The root (no `tools:`) gets everything; the helper with no `tools:` gets nothing.
     let assembly = assemble(&files, tools(&["a", "b"]), &Arc::new(MockModel::new()));
     let info = assembly.info();
-    assert_eq!(
-        info[0].tools,
-        [
-            "a",
-            "b",
-            "helper",
-            "subagent_start",
-            "subagent_send",
-            "subagent_read",
-            "subagent_edit",
-            "subagent_close",
-            "subagent_list"
-        ]
-    );
+    assert_eq!(info[0].tools, with_sessions(&["a", "b"]));
     assert!(info[1].tools.is_empty());
     // And listing one gives it exactly that one.
     let files = with_helper(&root, "", "tools: [b]");
@@ -443,7 +429,7 @@ async fn a_child_that_goes_over_its_own_limit_answers_from_its_closing_turn() {
     let root = uniq("root");
     let model = Arc::new(MockModel::new());
     model
-        .push_tool_calls(vec![call("c1", "helper", json!({"message": "loop"}))])
+        .push_tool_calls(vec![delegate("c1", "helper", "loop")])
         .push_tool_calls(vec![call("f1", "fetch", json!({}))])
         .push_tool_calls(vec![call("f2", "fetch", json!({}))])
         // The child's third call is its closing turn: no tool may be called, and this is its answer.
@@ -471,12 +457,8 @@ async fn a_child_that_goes_over_its_own_limit_answers_from_its_closing_turn() {
         "the child's closing turn asked the model"
     );
     assert_eq!(requests[3].tool_choice, adam_model::ToolChoice::None);
-    let (text, is_error) = last_tool_result(&requests[4], "c1");
-    assert!(!is_error, "{text}");
-    assert!(
-        text.starts_with("two pages read, the third is left"),
-        "{text}"
-    );
+    let text = answer(&requests[4], "c1");
+    assert!(text.contains("two pages read, the third is left"), "{text}");
     assert!(text.contains("`max_turns` limit"), "{text}");
     assert!(text.contains("may be incomplete"), "{text}");
 
@@ -486,8 +468,8 @@ async fn a_child_that_goes_over_its_own_limit_answers_from_its_closing_turn() {
     worker.stop().await;
 }
 
-/// The subagent's `limits.max_minutes` reaches the runtime: the child run is created with the
-/// deadline (a minute here), 30 minutes when its file says nothing, and none for `0`.
+/// The subagent's `limits.max_minutes` reaches the runtime: the round is created with the deadline
+/// (a minute here), 30 minutes when its file says nothing, and none for `0`.
 #[tokio::test]
 async fn a_subagents_max_minutes_becomes_the_deadline_of_its_run() {
     for (frontmatter, limit) in [
@@ -498,7 +480,7 @@ async fn a_subagents_max_minutes_becomes_the_deadline_of_its_run() {
         let root = uniq("root");
         let model = Arc::new(MockModel::new());
         model
-            .push_tool_calls(vec![call("c1", "helper", json!({"message": "go"}))])
+            .push_tool_calls(vec![delegate("c1", "helper", "go")])
             .push_text("the helper's answer")
             .push_text("done");
         let files = with_helper(&root, "tools: []", frontmatter);
@@ -532,7 +514,7 @@ async fn the_turns_of_a_child_are_not_the_parents() {
     let root = uniq("root");
     let model = Arc::new(MockModel::new());
     model
-        .push_tool_calls(vec![call("c1", "helper", json!({"message": "go"}))])
+        .push_tool_calls(vec![delegate("c1", "helper", "go")])
         .push_tool_calls(vec![call("f1", "fetch", json!({}))])
         .push_text("helped")
         .push_text("done");
@@ -556,11 +538,15 @@ async fn the_turns_of_a_child_are_not_the_parents() {
 // --- a bad call ----------------------------------------------------------------------------
 
 #[tokio::test]
-async fn a_call_without_a_message_starts_no_child() {
+async fn a_start_without_a_prompt_starts_no_child() {
     let root = uniq("root");
     let model = Arc::new(MockModel::new());
     model
-        .push_tool_calls(vec![call("c1", "helper", json!({"msg": "typo"}))])
+        .push_tool_calls(vec![call(
+            "c1",
+            "subagent_start",
+            json!({"agent": "helper", "description": "d", "msg": "typo", "wait": true}),
+        )])
         .push_text("ok");
     let files = with_helper(&root, "tools: []", "");
     let assembly = assemble(&files, ToolSet::new(), &model);
@@ -570,7 +556,7 @@ async fn a_call_without_a_message_starts_no_child() {
     wait_done(&rt, run).await;
     let (text, is_error) = last_tool_result(&model.requests()[1], "c1");
     assert!(is_error);
-    assert!(text.contains("`helper` needs `message`"), "{text}");
+    assert!(text.contains("`subagent_start` needs `prompt`"), "{text}");
     assert!(
         rt.store()
             .load_run(child_run_id(run, "c1"))
@@ -583,12 +569,12 @@ async fn a_call_without_a_message_starts_no_child() {
 
 #[tokio::test]
 async fn a_runtime_that_does_not_know_the_child_says_so_and_the_parent_goes_on() {
-    // Only the root is registered (not `Assembly::register`): the call is refused for good, with
+    // Only the root is registered (not `Assembly::register`): the start is refused for good, with
     // the name of the missing agent, and is not retried.
     let root = uniq("root");
     let model = Arc::new(MockModel::new());
     model
-        .push_tool_calls(vec![call("c1", "helper", json!({"message": "go"}))])
+        .push_tool_calls(vec![delegate("c1", "helper", "go")])
         .push_text("no helper here");
     let files = with_helper(&root, "tools: []", "");
     let assembly = assemble(&files, ToolSet::new(), &model);
@@ -619,7 +605,7 @@ async fn a_parent_restarted_mid_wait_still_gets_the_childs_answer() {
         let child = format!("{root}/helper");
         let model = Arc::new(MockModel::new());
         model
-            .push_tool_calls(vec![call("c1", "helper", json!({"message": "work"}))])
+            .push_tool_calls(vec![delegate("c1", "helper", "work")])
             .push_text("the child's answer")
             .push_text("all done");
         let files = with_helper(&root, "tools: []", "");
@@ -641,7 +627,7 @@ async fn a_parent_restarted_mid_wait_still_gets_the_childs_answer() {
             (parent.status == RunStatus::Parked
                 && kid.status == RunStatus::Runnable
                 && kid.parent_id == Some(run)
-                // A one-shot session of the parent (ADR 0089 slice C1).
+                // A round of a session of the parent (ADR 0089).
                 && kid.conversation_id
                     == Some(session_conversation_id(&format!("run:{run}"), child_id)))
             .then_some(())
@@ -674,15 +660,12 @@ async fn a_parent_restarted_mid_wait_still_gets_the_childs_answer() {
             "{backend}: one turn each, nothing asked twice"
         );
         assert_eq!(user_texts(&requests[1]), ["work"]);
-        assert_eq!(
-            last_tool_result(&requests[2], "c1"),
-            ("the child's answer".into(), false)
-        );
+        assert!(answer(&requests[2], "c1").contains("the child's answer"));
         worker.stop().await;
     }
 }
 
-// --- a subagent's call is a one-shot session (ADR 0089 slice C1) ---------------------------
+// --- the one-shot call is a session that closes after its round (ADR 0089 slices C1 and C4) --
 
 /// The conversation the sessions of a run that has none belong to (`ChildStarter`).
 fn sessions_of(run: RunId) -> String {
@@ -699,7 +682,7 @@ fn told_a_report(request: &ModelRequest) -> bool {
 }
 
 #[tokio::test]
-async fn a_subagents_call_is_a_one_shot_session_that_is_closed_after_its_round() {
+async fn a_one_shot_start_that_waits_is_a_session_closed_after_its_round() {
     for (backend, store) in stores().await {
         let root = uniq("root");
         let agent = format!("{root}/helper");
@@ -707,7 +690,7 @@ async fn a_subagents_call_is_a_one_shot_session_that_is_closed_after_its_round()
         let session = child_run_id(run, "c1");
         let model = Arc::new(MockModel::new());
         model
-            .push_tool_calls(vec![call("c1", "helper", json!({"message": "work\nhard"}))])
+            .push_tool_calls(vec![delegate("c1", "helper", "work\nhard")])
             .push_text("the child's answer")
             // The parent's next turn sends to the session the call started: it is closed.
             .push_tool_calls(vec![call(
@@ -736,7 +719,7 @@ async fn a_subagents_call_is_a_one_shot_session_that_is_closed_after_its_round()
             Some(session_conversation_id(&conversation, session).as_str()),
             "{backend}"
         );
-        // Closed from its start, and closed now that its round has ended.
+        // `one_shot`: closed now that its round has ended.
         let read = rt
             .session_view(&conversation, session)
             .await
@@ -747,10 +730,8 @@ async fn a_subagents_call_is_a_one_shot_session_that_is_closed_after_its_round()
             (SessionState::Closed, true, 1)
         );
         let header = read.header.expect("a header");
-        assert!(
-            header.closed && header.mode == adam_runtime::SessionMode::OneShot && !header.closing
-        );
-        assert_eq!(header.description, "work");
+        assert_eq!(header.mode, adam_runtime::SessionMode::OneShot);
+        assert_eq!(header.description, "the task");
         // A listing shows it, as it shows any session.
         let listed = rt
             .list_sessions(&conversation, &[agent.as_str()], 0, 10)
@@ -766,10 +747,14 @@ async fn a_subagents_call_is_a_one_shot_session_that_is_closed_after_its_round()
             "{backend}: one turn each, no report told"
         );
         // The child's answer is the call's result, once: never told again as a report.
-        assert_eq!(
-            last_tool_result(&requests[2], "c1"),
-            ("the child's answer".into(), false)
+        let report = answer(&requests[2], "c1");
+        assert!(
+            report.starts_with(&format!(
+                "session {session} (helper, \"the task\"): round 1, closed"
+            )),
+            "{report}"
         );
+        assert!(report.contains("the child's answer"), "{report}");
         let (text, is_error) = last_tool_result(&requests[3], "s1");
         assert!(is_error, "{text}");
         assert!(
@@ -788,8 +773,8 @@ async fn two_calls_of_one_turn_are_two_sessions_with_their_own_conversations() {
     let model = Arc::new(MockModel::new());
     model
         .push_tool_calls(vec![
-            call("c1", "helper", json!({"message": "first"})),
-            call("c2", "helper", json!({"message": "second"})),
+            delegate("c1", "helper", "first"),
+            delegate("c2", "helper", "second"),
         ])
         .push_text("one")
         .push_text("two")
@@ -842,12 +827,51 @@ async fn two_calls_of_one_turn_are_two_sessions_with_their_own_conversations() {
             _ => None,
         })
         .collect();
-    assert_eq!(results, [("c1", "one".into()), ("c2", "two".into())]);
+    assert_eq!(results.len(), 2, "{results:?}");
+    for ((id, report), (want_id, answer)) in results.iter().zip([("c1", "one"), ("c2", "two")]) {
+        assert_eq!(*id, want_id);
+        assert!(report.contains(&format!("\t{answer}\n")), "{report}");
+    }
     worker.stop().await;
 }
 
+/// A host's own tool that waits on a child, as a subagent's own tool did before ADR 0089 slice C4
+/// (`ToolCtx::start_one_shot_session`, which the assembly no longer offers a tool for): it starts
+/// `helper` as a one-shot session of the parent and parks the parent on it.
+struct OneShot {
+    name: &'static str,
+    helper: String,
+}
+
+#[async_trait::async_trait]
+impl adam_llm_agent::Tool for OneShot {
+    fn spec(&self) -> adam_model::ToolSpec {
+        adam_model::ToolSpec {
+            name: self.name.into(),
+            description: "asks the helper once".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {"message": {"type": "string"}},
+                "required": ["message"],
+            }),
+        }
+    }
+
+    async fn call(
+        &self,
+        ctx: &adam_llm_agent::ToolCtx,
+        args: Value,
+    ) -> Result<ToolOutput, ToolError> {
+        let message = args["message"].as_str().unwrap_or_default();
+        let run = ctx
+            .start_one_shot_session(&self.helper, message, None)
+            .await?;
+        Err(ToolError::AwaitRun { run })
+    }
+}
+
 #[tokio::test]
-async fn a_child_started_before_it_was_a_session_is_found_by_the_call() {
+async fn a_hosts_one_shot_tool_finds_a_child_started_before_it_was_a_session() {
     // A parent journaled the call when its child was a plain child run (no conversation): the
     // call, run again under C1, finds that child and waits for it instead of failing.
     let root = uniq("root");
@@ -855,10 +879,17 @@ async fn a_child_started_before_it_was_a_session_is_found_by_the_call() {
     let model = Arc::new(MockModel::new());
     model
         .push_text("the old child's answer")
-        .push_tool_calls(vec![call("c1", "helper", json!({"message": "work"}))])
+        .push_tool_calls(vec![call("c1", "ask_helper", json!({"message": "work"}))])
         .push_text("all done");
-    let files = with_helper(&root, "tools: []", "");
-    let assembly = assemble(&files, ToolSet::new(), &model);
+    let files = with_helper(&root, "tools: [ask_helper]", "");
+    let assembly = assemble(
+        &files,
+        ToolSet::new().tool(OneShot {
+            name: "ask_helper",
+            helper: agent.clone(),
+        }),
+        &model,
+    );
     let rt = runtime_on(&assembly, Arc::new(MemoryStore::new()));
     let worker = spawn_worker(&rt);
     let run = RunId::new();
@@ -894,6 +925,65 @@ async fn a_child_started_before_it_was_a_session_is_found_by_the_call() {
     worker.stop().await;
 }
 
+/// A parent parked on a child that a subagent's own tool started before slice C4 (here a host tool
+/// that does what it did) is answered by a process of after it, which offers no such tool: the
+/// wait settles from the store, not from the tool.
+#[tokio::test]
+async fn a_parent_parked_on_a_subagents_own_tool_of_before_is_answered_after_the_upgrade() {
+    for (backend, store) in stores().await {
+        let root = uniq("root");
+        let child = format!("{root}/helper");
+        let model = Arc::new(MockModel::new());
+        model
+            .push_tool_calls(vec![call("c1", "helper_once", json!({"message": "work"}))])
+            .push_text("the child's answer")
+            .push_text("all done");
+        let before = assemble(
+            &with_helper(&root, "tools: [helper_once]", ""),
+            ToolSet::new().tool(OneShot {
+                name: "helper_once",
+                helper: child.clone(),
+            }),
+            &model,
+        );
+        // The process of before steps the parent and can start the child, but does not step it.
+        let first = Runtime::builder(store.clone())
+            .agent(before.root().clone())
+            .starter(LlmStarter::new(&child))
+            .poll_interval(std::time::Duration::from_millis(20))
+            .build();
+        let worker = spawn_worker(&first);
+        let run = first.start(&root, user_message("go"), None).await.unwrap();
+        let child_id = child_run_id(run, "c1");
+        wait_for("the parent to park on its child", || async {
+            let parent = store.load_run(run).await.unwrap()?;
+            let kid = store.load_run(child_id).await.unwrap()?;
+            (parent.status == RunStatus::Parked && kid.status == RunStatus::Runnable).then_some(())
+        })
+        .await;
+        worker.stop().await;
+        drop(first);
+
+        // The process of after: the same folder, and no tool named after the subagent.
+        let after = assemble(&with_helper(&root, "tools: []", ""), ToolSet::new(), &model);
+        assert_eq!(after.info()[0].tools, with_sessions(&[]));
+        let second = runtime_on(&after, store.clone());
+        let worker = spawn_worker(&second);
+        let view = wait_done(&second, run).await;
+        assert_eq!(
+            view.output.as_ref().unwrap()["text"],
+            "all done",
+            "{backend}"
+        );
+        assert_eq!(
+            last_tool_result(&model.requests()[2], "c1"),
+            ("the child's answer".into(), false),
+            "{backend}"
+        );
+        worker.stop().await;
+    }
+}
+
 // --- name clashes --------------------------------------------------------------------------
 
 fn bind_error(files: &Files, registered: ToolSet) -> Error {
@@ -921,9 +1011,9 @@ fn a_subagent_named_like_a_tool_of_its_parent_is_refused() {
     assert_eq!(*clash, ToolClash::Tool);
     assert_eq!(
         error.to_string(),
-        "agent `coder/helper` (agent/subagents/helper.md): the parent `coder` would get a tool \
-         called `helper` to call this subagent, but it already has a tool with that name: rename \
-         the subagent, or leave the tool out of the parent's `tools`"
+        "agent `coder/helper` (agent/subagents/helper.md): the parent `coder` would read `helper` \
+         as two things, a subagent and a tool it already has: rename the subagent, or leave the \
+         tool out of the parent's `tools`"
     );
 }
 
@@ -944,17 +1034,37 @@ fn a_tool_named_like_a_session_tool_is_refused() {
     assert_eq!(*clash, ToolClash::Tool);
 }
 
+/// ADR 0089 slice C4: an agent that has subagents, the root or a subagent with its own, gets the
+/// session tools, which are how it delegates; an agent without one gets none. No agent gets a tool
+/// named after a subagent.
 #[test]
-fn only_the_root_gets_the_session_tools() {
+fn every_agent_with_subagents_gets_the_session_tools_and_no_other() {
     let files = with_helper("coder", "", "");
     let assembly = assemble(&files, ToolSet::new(), &Arc::new(MockModel::new()));
     let info = assembly.info();
-    assert!(info[0].tools.iter().any(|t| t == "subagent_start"));
+    assert_eq!(info[0].tools, with_sessions(&[]));
     assert!(
         info[1].tools.iter().all(|t| !t.starts_with("subagent_")),
         "a subagent's tools: {:?}",
         info[1].tools
     );
+    let assembly = assemble(
+        &nested("coder"),
+        tools(&["parent_only", "fetch"]),
+        &Arc::new(MockModel::new()),
+    );
+    let tools_of = |name: &str| {
+        assembly
+            .info()
+            .iter()
+            .find(|i| i.name == name)
+            .unwrap()
+            .tools
+            .clone()
+    };
+    assert_eq!(tools_of("coder"), with_sessions(&["parent_only"]));
+    assert_eq!(tools_of("coder/researcher"), with_sessions(&["fetch"]));
+    assert!(tools_of("coder/researcher/summarizer").is_empty());
 }
 
 #[test]
@@ -965,19 +1075,7 @@ fn a_registered_tool_the_parent_does_not_list_is_no_clash() {
         tools(&["other", "helper"]),
         &Arc::new(MockModel::new()),
     );
-    assert_eq!(
-        assembly.info()[0].tools,
-        [
-            "other",
-            "helper",
-            "subagent_start",
-            "subagent_send",
-            "subagent_read",
-            "subagent_edit",
-            "subagent_close",
-            "subagent_list"
-        ]
-    );
+    assert_eq!(assembly.info()[0].tools, with_sessions(&["other"]));
 }
 
 #[test]
@@ -998,9 +1096,7 @@ fn a_subagent_named_like_a_skill_tool_is_refused() {
     assert_eq!(tool, "load_skill");
     assert_eq!(*clash, ToolClash::SkillTool);
     assert!(
-        error
-            .to_string()
-            .contains("its skills bring a tool with that name"),
+        error.to_string().contains("a tool its skills bring"),
         "{error}"
     );
 
@@ -1008,24 +1104,13 @@ fn a_subagent_named_like_a_skill_tool_is_refused() {
     files.pop();
     files.retain(|(path, _)| !path.starts_with("agent/skills"));
     let assembly = assemble(&files, ToolSet::new(), &Arc::new(MockModel::new()));
-    assert_eq!(
-        assembly.info()[0].tools,
-        [
-            "helper",
-            "load_skill",
-            "subagent_start",
-            "subagent_send",
-            "subagent_read",
-            "subagent_edit",
-            "subagent_close",
-            "subagent_list"
-        ]
-    );
+    assert_eq!(assembly.info()[0].tools, with_sessions(&["load_skill"]));
 }
 
 #[test]
 fn a_registered_tool_named_like_a_skill_tool_is_a_plain_tool_clash_without_skills() {
-    let mut files = with_helper("coder", "tools: [load_skill]", "");
+    // The root has no `tools:`, so it has every registered tool, `load_skill` among them.
+    let mut files = with_helper("coder", "", "");
     files.push((
         "agent/subagents/load_skill.md".into(),
         instructions("description: Loads.", "You load."),
@@ -1043,7 +1128,7 @@ fn a_registered_tool_named_like_a_skill_tool_is_a_plain_tool_clash_without_skill
     assert!(
         error
             .to_string()
-            .contains("already has a tool with that name"),
+            .contains("a subagent and a tool it already has"),
         "{error}"
     );
 }
@@ -1086,10 +1171,10 @@ fn two_subagents_with_one_name_are_refused() {
 
 #[test]
 fn a_clash_is_found_below_the_root_too() {
-    // researcher lists `summarizer` (a tool) and has a subagent of that name.
+    // researcher has every registered tool, `summarizer` among them, and a subagent of that name.
     let mut files = nested("coder");
     files[1].1 = instructions(
-        "description: Researches a topic.\ntools: [summarizer]",
+        "description: Researches a topic.\ntools: '*'",
         "You research.",
     );
     let error = bind_error(&files, tools(&["parent_only", "summarizer"]));
@@ -1149,19 +1234,7 @@ fn the_root_may_ask_and_a_subagent_that_does_not_is_fine() {
         ToolSet::new().tool(asking("ask_user")).tool(stub("fetch")),
         &Arc::new(MockModel::new()),
     );
-    assert_eq!(
-        assembly.info()[0].tools,
-        [
-            "ask_user",
-            "helper",
-            "subagent_start",
-            "subagent_send",
-            "subagent_read",
-            "subagent_edit",
-            "subagent_close",
-            "subagent_list"
-        ]
-    );
+    assert_eq!(assembly.info()[0].tools, with_sessions(&["ask_user"]));
     assert_eq!(assembly.info()[1].tools, ["fetch"]);
 }
 
@@ -1272,21 +1345,36 @@ async fn a_start_gets_the_filed_mode_says_it_in_the_roster_and_may_not_widen_it(
     assert_eq!(read.state, SessionState::Idle, "sealed stays open");
 }
 
-// --- the tool itself -----------------------------------------------------------------------
+// --- the named tools are gone (ADR 0089 slice C4) ---------------------------------------------
 
-#[test]
-fn a_subagent_tool_can_be_made_by_hand() {
-    let tool = SubagentTool::new("planner", "planner-agent", "Plans.");
-    assert_eq!(tool.agent(), "planner-agent");
-    assert_eq!(tool.spec().name, "planner");
-    assert!(!tool.asks_user());
-    assert!(tool.spec().description.starts_with("Plans. "));
-    // Its runs stop after 30 minutes unless it is told otherwise.
+/// A mode that lists the session tools keeps them (ADR 0089 slice C4): they are made after `bind`
+/// resolves the modes, and a mode may name them all the same, so an agent in that mode can still
+/// delegate. Before C4 such a mode quietly lost them and kept only the subagents' own tools.
+#[tokio::test]
+async fn a_mode_that_names_the_session_tools_keeps_them() {
+    let root = uniq("root");
+    let mut files = with_helper(&root, "tools: [fetch, other]", "");
+    files.push((
+        "agent/modes/plan.md".into(),
+        "---\ntitle: Plan\ndescription: Plans.\ndefault: true\ntools: [fetch, subagent_start, subagent_read]\n---\nPlan.\n"
+            .into(),
+    ));
+    let model = Arc::new(MockModel::new());
+    model.push_text("planned");
+    let assembly = assemble(&files, tools(&["fetch", "other"]), &model);
+    assert_eq!(assembly.info()[0].tools, with_sessions(&["fetch", "other"]));
+    let rt = runtime_on(&assembly, Arc::new(MemoryStore::new()));
+    let worker = spawn_worker(&rt);
+    let run = rt
+        .start(&root, user_message("plan it"), None)
+        .await
+        .unwrap();
+    wait_done(&rt, run).await;
+    worker.stop().await;
     assert_eq!(
-        tool.run_limit(),
-        Some(std::time::Duration::from_secs(30 * 60))
+        offered(&model.requests()[0]),
+        ["fetch", "subagent_start", "subagent_read"]
     );
-    assert_eq!(tool.with_run_limit(None).run_limit(), None);
 }
 
 // --- session limits (ADR 0045, slice 4) -------------------------------------------------------

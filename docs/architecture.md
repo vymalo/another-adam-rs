@@ -1383,27 +1383,30 @@ stateDiagram-v2
 
 ## Child runs
 
-A subagent is a child run: an agent started by a tool of another agent, with its own history, tools and
-limits, whose final answer is the result of that tool call. The runtime supplies `start_child`, the
+A subagent is a child run: an agent started by `subagent_start`, with its own history, tools and limits, as a round
+of a session of its parent. Started with `wait: true`, its first report is the result of that tool call. The runtime supplies `start_child`, the
 `adam.run.finished` message, `Ctx::child_status`, `Ctx::child_look` and `ToolError::AwaitRun`; no scheduler. A
 child that parks tells its parent with `adam.child.parked`, and a parent wakes a child parked on the model
 through itself (`Ctx::resume_child`, ADR 0067 decision 5). A child with a
 conversation (a session round, ADR 0045) reports with `adam.child.reported` instead, and
 `start_child_continuing` starts it ([Child runs](reference/child-runs.md#sessions-adr-0045-slices-1-to-4)).
 
-**A subagent's own tool starts a one-shot session** (ADR 0089, slice C1). The child is round 1 of a session of the
-parent, under the same derived id, and it is **closed from its start**:
+**Every child is a session, and a subagent has no tool of its own** ([ADR 0089](decisions/0089-every-child-is-a-session-and-the-one-shot-subagent-tool-goes.md), slices C1 and C4).
+The one-shot call is `subagent_start` with `mode: one_shot` and `wait: true`: round 1 of a session of the parent, under
+the id the call derives, which closes when its round ends.
 
-| | Before C1 | Since C1 |
-|---|---|---|
-| Conversation id | none | `<parent escaped>/s/<child id>` |
-| Listed by `subagent_list` and `child-sessions/v1` | no | yes: working, then closed |
-| A message to it, from the parent or a person | impossible (nothing addressed it) | refused: the session is closed |
-| Exported (ADR 0087) | no | yes, a record with `parent` set |
-| What the model sees | the call's result | the same: the same tool, the same result, never a second report |
+| | Before C1 | C1 to C4 | Since C4 |
+|---|---|---|---|
+| The tool | one per subagent, `{ message }` | the same | `subagent_start`, for every subagent |
+| Conversation id | none | `<parent escaped>/s/<child id>` | the same |
+| Listed by `subagent_list` and `child-sessions/v1` | no | yes | yes |
+| What the model gets | the child's text | the same | the session's page: its header line, `report: done` and the text |
+| A subagent with subagents of its own | a tool per subagent | the same | the session tools |
+| A remote subagent | its own tool, polled from the parent's step | the same | rounds of a round agent |
 
-The parent still parks on it as below; its end notice is `adam.child.reported`, which wakes the parent like the other.
-The evidence: [the page for agents](../.agents/docs/architecture.md#child-runs-a-subagents-tool-starts-a-one-shot-session-adr-0089-slice-c1).
+The parent parks on round 1 as below; its end notice is `adam.child.reported`, which wakes the parent like the other,
+and a round parked on the model shows on the parent as a child run does.
+The evidence: [the page for agents](../.agents/docs/architecture.md#child-runs-every-child-is-a-session-started-with-subagent_start-adr-0089-slices-c1-and-c4).
 
 ```mermaid
 sequenceDiagram
@@ -1414,11 +1417,11 @@ sequenceDiagram
     participant DB as Store
     participant C as Child run
 
-    P->>J: step tool:c1, run the tool
-    J->>R: start a one-shot session round under child_run_id(parent, c1)
+    P->>J: step tool:c1, subagent_start with mode one_shot, wait true
+    J->>R: start round 1 of a session under child_run_id(parent, c1)
     R->>DB: create_run with parent_id, or AlreadyExists (a replay)
-    J-->>P: Err(AwaitRun { run: child }), journaled
-    P->>DB: commit Park, wake_at = now + 60 s, pending_wait = { c1, child }
+    J-->>P: Err(AwaitSession { session: child }), journaled
+    P->>DB: commit Park, wake_at = now + 60 s, pending_wait = { c1, session }
     C->>DB: claim, step ... the model refuses: Park, wake_at = None, model_wait
     Note over C,DB: before a step and on each poll of its cancel watch the child reads the parent.<br/>Parent Failed, the child fails as cancelled by the parent run ending.<br/>Past its deadline, the child fails as cancelled by its time limit.
     C->>R: after the commit: notify_parent_parked
@@ -1426,48 +1429,51 @@ sequenceDiagram
     DB-->>P: parent is Runnable, inbox holds the notice
     P->>R: Ctx::child_look(child): its status and the head of its state
     R->>DB: load_run(child)
-    P->>DB: commit Park, wake_at = None, pending_wait = { c1, child, model_wait }
+    P->>DB: commit Park, wake_at = None, pending_wait = { c1, session, model_wait }
     Note over P,DB: the root's task is input-required with the child's reason
     P->>R: a message or a resume arrives: Ctx::resume_child(child, derived id)
     R->>DB: deliver adam.resume to the child (the words stay at the parent)
     C->>DB: claim, the same model call again
     C->>DB: step ... terminal commit, Done or Failed
     C->>R: after the commit: notify_parent
-    R->>DB: deliver to the parent: adam.run.finished, id = child id,<br/>payload { status, output or error }
-    DB-->>P: parent is Runnable, inbox holds the message
-    P->>P: message matches pending_wait: it becomes the tool result
-    Note over P,DB: If the message never arrives: at wake_at the parent<br/>reads the child with Ctx::child_look and answers or parks again.<br/>A child on a timer keeps that wake, and one until woken has none.
+    R->>DB: deliver to the parent: adam.child.reported, id = child id
+    DB-->>P: parent is Runnable, inbox holds the notice
+    P->>R: step poll:c1, read the session
+    P->>P: the session's page becomes the tool result, counted as read
+    Note over P,DB: If the notice never arrives: at wake_at the parent<br/>reads the session and answers or parks again.<br/>A round on a timer keeps that wake, and one until woken has none.
 ```
 
 ```mermaid
 stateDiagram-v2
-    [*] --> Calling: the model calls the tool
-    Calling --> Waiting: child started or found, AwaitRun journaled, run parked with a timer
-    Calling --> Answered: the child's message is already in the inbox (a replay or a retry)
-    Waiting --> Answered: adam.run.finished for this child arrives
-    Waiting --> Answered: timer wake, and the store says the child is terminal
-    Waiting --> Answered: timer wake, and the child no longer exists (an error result)
+    [*] --> Calling: the model calls subagent_start with wait true
+    Calling --> Waiting: round 1 started or found, AwaitSession journaled, run parked with a timer
+    Calling --> Answered: a replay finds the round ended: its report at once
+    Waiting --> Answered: adam.child.reported for this round arrives, and the read finds its report
+    Waiting --> Answered: timer wake, and the store says the round has ended
+    Waiting --> Answered: timer wake, and the session no longer exists (an error result)
     Waiting --> Waiting: timer wake, the child is still working (one read, new timer)
     Waiting --> Waiting: a user message or a stray notice arrives (nothing answers, new timer)
     Waiting --> WaitingOnPark: adam.child.parked, the child waits until it is woken (no timer)
     Waiting --> Waiting: adam.child.parked, the child waits on a timer (its reason kept, new timer)
     WaitingOnPark --> Waiting: a message or a resume arrives: one resume goes down, the copy is cleared, a new timer
     WaitingOnPark --> WaitingOnPark: a copy of a resume it read arrives: no call, the same wait
-    WaitingOnPark --> Answered: adam.run.finished for this child arrives
+    WaitingOnPark --> Answered: adam.child.reported for this round arrives
     WaitingOnPark --> Cancelled: the parent is cancelled
     Waiting --> Cancelled: the parent is cancelled (its child follows when its worker next looks)
-    Answered --> [*]: tool result is the child's text, or an error result
+    Answered --> [*]: tool result is the session's page, report done or failed
     Cancelled --> [*]
 ```
 
 The message is a hint; the parent's timer (`wait_poll`, 60 s) is the guarantee. A child parked on the model
 until it is woken is the one wait without a timer: such a child cannot finish on its own, so the parent parks
 with no timer too and its task says the reason, and a message or a resume to the root wakes the child through
-it (ADR 0067 decision 5). The child id is derived
+it (ADR 0067 decision 5). A host's own tool may still wait on a child run with `ToolError::AwaitRun`, the same wait
+with `adam.run.finished`. The child id is derived
 (`child_run_id(parent, key)`), so a tool that runs again asks for the same child. Cancelling a parent does
 cancel its children: a child whose parent is `Failed` is failed by its own worker, and a child started
 within a time limit is failed past it ([Cancel cascades](reference/child-runs.md#cancel-cascades-and-time-limits)). A
-subagent on another A2A agent is the same wait with polling and no message, and a cancel does not reach that task.
+subagent on another A2A agent is a session too: its rounds are runs of a round agent that polls the remote task, and a
+cancelled round cancels that task.
 The failure interleavings, their tests and what the design refuses are in
 [Child runs](reference/child-runs.md).
 

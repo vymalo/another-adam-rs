@@ -4,9 +4,9 @@
 //! A round is a run like any other round of a session, so the session tools, the listing, the
 //! notices, the closing round and the turn-end wait work on it unchanged. What it does differs: it
 //! has no model. It sends the round's message to the remote agent, looks at the task with `GetTask`
-//! on a timer, and reports the answer, as the tool of a one-shot remote subagent does
-//! ([`RemoteSubagentTool`](crate::remote::RemoteSubagentTool)) but with the context of the
-//! conversation carried from round to round.
+//! on a timer, and reports the answer, with the context of the conversation carried from round to
+//! round. It is the only way a remote subagent is reached: a one-shot use is a session with
+//! `mode: one_shot` and `wait: true` (ADR 0089 slice C4).
 //!
 //! Every call to the remote is a journaled step, and the task id is committed in the round's state
 //! as soon as it is known, so a restart looks at the task again and a replay sends nothing twice
@@ -542,6 +542,9 @@ impl RemoteRoundAgent {
             Ok(seen) => seen,
             Err(text) => return Ok(Some(text)),
         };
+        if let Some(task) = &seen.task {
+            tracing::debug!(agent = %self.name, %task, "remote task started");
+        }
         st.sent_ok(seen);
         Ok(None)
     }
@@ -824,15 +827,12 @@ fn request_of(message: Message) -> SendMessageRequest {
 fn seen_of_response(endpoint: &RemoteEndpoint, response: SendMessageResponse) -> Seen {
     match response {
         SendMessageResponse::Task(task) => seen_of_task(endpoint, &task),
-        SendMessageResponse::Message(reply) => {
-            let output = RemoteEndpoint::reply_with(&reply, None);
-            Seen {
-                task: None,
-                context: reply.context_id.clone(),
-                stage: Stage::Completed,
-                text: output.content,
-            }
-        }
+        SendMessageResponse::Message(reply) => Seen {
+            task: None,
+            context: reply.context_id.clone(),
+            stage: Stage::Completed,
+            text: RemoteEndpoint::reply(&reply),
+        },
     }
 }
 
@@ -846,12 +846,10 @@ fn seen_of_task(endpoint: &RemoteEndpoint, task: &Task) -> Seen {
                 said.unwrap_or_else(|| "(the remote agent asked for more input)".to_owned()),
             )
         }
-        state => match endpoint.outcome_with(task, None) {
+        _ => match endpoint.outcome(task) {
             Outcome::Working => (Stage::Working, String::new()),
-            Outcome::Done(output) if *state == TaskState::Completed => {
-                (Stage::Completed, output.content)
-            }
-            Outcome::Done(output) => (Stage::Failed, output.content),
+            Outcome::Completed(text) => (Stage::Completed, text),
+            Outcome::Failed(text) => (Stage::Failed, text),
         },
     };
     Seen {

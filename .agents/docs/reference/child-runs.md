@@ -85,7 +85,7 @@ is read from the store, the notice is only a wake-up). The cases: [session inter
 | S16 | `a_journal_from_before_reports_replays_to_the_same_history`, `a_replay_appends_the_same_reports`, `a_replay_of_a_stale_answer_counts_each_round_once` |
 | S17 | `each_limit_refuses_in_words`, `an_idle_expired_session_refuses_a_send_as_closed`, `an_expired_sessions_report_is_still_told_once`, `an_edit_past_a_bound_is_refused_and_changes_nothing`, `an_edit_of_an_idle_session_is_a_round_that_calls_no_model`, `a_retried_edit_applies_once` |
 | S18 | `a_persons_round_that_asks_the_person_is_blocked_and_the_answer_resumes_it`, `a_child_run_that_is_no_shown_session_cannot_ask`, `a_shown_round_asks_the_person_who_answers_it_in_the_child_context`; a hook's `Ask` in a child: `a_child_reads_ask_as_deny` (`crates/adam-llm-agent/tests/approval.rs`, a run whose start names a `root_run`; the predicate is `Conversation::may_ask_person` and `is_unattended`, read by `approvable` in `crates/adam-llm-agent/src/agent.rs`) |
-| S19 | `crates/adam-assembly/tests/subagents.rs`: `a_subagents_call_is_a_one_shot_session_that_is_closed_after_its_round`, `two_calls_of_one_turn_are_two_sessions_with_their_own_conversations`, `a_child_started_before_it_was_a_session_is_found_by_the_call`, `a_parent_restarted_mid_wait_still_gets_the_childs_answer`; `crates/adam-a2a-runtime/tests/child_sessions.rs`: `a_one_shot_session_is_listed_and_takes_no_message_from_the_person`; `crates/adam-export/tests/export.rs`: `a_subagents_run_is_a_record_of_its_own_linked_to_its_parent` |
+| S19 | `crates/adam-assembly/tests/subagents.rs`: `a_one_shot_start_that_waits_is_a_session_closed_after_its_round`, `two_calls_of_one_turn_are_two_sessions_with_their_own_conversations`, `a_parent_parked_on_a_subagents_own_tool_of_before_is_answered_after_the_upgrade`, `a_hosts_one_shot_tool_finds_a_child_started_before_it_was_a_session`, `a_parent_restarted_mid_wait_still_gets_the_childs_answer`; `crates/adam-llm-agent/tests/model_park.rs`: `a_start_that_waits_carries_its_rounds_park_and_a_message_wakes_the_round_through_it`; `crates/adam-a2a-runtime/tests/child_sessions.rs`: `a_one_shot_session_is_listed_and_takes_no_message_from_the_person`; `crates/adam-export/tests/export.rs`: `a_subagents_run_is_a_record_of_its_own_linked_to_its_parent` |
 | S20 | `each_mode_is_kept_in_the_header_and_decides_what_follows_the_round`, `keep_open_maps_onto_mode_and_a_disagreement_is_refused`, `a_model_started_session_asks_only_when_the_client_shows_child_sessions` (a sealed round cannot ask); `crates/adam-a2a-runtime/tests/child_sessions.rs`: `a_sealed_or_one_shot_session_of_the_agent_refuses_the_persons_message_and_steer`; the header's decoding: `a_header_carries_its_mode_and_one_of_before_reads_as_the_mode_keep_open_meant`, `a_person_writes_to_an_open_session_or_their_own` (`crates/adam-runtime/src/session.rs`) |
 | S21 | `a_start_that_waits_answers_its_first_report_once` |
 | S22 | `a_filed_mode_is_the_default_and_the_ceiling_of_a_start`, `a_filed_wait_is_a_default_a_call_may_turn_off`, `a_filed_session_changes_only_its_roster_line`; the unit `a_start_may_narrow_the_filed_mode_and_never_widen_it` (`crates/adam-llm-agent/src/sessions.rs`); `crates/adam-assembly/tests/subagents.rs`: `the_definition_carries_each_subagents_session_block`, `a_start_gets_the_filed_mode_says_it_in_the_roster_and_may_not_widen_it`; the loader: `crates/adam-agent-fs/tests/rules.rs` (`session_on_a_subagent_is_read_local_and_remote_and_absent_by_default`, `a_bad_session_block_stops_the_subagent_with_its_line`, four rule cases) |
@@ -108,17 +108,20 @@ Each has a test in `crates/adam-assembly/tests/remote_sessions.rs` (memory, and 
 | R8 | `closing_a_remote_session_is_local` |
 | R9 | `cancelling_a_remote_session_sends_cancel_task`, `cancelling_the_parent_sends_cancel_task`, `a_round_past_its_limit_cancels_the_remote_task` |
 | R10 | `a_lost_cancel_is_sent_by_the_next_round` |
-| R11 | `a_remote_session_takes_mode_and_wait_as_a_local_one_does` |
+| R11 | `a_remote_session_takes_mode_and_wait_as_a_local_one_does`; the one-shot use (`one_shot`, `wait: true`) end to end in `crates/adam-assembly/tests/remote.rs` (ADR 0089 slice C4: every case of the remote's own tool, converted), and a remote under a local subagent in `a_local_subagent_calls_a_remote_subagent_declared_in_its_own_directory` |
 
 ## Remote tasks
 
-The failure interleavings of a remote (`a2a:`) subagent's task. The cases: [remote tasks](../../../docs/reference/child-runs.md#remote-tasks-the-same-wait-without-a-message).
+The failure interleavings of a task a tool waits on (`ToolError::AwaitRemote`). Since ADR 0089 slice C4 no tool of the
+assembly does (a remote subagent is a remote session, above), so the cases are proved on a scripted tool in
+`crates/adam-llm-agent/tests/remote_tasks.rs`, and for a remote subagent by the same cases as a round in
+`crates/adam-assembly/tests/remote.rs` (named after each row). The cases: [remote tasks](../../../docs/reference/child-runs.md#remote-tasks-the-same-wait-without-a-message).
 
 | # | Test |
 |---|---|
-| 1 | `a_restart_mid_wait_resumes_polling_without_sending_again` (`adam-assembly`), `a_new_process_keeps_polling_without_starting_the_task_again` (`adam-llm-agent`) |
-| 2 | `a_send_whose_response_is_lost_is_retried_under_the_same_message_id` |
+| 1 | `a_new_process_keeps_polling_without_starting_the_task_again` (`adam-llm-agent`); as a round, `a_restart_mid_wait_resumes_polling_without_sending_again` (`adam-assembly`) |
+| 2 | as a round, `a_send_whose_response_is_lost_is_retried_under_the_same_message_id` (`adam-assembly`) |
 | 3 | the restart case above |
-| 4 | `a_task_that_never_ends_is_given_up_on_after_the_limit`, `a_task_that_outlives_its_timeout_is_an_error_result_without_another_look` |
-| 5 | `a_remote_task_that_fails_is_an_error_result_and_the_parent_goes_on`, `a_remote_task_that_is_canceled_is_an_error_result`, `a_remote_that_needs_input_is_an_error_result_because_nobody_can_answer` |
-| 6 | `a_wrong_token_is_an_error_result_not_a_failed_run_and_the_token_stays_out_of_it`, `a_card_that_points_the_token_at_another_origin_is_refused_before_anything_is_sent` |
+| 4 | `a_task_that_outlives_its_timeout_is_an_error_result_without_another_look` (`adam-llm-agent`); as a round, `a_task_that_never_ends_is_given_up_on_after_the_limit` (a failed report, and the remote task is cancelled) |
+| 5 | `a_task_that_failed_is_an_error_result_and_the_run_goes_on` (`adam-llm-agent`); as a round, `a_remote_task_that_fails_is_a_failed_report_and_the_parent_goes_on`, `a_remote_task_that_is_canceled_is_a_failed_report`, `a_remote_that_needs_input_reports_its_question` |
+| 6 | as a round, `a_wrong_token_is_a_failed_report_not_a_failed_run_and_the_token_stays_out_of_it`, `a_card_that_points_the_token_at_another_origin_is_refused_before_anything_is_sent` |

@@ -1466,8 +1466,9 @@ async fn on_a_screen_without_cards_or_a_catalog_the_researcher_answers_in_words_
 
 // --------------------------------------------------------------------------- subagents
 
-/// The subagents of a folder are registered beside the agent: the model calls the subagent's tool,
-/// a child run answers with its own prompt, and the agent goes on with the child's text.
+/// The subagents of a folder are registered beside the agent: the model starts one with
+/// `subagent_start` and waits (ADR 0089 slice C4: no tool is named after a subagent), a child run
+/// answers with its own prompt, and the agent goes on with the child's text.
 #[tokio::test]
 async fn a_local_subagent_of_the_folder_runs_as_a_child_run() {
     let folder = chat();
@@ -1480,8 +1481,9 @@ async fn a_local_subagent_of_the_folder_runs_as_a_child_run() {
     let mock = Arc::new(MockModel::new());
     mock.push_tool_calls(vec![ToolCall {
         id: "c1".into(),
-        name: "reviewer".into(),
-        arguments: json!({"message": "review this"}),
+        name: "subagent_start".into(),
+        arguments: json!({"agent": "reviewer", "description": "review", "prompt": "review this",
+                          "mode": "one_shot", "wait": true}),
         ..Default::default()
     }])
     .push_text("LGTM, nothing to fix.")
@@ -1509,7 +1511,6 @@ async fn a_local_subagent_of_the_folder_runs_as_a_child_run() {
             "plan_work",
             "plan_check",
             "plan_add",
-            "reviewer",
             "subagent_start",
             "subagent_send",
             "subagent_read",
@@ -1528,9 +1529,10 @@ async fn a_local_subagent_of_the_folder_runs_as_a_child_run() {
         adam_model::Message::Tool {
             call_id, content, ..
         } => {
-            assert_eq!(
-                (call_id.as_str(), content.as_str()),
-                ("c1", "LGTM, nothing to fix.")
+            assert_eq!(call_id, "c1");
+            assert!(
+                content.contains("report: done") && content.contains("LGTM, nothing to fix."),
+                "{content}"
             );
         }
         other => panic!("{other:?}"),

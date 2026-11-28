@@ -45,9 +45,9 @@ the function names are the anchors.
    route or schedule runs one. Check with `grep -rn "Exporter::new\|export_runs" crates bin --include=*.rs`.
 8. **Which runs are reached.** `RuntimeSource::page` lists with `ConversationScope::Prefix(String::new())`
    (`crates/adam-export/src/runtime_source.rs:85`), and `ConversationScope::contains` is `false` for a run with no conversation id
-   (`crates/adam-core/src/store/query.rs:23-29`). Since ADR 0089 slice C1 a subagent's own tool starts its child as a
-   one-shot session (`SubagentTool::call` → `ToolCtx::start_one_shot_session`), so every subagent run has a session's
-   conversation id and is exported, linked by `parent`
+   (`crates/adam-core/src/store/query.rs:23-29`). Since ADR 0089 slice C4 a subagent is started only with
+   `subagent_start` (C1 had made its own tool start a one-shot session, `ToolCtx::start_one_shot_session`), so every
+   subagent run has a session's conversation id and is exported, linked by `parent`
    (`crates/adam-export/tests/export.rs` `a_subagents_run_is_a_record_of_its_own_linked_to_its_parent`). Still not
    reached: a child a host starts with `Runtime::start_child` (no conversation) and a subagent run from before C1;
    listing those needs a query by parent, which `RunQuery` does not have: a `Store` change (Rule 2), not an exporter

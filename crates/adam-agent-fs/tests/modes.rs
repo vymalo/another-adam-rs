@@ -341,3 +341,100 @@ fn each_agent_of_a_package_has_its_own_modes() {
     assert_eq!(agents[0].modes.len(), 1);
     assert!(agents[1].modes.is_empty());
 }
+
+/// ADR 0089 decision 6, slice C4: a subagent is no tool, so a `tools:` that names one by the tool
+/// it used to have (`reviewer`) is refused when the folder is read, at the line of `tools`, naming
+/// `subagent_start` instead: the root's own, a mode's (which would quietly lose the subagent), and
+/// a subagent's that names one of its own subagents. A remote subagent counts as one; a name that
+/// is only some other agent's subagent is no concern of this list.
+#[test]
+fn a_tools_list_that_names_a_subagent_is_refused_naming_subagent_start() {
+    let refusal = |name: &str| {
+        format!(
+            "`tools` names the subagent `{name}`, and it is not a tool: a subagent is started \
+             with `subagent_start` (`agent: {name}`; `mode: one_shot` and `wait: true` to wait for \
+             its answer), which an agent with subagents always has. Remove it from `tools`"
+        )
+    };
+    let reviewer = "---\ndescription: Reviews.\n---\nYou review.\n";
+    let billing = "---\ndescription: Billing.\na2a: https://billing.example.com/card\n---\n";
+    for (files, file, line, name) in [
+        (
+            vec![
+                (
+                    "agent/instructions.md",
+                    "---\nname: root\ntools: [read_file, reviewer]\n---\nYou are root.\n",
+                ),
+                ("agent/subagents/reviewer.md", reviewer),
+            ],
+            "agent/instructions.md",
+            3,
+            "reviewer",
+        ),
+        (
+            vec![
+                ("agent/instructions.md", ROOT),
+                ("agent/subagents/billing.md", billing),
+                (
+                    "agent/modes/plan.md",
+                    "---\ndescription: Plans.\ndefault: true\ntools:\n  - read_file\n  - billing\n---\n",
+                ),
+            ],
+            "agent/modes/plan.md",
+            4,
+            "billing",
+        ),
+        (
+            vec![
+                ("agent/instructions.md", ROOT),
+                (
+                    "agent/subagents/researcher/instructions.md",
+                    "---\ndescription: Researches.\ntools: [summarizer]\n---\nYou research.\n",
+                ),
+                ("agent/subagents/researcher/subagents/summarizer.md", SUB),
+            ],
+            "agent/subagents/researcher/instructions.md",
+            3,
+            "summarizer",
+        ),
+    ] {
+        let dir = write(&files);
+        let report = load(dir.path());
+        let found = errors(&report);
+        assert_eq!(found.len(), 1, "{file}: {found:#?}");
+        assert_eq!(found[0].path, Path::new(file));
+        assert_eq!(found[0].line, Some(line), "{file}");
+        assert_eq!(found[0].message, refusal(name), "{file}");
+    }
+    // Two of them are named in one sentence; a sibling's subagent is not this agent's.
+    let dir = write(&[
+        (
+            "agent/instructions.md",
+            "---\nname: root\ntools: [reviewer, billing, summarizer]\n---\nYou are root.\n",
+        ),
+        ("agent/subagents/reviewer.md", reviewer),
+        ("agent/subagents/billing.md", billing),
+        ("agent/subagents/researcher/instructions.md", SUB),
+        ("agent/subagents/researcher/subagents/summarizer.md", SUB),
+    ]);
+    let report = load(dir.path());
+    let found = errors(&report);
+    assert_eq!(found.len(), 1, "{found:#?}");
+    assert!(
+        found[0].message.starts_with(
+            "`tools` names the subagents `reviewer`, `billing`, and they are not tools: a \
+             subagent is started with `subagent_start` (`agent: reviewer`;"
+        ) && found[0].message.ends_with("Remove them from `tools`"),
+        "{}",
+        found[0].message
+    );
+    // A list that names none, `*`, and the session tools themselves load.
+    for tools in ["[read_file]", "'*'", "[subagent_start, subagent_read]"] {
+        let root = format!("---\nname: root\ntools: {tools}\n---\nYou are root.\n");
+        let dir = write(&[
+            ("agent/instructions.md", root.as_str()),
+            ("agent/subagents/reviewer.md", reviewer),
+        ]);
+        assert!(errors(&load(dir.path())).is_empty(), "{tools}");
+    }
+}

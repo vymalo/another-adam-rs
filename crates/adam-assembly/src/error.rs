@@ -145,7 +145,7 @@ impl fmt::Display for CapSource {
     }
 }
 
-/// What a subagent's tool name collides with, in [`Error::SubagentToolClash`].
+/// What a subagent's name collides with, in [`Error::SubagentToolClash`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ToolClash {
     /// A tool of the parent: one registered with
@@ -563,11 +563,11 @@ pub enum Error {
         /// The name in conflict.
         tool: String,
     },
-    /// A subagent is called as a tool named after it, and its parent already has a tool of that
-    /// name.
+    /// A subagent is named like a tool its parent's model reads, or like another subagent of the
+    /// parent: the model would read one word as two things. (Before ADR 0089 slice C4 the parent
+    /// got a tool named after each subagent; the names stay apart without it.)
     #[error(
-        "{origin}: the parent `{parent}` would get a tool called `{tool}` to call this subagent, \
-         but {}",
+        "{origin}: the parent `{parent}` would read `{tool}` as two things, {}",
         clash_reason(.clash)
     )]
     SubagentToolClash {
@@ -575,7 +575,7 @@ pub enum Error {
         origin: Origin,
         /// The registration name of the parent.
         parent: String,
-        /// The tool name, which is the subagent's name.
+        /// The name in conflict, the subagent's.
         tool: String,
         /// What it collides with.
         clash: ToolClash,
@@ -799,21 +799,20 @@ impl Classify for Error {
 /// The second half of [`Error::SubagentToolClash`].
 fn clash_reason(clash: &ToolClash) -> String {
     match clash {
-        ToolClash::Tool => {
-            "it already has a tool with that name: rename the subagent, or leave the \
-             tool out of the parent's `tools`"
-                .to_owned()
-        }
-        ToolClash::SkillTool => "its skills bring a tool with that name (`load_skill` and \
+        ToolClash::Tool => "a subagent and a tool it already has: rename the subagent, or leave \
+             the tool out of the parent's `tools`"
+            .to_owned(),
+        ToolClash::SkillTool => "a subagent and a tool its skills bring (`load_skill` and \
              `read_skill_file` are reserved): rename the subagent"
             .to_owned(),
         ToolClash::Subagent { file } => format!(
-            "another subagent of the parent, in {}, has the same name: rename one of them",
+            "this subagent and another subagent of the parent, in {}, with the same name: rename \
+             one of them",
             portable(file)
         ),
         ToolClash::McpTool { server } => format!(
-            "the parent's MCP server `{server}` has a tool with that name: rename the subagent, \
-             or list the server's tools under `tools` in `mcp.json` without it"
+            "a subagent and a tool of the parent's MCP server `{server}`: rename the subagent, or \
+             list the server's tools under `tools` in `mcp.json` without it"
         ),
     }
 }

@@ -177,7 +177,6 @@ async fn each_agent_gets_its_own_mcp_json() {
         [
             "linear__echo",
             "read_output",
-            "researcher",
             "subagent_start",
             "subagent_send",
             "subagent_read",
@@ -818,7 +817,11 @@ async fn a_subagents_files_stay_on_the_subagents_run() {
         .unwrap();
     let model = Arc::new(MockModel::new());
     model
-        .push_tool_calls(vec![call("c1", "browser", json!({"message": "look"}))])
+        .push_tool_calls(vec![call(
+            "c1",
+            "subagent_start",
+            json!({"agent": "browser", "description": "look", "prompt": "look", "wait": true}),
+        )])
         .push_tool_calls(vec![call("s1", "linear__screenshot", json!({}))])
         .push_text("The page is blank.")
         .push_text("The browser says the page is blank.");
@@ -839,10 +842,10 @@ async fn a_subagents_files_stay_on_the_subagents_run() {
         view.output.as_ref().unwrap()["text"],
         "The browser says the page is blank."
     );
-    assert_eq!(
-        last_tool_result(&model.requests()[3], "c1"),
-        ("The page is blank.".into(), false),
-        "only the subagent's text comes back"
+    let (report, is_error) = last_tool_result(&model.requests()[3], "c1");
+    assert!(
+        !is_error && report.contains("report: done") && report.contains("The page is blank."),
+        "only the subagent's text comes back: {report}"
     );
     let on = |v: &adam_runtime::RunView| -> Vec<String> {
         v.artifacts.iter().map(|a| a.name.clone()).collect()

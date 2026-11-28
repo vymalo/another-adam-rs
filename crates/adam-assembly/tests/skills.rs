@@ -194,12 +194,11 @@ fn the_catalog_follows_the_prompt_and_escapes_the_descriptions() {
     assert_eq!(info(&assembly, "coder").skills, ["alpha", "beta", "gamma"]);
     assert_eq!(
         info(&assembly, "coder").tools,
-        // The skills' tools, then the tool that runs the subagent, then the six that run one in
-        // the background.
+        // The skills' tools, then the six that start and follow the subagent (no tool is named
+        // after it: ADR 0089 slice C4).
         [
             LOAD_SKILL,
             READ_SKILL_FILE,
-            "helper",
             "subagent_start",
             "subagent_send",
             "subagent_read",
@@ -231,11 +230,10 @@ fn without_a_skill_there_is_no_catalog_and_no_tool() {
     let assembly = assemble(def_of(&dir), Arc::new(MockModel::new()));
     let none = info(&assembly, "coder");
     assert_eq!(without_sessions(&none.prompt), "You are the coder.");
-    // No skill tools, and no catalog; the subagent's tool stays.
+    // No skill tools, and no catalog; the session tools stay.
     assert_eq!(
         none.tools,
         [
-            "helper",
             "subagent_start",
             "subagent_send",
             "subagent_read",
@@ -491,7 +489,6 @@ async fn the_model_loads_a_skill_then_reads_one_of_its_files() {
         [
             LOAD_SKILL,
             READ_SKILL_FILE,
-            "helper",
             "subagent_start",
             "subagent_send",
             "subagent_read",
@@ -692,7 +689,6 @@ async fn preloading_everything_leaves_no_loader_and_no_catalog() {
         coder.tools,
         [
             READ_SKILL_FILE,
-            "helper",
             "subagent_start",
             "subagent_send",
             "subagent_read",
@@ -709,7 +705,6 @@ async fn preloading_everything_leaves_no_loader_and_no_catalog() {
         tool_names(&model.requests()[0]),
         [
             READ_SKILL_FILE,
-            "helper",
             "subagent_start",
             "subagent_send",
             "subagent_read",
@@ -726,7 +721,6 @@ async fn preloading_everything_leaves_no_loader_and_no_catalog() {
     assert_eq!(
         coder.tools,
         [
-            "helper",
             "subagent_start",
             "subagent_send",
             "subagent_read",

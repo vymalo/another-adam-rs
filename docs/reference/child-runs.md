@@ -1,12 +1,14 @@
 # Child runs and remote tasks
 
-A subagent is a run started by a tool of another run. This page is the full design of the runtime half:
+A subagent is a run started by a tool of another run: `subagent_start`, since [ADR 0089](../decisions/0089-every-child-is-a-session-and-the-one-shot-subagent-tool-goes.md)
+slice C4 the only one the assembly offers (no tool is named after a subagent). This page is the full design of the runtime half:
 the local case, the remote (A2A) case, every failure interleaving and what the design does about it,
 and what the design refuses. The picture is in [Architecture](../architecture.md#child-runs); how a
 folder declares subagents is in [Agent files](agent-files.md#subagents-at-run-time).
 
 Code: `crates/adam-runtime` (`start_child`, `child_status`, `child_look`, `resume_child`, the notices), `crates/adam-llm-agent`
-(`pending_wait`, `AwaitRun`, `AwaitRemote`), `crates/adam-assembly` (`SubagentTool`, `RemoteSubagentTool`).
+(`pending_wait`, `AwaitRun`, `AwaitRemote`, `AwaitSession`, the session tools), `crates/adam-assembly` (the roster of the
+session tools, `RemoteRoundAgent`).
 
 Every interleaving below has a test that makes it happen. The test of each row, and how the tests hold a step
 or move the clock: [child runs, for agents](../../.agents/docs/reference/child-runs.md).
@@ -19,7 +21,7 @@ or move the clock: [child runs, for agents](../../.agents/docs/reference/child-r
 * [Sessions (ADR 0045, slices 1 to 4)](#sessions-adr-0045-slices-1-to-4)
 * [A child that asks the person](#a-child-that-asks-the-person)
 * [Remote sessions](#remote-sessions)
-* [Remote tasks: the same wait without a message](#remote-tasks-the-same-wait-without-a-message)
+* [Remote tasks: the same wait without a message](#remote-tasks-the-same-wait-without-a-message) (a tool of your own)
 
 ## A local child
 
@@ -187,9 +189,9 @@ stateDiagram-v2
   it parks with no timer the deadline is cleared and what is left is kept (`remaining_secs`), and the next step that
   follows a message sets it again; time on a timer, or on a child, still counts. A wake that arrives before the deadline
   (the store's clock and the runtime's disagree) parks the run again to the deadline plus a second, without stepping the
-  agent, so a skew cannot make a tight loop. `SubagentTool` passes
+  agent, so a skew cannot make a tight loop. `subagent_start` passes
   `limits.max_minutes` of the subagent's file: **30 minutes** when it says nothing, `0` for none, at most 1,440
-  ([agent files](agent-files.md#the-subagent-tool)). The limit is per run: each round of a session has its own.
+  ([agent files](agent-files.md#starting-a-subagent)). The limit is per run: each round of a session has its own.
 * **Time limit of a tool call.** A call that runs past `Tool::time_limit` (300 s when it declares none) is stopped
   inside its journaled step and answered with an error, so a replay never waits ([errors](errors.md#what-the-model-is-told)).
 
@@ -204,12 +206,12 @@ What the design refuses to do, and why:
   lost *finish* notice after the root has copied an until-woken wait: the root has no timer then, so it never steps
   again, the child's end is never read, and the task stays `input-required` with the child's reason until a message,
   a resume or a cancel.
-* **No parallel fan-out of one-shot subagents yet.** An `LlmAgent` runs the calls of one model turn at the same time
+* **No parallel fan-out of starts that wait.** An `LlmAgent` runs the calls of one model turn at the same time
   ([ADR 0049](../decisions/0049-the-tool-calls-of-a-turn-run-at-the-same-time.md)), but a call that can park the run (a
-  subagent, a remote agent) runs alone, so three subagent calls in one turn run one after the other; background
-  sessions ([ADR 0045](../decisions/0045-a-subagent-can-run-in-the-background-as-a-session.md)) are the way to children
-  side by side. Starting all the
-  children first and waiting for all of them needs `pending_wait` to hold several runs.
+  `subagent_start` with `wait: true`, a remote task) runs alone, so three such calls in one turn run one after the
+  other; starts that do not wait ([ADR 0045](../decisions/0045-a-subagent-can-run-in-the-background-as-a-session.md))
+  are the way to children side by side. Starting all the
+  children first and waiting for all of them in one call needs `pending_wait` to hold several runs.
 * **A child asks the person only in a shown `open` session.** A park with no timer clears the child's deadline,
   so nothing but a cancel ends it: a question nobody can answer would strand the child. Since ADR 0045 slice 8 the
   rule is decided **per run**, not at bind: a round of an `open` session whose client shows it
@@ -237,8 +239,9 @@ Code that runs inside a step but cannot hold the `Ctx`, such as a tool of an `Ll
 `Ctx::child_starter()`: an owned `ChildStarter` for the runtime that is stepping the run, which can start only
 children of that run (`start` is `start_child` with the parent fixed). `LlmAgent` hands it to every tool as
 `ToolCtx::start_child(agent, message)` (under `ToolCtx::child_run_id()`), so a tool needs no `Runtime` handle,
-and the child starts on the runtime that steps the parent, whichever process that is. The subagent tool of
-`adam-assembly` is exactly this call followed by `AwaitRun`; see [subagents](agent-files.md#the-subagent-tool).
+and the child starts on the runtime that steps the parent, whichever process that is. A host's own tool that waits on
+a child is this call (or `ToolCtx::start_one_shot_session`) followed by `AwaitRun`; the assembly's subagents are started
+with `subagent_start` instead ([subagents](agent-files.md#starting-a-subagent)).
 
 A hand-written `Agent` can wait for children too: start them with `start_child`, `Park` with a timer, and on
 the next step read `take_inbox()` for messages of kind `adam.run.finished` (`ChildStatus::from_notice`) and
@@ -250,15 +253,16 @@ reading it sleeps until its timer.
 
 [ADR 0045](../decisions/0045-a-subagent-can-run-in-the-background-as-a-session.md) lets a subagent run in the
 background as a session that is sent more messages. The runtime half (slice 1) is in `crates/adam-runtime`; the six tools
-(slice 2, and slice 4's `subagent_edit`) are in `crates/adam-llm-agent` (`sessions.rs`) and are given to a root with subagents by `adam-assembly`, which also ends that root's instructions with a short *Child sessions* section that tells the model what each tool does ([ADR 0054](../decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md) decision 9). A person can start the same sessions over A2A (`child-sessions/v1`, slice 6): the rounds are runs of the same helper agents, started by the front of a `control-plane` process through start-only registrations (`AgentDef::session_starters`) and stepped by a worker; see [the A2A server](a2a-server.md#child-sessions-child-sessionsv1).
+(slice 2, and slice 4's `subagent_edit`) are in `crates/adam-llm-agent` (`sessions.rs`) and are given to every agent with subagents by `adam-assembly`
+(the root, and since ADR 0089 slice C4 a subagent with its own: its round's sessions live in its round's conversation). A person can start the same sessions over A2A (`child-sessions/v1`, slice 6): the rounds are runs of the same helper agents, started by the front of a `control-plane` process through start-only registrations (`AgentDef::session_starters`) and stepped by a worker; see [the A2A server](a2a-server.md#child-sessions-child-sessionsv1).
 
 **What the runtime has.**
 
-* **A subagent's own tool starts a one-shot session** (ADR 0089, slice C1): `ToolCtx::start_one_shot_session`, which
-  `SubagentTool` calls, starts round 1 of a session whose header says it is closed from the start, under
-  `child_run_id(parent, call_id)` as before. The parent parks on it as on any child ([a local child](#a-local-child)).
-  A remote subagent's own tool is unchanged: it calls the remote from the parent's step and starts no child run
-  (slice C2 keeps it so; [remote sessions](#remote-sessions) say why).
+* **The one-shot call is a session** (ADR 0089, slices C1 and C4): `subagent_start` with `mode: one_shot` and
+  `wait: true` starts round 1 under `child_run_id(parent, call_id)`, the id the subagent's own tool used, and parks on
+  it; the round's park on the model shows on the parent as a child run's does ([a park on the model](#a-park-on-the-model)).
+  C1's `ToolCtx::start_one_shot_session` (a header closed from the start) stays for a host's own tool; the assembly's
+  named tools, local and remote, are gone (C4).
 * **`mode` and `wait`** (ADR 0089, slice C2): `subagent_start` chooses who may write after the first round and whether the
   call waits for the first report. `SessionMode` is kept in the header (`SessionHeader::mode`):
 
@@ -270,8 +274,9 @@ background as a session that is sent more messages. The runtime half (slice 1) i
 
   `keep_open` is read for one release (`true` is `open`, `false` `one_shot`; with a `mode` that disagrees, an error result naming
   both). `wait: true` parks the call as `subagent_read` with `wait: true` does (`ToolError::AwaitSession`), and its result is the
-  first report with the session's id, counted as read, so it is never told again as a report. A subagent's own tool (slice C1)
-  is `one_shot` **closed from its start**, so not even the parent can steer it, and waits with `ToolError::AwaitRun`.
+  first report with the session's id, counted as read, so it is never told again as a report. C1's one-shot session
+  (`ToolCtx::start_one_shot_session`, a host's tool) is `one_shot` **closed from its start**, so not even the parent can
+  steer it, and waits with `ToolError::AwaitRun`.
 * `Runtime::start_child_continuing` starts a child run **with a conversation id**: the parent's id (with `%` and
   `/` escaped, so a client's context id cannot spell another session's), then `/s/` and the session id
   (`session_conversation_id`). Round 1's run id, `child_run_id(parent, call_id)`, is the session id. From round 2
@@ -518,7 +523,7 @@ answer has streamed, not before the call.
 | S16 | A journal from before slice 3, or one with reports, is replayed, with a message that arrived since | The same history, no model asked, no child run, no disagreement; the rounds are counted once even when the answer is dropped as stale |
 | S17 | A session has sat idle for `idle_ttl`, or an edit goes past a bound, or an edit reaches an idle session | It reads closed, frees its place, refuses a send in words; a working round never expires; its unreported report is told once. An edit past a bound is refused in words and changes nothing; an edit of an idle session is a round that calls no model, has no report and counts toward `max_rounds` |
 | S18 | A round asks the person, and one that may not asks anyway | A shown kept-open round parks `input-required` and the parent's read says `blocked`; an answer in the child context resumes it; a child that may not ask is told `NOT_ASKABLE` and goes on |
-| S19 | A subagent's own tool is called (ADR 0089, slice C1) | The child is a **one-shot session**: round 1 under the call's derived id, closed from its start. It has a session's conversation id, is listed working and then closed, refuses a send from the parent and a message or a steer from a person, and its answer is the call's result once, never a report; a child a journal started before C1 (no conversation) is found by the call |
+| S19 | A one-shot call: `subagent_start` with `mode: one_shot` and `wait: true` (ADR 0089, slices C1 and C4) | The child is round 1 of a session under the call's derived id. It has a session's conversation id, is listed working and then closed, refuses a send from the parent afterwards, and its report is the call's result once, never a report; a parent parked on a subagent's own tool of before C4 is answered from the store; a host's tool over `start_one_shot_session` finds a child a journal started before C1 (no conversation) |
 | S20 | `subagent_start` names a `mode` (ADR 0089, slice C2) | `one_shot` closes after its round and refuses a send; `sealed` and `open` stay idle and take the parent's next round. A person's message to an agent's `sealed` or `one_shot` session, and a steer of its round, are `UnsupportedOperation` naming the mode; a close passes. Only an `open` round may ask the person. `keep_open` maps onto `mode`, and a disagreement is an error result naming both |
 | S21 | `subagent_start` with `wait: true` | The call parks on round 1 and its result is the first report, with the session id; the report is not told again; observers see `session.started` at the park and `session.round.ended` at the settle |
 | S22 | The subagent's file has `session:` (ADR 0089, slice C3) | A start that names no `mode` gets the file's, and one that names no `wait` the file's; a narrower `mode` (or `keep_open: false`) starts; a wider one (or `keep_open: true`) is an error result naming the mode asked, the ceiling and the subagent, and starts nothing; `wait: false` beats a filed `wait: true`. Only that subagent's roster line in `subagent_start` changes |
@@ -575,7 +580,7 @@ round that only closes a session, for the tools and for the A2A front.
 
 A **round of an `open` session** may ask the person (ADR 0045 decision 9), and only that: the person sees the
 session because their client activated `child-sessions/v1`, and answers in the round's own thread. Anything else in
-a child run is told that nobody can answer and goes on: a one-shot child, a round of a `one_shot` or `sealed` session
+a child run is told that nobody can answer and goes on: a plain child run, a round of a `one_shot` or `sealed` session
 (ADR 0089: the person cannot write to it), and a round of a session whose client does not show it (`adam_llm_agent::NOT_ASKABLE`). A hook's request to approve a
 call (ADR 0050, slice H8) follows the same rule: such a child reads it as a refusal, the call is answered with
 `adam_llm_agent::NOT_APPROVABLE` and the hook's question, and nothing waits.
@@ -637,19 +642,19 @@ variables are set.
 
 A session on a remote (`a2a:`) subagent works like any other session: the same six tools, listing, notices, closing
 round and turn-end wait. Its rounds are runs of `RemoteRoundAgent` (`crates/adam-assembly/src/remote_session.rs`),
-registered as `<root>/<subagent>` by `Assembly::register`. The round has no model: it sends the message, looks at the
-task and reports. It shares the connection of the subagent's tool (`RemoteEndpoint` in `remote.rs`: card, token,
-interface rules), so the token goes only where the tool sends it.
+registered as `<parent>/<subagent>` by `Assembly::register` (every remote subagent has one, a subagent's included). The
+round has no model: it sends the message, looks at the task and reports. It holds the connection `bind` checked
+(`RemoteEndpoint` in `remote.rs`: card, token, interface rules), so the token goes only to the card's origin.
 
 **`mode` and `wait` on a remote session** (ADR 0089, slice C2) are the local ones: the rounds are local runs with the
 session's header, so `one_shot` closes, `sealed` refuses the person's message and steer at the A2A front, and `wait: true`
 parks the start on round 1. The remote agent is told nothing of the mode: it is ours to enforce, and no A2A field carries it.
-**What stays different: the remote subagent's own tool** (`RemoteSubagentTool`). It sends the message from the parent's own
-step and waits with `ToolError::AwaitRemote`, so it starts no child run and has no session, no conversation id, no listing
-and no export record. C2 leaves it so, for three reasons: it shares the remote's files as artifacts of the parent
-(`files: true`), which a round only describes in a line; it exists whether or not the root has session tools, while a
-`RemoteRoundAgent` is registered only for a root that has them; and slice C4 removes it, its use then being `subagent_start`
-with `mode: one_shot` and `wait: true`, which already works.
+**The remote subagent's own tool is gone** (ADR 0089, slice C4). It sent the message from the parent's own step and waited
+with `ToolError::AwaitRemote`, so it had no session, no conversation id, no listing and no export record. Its use is
+`subagent_start` with `mode: one_shot` and `wait: true`. What a round does not do that it did: share a `files: true` answer
+as files of the parent (a round describes a file in a line, and `bind` warns that the key has no effect), and put the
+body of the remote's file in a description (the roster line is its `description`). A remote under a local subagent has a
+round agent too now, so that subagent can use it.
 
 ```mermaid
 sequenceDiagram
@@ -719,8 +724,7 @@ look, or report. Every call to the remote is a journaled step (`card`, `send:<n>
   message that arrives first joins the first send.
 * **Window of a message id.** A round remembers the last 64 message ids it read (`read_ids`, what a retried
   `subagent_send` checks). A copy delivered again after 64 newer messages is read as new and sent again.
-* **Limit.** `AgentDef::remote_timeout` (`RemoteSettings::max_wait`) is both the wait cap of the one-shot tool and the limit
-  of a session round. The tools give it to the runtime as the round's time limit, and the round also records its first step
+* **Limit.** `AgentDef::remote_timeout` (`RemoteSettings::max_wait`) is the limit of a session round. The tools give it to the runtime as the round's time limit, and the round also records its first step
   and fails at the limit itself (`cancel-limit`), because a round the A2A front starts has no runtime limit.
 * **Looks.** The first look is 2 s after the send, then 4 s, 8 s and so on up to `wait_poll`, each a journaled `GetTask`.
   The report waits at most that long.
@@ -750,12 +754,15 @@ message id, which a deduplicating remote answers with the task it made, and canc
 makes a task and then cancels it.) A closing round cancels what the round before left before it closes. Messages a failed or
 cancelled round never sent go first in the next round. The cancel is not durable: it is sent once by the process that commits the cancel, and a process that registered
 only the starter sends nothing (the next round recovers it). A reload of `LiveAssembly` does not replace the round agents:
-a changed remote needs a restart. A parent that has a remote subagent and no local one now has the six session tools.
+a changed remote needs a restart (since C4 a rotated token too: the remote's own tool was bound again by a reload). A parent
+that has a remote subagent and no local one has the six session tools.
 
 ## Remote tasks: the same wait without a message
 
-A subagent on another A2A agent (`a2a:` in its file) is the same idea with one thing missing: nothing tells
-the parent when the remote task is over. The tool starts the task, returns `ToolError::AwaitRemote { task,
+A tool that starts a task on another system is the same idea with one thing missing: nothing tells the parent when
+the remote task is over. It was the remote subagent's own tool until ADR 0089 slice C4 removed it (a remote subagent is
+a [remote session](#remote-sessions) now); `ToolError::AwaitRemote` and `Tool::poll_remote` stay for a host's own tool.
+The tool starts the task, returns `ToolError::AwaitRemote { task,
 timeout_ms }`, and the parent records `PendingWait::Remote { call_id, tool, task, deadline }` and parks with
 the `wait_poll` timer. Each time it fires the agent asks the tool how the task stands, as a journaled step,
 until it is over. **The timer is the mechanism.**
@@ -765,12 +772,12 @@ sequenceDiagram
     autonumber
     participant P as Parent run<br/>LlmAgent
     participant J as Journal
-    participant T as RemoteSubagentTool
+    participant T as A tool that waits<br/>on a remote task
     participant A as Remote A2A agent
     participant DB as Store
 
     P->>J: step tool:c1
-    J->>T: call(message)
+    J->>T: call(arguments)
     T->>A: SendMessage, returnImmediately, messageId = child_run_id(parent, c1)
     A-->>T: Task, working
     J-->>P: Err(AwaitRemote { task, timeout_ms }), journaled

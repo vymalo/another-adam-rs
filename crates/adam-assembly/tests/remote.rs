@@ -1,5 +1,7 @@
-//! Remote (A2A) subagents: a tool on the parent whose call is a journaled `SendMessage`, and a
-//! wait that looks at the remote task with `GetTask` on the timer. Run end to end on `MockModel`
+//! Remote (A2A) subagents used once: `subagent_start` with `mode: one_shot` and `wait: true` (ADR
+//! 0089 slice C4: no tool is named after a remote subagent). The round sends a journaled
+//! `SendMessage`, looks at the remote task with `GetTask` on the timer, and its report is the
+//! call's result. Run end to end on `MockModel`
 //! through the runtime, against an in-process `adam-a2a` server: the reference `InMemoryBackend`
 //! where it does what the case needs, and a scripted backend where it cannot (a failing task, a
 //! server that recognises repeated message ids, a lost response). The memory store always,
@@ -22,9 +24,9 @@ use adam_a2a::{
 use adam_agent_fs::Subagent;
 use adam_assembly::{AgentDef, Assembly, Error, RemoteAuthProblem, RemoteUrlProblem, ToolClash};
 use adam_core::{DynStore, MemoryStore, RunId, RunStatus, Store};
-use adam_llm_agent::{ToolSet, user_message};
+use adam_llm_agent::{SESSION_TOOLS, ToolSet, user_message};
 use adam_model::{Message as ModelMessage, MockModel, ModelRequest, ToolCall};
-use adam_runtime::{CollectingSink, FileSource, RetryPolicy, Runtime, child_run_id};
+use adam_runtime::{CollectingSink, RetryPolicy, Runtime, child_run_id, session_conversation_id};
 use async_trait::async_trait;
 use axum::extract::{Request, State};
 use axum::middleware::{self, Next};
@@ -37,8 +39,6 @@ const TOKEN: &str = "tok-7f3a9c2e51d84b06";
 /// The start of a PNG: enough for the bytes to say what they are.
 const PNG: &[u8] = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR";
 const VAR: &str = "BILLING_AGENT_TOKEN";
-const NOTE: &str =
-    "The agent does not see this conversation; put everything it needs in `message`.";
 
 // --- harness -------------------------------------------------------------------------------
 
@@ -65,6 +65,53 @@ fn call(id: &str, name: &str, args: Value) -> ToolCall {
         arguments: args,
         ..Default::default()
     }
+}
+
+/// The one-shot call of before ADR 0089 slice C4, as a model writes it now.
+fn delegate(id: &str, agent: &str, prompt: &str) -> ToolCall {
+    call(
+        id,
+        "subagent_start",
+        json!({
+            "agent": agent,
+            "description": "the task",
+            "prompt": prompt,
+            "mode": "one_shot",
+            "wait": true,
+        }),
+    )
+}
+
+/// `own`, then the six session tools, as an agent with subagents is offered them.
+fn with_sessions(own: &[&str]) -> Vec<String> {
+    own.iter()
+        .chain(SESSION_TOOLS.iter())
+        .map(|name| (*name).to_owned())
+        .collect()
+}
+
+/// What a `subagent_start` that waited answered for the call `id` in the last message of the
+/// request: the session's page (its header line, `report: <status>`, the report's lines). A round
+/// that failed is a report too, never an error result.
+fn report(request: &ModelRequest, id: &str) -> String {
+    let (text, is_error) = last_tool_result(request, id);
+    assert!(!is_error, "{text}");
+    assert!(text.starts_with("session "), "{text}");
+    text
+}
+
+/// [`report`] of a round that completed, checked to be one.
+fn answer(request: &ModelRequest, id: &str) -> String {
+    let text = report(request, id);
+    assert!(text.contains("\nreport: done\n"), "{text}");
+    text
+}
+
+/// [`report`] of a round that failed, checked to be one.
+fn failure(request: &ModelRequest, id: &str) -> String {
+    let text = report(request, id);
+    assert!(text.contains("\nreport: failed\n"), "{text}");
+    text
 }
 
 fn last_tool_result(request: &ModelRequest, id: &str) -> (String, bool) {
@@ -368,15 +415,15 @@ fn runtime(assembly: &Assembly, store: &DynStore) -> Runtime {
         .build()
 }
 
-/// The model calls `billing` (call id `c1`) with `message`, then says `last`.
+/// The model starts `billing` (call id `c1`) with `message` and waits for it, then says `last`.
 fn script(model: &MockModel, message: &str, last: &str) {
     model
-        .push_tool_calls(vec![call("c1", "billing", json!({"message": message}))])
+        .push_tool_calls(vec![delegate("c1", "billing", message)])
         .push_text(last);
 }
 
-/// Run a parent that calls `billing` once with `message`, on every store, and hand each run to
-/// `check` with the assembly's model requests.
+/// Run a parent that starts `billing` once with `message` and waits, on every store, and hand each
+/// run to `check` with the assembly's model requests.
 async fn run_case(
     files: impl Fn() -> Files,
     message: &str,
@@ -410,21 +457,8 @@ async fn a_remote_subagent_is_called_polled_and_its_answer_comes_back() {
         let model = Arc::new(MockModel::new());
         script(&model, "invoice 7", "the invoice is settled");
         let assembly = assemble(&files, &model);
-        // The tool is the parent's, after its own (none), like a local subagent. A root with a
-        // remote subagent has the session tools too.
-        assert_eq!(
-            assembly.info()[0].tools,
-            [
-                "billing",
-                "subagent_start",
-                "subagent_send",
-                "subagent_read",
-                "subagent_edit",
-                "subagent_close",
-                "subagent_list"
-            ],
-            "{backend}"
-        );
+        // No tool is named after it: the parent has the session tools, as with a local subagent.
+        assert_eq!(assembly.info()[0].tools, with_sessions(&[]), "{backend}");
         assert_eq!(assembly.remotes().len(), 1, "{backend}");
 
         let sink = CollectingSink::new();
@@ -445,29 +479,22 @@ async fn a_remote_subagent_is_called_polled_and_its_answer_comes_back() {
 
         let requests = model.requests();
         assert_eq!(requests.len(), 2, "{backend}");
-        // Same shape as a local subagent: `{message}` and the same suffix.
-        assert_eq!(
-            requests[0].tools.len(),
-            7,
-            "the tool and the six of a session"
+        // In the roster of the session tools, with its file's description, like a local subagent.
+        assert_eq!(requests[0].tools.len(), 6, "the six of a session");
+        assert!(
+            requests[0].tools[0]
+                .description
+                .ends_with("\n- billing: Handles billing questions for a customer account."),
+            "{backend}: {}",
+            requests[0].tools[0].description
         );
-        assert_eq!(
-            requests[0].tools[0].description,
-            format!("Handles billing questions for a customer account. {NOTE}"),
-            "{backend}"
-        );
-        assert_eq!(
-            requests[0].tools[0].parameters["required"],
-            json!(["message"])
-        );
-        assert_eq!(
-            last_tool_result(&requests[1], "c1"),
-            ("echo: invoice 7".into(), false),
+        assert!(
+            answer(&requests[1], "c1").contains("echo: invoice 7"),
             "{backend}"
         );
 
-        // One task on the remote, made by one message whose id is derived from run and call, and
-        // asked for on behalf of the first configured token.
+        // One task on the remote, made by one message whose id is the round's, derived from run
+        // and call, and asked for on behalf of the first configured token.
         let ids = memory.task_ids();
         assert_eq!(ids.len(), 1, "{backend}");
         let task = memory
@@ -488,23 +515,34 @@ async fn a_remote_subagent_is_called_polled_and_its_answer_comes_back() {
             assert_eq!(header.as_deref(), Some(format!("Bearer {TOKEN}").as_str()));
         }
 
-        // The journal records a send that parked and at least one look, and the token is nowhere:
-        // not in the journal, the run's state, its result or the events.
+        // The parent's journal records the start that parked on the session; the round's, the send
+        // and at least one look. The token is nowhere: not in either journal, the runs' state,
+        // the result or the events.
         let journal = store.journal_list(run).await.unwrap();
-        let names: Vec<&str> = journal.iter().map(|e| e.name.as_str()).collect();
-        assert!(names.contains(&"tool:c1"), "{backend}: {names:?}");
-        assert!(names.contains(&"poll:c1"), "{backend}: {names:?}");
         let tool_entry = journal.iter().find(|e| e.name == "tool:c1").unwrap();
-        assert!(!tool_entry.ok, "the send is journaled as a wait");
+        assert!(!tool_entry.ok, "the start is journaled as a wait");
         assert!(
-            tool_entry.payload["AwaitRemote"]["task"].is_string(),
+            tool_entry.payload["AwaitSession"]["session"].is_string(),
             "{backend}: {:?}",
             tool_entry.payload
+        );
+        let round = child_run_id(run, "c1");
+        let rounds = store.journal_list(round).await.unwrap();
+        let names: Vec<&str> = rounds.iter().map(|e| e.name.as_str()).collect();
+        assert!(names.contains(&"send:0"), "{backend}: {names:?}");
+        assert!(
+            names.iter().any(|n| n.starts_with("poll:")),
+            "{backend}: {names:?}"
         );
         // The joined state, not the view's head: the tool result (and anything it leaked) is in
         // the transcript.
         let joined = rt.state(run).await.expect("state").expect("the run");
-        let everything = format!("{journal:?}{joined:?}{:?}{:?}", view.output, sink.events());
+        let round_state = rt.state(round).await.expect("state").expect("the round");
+        let everything = format!(
+            "{journal:?}{rounds:?}{joined:?}{round_state:?}{:?}{:?}",
+            view.output,
+            sink.events()
+        );
         assert!(!everything.contains(TOKEN), "{backend}: the token leaked");
     }
 }
@@ -512,7 +550,7 @@ async fn a_remote_subagent_is_called_polled_and_its_answer_comes_back() {
 // --- endings that are not success ----------------------------------------------------------
 
 #[tokio::test]
-async fn a_remote_task_that_fails_is_an_error_result_and_the_parent_goes_on() {
+async fn a_remote_task_that_fails_is_a_failed_report_and_the_parent_goes_on() {
     let scripted = Scripted::new(2);
     let server = Server::start(scripted.clone(), TOKEN).await;
     let url = server.card_url();
@@ -521,13 +559,10 @@ async fn a_remote_task_that_fails_is_an_error_result_and_the_parent_goes_on() {
         "please [fail]",
         async |backend, _store, _run, requests| {
             assert_eq!(requests.len(), 2, "{backend}");
-            assert_eq!(
-                last_tool_result(&requests[1], "c1"),
-                (
-                    "the remote agent `billing` failed: out of budget".into(),
-                    true
-                ),
-                "{backend}"
+            let text = failure(&requests[1], "c1");
+            assert!(
+                text.contains("the remote agent `billing` failed: out of budget"),
+                "{backend}: {text}"
             );
         },
     )
@@ -536,7 +571,7 @@ async fn a_remote_task_that_fails_is_an_error_result_and_the_parent_goes_on() {
 }
 
 #[tokio::test]
-async fn a_remote_task_that_is_canceled_is_an_error_result() {
+async fn a_remote_task_that_is_canceled_is_a_failed_report() {
     for (backend, store) in stores().await {
         let root = uniq("root");
         let memory = InMemoryBackend::new();
@@ -564,39 +599,35 @@ async fn a_remote_task_that_is_canceled_is_an_error_result() {
         worker.stop().await;
         let requests = model.requests();
         assert_eq!(requests.len(), 2, "{backend}");
-        let (text, is_error) = last_tool_result(&requests[1], "c1");
-        assert!(is_error, "{backend}");
+        let text = failure(&requests[1], "c1");
         assert!(
-            text.starts_with("the remote task of `billing` was canceled"),
+            text.contains("the remote task of `billing` was canceled"),
             "{backend}: {text}"
         );
     }
 }
 
+/// A remote that asks (`input-required`) reports its question: the parent reads it as the
+/// call's result. A `one_shot` session closes after it, so nobody answers that task; a `sealed`
+/// one would let the parent's next round answer it (`tests/remote_sessions.rs`).
 #[tokio::test]
-async fn a_remote_that_needs_input_is_an_error_result_because_nobody_can_answer() {
+async fn a_remote_that_needs_input_reports_its_question() {
     let server = Server::start(InMemoryBackend::new(), TOKEN).await;
     let url = server.card_url();
     run_case(
         || remote_files("x", &url, Some(VAR)),
         "[input-required] which invoice?",
         async |backend, _store, _run, requests| {
-            let (text, is_error) = last_tool_result(&requests[1], "c1");
-            assert!(is_error, "{backend}");
-            assert!(
-                text.starts_with(
-                    "the remote agent `billing` needs more input: more input required."
-                ),
-                "{backend}: {text}"
-            );
-            assert!(text.contains("cannot ask the user"), "{backend}: {text}");
+            let text = answer(&requests[1], "c1");
+            assert!(text.contains("more input required"), "{backend}: {text}");
+            assert!(text.contains("): round 1, closed\n"), "{backend}: {text}");
         },
     )
     .await;
 }
 
 #[tokio::test]
-async fn a_blank_message_is_an_error_result_and_sends_nothing() {
+async fn a_blank_prompt_is_an_error_result_and_sends_nothing() {
     let scripted = Scripted::new(1);
     let server = Server::start(scripted.clone(), TOKEN).await;
     let url = server.card_url();
@@ -607,7 +638,7 @@ async fn a_blank_message_is_an_error_result_and_sends_nothing() {
             let (text, is_error) = last_tool_result(&requests[1], "c1");
             assert!(is_error, "{backend}");
             assert!(
-                text.contains("`billing` needs `message`"),
+                text.contains("`subagent_start` needs `prompt`"),
                 "{backend}: {text}"
             );
         },
@@ -679,7 +710,7 @@ fn a_source_that_refuses_every_name_refuses_a_token_the_process_has() {
 }
 
 #[tokio::test]
-async fn a_wrong_token_is_an_error_result_not_a_failed_run_and_the_token_stays_out_of_it() {
+async fn a_wrong_token_is_a_failed_report_not_a_failed_run_and_the_token_stays_out_of_it() {
     let server = Server::start(InMemoryBackend::new(), TOKEN).await;
     let url = server.card_url();
     for (backend, store) in stores().await {
@@ -698,10 +729,9 @@ async fn a_wrong_token_is_an_error_result_not_a_failed_run_and_the_token_stays_o
         let run = rt.start(&root, user_message("go"), None).await.unwrap();
         wait_done(&rt, run).await;
         worker.stop().await;
-        let (text, is_error) = last_tool_result(&model.requests()[1], "c1");
-        assert!(is_error, "{backend}");
+        let text = failure(&model.requests()[1], "c1");
         assert!(
-            text.starts_with("cannot send the message to the remote agent `billing`"),
+            text.contains("cannot send the message to the remote agent `billing`"),
             "{backend}: {text}"
         );
         assert!(!text.contains("some-other-token"), "{text}");
@@ -721,8 +751,7 @@ async fn a_card_that_points_the_token_at_another_origin_is_refused_before_anythi
         || remote_files("x", &url, Some(VAR)),
         "invoice 7",
         async |backend, _store, _run, requests| {
-            let (text, is_error) = last_tool_result(&requests[1], "c1");
-            assert!(is_error, "{backend}");
+            let text = failure(&requests[1], "c1");
             assert!(
                 text.contains("offers no interface that can be used")
                     && text.contains("same host and port as the card"),
@@ -738,7 +767,7 @@ async fn a_card_that_points_the_token_at_another_origin_is_refused_before_anythi
             .all(|h| h.as_deref() == Some(&format!("Bearer {TOKEN}"))),
         "{seen:?}"
     );
-    // Only the card was asked for (once per call, per store).
+    // Only the card was asked for (once per round, per store).
     assert!(!seen.is_empty());
 }
 
@@ -787,7 +816,8 @@ async fn a_restart_mid_wait_resumes_polling_without_sending_again() {
         let model = Arc::new(MockModel::new());
         script(&model, "invoice 7", "settled after the restart");
 
-        // The first process sends, parks, and looks a few times: still going.
+        // The first process starts the round, which sends, parks, and looks a few times: still
+        // going.
         let first = runtime(&assemble(&files, &model), &store);
         let worker = spawn_worker(&first);
         let run = first.start(&root, user_message("go"), None).await.unwrap();
@@ -798,10 +828,14 @@ async fn a_restart_mid_wait_resumes_polling_without_sending_again() {
         worker.stop().await;
         drop(first);
         assert_eq!(scripted.submits().len(), 1, "{backend}");
-        assert_eq!(model.requests().len(), 1, "{backend}: only the send so far");
+        assert_eq!(
+            model.requests().len(),
+            1,
+            "{backend}: only the start so far"
+        );
 
         // The remote finishes while nobody is looking. A new process, from the same files (its
-        // own tool, its own client), finds the wait in the run's state and asks again.
+        // own round agent, its own client), finds the wait in the round's state and asks again.
         scripted.done_after.store(0, SeqCst);
         let second = runtime(&assemble(&files, &model), &store);
         let worker = spawn_worker(&second);
@@ -818,9 +852,8 @@ async fn a_restart_mid_wait_resumes_polling_without_sending_again() {
             "{backend}: the message was not sent again"
         );
         assert_eq!(scripted.tasks(), 1, "{backend}");
-        assert_eq!(
-            last_tool_result(&model.requests()[1], "c1"),
-            ("done: invoice 7".into(), false),
+        assert!(
+            answer(&model.requests()[1], "c1").contains("done: invoice 7"),
             "{backend}"
         );
     }
@@ -835,11 +868,10 @@ async fn a_send_whose_response_is_lost_is_retried_under_the_same_message_id() {
         let server = Server::start(scripted.clone(), TOKEN).await;
         let files = remote_files(&root, &server.card_url(), Some(VAR));
         let model = Arc::new(MockModel::new());
-        // A retry runs the whole transition again, the model turn included: the model is asked
-        // twice, and asks for the same call twice.
+        // The send is a step of the round, retried with the round's backoff: the parent's turn,
+        // committed before the start ran, is not asked again.
         model
-            .push_tool_calls(vec![call("c1", "billing", json!({"message": "invoice 7"}))])
-            .push_tool_calls(vec![call("c1", "billing", json!({"message": "invoice 7"}))])
+            .push_tool_calls(vec![delegate("c1", "billing", "invoice 7")])
             .push_text("settled");
         let rt = runtime(&assemble(&files, &model), &store);
         let worker = spawn_worker(&rt);
@@ -860,10 +892,9 @@ async fn a_send_whose_response_is_lost_is_retried_under_the_same_message_id() {
         assert_eq!(submits[0].text, "invoice 7");
         assert_eq!(scripted.tasks(), 1, "{backend}");
         let requests = model.requests();
-        assert_eq!(requests.len(), 3, "{backend}");
-        assert_eq!(
-            last_tool_result(&requests[2], "c1"),
-            ("done: invoice 7".into(), false),
+        assert_eq!(requests.len(), 2, "{backend}");
+        assert!(
+            answer(&requests[1], "c1").contains("done: invoice 7"),
             "{backend}"
         );
     }
@@ -891,12 +922,8 @@ async fn a_task_that_never_ends_is_given_up_on_after_the_limit() {
         let run = rt.start(&root, user_message("go"), None).await.unwrap();
         wait_done(&rt, run).await;
         worker.stop().await;
-        let (text, is_error) = last_tool_result(&model.requests()[1], "c1");
-        assert!(is_error, "{backend}");
-        assert!(
-            text.contains("did not finish in the time allowed"),
-            "{backend}: {text}"
-        );
+        let text = failure(&model.requests()[1], "c1");
+        assert!(text.contains("time limit"), "{backend}: {text}");
     }
 }
 
@@ -988,19 +1015,7 @@ fn a_remote_named_like_a_tool_of_its_parent_or_a_skill_tool_or_a_subagent_is_ref
         .unwrap()
         .model(Arc::new(MockModel::new()), "default")
         .unwrap();
-    assert_eq!(
-        assembly.info()[0].tools,
-        [
-            "other",
-            "billing",
-            "subagent_start",
-            "subagent_send",
-            "subagent_read",
-            "subagent_edit",
-            "subagent_close",
-            "subagent_list"
-        ]
-    );
+    assert_eq!(assembly.info()[0].tools, with_sessions(&["other"]));
 
     // A remote named `load_skill`, on a parent with skills.
     let mut skill = remote_files("coder", "https://billing.example.com/card", None);
@@ -1075,7 +1090,7 @@ fn a_remote_named_like_a_tool_of_its_parent_or_a_skill_tool_or_a_subagent_is_ref
 }
 
 #[test]
-fn a_remote_subagent_is_a_tool_in_the_order_of_the_manifest_beside_local_ones() {
+fn a_remote_subagent_is_in_the_roster_in_the_order_of_the_manifest_beside_local_ones() {
     let mut files = remote_files("coder", "https://billing.example.com/card", None);
     files.push((
         "agent/subagents/audit.md".into(),
@@ -1087,31 +1102,27 @@ fn a_remote_subagent_is_a_tool_in_the_order_of_the_manifest_beside_local_ones() 
         .unwrap()
         .model(Arc::new(MockModel::new()), "default")
         .unwrap();
-    // Own tools first, then the subagents by file name: `audit` (local) before `billing` (remote).
-    assert_eq!(
-        assembly.info()[0].tools,
-        [
-            "read",
-            "audit",
-            "billing",
-            "subagent_start",
-            "subagent_send",
-            "subagent_read",
-            "subagent_edit",
-            "subagent_close",
-            "subagent_list"
-        ]
-    );
-    // The remote is not an agent of the assembly: nothing to register on the runtime.
+    // Own tools first, then the session tools, and no tool named after a subagent: `audit` (local)
+    // and `billing` (remote) are the roster of `subagent_start`, in the order of the files.
+    assert_eq!(assembly.info()[0].tools, with_sessions(&["read"]));
+    let defaults: Vec<String> = def_of(&files)
+        .session_defaults()
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect();
+    assert_eq!(defaults, ["audit", "billing"]);
+    // The remote is not an `LlmAgent` of the assembly: its rounds are the round agent's.
     assert_eq!(assembly.agents().len(), 2);
+    assert_eq!(assembly.remote_round_agents().len(), 1);
 }
 
 // --- a remote under a local subagent ---------------------------------------------------------
 
-/// A local subagent calls a remote one: the remote is declared under the subagent's own directory
-/// (`subagents/researcher/subagents/browser.md`), so it is a tool of the researcher, with its own
-/// `auth`, and the researcher's child run sends, parks on the remote task, polls it and goes on,
-/// exactly as a root does. Only text travels: the researcher's answer is what the root reads.
+/// A local subagent uses a remote one: the remote is declared under the subagent's own directory
+/// (`subagents/researcher/subagents/browser.md`), so it is a subagent of the researcher, with its
+/// own `auth`, and the researcher's round starts a session on it that waits, exactly as a root
+/// does (ADR 0089 slice C4: sessions at any depth of the folder). Only text travels: the
+/// researcher's answer is what the root reads.
 #[tokio::test]
 async fn a_local_subagent_calls_a_remote_subagent_declared_in_its_own_directory() {
     for (backend, store) in stores().await {
@@ -1140,20 +1151,18 @@ async fn a_local_subagent_calls_a_remote_subagent_declared_in_its_own_directory(
         ];
         let model = Arc::new(MockModel::new());
         model
-            .push_tool_calls(vec![call(
+            .push_tool_calls(vec![delegate(
                 "c1",
                 "researcher",
-                json!({"message": "what does example.com say?"}),
+                "what does example.com say?",
             )])
-            .push_tool_calls(vec![call(
-                "r1",
-                "browser",
-                json!({"message": "read example.com"}),
-            )])
+            .push_tool_calls(vec![delegate("r1", "browser", "read example.com")])
             .push_text("It says: echo: read example.com")
             .push_text("The researcher found it.");
         let assembly = assemble(&files, &model);
-        // The remote is a tool of the subagent whose directory declares it, not of the root.
+        // The remote is a subagent of the subagent whose directory declares it, not of the root:
+        // both have the session tools, each for its own subagents, and the remote's rounds have
+        // an agent of their own under the researcher's name.
         let tools_of = |name: &str| {
             assembly
                 .info()
@@ -1163,24 +1172,13 @@ async fn a_local_subagent_calls_a_remote_subagent_declared_in_its_own_directory(
                 .tools
                 .clone()
         };
-        assert_eq!(
-            tools_of(&root),
-            [
-                "researcher",
-                "subagent_start",
-                "subagent_send",
-                "subagent_read",
-                "subagent_edit",
-                "subagent_close",
-                "subagent_list"
-            ],
-            "{backend}"
-        );
+        assert_eq!(tools_of(&root), with_sessions(&[]), "{backend}");
         assert_eq!(
             tools_of(&format!("{root}/researcher")),
-            ["browser"],
+            with_sessions(&[]),
             "{backend}"
         );
+        assert_eq!(assembly.remote_round_agents().len(), 1, "{backend}");
 
         let rt = runtime(&assembly, &store);
         let worker = spawn_worker(&rt);
@@ -1195,18 +1193,17 @@ async fn a_local_subagent_calls_a_remote_subagent_declared_in_its_own_directory(
 
         let requests = model.requests();
         assert_eq!(requests.len(), 4, "{backend}");
-        assert_eq!(
-            last_tool_result(&requests[2], "r1"),
-            ("echo: read example.com".into(), false),
+        assert!(
+            answer(&requests[2], "r1").contains("echo: read example.com"),
             "{backend}: the researcher read the remote's answer"
         );
-        assert_eq!(
-            last_tool_result(&requests[3], "c1"),
-            ("It says: echo: read example.com".into(), false),
+        assert!(
+            answer(&requests[3], "c1").contains("It says: echo: read example.com"),
             "{backend}: the root read the researcher's text"
         );
-        // The send and its wait are journaled steps of the researcher's run, under the id derived
-        // from that run and its call.
+        // The start and its wait are journaled steps of the researcher's run; the send is the
+        // round's, under the id derived from that run and its call, in the researcher's
+        // conversation.
         let child = child_run_id(run, "c1");
         let names: Vec<String> = store
             .journal_list(child)
@@ -1216,6 +1213,24 @@ async fn a_local_subagent_calls_a_remote_subagent_declared_in_its_own_directory(
             .map(|e| e.name)
             .collect();
         assert!(names.iter().any(|n| n == "tool:r1"), "{backend}: {names:?}");
+        let browsing = store
+            .load_run(child_run_id(child, "r1"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            browsing.agent,
+            format!("{root}/researcher/browser"),
+            "{backend}"
+        );
+        assert_eq!(
+            browsing.conversation_id,
+            Some(session_conversation_id(
+                &session_conversation_id(&format!("run:{run}"), child),
+                child_run_id(child, "r1")
+            )),
+            "{backend}"
+        );
         let ids = memory.task_ids();
         assert_eq!(ids.len(), 1, "{backend}");
         let task = memory
@@ -1236,12 +1251,12 @@ async fn a_local_subagent_calls_a_remote_subagent_declared_in_its_own_directory(
 
 // --- files of a remote's answer ------------------------------------------------------------
 
-/// A remote subagent whose file says `files: true` (a browser agent): the screenshot its task
-/// answers with is an artifact of the run that called it (in the run's view, so the parent's A2A
-/// client gets it as it gets a shared file), the model reads a line in its place, and the same remote
-/// without the key keeps nothing.
+/// A remote subagent's answer that holds a file (a browser agent's screenshot) is text for the
+/// parent: the round describes the file in a line and keeps nothing, with or without `files: true`
+/// (ADR 0089 slice C4: the key, which shared the files of the subagent's own tool as the calling
+/// run's artifacts, has no effect on a round, and `bind` warns that it does not).
 #[tokio::test]
-async fn the_files_of_a_remote_with_files_true_are_artifacts_of_the_calling_run() {
+async fn the_files_of_a_remote_are_described_and_never_kept_files_true_or_not() {
     for files in [true, false] {
         let scripted = Scripted::new(1);
         let server = Server::start(scripted.clone(), TOKEN).await;
@@ -1256,52 +1271,16 @@ async fn the_files_of_a_remote_with_files_true_are_artifacts_of_the_calling_run(
             },
             "screenshot it [file]",
             async |backend, store, run, requests| {
-                let (text, is_error) = last_tool_result(&requests[1], "c1");
-                assert!(!is_error, "{backend}: {text}");
-                let view = Runtime::builder(store.clone())
-                    .build()
-                    .view(run)
-                    .await
-                    .unwrap()
-                    .unwrap();
-                if files {
-                    assert_eq!(view.artifacts.len(), 1, "{backend}");
-                    let artifact = &view.artifacts[0];
-                    let file = artifact.file.as_ref().unwrap();
-                    let name = file.filename.as_str();
-                    assert!(
-                        name.starts_with("page-") && name.ends_with(".png"),
-                        "{name}"
-                    );
-                    assert_eq!(artifact.name, "page.png", "the remote artifact's own name");
-                    let hash = file.digest();
-                    assert_eq!(
-                        text,
-                        format!(
-                            "The page is blank.\n\nShared {name} (16 bytes, image/png). To show it \
-                             in your answer, write ![description]({name}). To use it as the picture \
-                             of an `ask_user` option, pass image {{sha256: \"{hash}\", alt}}. In a \
-                             `show` block, an `Image` names it: {{component: \"Image\", artifact: \
-                             \"{hash}\", alt}}."
-                        ),
-                        "{backend}"
-                    );
-                    assert_eq!(file.size, PNG.len() as u64);
-                    assert_eq!(file.digest(), adam_runtime::blob_id(PNG));
-                    match &file.source {
-                        FileSource::Inline(bytes) => assert_eq!(bytes, PNG),
-                        FileSource::Blob(id) => assert_eq!(
-                            store.get_blob(id).await.unwrap(),
-                            Some(PNG.to_vec()),
-                            "the blob the head names holds the file"
-                        ),
-                    }
-                } else {
-                    assert!(
-                        text.ends_with("[file `page.png` not included: 16 bytes, image/png]"),
-                        "{backend}: {text}"
-                    );
-                    assert!(view.artifacts.is_empty(), "{backend}");
+                let text = answer(&requests[1], "c1");
+                assert!(text.contains("The page is blank."), "{backend}: {text}");
+                assert!(
+                    text.contains("[file `page.png` not included: 16 bytes, image/png]"),
+                    "{backend}: {text}"
+                );
+                let rt = Runtime::builder(store.clone()).build();
+                for id in [run, child_run_id(run, "c1")] {
+                    let view = rt.view(id).await.unwrap().unwrap();
+                    assert!(view.artifacts.is_empty(), "{backend} {files}: {id}");
                 }
             },
         )
@@ -1320,18 +1299,7 @@ async fn a_root_with_only_remote_subagents_gets_the_session_tools_and_a_round_ag
         .unwrap()
         .model(Arc::new(MockModel::new()), "default")
         .unwrap();
-    assert_eq!(
-        assembly.info()[0].tools,
-        [
-            "billing",
-            "subagent_start",
-            "subagent_send",
-            "subagent_read",
-            "subagent_edit",
-            "subagent_close",
-            "subagent_list"
-        ]
-    );
+    assert_eq!(assembly.info()[0].tools, with_sessions(&[]));
     assert_eq!(assembly.remote_round_agents().len(), 1);
     // The agent of its rounds is registered beside the root, under `<root>/<subagent>`.
     let store: DynStore = Arc::new(MemoryStore::new());
@@ -1350,8 +1318,11 @@ async fn a_root_with_only_remote_subagents_gets_the_session_tools_and_a_round_ag
     assert_eq!(by_hand.agent_names(), rt.agent_names());
 }
 
+/// ADR 0089 slice C4: the remote subagent of a subagent has sessions too, so the subagent can use
+/// it: the subagent gets the session tools and the remote a round agent under its name. (Before C4
+/// it had only the remote's own tool, and sessions were one level deep.)
 #[tokio::test]
-async fn the_remote_subagent_of_a_subagent_has_no_session_and_no_round_agent() {
+async fn the_remote_subagent_of_a_subagent_has_a_session_and_a_round_agent() {
     let root = uniq("root");
     let files: Files = vec![
         (
@@ -1372,7 +1343,17 @@ async fn the_remote_subagent_of_a_subagent_has_no_session_and_no_round_agent() {
         .unwrap()
         .model(Arc::new(MockModel::new()), "default")
         .unwrap();
-    assert!(assembly.remote_round_agents().is_empty());
+    assert_eq!(assembly.remote_round_agents().len(), 1);
     let researcher = &assembly.info()[1];
-    assert_eq!(researcher.tools, ["browser"], "sessions are one level deep");
+    assert_eq!(researcher.tools, with_sessions(&[]));
+    let store: DynStore = Arc::new(MemoryStore::new());
+    let rt = assembly.register(Runtime::builder(store)).build();
+    assert_eq!(
+        rt.agent_names(),
+        [
+            root.clone(),
+            format!("{root}/researcher"),
+            format!("{root}/researcher/browser")
+        ]
+    );
 }

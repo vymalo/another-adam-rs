@@ -691,9 +691,9 @@ async fn a_removed_subagent_stays_registered_with_its_last_version() {
         [ToolChange {
             agent: name.clone(),
             added: vec![],
-            // The six tools that run a subagent in the background go with its last subagent.
+            // The six tools that start and follow a subagent go with its last subagent (no tool
+            // is named after one: ADR 0089 slice C4).
             removed: [
-                "sub",
                 "subagent_close",
                 "subagent_edit",
                 "subagent_list",
@@ -959,12 +959,7 @@ async fn remote_subagent_settings_are_applied_again_on_reload() {
     assert_eq!(live.info()[0].prompt, after);
 
     model
-        .push_tool_calls(vec![ToolCall {
-            id: "c1".into(),
-            name: "billing".into(),
-            arguments: json!({"message": "invoice 7"}),
-            ..Default::default()
-        }])
+        .push_tool_calls(vec![ask_billing("c1")])
         .push_text("gave up");
     let run = rt.start(&name, user_message("go"), None).await.unwrap();
     wait_done(&rt, run).await;
@@ -977,17 +972,31 @@ async fn remote_subagent_settings_are_applied_again_on_reload() {
     else {
         panic!("no tool result: {:?}", requests[1].messages);
     };
-    assert!(is_error);
+    assert!(!is_error, "a round that failed is a report: {content}");
     assert!(
-        content.contains("did not finish in the time allowed"),
+        content.contains("report: failed") && content.contains("time limit"),
         "{content}"
     );
 }
 
-/// A reload binds the remote subagents again, so the tool is new and so is its client: a token
-/// that was rotated (here, by the hook reading a value the test changes) is the one sent next.
+/// The one-shot use of `billing` (ADR 0089 slice C4): `subagent_start` that waits.
+fn ask_billing(id: &str) -> ToolCall {
+    ToolCall {
+        id: id.into(),
+        name: "subagent_start".into(),
+        arguments: json!({"agent": "billing", "description": "billing", "prompt": "invoice 7",
+                          "mode": "one_shot", "wait": true}),
+        ..Default::default()
+    }
+}
+
+/// A reload binds the remote subagents again, but the agent of their rounds is the one of the first
+/// load (`LiveAssembly::register`): a token that was rotated (here, by the hook reading a value the
+/// test changes) is sent only after a restart. Before ADR 0089 slice C4 the remote's own tool was
+/// bound again and sent the new token at once; the round agent never did, and since C4 a remote is
+/// reached only through it.
 #[tokio::test]
-async fn a_reload_gives_the_remote_tool_a_fresh_client_and_token() {
+async fn a_reload_keeps_the_remote_round_agent_and_its_token_until_a_restart() {
     let server = Server::start(InMemoryBackend::new(), "new-token-1111").await;
     let name = uniq("root");
     let store: DynStore = Arc::new(MemoryStore::new());
@@ -1005,43 +1014,37 @@ async fn a_reload_gives_the_remote_tool_a_fresh_client_and_token() {
         .unwrap();
     let rt = runtime(&live, &store);
     let worker = spawn_worker(&rt);
-    let ask = |id: &str| {
-        vec![ToolCall {
-            id: id.into(),
-            name: "billing".into(),
-            arguments: json!({"message": "invoice 7"}),
-            ..Default::default()
-        }]
+    let report = |index: usize| match model.requests()[index].messages.last() {
+        Some(adam_model::Message::Tool { content, .. }) => content.clone(),
+        other => panic!("no tool result: {other:?}"),
     };
 
-    // With the old token the server says no: an error result, and the run goes on.
-    model.push_tool_calls(ask("c1")).push_text("first");
+    // With the old token the server says no: a failed report, and the run goes on.
+    model
+        .push_tool_calls(vec![ask_billing("c1")])
+        .push_text("first");
     let run = rt.start(&name, user_message("go"), None).await.unwrap();
     wait_done(&rt, run).await;
-    let requests = model.requests();
-    let Some(adam_model::Message::Tool { is_error, .. }) = requests[1].messages.last() else {
-        panic!("no tool result");
-    };
-    assert!(is_error, "the old token is refused");
+    assert!(
+        report(1).contains("report: failed"),
+        "the old token is refused"
+    );
 
+    // The reload binds with the new token, and the round agent of the first load still sends
+    // the old one.
     *token.lock().unwrap() = "new-token-1111".into();
     live.reload().unwrap();
-    model.push_tool_calls(ask("c2")).push_text("second");
+    model
+        .push_tool_calls(vec![ask_billing("c2")])
+        .push_text("second");
     let run = rt.start(&name, user_message("again"), None).await.unwrap();
     wait_done(&rt, run).await;
     worker.stop().await;
-    let requests = model.requests();
-    let Some(adam_model::Message::Tool {
-        is_error, content, ..
-    }) = requests[3].messages.last()
-    else {
-        panic!("no tool result");
-    };
-    assert!(!is_error, "{content}");
+    assert!(report(3).contains("report: failed"), "{}", report(3));
     let seen = server.authorization.lock().unwrap().clone();
     assert!(
         seen.iter()
-            .any(|h| h.as_deref() == Some("Bearer new-token-1111")),
+            .all(|h| h.as_deref() == Some("Bearer old-token-0000")),
         "{seen:?}"
     );
 }

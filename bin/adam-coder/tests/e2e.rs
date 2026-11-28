@@ -500,8 +500,6 @@ async fn add_hello_txt_streams_working_progress_checks_artifact_completed(store:
             "plan_add",
             "load_skill",
             "read_skill_file",
-            "explorer",
-            "reviewer",
             "subagent_start",
             "subagent_send",
             "subagent_read",
@@ -4264,8 +4262,6 @@ async fn three_questions_as_one_form_the_answers_come_back_and_the_run_goes_on(s
             "plan_add",
             "load_skill",
             "read_skill_file",
-            "explorer",
-            "reviewer",
             "subagent_start",
             "subagent_send",
             "subagent_read",
@@ -4374,10 +4370,8 @@ async fn the_catalog_is_read_again_over_the_thread_tools_and_their_tools_are_off
         .map(|t| t.name.clone())
         .collect();
     assert_eq!(
-        offered[offered.len() - 9..],
+        offered[offered.len() - 7..],
         [
-            "explorer",
-            "reviewer",
             "subagent_start",
             "subagent_send",
             "subagent_read",
@@ -5353,8 +5347,9 @@ async fn the_tokens_of_the_coder_and_its_explorer_reach_an_activated_client() {
         with_usage(
             tool_reply(
                 "x1",
-                "explorer",
-                json!({"message": "where is the greeting?"}),
+                "subagent_start",
+                json!({"agent": "explorer", "description": "look",
+                       "prompt": "where is the greeting?", "mode": "one_shot", "wait": true}),
             ),
             1000,
             50,

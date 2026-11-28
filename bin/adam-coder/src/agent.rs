@@ -452,8 +452,8 @@ impl CoderAgent {
 
     /// The subagents of the folder the agent was assembled from, registered as `coder/<name>`
     /// (`explorer` and `reviewer` for the embedded copy). A process that steps runs registers them
-    /// beside the agent ([`Coder::new_with`](crate::Coder::new_with) does): a subagent tool starts
-    /// its child as a run of its own, found by that name. The tools of the coder find the
+    /// beside the agent ([`Coder::new_with`](crate::Coder::new_with) does): `subagent_start` starts
+    /// each round as a run of its own, found by that name. The tools of the coder find the
     /// workspace, the notes and the budgets of the run's **root** (`ToolCtx::root_run_id`), so a
     /// subagent that is given `read_file` or `run_command` works in the worktree of the run that
     /// called it.
@@ -1351,6 +1351,16 @@ fn expect_assembled(assembled: Result<CoderAgent, Box<AssemblyError>>) -> CoderA
 /// its own wait, or the wait of a child it waits on, which it shows and wakes (ADR 0067 decision
 /// 5). The end of a child run ends nothing, and a park on anything else (a child that is not
 /// parked on the model, a task on another system, a timer) leaves them running.
+/// The model wait of the child a wait is on: a child run's, or the first round of a session a
+/// `subagent_start` that waits started (ADR 0089 slice C4); none for any other wait.
+fn child_model_wait(wait: &adam_llm_agent::PendingWait) -> Option<&adam_llm_agent::ModelWait> {
+    match wait {
+        adam_llm_agent::PendingWait::Run(wait) => wait.model_wait.as_ref(),
+        adam_llm_agent::PendingWait::Session(wait) => wait.model_wait.as_ref(),
+        adam_llm_agent::PendingWait::Question(_) | adam_llm_agent::PendingWait::Remote(_) => None,
+    }
+}
+
 fn commands_end_with(transition: &Transition<Conversation>, child: bool) -> Option<&'static str> {
     match transition {
         Transition::Done { .. } | Transition::Fail { .. } if !child => Some("the run ended"),
@@ -1371,14 +1381,11 @@ fn commands_end_with(transition: &Transition<Conversation>, child: bool) -> Opti
             Some("the run waits on the model until it is woken")
         }
         Transition::Park { state, .. }
-            if matches!(
-                &state.pending_wait,
-                Some(adam_llm_agent::PendingWait::Run(wait))
-                    if wait
-                        .model_wait
-                        .as_ref()
-                        .is_some_and(|wait| wait.park == ModelPark::UntilWoken)
-            ) =>
+            if state
+                .pending_wait
+                .as_ref()
+                .and_then(child_model_wait)
+                .is_some_and(|wait| wait.park == ModelPark::UntilWoken) =>
         {
             Some("the run waits on the model until it is woken")
         }
@@ -1749,6 +1756,7 @@ mod commands_tests {
                 call_id: "c".into(),
                 tool: "subagent_read".into(),
                 session: adam_core::RunId::new(),
+                model_wait: None,
             }),
         ] {
             assert_eq!(commands_end_with(&parked(Some(wait)), false), None);

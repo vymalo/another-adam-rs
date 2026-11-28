@@ -1198,8 +1198,9 @@ async fn a_child_parked_until_woken_stops_the_commands() {
         )]);
         m.push_tool_calls(vec![call(
             "c3",
-            "explorer",
-            json!({"message": "look around"}),
+            "subagent_start",
+            json!({"agent": "explorer", "description": "look", "prompt": "look around",
+                   "mode": "one_shot", "wait": true}),
         )]);
         // The explorer's own call is refused: it waits until the person raises the limit, and the
         // root waits on it with no timer.

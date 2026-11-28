@@ -118,13 +118,11 @@ pub fn known(tool: &str) -> Option<AccessTier> {
         | "plan_check"
         | "plan_add"
         | "ask_agent"
-        | "explorer"
-        | "reviewer"
-        // The tools that run those helpers in the background: they start, read, edit and close the
-        // same read-only subagents, which keep to the tier of the run they serve. An edit is `Plan`
-        // with them even though it may raise a session's `token_budget` or `max_turns`: it changes
-        // no file and reaches no repository, and the family is one tier so a session is not edited
-        // under a gate its other tools do not open.
+        // The tools that run the helpers (no tool is named after a subagent: ADR 0089 slice C4):
+        // they start, read, edit and close the same read-only subagents, which keep to the tier of
+        // the run they serve. An edit is `Plan` with them even though it may raise a session's
+        // `token_budget` or `max_turns`: it changes no file and reaches no repository, and the family
+        // is one tier so a session is not edited under a gate its other tools do not open.
         | "subagent_start"
         | "subagent_send"
         | "subagent_read"
@@ -352,7 +350,7 @@ mod tests {
             ("plan_check", Plan),
             ("plan_add", Plan),
             ("use_repository_environment", Plan),
-            ("explorer", Plan),
+            ("subagent_start", Plan),
             ("write_file", Edits),
             ("edit_file", Edits),
             ("apply_patch", Edits),
@@ -377,6 +375,17 @@ mod tests {
     fn delegate_to_opencode_is_unknown_and_needs_auto() {
         assert_eq!(known("delegate_to_opencode"), None);
         assert_eq!(needs("delegate_to_opencode"), AccessTier::Auto);
+    }
+
+    /// ADR 0089 slice C4: the helpers' own tools are gone, so their names, still in an old
+    /// journal, are unknown tools; the helpers are started with `subagent_start`, a read.
+    #[test]
+    fn the_helpers_own_tools_are_unknown_and_subagent_start_is_a_read() {
+        for gone in ["explorer", "reviewer"] {
+            assert_eq!(known(gone), None, "{gone}");
+            assert_eq!(needs(gone), AccessTier::Auto, "{gone}");
+        }
+        assert_eq!(needs("subagent_start"), AccessTier::Plan);
     }
 
     #[test]

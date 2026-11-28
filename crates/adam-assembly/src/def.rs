@@ -24,13 +24,16 @@ use crate::assembly::{BoundDef, Rounds};
 use crate::error::{Error, Origin, ToolClash};
 use crate::mcp::{self, McpBinding};
 #[cfg(feature = "remote")]
-use crate::remote::RemoteSubagentTool;
+use crate::remote::RemoteEndpoint;
 #[cfg(feature = "remote")]
 use crate::remote_session::{RemoteRoundAgent, RemoteRoundStarter};
 use crate::skills::{self, RunSkills, RunSkillsHandle, SkillFiles, SkillSet};
-use crate::subagent::{DEFAULT_SUBAGENT_MINUTES, SubagentTool};
 use crate::suggest::closest;
 use crate::template::{self, Piece};
+
+/// How long a round of a session on a subagent may take when its file says nothing
+/// (`limits.max_minutes`): 30 minutes.
+pub const DEFAULT_SUBAGENT_MINUTES: u32 = 30;
 
 /// Something an [`AgentDef`] can be made from: the owned manifest that a directory produces, or
 /// the `'static` one that `build.rs` embeds. Both end up as the same [`AgentManifest`], so an
@@ -811,19 +814,21 @@ impl AgentDef {
     ///   ([`Error::InvalidRetry`]).
     ///
     /// The root agent gets every registered tool when it has no `tools:`; a subagent gets none
-    /// (decision D3 of `docs/reference/agent-files.md`), whatever its parent has. Each agent then gets a
-    /// tool per local subagent, named after it ([`SubagentTool`]), after its own tools and its
-    /// skills' tools. Two more things are refused here:
+    /// (decision D3 of `docs/reference/agent-files.md`), whatever its parent has. An agent that has
+    /// subagents, the root or a subagent with its own, then gets the five session tools of
+    /// `adam-llm-agent` (`subagent_start` and the others) after its own tools and its skills' tools:
+    /// that is how it delegates ([ADR 0089]: every child is a session, and no tool is named after a
+    /// subagent). One more thing is refused here:
     ///
-    /// * a subagent tool whose name is already a tool of the parent, or another subagent's
-    ///   ([`Error::SubagentToolClash`]);
+    /// * a subagent named like a tool of the parent, like another subagent, or like one of the
+    ///   session tools ([`Error::SubagentToolClash`]): the words the model reads for tools and for
+    ///   subagents stay apart;
     ///
-    /// A remote subagent (`a2a:`) gets a tool of the same shape and the same name checks, and is
-    /// checked here too: its URL must be https (or local, unless
+    /// A remote subagent (`a2a:`) takes the same name checks, and is checked here too: its URL must be https (or local, unless
     /// [`allow_insecure_remotes`](Self::allow_insecure_remotes)) and carry no credentials
     /// ([`Error::RemoteUrl`]), and the variable of its `auth: bearer:VAR` must hold a token
     /// ([`Error::RemoteAuth`]). The token is read now and kept in memory, and the network is not
-    /// touched until the first call. Without the feature `remote` (on by default) there is no A2A
+    /// touched until the first round. Without the feature `remote` (on by default) there is no A2A
     /// client: the subagent is refused after the name checks and before any secret is read
     /// ([`Error::RemoteNotEnabled`]).
     ///
@@ -838,6 +843,8 @@ impl AgentDef {
     /// ([`Error::McpToolClash`]).
     ///
     /// Nothing is built yet: the model and the state come next ([`BoundDef`]).
+    ///
+    /// [ADR 0089]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0089-every-child-is-a-session-and-the-one-shot-subagent-tool-goes.md
     ///
     /// # Errors
     ///
@@ -964,15 +971,15 @@ pub(crate) struct Node {
     pub(crate) skills: Vec<String>,
     /// The skills whose body is in the prompt.
     pub(crate) preloaded: Vec<String>,
-    /// The registration names of the subagents a session can be started on, when the agent has the
-    /// session tools; empty otherwise.
+    /// The registration names of the subagents a session can be started on, sorted; empty for an
+    /// agent with no subagent.
     pub(crate) session_agents: Vec<String>,
-    /// The subagents a session can be started on, as [`add_subagent_tools`] found them (ADR 0054
+    /// The subagents a session can be started on, as [`session_roster`] found them (ADR 0054
     /// slice 1 part 2): the roster the session tools are made from, once the model — and with it
-    /// the deployment's `MAX_PARALLEL_TOOL_CALLS` — is known. Empty unless the agent has them.
+    /// the deployment's `MAX_PARALLEL_TOOL_CALLS` — is known. Empty for an agent with no subagent.
     pub(crate) session_targets: Vec<SessionTarget>,
     /// The agents that work the rounds of a session on a remote subagent, one per remote subagent
-    /// of the root; empty for any other agent.
+    /// of this agent.
     pub(crate) round_agents: Rounds,
     /// The `mcp.json` servers whose `when` loads them only when a run's task matches: the server
     /// and its keywords, in name order. [`AgentInfo::when`](crate::AgentInfo::when) carries them, so
@@ -1015,7 +1022,7 @@ pub(crate) struct SessionTarget {
 }
 
 /// A remote (A2A) subagent, found on the way: what [`Assembly::remotes`](crate::Assembly::remotes) lists.
-/// Its tool is made in `add_subagent_tools`.
+/// The agent that works its rounds is made in [`session_roster`].
 #[derive(Debug, Clone)]
 pub(crate) struct Remote {
     /// The registration name of the agent that owns it.
@@ -1068,7 +1075,7 @@ struct Walk<'a> {
     plugins: &'a BTreeMap<String, PluginFactory>,
     /// What the root's run finds ([`AgentDef::run_skills`]); a subagent has none.
     run_skills: Option<&'a RunSkillsHandle>,
-    /// What the root's sessions run under: the deployment's, lowered by the root's file.
+    /// What the sessions of every agent run under: the deployment's, lowered by the root's file.
     session_limits: SessionLimits,
     /// The root's reasoning level when its file sets none ([`AgentDef::reasoning_effort`]),
     /// as its wire word; it never applies to a subagent, which has its own file.
@@ -1270,8 +1277,13 @@ impl Walk<'_> {
         // The tools `add_skills` appended, so a clash can say whose tool it hit.
         let skill_tools: Vec<String> = tools[registered..].iter().map(|(n, _)| n.clone()).collect();
         let mcp_names: Vec<String> = own_mcp.iter().map(|(n, _)| n.clone()).collect();
-        // The session tools (ADR 0045) go to the root only: sessions are one level deep.
-        let (session_agents, session_targets, round_agents) = add_subagent_tools(
+        // The session tools (ADR 0045) go to every agent that has subagents: they are how it
+        // delegates, at any depth of the folder (ADR 0089 slice C4).
+        let Roster {
+            agents: session_agents,
+            targets: session_targets,
+            rounds: round_agents,
+        } = session_roster(
             &origin,
             manifest,
             &Taken {
@@ -1280,8 +1292,7 @@ impl Walk<'_> {
             },
             self.remote,
             self.secrets,
-            &mut tools,
-            parent.is_none().then_some(self.session_limits),
+            &tools,
         )?;
         // An agent that has the session tools reads what they are, after the skills catalog: the
         // same bytes for the same helpers, whatever the deployment's limits (ADR 0054 decision 9).
@@ -1294,9 +1305,15 @@ impl Walk<'_> {
         let retry = retry_policies(&origin, manifest, &tools)?;
         let plugins = self.plugins_of(&origin, manifest, parent)?;
         // The root's modes: a name in a mode's `tools:` is one of the agent's tools (fail closed),
-        // and every agent narrows by the same set (a child starts in its parent's mode).
+        // and every agent narrows by the same set (a child starts in its parent's mode). The
+        // session tools are made at `model`, after this, and are the agent's all the same: a mode
+        // that names them keeps them, so it can still delegate (ADR 0089 slice C4).
         if parent.is_none() {
-            self.root_modes = resolve_modes(&origin, manifest, &tools)?;
+            let mut offered: Vec<String> = tools.iter().map(|(name, _)| name.clone()).collect();
+            if !session_targets.is_empty() {
+                offered.extend(SESSION_TOOLS.iter().map(|name| (*name).to_owned()));
+            }
+            self.root_modes = resolve_modes(&origin, manifest, &offered)?;
         }
         let index = self.nodes.len();
         self.nodes.push(Node {
@@ -1471,20 +1488,31 @@ struct Taken<'a> {
     mcp_tools: &'a [String],
 }
 
-/// Give the agent a tool for each of its subagents, local and remote, named after the subagent and
-/// placed after the agent's own tools and its skills' tools, in the order of the manifest. The name
-/// must not be one the agent's model already sees.
-fn add_subagent_tools(
+/// What [`session_roster`] found for one agent: what its session tools are made from.
+struct Roster {
+    /// The registration names of its subagents, sorted: what the loop's turn-end wait names.
+    agents: Vec<String>,
+    /// Its subagents, in the order of the manifest.
+    targets: Vec<SessionTarget>,
+    /// The agents that work the rounds of its remote subagents.
+    rounds: Rounds,
+}
+
+/// The subagents of the agent as its five session tools offer them (ADR 0045, ADR 0089 slice C4):
+/// the roster, in the order of the manifest, and an agent of its own for the rounds of each remote
+/// one. Nothing is offered under a subagent's name: a subagent is the `agent` of a
+/// `subagent_start`. A name must still not be one the agent's model already reads for something
+/// else (a tool, another subagent, one of the session tools), and a remote subagent is checked
+/// against the deployment's rules here, before any model is needed.
+fn session_roster(
     origin: &Origin,
     manifest: &AgentManifest,
     taken: &Taken<'_>,
     remote: &RemoteSettings,
     secrets: &Secrets,
-    tools: &mut Vec<(String, DynTool)>,
-    session_limits: Option<SessionLimits>,
-) -> Result<(Vec<String>, Vec<SessionTarget>, Rounds), Error> {
-    let sessions = session_limits.is_some();
-    // The subagent tools added so far, by name, with the file of the subagent that owns each.
+    tools: &[(String, DynTool)],
+) -> Result<Roster, Error> {
+    // The subagents checked so far, by name, with the file of each.
     let mut subagents: Vec<(&str, &std::path::Path)> = Vec::new();
     #[cfg_attr(not(feature = "remote"), allow(unused_mut))]
     let mut rounds = Rounds::default();
@@ -1527,27 +1555,28 @@ fn add_subagent_tools(
                 clash,
             });
         }
-        let tool: DynTool = match sub {
-            Subagent::Local(child) => Arc::new(
-                SubagentTool::new(
-                    child.name.clone(),
-                    format!("{}/{}", origin.agent, child.name),
-                    child.frontmatter.description.as_deref().unwrap_or_default(),
-                )
-                .with_run_limit(run_limit(child.frontmatter.limits.as_ref())),
-            ),
+        match sub {
+            Subagent::Local(_) => {}
+            // The rounds of a session on it are runs of an agent of its own, which holds the
+            // connection: the URL and the token are checked now, the network touched at the first
+            // round.
             #[cfg(feature = "remote")]
             Subagent::Remote(agent) => {
-                let tool = RemoteSubagentTool::bind(&sub_origin, agent, remote, secrets)?;
-                // The rounds of a session on it are runs of an agent of its own, for the root.
-                if sessions {
-                    rounds.push(RemoteRoundAgent::new(
-                        format!("{}/{}", origin.agent, agent.name),
-                        Arc::clone(tool.endpoint()),
-                        remote.max_wait,
-                    ));
+                let endpoint = RemoteEndpoint::bind(&sub_origin, agent, remote, secrets)?;
+                if agent.files {
+                    // Never silent: the file asks for what no round does (ADR 0089 slice C4).
+                    tracing::warn!(
+                        agent = %sub_origin.agent,
+                        file = %file.display(),
+                        "`files: true` has no effect: a remote subagent's round describes each file \
+                         of the answer in a line and shares none"
+                    );
                 }
-                Arc::new(tool)
+                rounds.push(RemoteRoundAgent::new(
+                    sub_origin.agent.clone(),
+                    Arc::new(endpoint),
+                    remote.max_wait,
+                ));
             }
             // Refused before any secret is read: this build has no A2A client to call it with.
             #[cfg(not(feature = "remote"))]
@@ -1555,18 +1584,20 @@ fn add_subagent_tools(
                 let _ = secrets;
                 return Err(Error::RemoteNotEnabled { origin: sub_origin });
             }
-        };
+        }
         subagents.push((name, file));
-        tools.push((name.to_owned(), tool));
     }
-    if !sessions || manifest.subagents.is_empty() {
-        return Ok((Vec::new(), Vec::new(), Rounds::default()));
+    if manifest.subagents.is_empty() {
+        return Ok(Roster {
+            agents: Vec::new(),
+            targets: Vec::new(),
+            rounds,
+        });
     }
-    // The tools that run a subagent in the background: after the one tool per subagent, and named
-    // so that a clash with a tool or a subagent is found now.
-    let targets = session_targets(manifest, &origin.agent, remote);
+    // The five tools come after the agent's own and its skills' tools, and are named so that a
+    // clash with a tool or a subagent is found now.
     for name in SESSION_TOOLS {
-        if tools.iter().any(|(n, _)| n == name) {
+        if tools.iter().any(|(n, _)| n == name) || subagents.iter().any(|(n, _)| *n == name) {
             let clash = manifest
                 .subagents
                 .iter()
@@ -1588,12 +1619,17 @@ fn add_subagent_tools(
     // `MAX_PARALLEL_TOOL_CALLS` and the model are known: each subagent's bounds need both (ADR
     // 0054 slice 1 part 2). Their names and order are fixed here, so a clash is still found
     // before a model is needed, and `AgentInfo::tools` names them.
-    let mut names: Vec<String> = targets.iter().map(|t| t.agent.clone()).collect();
-    names.sort();
-    Ok((names, targets, rounds))
+    let targets = session_targets(manifest, &origin.agent, remote);
+    let mut agents: Vec<String> = targets.iter().map(|t| t.agent.clone()).collect();
+    agents.sort();
+    Ok(Roster {
+        agents,
+        targets,
+        rounds,
+    })
 }
 
-/// The subagents of the root a session can be started on, in the order of the manifest: the one
+/// The subagents of an agent a session can be started on, in the order of the manifest: the one
 /// list the session tools, the card and the A2A front are made from, so they cannot disagree. A
 /// local subagent's rounds are limited by its `limits.max_minutes`, a remote one's by the
 /// deployment's remote wait.
@@ -1725,7 +1761,8 @@ pub(crate) fn limits(file: Option<&FileLimits>) -> Limits {
     }
 }
 
-/// The root's modes, resolved against the tools the agent ends up with (ADR 0039, decision 3): a
+/// The root's modes, resolved against the names of the tools the agent ends up with, `available`
+/// (ADR 0039, decision 3): a
 /// pattern is expanded (one that matches nothing is an error), a plain name the agent does not have
 /// is dropped with a warning (a deployment's environment decides some tools, and a folder's `tools:`
 /// may narrow them: a mode only narrows what exists, so it can never widen anything by it), and
@@ -1733,20 +1770,19 @@ pub(crate) fn limits(file: Option<&FileLimits>) -> Limits {
 fn resolve_modes(
     origin: &Origin,
     manifest: &AgentManifest,
-    tools: &[(String, DynTool)],
+    available: &[String],
 ) -> Result<Option<std::sync::Arc<crate::modes::Modes>>, Error> {
     use crate::modes::{Modes, ResolvedMode};
 
     if manifest.modes.is_empty() {
         return Ok(None);
     }
-    let available: Vec<String> = tools.iter().map(|(name, _)| name.clone()).collect();
     let mut resolved = Vec::with_capacity(manifest.modes.len());
     for mode in &manifest.modes {
         let at = origin.in_file(mode.path.clone());
         let allowed = match &mode.tools {
             None => None,
-            Some(ToolList::All) => Some(available.clone()),
+            Some(ToolList::All) => Some(available.to_vec()),
             Some(ToolList::Named(names)) => {
                 let mut chosen: Vec<String> = Vec::new();
                 for wanted in names {
@@ -1762,10 +1798,10 @@ fn resolve_modes(
                             return Err(Error::NoToolMatches {
                                 origin: at.clone(),
                                 pattern: wanted.clone(),
-                                available: available.clone(),
+                                available: available.to_vec(),
                             });
                         }
-                    } else if available.contains(wanted) {
+                    } else if available.iter().any(|name| name == wanted) {
                         if !chosen.contains(wanted) {
                             chosen.push(wanted.clone());
                         }

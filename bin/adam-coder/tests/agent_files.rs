@@ -130,9 +130,9 @@ fn the_prompt_names_no_opencode_and_stays_under_30000_chars() {
     );
 }
 
-/// The tools in the order the model is offered them: the coder's own, the screen's, and one per
-/// subagent of the shipped folder.
-const TOOLS: [&str; 45] = [
+/// The tools in the order the model is offered them: the coder's own, the screen's, the skill tools
+/// and the six that start and follow the shipped folder's subagents.
+const TOOLS: [&str; 43] = [
     "prepare_workspace",
     "start_scratch",
     "publish_scratch",
@@ -172,9 +172,8 @@ const TOOLS: [&str; 45] = [
     // repository) is a tool result and the tool list never changes (ADR 0044, decision 8).
     "load_skill",
     "read_skill_file",
-    "explorer",
-    "reviewer",
-    // The six that run a subagent in the background (ADR 0045), after the one tool per subagent.
+    // The six that start and follow a subagent (ADR 0045): the only way to one, since no tool is
+    // named after a subagent (ADR 0089 slice C4).
     "subagent_start",
     "subagent_send",
     "subagent_read",
@@ -193,11 +192,7 @@ async fn every_tool_of_the_coder_has_a_title_for_its_step() {
     })
     .await;
     let tools = coder_tools(&fx.env);
-    assert_eq!(
-        tools.len(),
-        TOOLS.len() - 10,
-        "the coder's and the screen's"
-    );
+    assert_eq!(tools.len(), TOOLS.len() - 8, "the coder's and the screen's");
     let mut titles = Vec::new();
     for tool in tools.iter() {
         let name = tool.spec().name;
@@ -922,8 +917,6 @@ async fn a_folder_may_narrow_the_tools() {
             "ask_user",
             "load_skill",
             "read_skill_file",
-            "explorer",
-            "reviewer",
             "subagent_start",
             "subagent_send",
             "subagent_read",
@@ -932,7 +925,7 @@ async fn a_folder_may_narrow_the_tools() {
             "subagent_list"
         ],
         "the tools of the folder's `tools:`, the two skill tools (`tools:` does not filter them), \
-         then one per subagent, then the six that run one in the background"
+         then the six that start and follow a subagent (`tools:` does not filter them either)"
     );
 }
 
@@ -978,12 +971,7 @@ async fn a_subagent_reads_the_worktree_its_root_run_prepared() {
         arguments: json!({"repo_url": url, "base_branch": "main"}),
         ..Default::default()
     }])
-    .push_tool_calls(vec![ToolCall {
-        id: "c2".into(),
-        name: "explorer".into(),
-        arguments: json!({"message": "what does README.md say?"}),
-        ..Default::default()
-    }])
+    .push_tool_calls(vec![delegate("c2", "explorer", "what does README.md say?")])
     // The explorer's own turns.
     .push_tool_calls(vec![ToolCall {
         id: "e1".into(),
@@ -1022,15 +1010,30 @@ async fn a_subagent_reads_the_worktree_its_root_run_prepared() {
         }
         other => panic!("{other:?}"),
     }
-    // And the coder got the explorer's answer.
+    // And the coder got the explorer's answer, as the report of the session it started.
     match requests[4].messages.last().unwrap() {
-        Message::Tool { content, .. } => assert_eq!(content, "README.md:1 says widgets."),
+        Message::Tool { content, .. } => {
+            assert!(content.contains("report: done"), "{content}");
+            assert!(content.contains("README.md:1 says widgets."), "{content}");
+        }
         other => panic!("{other:?}"),
     }
 }
 
-/// The subagents of a folder are registered beside the coder and the shipped ones: the model calls the subagent's tool,
-/// a child run answers, and the coder goes on with the child's text.
+/// The one-shot call of before ADR 0089 slice C4, as the coder's model writes it now:
+/// `subagent_start` on `agent` with `mode: one_shot` and `wait: true`.
+fn delegate(id: &str, agent: &str, prompt: &str) -> ToolCall {
+    ToolCall {
+        id: id.into(),
+        name: "subagent_start".into(),
+        arguments: json!({"agent": agent, "description": "the task", "prompt": prompt,
+                          "mode": "one_shot", "wait": true}),
+        ..Default::default()
+    }
+}
+
+/// The subagents of a folder are registered beside the coder and the shipped ones: the model starts
+/// one with `subagent_start`, a child run answers, and the coder goes on with the child's text.
 #[tokio::test]
 async fn a_subagent_of_the_folder_is_registered_and_runs_as_a_child() {
     let fx = Fixture::new().await;
@@ -1044,14 +1047,9 @@ async fn a_subagent_of_the_folder_is_registered_and_runs_as_a_child() {
     let files = files_of(&tmp);
 
     let mock = Arc::new(MockModel::new());
-    mock.push_tool_calls(vec![ToolCall {
-        id: "c1".into(),
-        name: "summariser".into(),
-        arguments: json!({"message": "summarise the diff"}),
-        ..Default::default()
-    }])
-    .push_text("LGTM, nothing to fix.")
-    .push_text("The summariser is happy.");
+    mock.push_tool_calls(vec![delegate("c1", "summariser", "summarise the diff")])
+        .push_text("LGTM, nothing to fix.")
+        .push_text("The summariser is happy.");
     let agent = coder_from(&files, &fx, &mock);
     let info = agent.assembly().info();
     assert_eq!(
@@ -1064,9 +1062,10 @@ async fn a_subagent_of_the_folder_is_registered_and_runs_as_a_child() {
         ]
     );
     assert_eq!(agent.subagents().len(), 3);
-    // The subagents' tools, in the order of the files, and the six session tools after them.
+    // The tools are the shipped folder's: the six session tools last, none named after a
+    // subagent; the new one is in the roster of `subagent_start`.
     let tools = &info[0].tools;
-    assert_eq!(tools[tools.len() - 7], "summariser");
+    assert!(!tools.iter().any(|t| t == "summariser"), "{tools:?}");
     assert_eq!(tools.last().map(String::as_str), Some("subagent_list"));
 
     let coder = Coder::new(Arc::new(MemoryStore::new()), agent, &options());
@@ -1076,7 +1075,15 @@ async fn a_subagent_of_the_folder_is_registered_and_runs_as_a_child() {
     assert_eq!(requests.len(), 3);
     let offered =
         |r: &ModelRequest| -> Vec<String> { r.tools.iter().map(|t| t.name.clone()).collect() };
-    assert!(offered(&requests[0]).contains(&"summariser".to_owned()));
+    let start = requests[0]
+        .tools
+        .iter()
+        .find(|t| t.name == "subagent_start")
+        .expect("subagent_start");
+    assert_eq!(
+        start.parameters["properties"]["agent"]["enum"],
+        json!(["explorer", "reviewer", "summariser"])
+    );
     // The child: its own prompt and the one tool it picked from the coder's.
     assert_eq!(
         plain(&requests[1].system).as_deref(),
@@ -1089,7 +1096,7 @@ async fn a_subagent_of_the_folder_is_registered_and_runs_as_a_child() {
             call_id, content, ..
         } => {
             assert_eq!(call_id, "c1");
-            assert_eq!(content, "LGTM, nothing to fix.");
+            assert!(content.contains("LGTM, nothing to fix."), "{content}");
         }
         other => panic!("{other:?}"),
     }
@@ -1309,8 +1316,8 @@ async fn a_folder_with_an_mcp_json_gives_the_coder_the_tools_of_its_servers() {
     )
     .expect("the folder assembles with its MCP tools");
     let tools = &agent.assembly().info()[0].tools;
-    // The coder's own tools, the server's, then one per subagent and the six session tools.
-    let own = TOOLS.len() - 10;
+    // The coder's own tools, the server's, then the skill tools and the six session tools.
+    let own = TOOLS.len() - 8;
     assert_eq!(tools.len(), TOOLS.len() + 1, "{tools:?}");
     assert_eq!(&tools[..own], &TOOLS[..own]);
     assert_eq!(tools[own], "test__echo");

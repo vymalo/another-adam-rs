@@ -98,11 +98,29 @@ fn a_file_value_equal_to_the_setting_is_that_value() {
     assert_eq!(parallel_of(&got), (4, 4));
 }
 
+/// A parent delegates with the session tools (ADR 0089 slice C4: there is no tool named after a
+/// subagent), and each of them runs alone, `subagent_start` waiting or not: a start that waits
+/// parks the run on the child, as the subagent's own tool did.
 #[test]
-fn a_subagent_tool_runs_alone() {
-    use adam_llm_agent::{Tool, ToolAccess};
-    let tool = adam_assembly::SubagentTool::new("helper", "coder/helper", "Does a piece of work.");
-    assert_eq!(tool.access(&serde_json::json!({})), ToolAccess::Alone);
+fn the_tools_that_start_a_subagent_run_alone() {
+    use adam_llm_agent::{SESSION_TOOLS, SessionTools, ToolAccess};
+    let assembly = assemble(family("", ""), None);
+    let root = &assembly.info()[0];
+    assert!(!root.tools.iter().any(|tool| tool == "child"));
+    assert!(root.tools.ends_with(&SESSION_TOOLS.map(str::to_owned)));
+    for tool in SessionTools::new(Vec::new()).tools() {
+        for args in [
+            serde_json::json!({}),
+            serde_json::json!({"agent": "child", "description": "d", "prompt": "p", "wait": true}),
+        ] {
+            assert_eq!(
+                tool.access(&args),
+                ToolAccess::Alone,
+                "{}",
+                tool.spec().name
+            );
+        }
+    }
 }
 
 /// How a run waits on a model that refused it (ADR 0067) is the deployment's, for every agent: the
