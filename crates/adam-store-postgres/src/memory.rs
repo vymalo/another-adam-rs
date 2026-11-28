@@ -143,7 +143,7 @@ impl MemSql {
 /// schema version 10**, whatever the `memory` feature says.
 ///
 /// The synchronous [`Memory`] port over the async driver is bridged by one owned multi-thread
-/// Tokio runtime: read [the blocking bridge](self#the-blocking-bridge) before calling this type
+/// Tokio runtime: read [the blocking bridge](index.html#the-blocking-bridge) before calling this type
 /// from async code.
 #[derive(Debug)]
 pub struct PgMemory {
