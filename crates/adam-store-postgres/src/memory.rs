@@ -23,17 +23,23 @@
 //! way per context, and a fourth context (a future running on the adapter's own runtime calling
 //! back into the adapter) is not one of them. `PgMemory` is `Send + Sync + 'static` (the port's
 //! bound), and no transaction is held open while caller code runs.
+//!
+//! Timestamps are `TIMESTAMPTZ`, so they keep microseconds where the in-process reference keeps
+//! nanoseconds: two writes less than a microsecond apart compare equal here and are ordered by
+//! root cause, the port's stable tie-break, while the reference would order them by time. A recall
+//! still serves the freshest first, and the port's five-millisecond case is unaffected.
 
 use std::future::Future;
 use std::panic::resume_unwind;
 use std::sync::Arc;
 
 use adam_core::time::Timestamp;
+use adam_core::{StoreError, StoreResult};
 use adam_memory::{
     Audience, Lesson, LessonDraft, LessonSettings, LessonState, Memory, MemoryError, MemoryResult,
     MemoryScope, prepare,
 };
-use adam_postgres::PgConfig;
+use adam_postgres::{PgConfig, classify, classify_pool};
 use deadpool_postgres::Pool;
 use serde_json::Value;
 use tokio::runtime::{Builder, Handle, Runtime, RuntimeFlavor};
@@ -75,7 +81,7 @@ impl MemSql {
             // The write is serialised per scope and audience, like the reference's one lock per
             // store call: sixteen writers on one audience write one at a time.
             lock_scope_audience: Arc::from(
-                "SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))",
+                "SELECT pg_advisory_xact_lock(hashtextextended($1 || chr(31) || $2, 0))",
             ),
             // The migration's own lock: `adam-rs:migrate:{prefix}`, the key every migrator of this
             // prefix takes (`PgStore::migrate`'s transaction takes it too).
@@ -112,10 +118,15 @@ impl MemSql {
             // One statement: retire unless already retired (then keep `retired_at` and `updated`,
             // so retiring twice is one retirement), and return the stored row. A row the statement
             // does not touch is either already retired (returned unchanged) or absent (refused).
+            // It takes the same scope/audience lock `record` takes, in the same implicit
+            // transaction, so a retire cannot interleave between a record's count and its upsert:
+            // the volatile function in the CTE is always evaluated.
             retire: Arc::from(format!(
-                "UPDATE {t}
+                "WITH lock AS (SELECT pg_advisory_xact_lock(hashtextextended($1 || chr(31) || $2, 0)))
+                 UPDATE {t}
                     SET state = 'retired', retired_at = COALESCE(retired_at, $4),
                         updated = CASE WHEN state = 'retired' THEN updated ELSE $4 END
+                   FROM lock
                   WHERE scope = $1 AND audience = $2 AND root_cause = $3
                  RETURNING {LESSON_COLUMNS}"
             )),
@@ -151,30 +162,24 @@ impl PgMemory {
     ///
     /// # Errors
     ///
-    /// [`MemoryError::backend`] (class `Transient`) on a URL the driver refuses, a pool that
-    /// cannot be built or a database that does not answer; a deployment validates its
-    /// configuration at startup and exits 78 on any of them (ADR 0081 decision 12).
-    pub fn connect(url: &str, settings: LessonSettings, scope: MemoryScope) -> MemoryResult<Self> {
-        let config = PgConfig::parse(url).map_err(MemoryError::backend)?;
-        let pool = config
-            .pool(DEFAULT_POOL_SIZE as usize)
-            .map_err(MemoryError::backend)?;
+    /// [`StoreError::InvalidInput`] (class `Invalid`) on a URL or prefix the driver refuses, and
+    /// [`StoreError`] with its own class on a pool that cannot be built or a database that does
+    /// not answer — the same classes [`PgStore::connect`](crate::PgStore) gives them. A
+    /// deployment validates its configuration at startup and exits 78 on the invalid ones (ADR
+    /// 0081 decision 12); a retrying caller must not retry an `Invalid`.
+    pub fn connect(url: &str, settings: LessonSettings, scope: MemoryScope) -> StoreResult<Self> {
+        let config = PgConfig::parse(url)?;
+        let pool = config.pool(DEFAULT_POOL_SIZE as usize)?;
         let memory = Self::from_pool(pool, settings, scope)?;
         memory.block_on(memory.ping())?;
         Ok(memory)
     }
 
     /// Open one connection now, to learn whether the database answers.
-    async fn ping(&self) -> MemoryResult<()> {
-        let client = self.pool.get().await.map_err(MemoryError::backend)?;
-        let stmt = client
-            .prepare_cached("SELECT 1")
-            .await
-            .map_err(MemoryError::backend)?;
-        client
-            .query_one(&stmt, &[])
-            .await
-            .map_err(MemoryError::backend)?;
+    async fn ping(&self) -> StoreResult<()> {
+        let client = self.pool.get().await.map_err(classify_pool)?;
+        let stmt = client.prepare_cached("SELECT 1").await.map_err(classify)?;
+        client.query_one(&stmt, &[]).await.map_err(classify)?;
         Ok(())
     }
 
@@ -183,18 +188,19 @@ impl PgMemory {
     ///
     /// # Errors
     ///
-    /// [`MemoryError::backend`] when the owned runtime cannot be built (a thread spawn failure).
+    /// [`StoreError::internal`] (class `Internal`, never retried) when the owned runtime cannot be
+    /// built, which is a thread-spawn failure in the process, not the database.
     pub fn from_pool(
         pool: Pool,
         settings: LessonSettings,
         scope: MemoryScope,
-    ) -> MemoryResult<Self> {
+    ) -> StoreResult<Self> {
         let runtime = Builder::new_multi_thread()
             .worker_threads(2)
             .thread_name("adam-memory-pg")
             .enable_all()
             .build()
-            .map_err(MemoryError::backend)?;
+            .map_err(StoreError::internal)?;
         Ok(Self {
             pool,
             runtime,
@@ -210,10 +216,10 @@ impl PgMemory {
     ///
     /// # Errors
     ///
-    /// [`MemoryError::backend`] on a prefix that is not `[a-z0-9_]`, at most 40 characters and
-    /// starting with a letter or underscore.
-    pub fn with_table_prefix(mut self, prefix: &str) -> MemoryResult<Self> {
-        check_table_prefix(prefix).map_err(MemoryError::backend)?;
+    /// [`StoreError::InvalidInput`] (class `Invalid`) on a prefix that is not `[a-z0-9_]`, at most
+    /// 40 characters and starting with a letter or underscore.
+    pub fn with_table_prefix(mut self, prefix: &str) -> StoreResult<Self> {
+        check_table_prefix(prefix)?;
         self.sql = MemSql::new(prefix);
         Ok(self)
     }
@@ -237,23 +243,22 @@ impl PgMemory {
     ///
     /// # Errors
     ///
-    /// [`MemoryError::backend`] when the DDL cannot run.
-    pub fn migrate(&self) -> MemoryResult<()> {
+    /// [`StoreError`] with the driver's class, as [`PgStore::migrate`](crate::PgStore): a
+    /// connection loss is `Transient`, a rejected statement `Internal`.
+    pub fn migrate(&self) -> StoreResult<()> {
         let lock = self.sql.migrate_lock.clone();
         self.block_on(async {
-            let mut client = self.pool.get().await.map_err(MemoryError::backend)?;
-            let tx = client.transaction().await.map_err(MemoryError::backend)?;
+            let mut client = self.pool.get().await.map_err(classify_pool)?;
+            let tx = client.transaction().await.map_err(classify)?;
             let stmt = tx
                 .prepare_cached(&self.sql.lock_migrate)
                 .await
-                .map_err(MemoryError::backend)?;
-            tx.execute(&stmt, &[&lock])
-                .await
-                .map_err(MemoryError::backend)?;
+                .map_err(classify)?;
+            tx.execute(&stmt, &[&lock]).await.map_err(classify)?;
             for stmt in &self.sql.migrate {
-                tx.batch_execute(stmt).await.map_err(MemoryError::backend)?;
+                tx.batch_execute(stmt).await.map_err(classify)?;
             }
-            tx.commit().await.map_err(MemoryError::backend)
+            tx.commit().await.map_err(classify)
         })
     }
 

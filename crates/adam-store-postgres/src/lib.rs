@@ -686,7 +686,7 @@ pub(crate) fn memory_lesson_ddl(p: &str) -> Vec<Arc<str>> {
             "CREATE TABLE IF NOT EXISTS {t} (
                 scope      TEXT        NOT NULL,
                 audience   TEXT        NOT NULL,
-                root_cause TEXT        NOT NULL,
+                root_cause TEXT        NOT NULL COLLATE \"C\",
                 remedy     TEXT        NOT NULL,
                 rationale  TEXT        NOT NULL,
                 anchors    JSONB       NOT NULL,

@@ -278,7 +278,13 @@ process that migrates no store.
 
 `PgMemory` mirrors the store's shape: `connect(url, settings, scope)`, `from_pool(pool, settings,
 scope)`, `with_table_prefix(prefix)`, `pool()`, `scope()` and `migrate()`. The first two build a
-[`DEFAULT_POOL_SIZE`](#pool) pool (`connect` opens a connection at once). A `PgMemory` is
+[`DEFAULT_POOL_SIZE`](#pool) pool (`connect` opens a connection at once). Its constructors and
+`migrate` answer `adam_core::StoreError` with the store's classes (a bad URL or prefix is
+`InvalidInput`, class `Invalid`, never retried; an unreachable database is `Transient`; a runtime
+that cannot start is `Internal`); only the port's `record`, `recall` and `retire` answer
+`MemoryError`. Timestamps are `TIMESTAMPTZ`, so they keep microseconds where the in-process
+reference keeps nanoseconds: two writes less than a microsecond apart are ordered by root cause, the
+port's stable tie-break. A `PgMemory` is
 configured with one `MemoryScope` and every key and query carries it, so two scopes on one database
 never see each other's lessons; its `record`, `recall` and `retire` have the in-process reference's
 semantics exactly (the port's own preparation, the served-lesson bound, an upsert that keeps the

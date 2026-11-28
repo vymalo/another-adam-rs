@@ -149,7 +149,7 @@ CREATE OR REPLACE FUNCTION adam_claim_due(
 CREATE TABLE IF NOT EXISTS adam_memory_lesson (
                 scope      TEXT        NOT NULL,
                 audience   TEXT        NOT NULL,
-                root_cause TEXT        NOT NULL,
+                root_cause TEXT        NOT NULL COLLATE "C",
                 remedy     TEXT        NOT NULL,
                 rationale  TEXT        NOT NULL,
                 anchors    JSONB       NOT NULL,

@@ -16,7 +16,8 @@ adapter uses the port's own write path, exported for it: `prepare`, `MemoryError
 `<prefix>memory_lesson` and its recall index are in `Sql::migrate` **unconditionally** — schema version 10
 (`memory_lesson_ddl`, `crates/adam-store-postgres/src/lib.rs`; `tests/fixtures/schema-v10.sql`) — so a binary built
 without the feature cannot leave one with it on a schema with no table. `record` is one transaction:
-`pg_advisory_xact_lock(hashtext(scope), hashtext(audience))`, the served count and the key's state, the bound refused
+`pg_advisory_xact_lock(hashtextextended(scope || chr(31) || audience, 0))` (64-bit keys), the served count
+and the key's state, the bound refused
 as `AudienceFull`, an upsert keeping `created`. The synchronous port over the async pool is bridged by an owned
 multi-thread runtime (`PgMemory::block_on`: `block_in_place` in a multi-thread caller, a scoped thread in a
 current-thread one). The suite is `crates/adam-store-postgres/tests/memory.rs`
