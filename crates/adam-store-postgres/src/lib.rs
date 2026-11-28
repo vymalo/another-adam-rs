@@ -53,6 +53,12 @@
 //! migration and the notification listener take a connection out of the pool (`Object::take`)
 //! so a session lock or a `LISTEN` never returns to it.
 
+#[cfg(feature = "memory")]
+mod memory;
+
+#[cfg(feature = "memory")]
+pub use memory::PgMemory;
+
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;

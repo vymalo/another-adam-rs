@@ -976,6 +976,8 @@ version = "0.7.0"
 dependencies = [
  "adam-core",
  "adam-error",
+ "adam-memory",
+ "adam-memory-testkit",
  "adam-postgres",
  "adam-runtime",
  "adam-store-testkit",
