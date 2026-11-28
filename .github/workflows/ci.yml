@@ -1,14 +1,20 @@
 name: ci
 
-# Push to main and every pull request: not both on every branch push. A newer
-# push to a pull request cancels the run it supersedes; runs on main finish.
+# Push to main and every pull request: not both on every branch push.
 on:
   push:
     branches: [main]
   pull_request:
 
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
+  # A merge on main is a verification, so a push gets a group of its own per
+  # commit: GitHub cancels a *pending* run when a newer one joins its group even
+  # with `cancel-in-progress: false`, so a per-ref group on a busy main left every
+  # merge but the last without a verdict (ANR-1360: d3281289, dfc99a8e and
+  # 5178c56c all ended `cancelled`). A pull request keeps the per-ref group: its
+  # next head supersedes the previous run, which is the cheap behaviour, and
+  # `cancel-in-progress` cancels that one outright.
+  group: ci-${{ github.workflow }}-${{ github.event_name == 'push' && github.sha || github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:

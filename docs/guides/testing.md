@@ -36,6 +36,12 @@ and a nightly live-model smoke and a live test of `adam-acp` against OpenCode
 (`.github/workflows/nightly.yml`, needs secrets). The CI jobs are the reference:
 `.github/workflows/ci.yml` and `coder.yml`.
 
+Every commit pushed to `main` gets a `ci` run of its own: the concurrency group is the commit sha on a push and
+the branch on a pull request. GitHub cancels a *pending* run as soon as a newer one joins its group, even with
+`cancel-in-progress: false`, so a group shared by a busy `main` left merges without a verdict; a pull request
+still cancels its superseded heads. `coder.yml` keeps the same shape for the runs that must finish
+([ADR 0084](../decisions/0084-releases-are-cut-by-release-please-and-production-pins-a-version.md)).
+
 ## Tests that start a binary
 
 The git sandbox's tests start the real server (`adam-git-sandbox`) as a process and run `git` through it: the crate's own tests use
