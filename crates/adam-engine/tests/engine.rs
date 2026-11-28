@@ -2245,6 +2245,54 @@ async fn the_deployments_profiles_reach_an_engines_agent() {
     timeout(WAIT, engine.shutdown()).await.unwrap().unwrap();
 }
 
+/// A profile's `contextWindow` given to the builder alone is the model's window (ADR 0086, slice
+/// W1 amended 2026-11-28): the host's client has no profiles, and the window it was configured
+/// with loses to the profile's, as `resolve_context_window` rules. The clamp of the output cap and
+/// the `usage/v1` report read it; the history budget reads the same answer of the client.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_profiles_window_reaches_a_client_without_profiles() {
+    let mock = Arc::new(MockModel::new().with_context_window("m", 1_000_000));
+    mock.push_text("done");
+    let model: DynModel = mock.clone();
+    let profiles = ModelProfiles::parse_json(
+        r#"{"profiles": {"m": {"contextWindow": 200000, "maxOutputTokens": 100000}}}"#,
+    )
+    .expect("the deployment's profiles parse");
+    let engine = Engine::builder(Arc::new(MemoryStore::new()), chat(), model, "m")
+        .models(profiles)
+        .start()
+        .await
+        .expect("the agent starts with its model's profile");
+    let turn = engine.send(None, Say::new("hi")).await.unwrap();
+    let mut events = engine.events(turn.run).await.unwrap();
+    let mut windows = Vec::new();
+    let mut last = None;
+    while let Some(event) = timeout(WAIT, events.next()).await.expect("an event") {
+        let event = event.unwrap();
+        if let EngineEvent::Live(RunEvent::Usage(usage)) = &event {
+            windows.push(usage.context_window);
+        }
+        last = Some(event);
+    }
+    assert!(
+        matches!(last, Some(EngineEvent::Ended(ref info)) if info.state == RunState::Done),
+        "the run ends done: {last:?}"
+    );
+    assert_eq!(
+        windows,
+        [Some(200_000)],
+        "the report carries the profile's window, not the client's 1,000,000"
+    );
+    // 200,000 − 20,000 margin − 100,000 of history: 80,000. Over the client's own window the cap
+    // would have stayed 100,000.
+    assert_eq!(
+        mock.requests()[0].max_output_tokens,
+        Some(80_000),
+        "the profile's window clamps the cap"
+    );
+    timeout(WAIT, engine.shutdown()).await.unwrap().unwrap();
+}
+
 /// The builder's level is the **root's** (ADR 0063 decision 8), between the folder and the preset:
 /// a folder that sets none takes the builder's over its `model_preset`'s, and a folder that sets
 /// one wins over the builder's.

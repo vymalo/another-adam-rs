@@ -81,10 +81,15 @@ host brings the one it chooses), the agent's definition (`AgentDef`, from `inclu
 the model (`DynModel`, with its credentials: ADR 0047 decision 4, [ADR
 0058](../../docs/decisions/0058-the-models-credentials-come-from-a-provider-asked-for-each-call.md)), the
 deployment's profiles (`ModelProfiles`, `EngineBuilder::models`: what each model takes as a reasoning effort, the
-preset it starts from and its output cap, ADR 0063 and ADR 0064; without them an agent whose file sets an effort
-or a preset is refused, fail closed), and, for an embedded agent whose file sets none, the root's reasoning level
+preset it starts from, its output cap and its `contextWindow`, ADR 0063, ADR 0064 and ADR 0086; without them an
+agent whose file sets an effort or a preset is refused, fail closed), and, for an embedded agent whose file sets none, the root's reasoning level
 (`EngineBuilder::reasoning_effort`, a `ReasoningEffort`; the folder's key wins). If the agent's files name secrets,
-a `SecretSource` too. The engine reads no environment variable, no key and no file it was not
+a `SecretSource` too. The profiles reach the model client as well: for an alias the host's client has no profile
+of, the engine answers its window with the profile's `contextWindow`, over the window the client was configured with
+(`adam_model::resolve_context_window`), for the history budget, the output cap's clamp and each `usage/v1` report,
+so the host does not give its client the same profiles. A client's own profile of an alias wins whole (its requests
+are sent by it); the reasoning wire and extra body are still the client's own (`OpenAiCompatible::with_profiles`).
+The engine reads no environment variable, no key and no file it was not
 given. `default_secrets()` is `adam_core::NoSecrets`, which refuses every name (ADR 0047 decision 5), and the
 builder's source replaces whatever source the definition had.
 
@@ -421,6 +426,11 @@ every wait is bounded by `tokio::time::timeout`:
   the history, which the 200,000 default does not fit); a hand-built profile (the loader refuses a file whose cap is above its limit) with
   `maxOutputTokens: 64000` and `maxOutputTokensLimit: 32000` asks for 32,000 (the mock used directly, not through
   `Rig`: `GateModel` forwards no `context_window`);
+* `the_profiles_window_reaches_a_client_without_profiles`: `EngineBuilder::models` with `contextWindow: 200000` and
+  `maxOutputTokens: 100000`, over a client with no profiles told a 1,000,000-token window for the alias: the run's
+  `usage/v1` report carries 200,000 and the cap is clamped to 80,000 (ADR 0086, slice W1 amended 2026-11-28; the unit
+  tests of `src/profiled.rs` pin the precedence: the client's own profile wins whole, a profile without a window falls
+  through to the client's);
 * `the_builders_level_is_the_roots_and_the_file_wins`: `EngineBuilder::reasoning_effort(high)` with a folder
   `model_preset: quick` (a preset at `low`) asks for `high`; a folder `reasoning_effort: low` beside the same
   builder value asks for `low`;

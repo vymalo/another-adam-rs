@@ -49,8 +49,13 @@ Built 2026-11-27. The invariant: **one rule answers a model alias's window**, an
   `compaction::effective_window`), each `usage/v1` report (`agent.rs:4224`), and the output cap's clamp
   (`crates/adam-assembly/src/assembly.rs:758`). A subagent is built on the same client with its own alias, so its
   window is its own profile's.
-* Not covered: the engine's `EngineBuilder::models` reaches the assembly, not the client the host built; an embedded
-  host gives its client the same profiles (`with_profiles`) for a profile's window to apply.
+* The engine (amended 2026-11-28): `EngineBuilder::start` wraps the host's client in `Profiled`
+  (`crates/adam-engine/src/profiled.rs`) when `EngineBuilder::models` gave profiles, before the assembly is built, so the
+  three readers above see the profiles' windows without the host giving its client the same profiles. For an alias the
+  client has a profile of, the client answers alone (its profile wins whole, not merged: its requests are sent by it);
+  otherwise `resolve_context_window(engine's profile, client.context_window(alias))`, the client's answer without a
+  profile being its configured window. `profile()` answers likewise; everything else forwards. Check: no second rule,
+  and the wrap stays before `bound.model(..)`. The reasoning wire and extra body are still the client's own profiles.
 
 Tests: `profiles.rs` `a_context_window_is_one_to_two_to_the_53_minus_one_tokens`,
 `the_profiles_window_wins_over_the_configured_one`; `client.rs` `the_default_window_is_the_profiles`; `mock.rs`
@@ -58,7 +63,8 @@ Tests: `profiles.rs` `a_context_window_is_one_to_two_to_the_53_minus_one_tokens`
 `adam-service` `a_profiles_context_window_wins_over_default_model_context_window`; `adam-llm-agent` `tests/usage.rs`
 `each_report_carries_the_window_its_aliases_profile_names` and `tests/compaction.rs`
 `the_budget_is_taken_from_the_window_of_the_models_profile`; `adam-assembly` `tests/cap.rs`
-`a_subagent_on_another_alias_has_its_own_profiles_window`.
+`a_subagent_on_another_alias_has_its_own_profiles_window`; `adam-engine` `tests/engine.rs`
+`the_profiles_window_reaches_a_client_without_profiles` and the unit tests of `src/profiled.rs`.
 
 ## The history budget's default (ADR 0086, slice W3)
 

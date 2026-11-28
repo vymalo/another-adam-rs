@@ -56,6 +56,7 @@ pub use adam_ui;
 mod engine;
 mod error;
 mod events;
+mod profiled;
 mod resources;
 mod types;
 

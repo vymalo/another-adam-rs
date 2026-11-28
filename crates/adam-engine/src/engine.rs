@@ -287,6 +287,16 @@ impl EngineBuilder {
     /// a preset is refused at [`start`](Self::start) (fail closed), one that sets neither sends
     /// none, and every cap is the folder's, the preset's or the profile's, then clamped to the
     /// model's limit and the window.
+    ///
+    /// They also give the model client a profile's `contextWindow` ([ADR 0086]): for an alias the
+    /// client has no profile of, its [`context_window`](adam_model::ModelClient::context_window) is
+    /// the profile's window, over the one the client was configured with
+    /// ([`resolve_context_window`](adam_model::resolve_context_window)), for the history budget,
+    /// the clamp of the output cap and each `usage/v1` report. The host does not give its client
+    /// the same profiles; a client that has its own profile of an alias keeps it, whole (it is the
+    /// one its requests are sent by).
+    ///
+    /// [ADR 0086]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0086-the-context-window-follows-the-model-and-the-history-budget-is-200k.md
     pub fn models(mut self, profiles: ModelProfiles) -> Self {
         self.profiles = profiles;
         self
@@ -388,6 +398,9 @@ impl EngineBuilder {
             Some(effort) => agent.reasoning_effort(Some(effort)),
             None => agent,
         };
+        // The deployment's profiles answer the window of a model the host's client has no profile
+        // of (ADR 0086, slice W1 amended), so the assembly and every agent read one window.
+        let model = crate::profiled::profiled(model, &profiles);
         let bound = agent
             .secrets(secrets)
             .session_limits(limits.sessions)

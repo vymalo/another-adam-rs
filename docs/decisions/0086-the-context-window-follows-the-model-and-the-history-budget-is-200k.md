@@ -101,3 +101,11 @@ model. Without it the 200,000 default leaves one output token on any window up t
 200,000-token model); with it a 200,000 window leaves 80,000 and 131,072 leaves 45,536. Decision 4's "a known smaller
 window still wins" is the reason, and it applies to a folder's explicit value over half the window too. The people's
 pages (`docs/reference/agent-files.md`, the architecture's compaction section) say 200,000.
+
+*Amended 2026-11-28:* **the engine's gap in W1 is closed.** `EngineBuilder::models(profiles)` now reaches the model
+client too: `start` wraps the host's client (`crates/adam-engine/src/profiled.rs`) so that, for an alias the client has
+no profile of, its window is `resolve_context_window(the engine's profile, the client's own answer)` (the one rule),
+and the history budget, the output cap's clamp and each `usage/v1` report read the profile's window. An embedded host
+no longer gives its client the same profiles. A client that has its own profile of an alias keeps it whole, not merged
+with the engine's: it is the profile the client's requests are sent by (its reasoning wire, its extra body, which stay
+the client's). No trait changes.
