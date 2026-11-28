@@ -131,7 +131,8 @@ for base in \
   # line, and stops it with SIGTERM. What it answers is A4's tests' business (`cargo test -p
   # adam-run-signer`); this is the image's binary starting where no CA exists.
   code=0
-  out=$(timeout 30 docker run --rm --user 10001:10001 --network none \
+  # shellcheck disable=SC2016 # $pid, $?, $i expand in the container's shell.
+  out=$(timeout 60 docker run --rm --user 10001:10001 --network none \
     --mount "type=bind,src=$work/run-signer,dst=/bin/run-signer,readonly" \
     --entrypoint /bin/sh "$base" -c '
       printf "a-projected-token\n" > /tmp/run-cert-token || exit 96
@@ -154,6 +155,13 @@ for base in \
         exit 90
       fi
       kill -TERM "$pid"
+      i=0
+      while [ "$i" -lt 10 ]; do
+        kill -0 "$pid" 2>/dev/null || break
+        sleep 1
+        i=$((i+1))
+      done
+      kill -KILL "$pid" 2>/dev/null || true
       wait "$pid"
       echo "exit=$?"
     ' 2>&1) || code=$?

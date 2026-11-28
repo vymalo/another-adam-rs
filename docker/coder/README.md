@@ -36,7 +36,7 @@ gateway, GitHub or a git remote.
 
 | Script | What it checks |
 |---|---|
-| `test/static-smoke.sh <image>` | `file` says each binary is static, the image's default user is 10001, and each starts in `debian:bookworm-slim` and Alpine as uid 10001, ending on its configuration error (78; 64 for `adam-kube-exec`), never a loader error; `run-signer` is also started on loopback with a run-certificate configuration and stopped with SIGTERM, so its own serve path is proved in the image and not only its exit 78 |
+| `test/static-smoke.sh <image>` | `file` says each binary is static, the image's default user is 10001, and each starts in `debian:bookworm-slim` and Alpine as uid 10001, ending on its configuration error (78; 64 for `adam-kube-exec`), never a loader error; `run-signer` is also started on loopback with a run-certificate configuration and stopped with SIGTERM, so its own bind and clean stop are proved in the image and not only its exit 78 |
 | `test/container-smoke.sh <image>` | the coder starts under tini, serves A2A fail-closed and takes a task to completion against a stub model (needs a Postgres) |
 | `test/agent-smoke.sh <image>` | the same image with `--entrypoint tini -- adam-agent` |
 | `test/http-smoke.sh <base-url> <bearer-token>` | the HTTP+JSON binding, `/docs` and `/openapi.json` (run by the container and agent smoke tests) |
