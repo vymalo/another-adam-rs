@@ -190,6 +190,11 @@ async fn build_agent(
         folder.and_then(|l| l.command_memory.as_deref()),
         folder.and_then(|l| l.command_cpu.as_deref()),
     ));
+    // What the command tools show when a call gives no `output` (ADR 0090 slice T3): the folder's
+    // `limits.output`, else each tool's own default.
+    if let Some(output) = folder.and_then(|l| l.output.as_ref()) {
+        settings.set_output_defaults(output);
+    }
     let admission: adam_budget::DynAdmission =
         Arc::new(adam_admission_local::LocalAdmission::new(budget.clone()));
     settings.admission = Some(Arc::clone(&admission));
@@ -225,8 +230,8 @@ async fn build_agent(
             // What a rejected credential tells the model to check depends on which kind they are.
             .with_credentials_hint(worker.github.check_hint())
             // The URL a message announces for the conversation's tools is an MCP server's: the
-            // deployment's policy (MCP_ALLOW_INSECURE, timeouts) decides.
-            .with_mcp_policy(worker.mcp.policy())
+            // deployment's policy (MCP_ALLOW_INSECURE, timeouts, the result bound) decides.
+            .with_mcp_policy(worker.mcp_policy())
             // A file over the threshold `uploads/v1` serves (the same number the card is built
             // with) goes to the bucket by reference, not inline.
             .with_inline_upload_threshold(inline_upload_threshold),
@@ -245,10 +250,10 @@ async fn build_agent(
         // An App that finds the installation of each owner needs each call to name its account.
         worker.github.finds_installations(),
     ));
+    // A result over CHECK_OUTPUT_TAIL_BYTES is kept and paged, as a command's output is (ADR 0090).
     let policy =
         worker
-            .mcp
-            .policy()
+            .mcp_policy()
             .bearer_per_call(GITHUB_SERVER, worker.github_mcp_url.as_str(), bearer);
     // The MCP servers the folder's `mcp.json` names are connected now, at startup, before the
     // agent is bound: a server that is down, a local process the policy does not allow, a

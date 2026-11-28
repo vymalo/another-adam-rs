@@ -467,7 +467,7 @@ mod tests {
                 id: adam_core::RunId::new(),
                 agent: "root/helper".into(),
                 description: String::new(),
-                keep_open: false,
+                mode: adam_runtime::SessionMode::OneShot,
                 closed: false,
                 closing: false,
                 deleted: false,

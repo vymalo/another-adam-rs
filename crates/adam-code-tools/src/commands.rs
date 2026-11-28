@@ -26,6 +26,7 @@ use adam_workspace::{EnvError, EnvSession, ExecSpec};
 use async_trait::async_trait;
 
 use crate::governor::Governor;
+use crate::output::OutputDefaults;
 use crate::redact::Redactor;
 use crate::sandbox::Meter;
 use crate::shell::{self, Governed, MissingTool, RunError, ShellOutcome};
@@ -38,6 +39,9 @@ pub struct CommandLimits {
     pub timeout: Duration,
     /// The bytes of output a result shows: a longer output is shown as its head and tail and kept.
     pub output_tail: usize,
+    /// What a result shows of the output when the call gives no `output`, per tool
+    /// ([`OutputDefaults::TOOLS`] unless the workspace was given others; ADR 0090 slice T3).
+    pub output: OutputDefaults,
 }
 
 /// The workspace of the command tools: a [`CodeWorkspace`] that can run a command.

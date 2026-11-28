@@ -155,8 +155,9 @@ fn a_known_window_clamps_the_cap_to_what_the_history_leaves() {
             .limits
             .max_output_tokens
     };
-    // The coder's history: 131,072 - 20,000 - 100,000.
-    assert_eq!(cap("name: coder\nmodel: plain"), 11_072);
+    // The default history (200,000) is more than half the window, so the window wins and keeps
+    // half of itself for the history: 131,072 - 20,000 - 65,536.
+    assert_eq!(cap("name: coder\nmodel: plain"), 45_536);
     // A shorter history leaves more.
     assert_eq!(
         cap("name: coder\nmodel: plain\nlimits:\n  max_history_tokens: 50000"),
@@ -171,8 +172,9 @@ fn a_known_window_clamps_the_cap_to_what_the_history_leaves() {
 
 #[test]
 fn a_window_with_no_room_asks_for_one_token() {
+    // 30,000 - 20,000 - the 15,000 of history the window holds is nothing.
     let assembly = assembly_with(
-        MockModel::new().with_context_window("large", 131_072),
+        MockModel::new().with_context_window("large", 30_000),
         "name: coder\nmodel: large\nlimits:\n  max_history_tokens: 200000",
         "large",
         with_profile(),
@@ -191,7 +193,37 @@ fn a_known_window_clamps_the_folders_own_value_too() {
         with_profile(),
     )
     .unwrap();
-    assert_eq!(assembly.info()[0].limits.max_output_tokens, 11_072);
+    assert_eq!(assembly.info()[0].limits.max_output_tokens, 45_536);
+}
+
+/// ADR 0088 decision 4: the 200,000-token default, or a folder's history, never squeezes the
+/// output below what half the window leaves; a window that holds it keeps it whole.
+#[test]
+fn a_history_the_window_cannot_hold_leaves_the_output_half_the_window() {
+    let cap = |window: u64, frontmatter: &str| {
+        assembly_with(
+            MockModel::new().with_context_window("plain", window),
+            frontmatter,
+            "plain",
+            with_profile(),
+        )
+        .unwrap()
+        .info()[0]
+            .limits
+            .max_output_tokens
+    };
+    // 200,000 - 20,000 - 100,000, where the default history alone would leave one token.
+    assert_eq!(cap(200_000, "name: coder\nmodel: plain"), 80_000);
+    // A folder's own history over half the window gives way the same: 131,072 - 20,000 - 65,536.
+    assert_eq!(
+        cap(
+            131_072,
+            "name: coder\nmodel: plain\nlimits:\n  max_history_tokens: 100000"
+        ),
+        45_536
+    );
+    // A window that holds the default: 400,000 - 20,000 - 200,000 is over the 128,000 fallback.
+    assert_eq!(cap(400_000, "name: coder\nmodel: plain"), 128_000);
 }
 
 #[test]
@@ -343,4 +375,40 @@ async fn the_resolved_cap_reaches_the_request_of_a_run() {
     wait_done(&rt, run).await;
     worker.stop().await;
     assert_eq!(model.requests()[0].max_output_tokens, Some(65_536));
+}
+
+/// ADR 0088 decisions 1 and 3: a subagent whose `model:` names another alias has its own window,
+/// its profile's `contextWindow`, which the client answers for that alias (no `DEFAULT_MODEL_CONTEXT_WINDOW`
+/// ever reached it); the window clamps that subagent's cap, and not the root's.
+#[test]
+fn a_subagent_on_another_alias_has_its_own_profiles_window() {
+    let profiles = profiles(r#"{"profiles": {"plain": {}, "small": {"contextWindow": 131072}}}"#);
+    let assembly = def(&[
+        (
+            INSTRUCTIONS,
+            &instructions("name: coder\nmodel: plain", "Root."),
+        ),
+        (
+            "agent/subagents/helper.md",
+            &instructions("description: Helps.\nmodel: small", "Helper."),
+        ),
+    ])
+    .bind(ToolSet::new())
+    .unwrap()
+    .model_profiles(profiles.clone())
+    .model(Arc::new(MockModel::new().with_profiles(profiles)), "plain")
+    .unwrap();
+    let cap_of = |name: &str| {
+        assembly
+            .info()
+            .iter()
+            .find(|info| info.name == name)
+            .unwrap()
+            .limits
+            .max_output_tokens
+    };
+    // The root's alias has no window: the 128,000 fallback.
+    assert_eq!(cap_of("coder"), 128_000);
+    // The subagent's: 131,072 - 20,000 - half its window, which the 200,000 default does not fit.
+    assert_eq!(cap_of("coder/helper"), 45_536);
 }

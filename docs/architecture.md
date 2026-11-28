@@ -41,7 +41,7 @@ events, streamed text, a lease.
 
 An arrow means "depends on". Solid arrows are `[dependencies]`; dotted arrows are optional features.
 The picture is a selection: nearly every crate also depends on `adam-error`, and the test kits
-(`adam-store-testkit`, `adam-notify-testkit`, `adam-mcp-testkit`, `adam-code-tools-testkit`, `adam-agent-fixture`) are left out.
+(`adam-store-testkit`, `adam-notify-testkit`, `adam-mcp-testkit`, `adam-code-tools-testkit`, `adam-export-testkit`, `adam-agent-fixture`) are left out.
 
 ```mermaid
 flowchart TB
@@ -67,6 +67,7 @@ flowchart TB
         rt["adam-runtime"]
         pgn["adam-notify-postgres"]
         sched["adam-schedule"]
+        export["adam-export"]
     end
     subgraph contracts["Contracts"]
         a2a["adam-a2a"]
@@ -127,6 +128,10 @@ flowchart TB
     rt --> core
     pgn --> rt
     sched --> rt
+    export --> rt
+    export --> llm
+    coder --> export
+    agent --> export
     sched --> agentfs
     pg --> core
     mongo --> core
@@ -140,7 +145,7 @@ flowchart TB
 |---|---|---|
 | Contracts | [`adam-error`](../crates/adam-error/README.md), [`adam-core`](../crates/adam-core/README.md), [`adam-model`](../crates/adam-model/README.md), [`adam-a2a`](../crates/adam-a2a/README.md), [`adam-host`](../crates/adam-host/README.md) | Error classes, the `Store` port and run types, the `ModelClient` port, the `TaskBackend` port with the A2A 1.0 server, the process `Role` and `Placement` with a supervisor. |
 | Implementations | `adam-store-postgres`, `adam-store-mongodb`, `adam-store-sqlite`, `adam-model-openai`, [`adam-model-oauth`](../crates/adam-model-oauth/README.md), [`adam-workspace`](../crates/adam-workspace/README.md), [`adam-code-tools`](../crates/adam-code-tools/README.md) (the file and command tools as a library, ADR 0047; moving out of the coder in steps), [`adam-git-sandbox`](../crates/adam-git-sandbox/README.md), [`adam-env-kubernetes`](../crates/adam-env-kubernetes/README.md), [`adam-acp`](../crates/adam-acp/README.md), `adam-notify-postgres` | Each in a crate of its own, so a binary links only what it uses. |
-| Runtime | [`adam-runtime`](../crates/adam-runtime/README.md), [`adam-a2a-runtime`](../crates/adam-a2a-runtime/README.md), [`adam-service`](../crates/adam-service/README.md), [`adam-schedule`](../crates/adam-schedule/README.md) (a folder's schedules, [ADR 0060](decisions/0060-schedules-are-parked-runs.md): when they are due, the ids of their firings, each agent's scheduler `<agent>/adam.schedule` and `reconcile`; `adam-agent` and the coder run them with a `schedules` worker component, `reconcile_until_stopped`, and `adam-engine` with one `reconcile` at `start`) | The run state machine, journal, workers and retry policy; the A2A backend over it; the composition every agent binary shares. |
+| Runtime | [`adam-runtime`](../crates/adam-runtime/README.md), [`adam-a2a-runtime`](../crates/adam-a2a-runtime/README.md), [`adam-service`](../crates/adam-service/README.md), [`adam-schedule`](../crates/adam-schedule/README.md) (a folder's schedules, [ADR 0060](decisions/0060-schedules-are-parked-runs.md): when they are due, the ids of their firings, each agent's scheduler `<agent>/adam.schedule` and `reconcile`; `adam-agent` and the coder run them with a `schedules` worker component, `reconcile_until_stopped`, and `adam-engine` with one `reconcile` at `start`), [`adam-export`](../crates/adam-export/README.md) (runs as training records, [ADR 0087](decisions/0087-runs-are-exported-as-training-records.md): one JSON Lines record per run in the chat shape, from one or several sources into one sink (both ports, with [`adam-export-testkit`](../crates/adam-export-testkit/README.md)), read through the runtime by the binaries' `export` subcommand; see [Export runs for training](guides/export-runs-for-training.md)) | The run state machine, journal, workers and retry policy; the A2A backend over it; the composition every agent binary shares; the export of runs. |
 | Agents and authoring | [`adam-llm-agent`](../crates/adam-llm-agent/README.md), [`adam-ui`](../crates/adam-ui/README.md), [`adam-mcp`](../crates/adam-mcp/README.md), [`adam-agent-fs`](../crates/adam-agent-fs/README.md), [`adam-assembly`](../crates/adam-assembly/README.md), [`adam-macros`](../crates/adam-macros/README.md), [`adam`](../crates/adam/README.md) | The model-and-tools loop; the screen's tools; MCP tools; the agent-folder parser; binding a folder to agents; `#[tool]`; the facade. See [Write an agent](guides/write-an-agent.md). |
 | Embedded | [`adam-engine`](../crates/adam-engine/README.md) | adam-rs in an application with no server and nothing on the network of its own ([ADR 0047](decisions/0047-adam-rs-can-be-embedded-in-an-application.md)): the embedded set, the runtime and its agent crates with `adam-a2a`'s `server`, `adam-a2a-runtime`'s `push` and `adam-ui`'s `thread-tools` off, checked by `tools/embedded-deps/check.sh`. Its API (slice 4: send, steer, answer, cancel, list, over `RuntimeTaskBackend` and a store and a model the host gives) is built; its stream of events is not yet. |
 | Binaries | [`adam-coder`](../bin/adam-coder/README.md), [`adam-agent`](../bin/adam-agent/README.md), [`adam-egress`](../bin/adam-egress/README.md) | The two agents you can run, library and binary each, over `adam-service`; and the HTTPS-only egress proxy for run pods, which uses only `adam-error` and is in the same image; the chart deploys it with the run pods, whose network policy allows nothing else out ([ADR 0042](decisions/0042-run-pods-reach-the-internet-through-an-egress-proxy.md)). |
@@ -201,6 +206,10 @@ classDiagram
     Tool <|.. FnTool
     class Admission { <<interface>> }
     Admission <|.. LocalAdmission
+    class RunSource { <<interface>> }
+    RunSource <|.. RuntimeSource
+    class RecordSink { <<interface>> }
+    RecordSink <|.. JsonLines
     class Confine { <<interface>> }
     Confine <|.. NoConfine
     Confine <|.. Rlimits
@@ -236,6 +245,8 @@ classDiagram
 | `DeviceState` | `adam-device-state` | none yet: the host pushes its readings, and `adam_budget::Throttled` lowers the admission by them ([ADR 0065](decisions/0065-resource-governance-admission-pools-and-os-limits.md) decision 8) | `FakeDevice`, the reference of `device_state_conformance!` |
 | `SiMemory` (L1) | `adam-memory` | `FolderSiMemory`, the in-folder store and L1's only one ([ADR 0081](decisions/0081-an-agent-keeps-a-self-improvement-memory-near-it-and-what-holds-becomes-the-deployments-memory.md) decision 2) | `InProcessSiMemory` (reference); `ScopeBlindSiMemory` and `DoubleWritingSiMemory` (testkit, which the suite rejects) |
 | `Memory` (L2) | `adam-memory` | `PgMemory` (`adam-store-postgres`, feature `memory`), `MongoMemory` (`adam-store-mongodb`, feature `memory`) and `RedisMemory` (`adam-memory-redis`), ADR 0081 M2b/M2c/M2d | `InProcessMemory` (reference); `ScopeBlindMemory` and `DoubleWritingMemory` (testkit, which the suite rejects) |
+| `RunSource` | `adam-export` | `RuntimeSource` (any `Store` through a `Runtime`) | the suite `source_conformance!` (`adam-export-testkit`); `RuntimeSource` over `MemoryStore` is the reference |
+| `RecordSink` | `adam-export` | `JsonLines` (any `std::io::Write`: a file, standard output) | the suite `sink_conformance!` (`adam-export-testkit`); `JsonLines` is the reference |
 | `PermissionPrompt` | `adam-acp` | none (the default policy needs no prompt) | `StaticPrompt` |
 
 `AgentStarter` is the start-only half of `Agent` (`name`, `init`, `init_continuing`): a process that
@@ -498,7 +509,10 @@ its `model_preset` and the profile (`crates/adam-assembly/src/assembly.rs`), and
 per model: the folder's `limits.max_output_tokens`, its preset's, the profile's, the profile's base preset, then
 128,000, then the smallest of that, the model's `maxOutputTokensLimit` and what the window leaves after 20,000 tokens
 and the agent's history (`crates/adam-assembly/src/assembly.rs`, `output_cap`; the margin and the compaction budget
-are `crates/adam-llm-agent/src/compaction.rs`). A profile's `endpoint` is the deployment's own **endpoint label**
+are `crates/adam-llm-agent/src/compaction.rs`). The window is the profile's `contextWindow`, else
+`DEFAULT_MODEL_CONTEXT_WINDOW` (its deprecated alias `MODEL_CONTEXT_WINDOW`) for the alias `MODEL` names, alias by alias, so a subagent on another model has its own
+(`adam_model::resolve_context_window`, [ADR 0088](decisions/0088-the-context-window-follows-the-model-and-the-history-budget-is-200k.md);
+the evidence is on [the page for agents](../.agents/docs/architecture.md#the-models-window-adr-0088-slice-w1)). A profile's `endpoint` is the deployment's own **endpoint label**
 for the model — a label only, never a provider, a host, a URL or a key — which a served `model-pick/v1` choice
 carries beside its alias; a malformed one is omitted, never a refusal of the file (ANR-623,
 `crates/adam-model/src/profiles.rs`). An embedded engine takes the same profiles from its host
@@ -872,7 +886,7 @@ stateDiagram-v2
 
 | Part | Rule |
 |---|---|
-| **Budget** | the smaller of `MODEL_CONTEXT_WINDOW` less 20,000 less `max_output_tokens` (the cap resolved for the agent's model, ADR 0064), and `limits.max_history_tokens`; none when neither is set (a window with no room left counts as none) |
+| **Budget** | the smaller of the model's window (its profile's `contextWindow`, else `DEFAULT_MODEL_CONTEXT_WINDOW` for the alias `MODEL` names; ADR 0088) less 20,000 less `max_output_tokens` (the cap resolved for the agent's model, ADR 0064), and `limits.max_history_tokens` (200,000 when the key is omitted, ADR 0088; `0` leaves the window's alone), so a known smaller window wins; none when neither is set (a window with no room left is a budget of one token) |
 | **Estimate** | the last call's reported prompt tokens plus characters / 4 of what came after; with no report, characters / 4 of the instructions, the tools and every message |
 | **Cut** | at the start of a turn (an assistant message, never the first message), so a call is never parted from its result; the newest 1 to 8 turns worth at most a quarter of the budget stay verbatim; fewer than two turns to drop, eight compactions made by the run (a run that continues another carries the earlier ones as one record, which is not one of its eight), or a request that would still be over the budget with no summary, shortens instead |
 | **Summary** | the agent's own model, the request as it stands (same system, tools and history) plus one built-in instruction as the last message, `tool_choice: none`, `min(4,096, cap)` output tokens, or 4,096 when the cap is `0` (the run's resolved cap, ADR 0064), capped at 16 KiB; its usage is reported under an id of its own (`<run>-k<n>-<suffix>`); the person sees one step, "Summarise the conversation" |
@@ -880,7 +894,7 @@ stateDiagram-v2
 | **The marker's lines** | the summary, then lines **written by code** from what left: the plan, the **recap** of the loaded tools (one line per loaded group or tool, minus the journaled removals, and one per loader still available; at most 2 KiB and 50 lines, names only past either), the results a tool pinned, a pointer to each kept output (built from the call's own output id), the names of the skills loaded earlier, a line that sessions exist. Text that is copied has each line that starts with `[` written `\x5b`, so it cannot forge a loop line |
 | **Sessions** | a run whose `subagent_start` was cut still waits for, and cancels, the sessions it started (`Compaction::sessions`) |
 | **Trust** | the summary and the pinned results are in the first message, a user-role message: text a tool returned (a repository's instructions) has that standing from the first compaction on; it is labelled as the repository's, bounded and escaped, and the coder does not read it as the person's words. A `when` server's note in the recap is labelled `(the server's words: …)` for the same reason |
-| **A subagent** | compacts against its own limits; one on another alias has no window, so its `max_history_tokens` applies |
+| **A subagent** | compacts against its own limits and its own alias's window (its profile's `contextWindow`, ADR 0088); with no window known, its `max_history_tokens` applies |
 
 The summary request is the previous request plus one message, so the provider serves it from its cache
 (*unverified* without a provider: whether a changed `tool_choice` keeps the match). The request after a
@@ -1377,6 +1391,20 @@ through itself (`Ctx::resume_child`, ADR 0067 decision 5). A child with a
 conversation (a session round, ADR 0045) reports with `adam.child.reported` instead, and
 `start_child_continuing` starts it ([Child runs](reference/child-runs.md#sessions-adr-0045-slices-1-to-4)).
 
+**A subagent's own tool starts a one-shot session** (ADR 0089, slice C1). The child is round 1 of a session of the
+parent, under the same derived id, and it is **closed from its start**:
+
+| | Before C1 | Since C1 |
+|---|---|---|
+| Conversation id | none | `<parent escaped>/s/<child id>` |
+| Listed by `subagent_list` and `child-sessions/v1` | no | yes: working, then closed |
+| A message to it, from the parent or a person | impossible (nothing addressed it) | refused: the session is closed |
+| Exported (ADR 0087) | no | yes, a record with `parent` set |
+| What the model sees | the call's result | the same: the same tool, the same result, never a second report |
+
+The parent still parks on it as below; its end notice is `adam.child.reported`, which wakes the parent like the other.
+The evidence: [the page for agents](../.agents/docs/architecture.md#child-runs-a-subagents-tool-starts-a-one-shot-session-adr-0089-slice-c1).
+
 ```mermaid
 sequenceDiagram
     autonumber
@@ -1387,7 +1415,7 @@ sequenceDiagram
     participant C as Child run
 
     P->>J: step tool:c1, run the tool
-    J->>R: start_child(parent, child_run_id(parent, c1), agent, input)
+    J->>R: start a one-shot session round under child_run_id(parent, c1)
     R->>DB: create_run with parent_id, or AlreadyExists (a replay)
     J-->>P: Err(AwaitRun { run: child }), journaled
     P->>DB: commit Park, wake_at = now + 60 s, pending_wait = { c1, child }

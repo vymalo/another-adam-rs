@@ -34,7 +34,9 @@ adam-device-state = { path = "crates/adam-device-state", version = "0.7.0" } # x
 adam-device-state-testkit = { path = "crates/adam-device-state-testkit", version = "0.7.0" } # x-release-please-version
 adam-env-kubernetes = { path = "crates/adam-env-kubernetes", version = "0.7.0" } # x-release-please-version
 adam-error = { path = "crates/adam-error", version = "0.7.0" } # x-release-please-version
-adam-git-sandbox = { path = "crates/adam-git-sandbox", version = "0.7.0" } # x-release-please-version
+adam-export = { path = "crates/adam-export", version = "0.7.0" } # x-release-please-version
+adam-export-testkit = { path = "crates/adam-export-testkit", version = "0.7.0" } # x-release-please-version
+adam-git-sandbox = { path = "crates/adam-git-sandbox", version = "0.7.0", default-features = false } # x-release-please-version
 adam-hook-exec = { path = "crates/adam-hook-exec", version = "0.7.0" } # x-release-please-version
 adam-host = { path = "crates/adam-host", version = "0.7.0" } # x-release-please-version
 adam-llm-agent = { path = "crates/adam-llm-agent", version = "0.7.0" } # x-release-please-version
@@ -50,8 +52,9 @@ adam-model-openai = { path = "crates/adam-model-openai", version = "0.7.0", defa
 adam-notify-postgres = { path = "crates/adam-notify-postgres", version = "0.7.0" } # x-release-please-version
 adam-notify-testkit = { path = "crates/adam-notify-testkit", version = "0.7.0" } # x-release-please-version
 # The layer links a TLS provider only where a binary exports: a library that depends on it must not
-# put aws-lc-rs into an embedding host's graph (tools/tls-provider/check.sh, ANR-118). The three
-# binaries that call `adam_otel::init` opt in with `features = ["aws-lc"]`.
+# put aws-lc-rs into an embedding host's graph (tools/tls-provider/check.sh, ANR-118). With no
+# feature the crate is its label sets alone; a binary that exports names `sdk` (plain `http`) or
+# `aws-lc` (`https` too).
 adam-otel = { path = "crates/adam-otel", version = "0.7.0", default-features = false } # x-release-please-version
 adam-plugin = { path = "crates/adam-plugin", version = "0.7.0" } # x-release-please-version
 adam-plugin-testkit = { path = "crates/adam-plugin-testkit", version = "0.7.0" } # x-release-please-version

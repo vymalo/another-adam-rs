@@ -8465,6 +8465,67 @@ mod cases {
         );
     }
 
+    /// A delete whose round ended before the commit still writes the tombstone, with no cancel: the
+    /// session is gone from the listing and from `session_view`, the run stays in the store, and its
+    /// header (here a synthesized one: `RoundAgent` keeps none) says `deleted`. The path is the one
+    /// `delete_session_round` takes when the tool read a working round that ended meanwhile.
+    pub async fn deleting_a_round_that_already_ended_writes_the_tombstone(store: DynStore) {
+        let (parent_name, agent) = (uniq("parent"), uniq("round"));
+        let rt = Runtime::builder(store.clone())
+            .agent(child_parked(&parent_name))
+            .agent(RoundAgent {
+                name: agent.clone(),
+                waits: false,
+            })
+            .worker_id(uniq("w"))
+            .poll_interval(Duration::from_millis(20))
+            .build();
+        let parent = rt.start(&parent_name, inbound(), None).await.unwrap();
+        let ctx = uniq("u:ctx");
+        let worker = spawn_worker(&rt);
+        let session = child_run_id(parent, "call-1");
+        rt.start_child_continuing(
+            parent,
+            session,
+            &agent,
+            say("one"),
+            &session_conversation_id(&ctx, session),
+            None,
+        )
+        .await
+        .unwrap();
+        wait_done(&rt, session).await;
+        worker.stop().await;
+
+        let view = rt
+            .session_view(&ctx, session)
+            .await
+            .unwrap()
+            .expect("a session");
+        assert_eq!(view.state, SessionState::Idle, "the round ended first");
+        rt.delete_session_round(&view, "the session was deleted")
+            .await
+            .unwrap();
+
+        assert!(
+            rt.session_view(&ctx, session).await.unwrap().is_none(),
+            "a deleted session is not a session"
+        );
+        assert!(
+            rt.list_sessions(&ctx, &[&agent], 0, 10)
+                .await
+                .unwrap()
+                .sessions
+                .is_empty(),
+            "a deleted session is never listed"
+        );
+        let rec = rt.view(session).await.unwrap().expect("the run stays");
+        assert_eq!(rec.status, RunStatus::Done, "the round was not cancelled");
+        let header = &rec.state["session"];
+        assert_eq!(header["deleted"], true, "{header}");
+        assert_eq!(header["closed"], true, "{header}");
+    }
+
     /// A report that lands while a run finishes is not news, as a finished notice is not: no
     /// agent reads it before slice 2.
     pub async fn a_report_that_lands_while_a_run_finishes_does_not_reopen_it(store: DynStore) {
@@ -8765,6 +8826,7 @@ macro_rules! runtime_suite {
                 session_listings_do_not_mix_awkward_parent_ids,
                 a_session_listing_dedupes_agents_caps_the_page_and_reads_every_page,
                 a_session_listing_says_how_the_round_ended,
+                deleting_a_round_that_already_ended_writes_the_tombstone,
                 a_session_idle_past_its_ttl_reads_closed,
                 a_working_round_never_expires,
                 a_report_that_lands_while_a_run_finishes_does_not_reopen_it,
@@ -10553,5 +10615,57 @@ async fn a_store_without_blobs_clears_the_split() {
             .await
             .expect("read the blob"),
         None
+    );
+}
+
+/// A blob an agent stores from inside a step ([`Ctx::blob_writer`]) and names after it
+/// ([`Ctx::reference_blobs`]) is recorded by the commit that keeps the state, so a purge keeps its
+/// bytes; a blob stored and never named is collected.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_blob_an_agent_names_is_recorded_by_its_commit() {
+    let inner: DynStore = Arc::new(MemoryStore::new());
+    let recording = Arc::new(common::recording::RecordingStore::new(inner.clone()));
+    let store: DynStore = recording.clone();
+    let agent = fn_agent(
+        &uniq("blobs"),
+        step_fn(|ctx, state| {
+            async move {
+                let writer = ctx.blob_writer();
+                assert!(writer.keeps_blobs());
+                let id: Result<adam_core::BlobId, String> = ctx
+                    .step("put", move || async move {
+                        writer.put(b"named").await.map_err(|e| e.to_string())
+                    })
+                    .await?;
+                let id = id.map_err(AgentError::permanent)?;
+                let stray = ctx.blob_writer().put(b"stray").await.expect("put");
+                assert_eq!(stray, adam_runtime::blob_id(b"stray"));
+                ctx.reference_blobs([id.clone(), id]);
+                Ok(Transition::Done {
+                    state,
+                    output: json!(null),
+                })
+            }
+            .boxed()
+        }),
+    );
+    let rt = runtime(&store, &agent);
+    let run = rt.start(&agent.name, inbound(), None).await.expect("start");
+    let worker = spawn_worker(&rt);
+    wait_done(&rt, run).await;
+    worker.stop().await;
+
+    let named = adam_runtime::blob_id(b"named");
+    let commit = recording.commits_of(run).pop().expect("a commit");
+    assert_eq!(
+        commit.blobs,
+        vec![named.clone()],
+        "named once, the stray not"
+    );
+    let far = adam_core::store::now() + jiff::SignedDuration::from_hours(1);
+    assert_eq!(inner.purge_blobs(far).await.expect("purge"), 1, "the stray");
+    assert_eq!(
+        inner.get_blob(&named).await.expect("read"),
+        Some(b"named".to_vec())
     );
 }

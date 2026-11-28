@@ -1,0 +1,153 @@
+# Export runs for training
+
+For agents: [the invariants, the gates and the evidence](../../.agents/docs/guides/export-runs-for-training.md)
+
+`adam-coder export` and `adam-agent export` write the runs in the store as training records, one JSON line per run (or
+per assistant turn), in the chat shape most fine-tuning tools read. Use them to train a small model on what a strong model did with adam as
+its harness: for example an instruct model that knows Rust and CrateStack and drives adam's tools well. The decision is
+[ADR 0087](../decisions/0087-runs-are-exported-as-training-records.md).
+
+## Export
+
+Run the binary with the environment its server runs with (`DATABASE_URL` and the rest), and the `export` subcommand.
+It starts no server and no worker: it reads the store, writes the records and exits. With SQLite, stop the server
+first: one process holds the file.
+
+```sh
+EXPORT_PSEUDONYM_KEY=... adam-coder export --require lang=rust --require dep=cratestack --out coder-runs.jsonl
+```
+
+| Flag | Default | What it does |
+|---|---|---|
+| `--agent NAME` | the binary's agents | export this agent's runs; repeat it for several |
+| `--status done\|failed\|all` | `done` | which runs to keep: finished, failed, or every run, unfinished ones included |
+| `--require KIND=VALUE` | none | keep a run only if it has this facet; repeat it: `lang=rust` and `dep=cratestack` are both required |
+| `--since`, `--until` | none | keep runs last updated in this window (RFC 3339) |
+| `--include-compacted` | off | keep runs whose history was summarised: their messages are not what the model saw at every turn. With `--samples turn` such runs are kept anyway |
+| `--verified-only` | off | keep only runs that delivered a pull request whose head the run's checks verified (every one, when it opened several) |
+| `--include-reasoning` | off | keep the model's reasoning text, when the run kept it |
+| `--samples run\|turn` | `run` | one record per run, or one per assistant turn (below) |
+| `--max-tokens N` | none | leave out a record over `N` tokens, estimated as characters / 4; a record is never cut |
+| `--out PATH` | standard output | write to a file, readable by its owner only |
+
+A wrong command line is exit 64, an unknown `--agent` or an empty key exit 78. The summary (runs seen, records written,
+runs filtered, not a conversation, unreadable, records over the budget, turns lost to compaction, samples not exact)
+goes to the log on standard error.
+`EXPORT_PSEUDONYM_KEY` is the key of the pseudonymous ids: keep the same one to link two exports; leave it unset and
+each export gets a random key ([environment variables](../reference/environment.md)).
+
+The record, every field and the facets are described in [the crate's README](../../crates/adam-export/README.md).
+
+**Only verified pull requests.** A coder run that opens a pull request says, in its record's `outcome`, which one it
+was and whether the checks passed on exactly the code of its head:
+
+```json
+"outcome":{"status":"done","artifacts":[...],
+  "pull_requests":[{"number":42,"repository":"5f0c...","verified":true}],
+  "checks":{"passed":true,"reports":3,"failed":2}}
+```
+
+`verified` is `false` when a person accepted red checks, when the failure was the base branch's, and for a run from
+before this field. `checks` counts the run's check verdicts and says whether the last one passed. `repository` is a
+pseudonym under the export's key: the records of one repository share it, so you can keep a repository out of your
+training split without its name leaving the store. `--verified-only` keeps only the runs whose every pull request is
+`verified`:
+
+```sh
+EXPORT_PSEUDONYM_KEY=... adam-coder export --verified-only --require lang=rust --out verified.jsonl
+```
+
+Any agent can fill these fields: they are read from two artifacts, `pull_request` and `checks`, whose shape is the
+exporter's (the crate's README, *The outcome contract*).
+
+**Several stores into one dataset.** Where runs come from and where records go are adapters: a source (the store
+behind a runtime, so PostgreSQL, MongoDB, SQLite or memory) and a sink (JSON Lines to a file or standard output). The
+`export` subcommand reads its own store into one file. A Rust program can give the library's `Exporter` several
+sources, each with a label of its own, and get one dataset: each record names its source in `source`, and the ids link
+across stores because the pseudonym key is the export's. A new source or sink (object storage, a dataset hub, a
+table) is an adapter that passes the conformance suites of
+[`adam-export-testkit`](../../crates/adam-export-testkit/README.md).
+
+## One sample per turn, for a small GPU
+
+A whole run is often far longer than a small card trains on (a 12 GB card fits about 8,000 to 16,000 tokens). With
+`--samples turn` each assistant turn is its own record: what the model was sent at that call (system prompt, tools,
+the history before it) and its answer as the last message. Train on the last message only: each sample says
+`train_on: "last"`.
+
+```sh
+EXPORT_PSEUDONYM_KEY=... adam-coder export --samples turn --max-tokens 16000 --require lang=rust --out turns.jsonl
+```
+
+| What | How it is exported |
+|---|---|
+| a run compacted during a long task | kept: its samples are the turns since its **last** compaction, each starting with the compaction's summary, as the model saw it. They teach a model to go on after a compaction. The turns before are counted as lost, never rebuilt |
+| a turn whose tools changed (a group loaded) | the tools recorded for that turn, not the last turn's |
+| a sample over `--max-tokens` | left out whole and counted; cutting it would part a tool call from its result |
+| a sample the store cannot rebuild exactly | written with `sample.exact: false` (a tool result shortened after that turn, tools not recorded for it, a turn that cannot be placed for sure); keep only `exact: true` for a strict dataset |
+
+Each sample carries `sample: {turn, index, of, exact}` and the run's own fields (facets, outcome, models). The budget is
+an estimate: count with your tokenizer before training.
+
+## What leaves the store, and what does not
+
+| Exported | Never exported |
+|---|---|
+| the messages: what the person wrote, what the model wrote, its tool calls and the tools' results | the store's run and conversation ids: they become pseudonyms |
+| the agent, status, times, turns, tool calls, tokens, model aliases | the conversation's context, the caller, the prompt statement, the session header |
+| the facets (`lang`, `dep`) and the outcome (error, artifact names, each pull request's number and whether it was verified, the checks' verdicts) | image bytes: an image becomes `[image]` |
+| a pseudonym of a pull request's repository | the pull request's URL, its repository's address and its commit: they name an owner and a host |
+| reasoning, only when asked | secrets: every string is scrubbed of the deployment's secrets and of well-known token shapes |
+| the system prompt and tools the run's last model call was sent, when the run recorded them (`tools_source: "recorded"`) | |
+
+The messages a person wrote are exported. Export only threads you may train on: that is your call, not the code's. An
+export is always a command someone runs; no worker or schedule exports anything.
+
+A run's model calls record their system prompt and tools from this version on. A run from before has no system
+message and no tools (`tools_source: "none"`); keep it out of a tool-use dataset.
+
+**A subagent's run is a record of its own**, its `parent` the parent's record: since ADR 0089 slice C1 every subagent's
+child is a session and has a conversation, which is what the exporter lists runs by. A subagent run from before C1 has
+none and is not exported. Without `--agent`, the subagents (`coder/reviewer`) are exported with the rest.
+
+## The pipeline
+
+```mermaid
+flowchart LR
+    tasks["tasks: real ones and generated ones"] -->|A2A| teacher["adam-coder on a strong model"]
+    teacher --> store[("run store")]
+    store -->|"adam-coder export"| records["records, JSONL"]
+    records --> curate["curate"]
+    corpus["general corpus and instruct data"] --> mix["mix"]
+    curate --> mix
+    mix --> sft["fine-tune a small instruct model"]
+    sft --> serve["OpenAI-compatible server"]
+    serve --> bench["evaluate with bench"]
+    serve -->|MODEL_BASE_URL| student["adam-coder on the tuned model"]
+    student --> store
+```
+
+1. **Collect.** Run `adam-coder` ([locally](run-locally.md) or [in a cluster](deploy-the-coder.md)) on a strong
+   teacher model, with a store that keeps its runs, on tasks in the target stack. Use real tasks, and tasks another
+   model writes for you, sent to the coder over [A2A](../reference/a2a-server.md) a batch at a time. Each run that ends in a pull
+   request is a worked example.
+2. **Export** the finished runs of that stack: `--status done --require lang=rust --require dep=cratestack`, and
+   `--verified-only` to keep only the runs whose pull request passed the checks on exactly its code. Facets are
+   guessed from the files and manifests a run touched, so read a sample before you trust a filter.
+3. **Curate.** Drop duplicates (the same task twice), compacted runs (left out by default) and runs longer than your
+   trainer's context, or export per turn with a budget (`--samples turn --max-tokens N`). A judge model may score runs so you keep the best. **Never let a model rewrite a trajectory**:
+   the tool results are what the tools really returned, and a rewritten one teaches the model a world that does not
+   exist.
+4. **Mix and fine-tune.** adam's runs teach the harness, not the language: mix them with a general corpus for the
+   language and the framework (code, docs) and some general instruct data, then fine-tune (SFT) a small instruct model
+   with its own chat template. The records use the OpenAI chat shape (`messages` with `tool_calls`, and `tools`),
+   which the chat templates of models such as Qwen and common SFT tools accept (*unverified*: from memory, not checked
+   against each trainer's current documentation).
+5. **Evaluate.** Serve the tuned model on an OpenAI-compatible server and run [the benchmark harness](../../bench/README.md)
+   against it: its configuration's `endpoint` is the model's address, and the harness hands the coder its own meter
+   as `MODEL_BASE_URL`. Outside the harness, point the coder's `MODEL_BASE_URL` and `MODEL` at the tuned model.
+6. **Iterate.** The tuned model's own verified runs become more data. Later, a failed run and a successful one on the
+   same task can make a preference pair.
+
+The benchmark harness resets its database before each run, so its runs are not kept for export: collect with a coder
+of your own.

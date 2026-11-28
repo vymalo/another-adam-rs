@@ -114,6 +114,7 @@ limits:                        # LlmAgent Limits; Claude's `maxTurns` is read as
   max_turns: 200               # model calls that may be followed by tools, plus one closing turn in which it may call none (0: one call with no tools)
   max_tool_calls: 400          # over it, the turn's calls are answered "not run" and the closing turn follows
   max_output_tokens: 64000     # the output cap this agent asks for, at least 1; absent: its preset's, the model profile's, then 128,000, clamped to the model's limit and window (ADR 0064)
+  max_history_tokens: 200000   # the history budget: the run compacts at the smaller of this and what the window leaves; 0: the window's alone; absent: 200,000 (ADR 0088)
   max_minutes: 30              # subagent only: the longest one run may take; 0 = no limit, at most 1440
   max_parallel: 4              # tool calls of one turn that run at once, 1 to 32: lowers MAX_PARALLEL_TOOL_CALLS for this agent, never raises it
   max_processes: 2             # processes (commands) of the worker at once, 1 to 256: lowers MAX_PROCESSES, never raises it (read by adam-coder; ADR 0065)
@@ -123,6 +124,8 @@ limits:                        # LlmAgent Limits; Claude's `maxTurns` is read as
   max_working_sessions: 2      # root only: most rounds working at once, 1 to 32 and at most max_open_sessions; lowers SESSION_MAX_WORKING
   max_inline_upload_bytes: 10485760 # root only: the largest file sent inline (`uploads/v1`; a larger one asks for a slot; the card carries no params), 1 to 268435456 (256 MiB); wins over UPLOADS_INLINE_MAX_BYTES (a subagent's value is ignored, with a warning)
   max_session_rounds: 10       # root only: most rounds one session may have, 2 to 200; lowers SESSION_MAX_ROUNDS (a subagent's value is ignored, with a warning)
+  output: { run_command: on_error }  # root only: what a command tool shows when a call gives no `output` (below; read by adam-coder; ADR 0090)
+session: { mode: sealed, wait: true }   # subagent only: what a session its parent starts defaults to, and the widest mode it may be (below; ADR 0089)
 retry:                         # a retry policy per tool (below); this agent's own, none inherits
   web_search: { attempts: 5, backoff: 2s, max_backoff: 5m, on: [rate-limited] }
 plugins: [audit]                # compiled hooks the deployment registered (below); a subagent inherits them; a name nobody registered exits 78
@@ -171,9 +174,12 @@ You are the coder agent. Stop after at most {{max_check_cycles}} failed check cy
 * **The output cap is per model.** `limits.max_output_tokens` is what this agent's calls ask for;
   without it the cap is its `model_preset`'s, else the model profile's `maxOutputTokens`, else the
   profile's base preset, else 128,000 (ADR 0064). The result is clamped to the model's
-  `maxOutputTokensLimit` and, when the context window is known, to what the window leaves after
-  20,000 tokens and the history the agent keeps (`max_history_tokens`, or half the window when it
-  is `0`; an omitted key keeps the 100,000 default). A **preset** above the model's limit is refused at startup, and a profile's own
+  `maxOutputTokensLimit` and, when the context window is known (the model profile's `contextWindow`, else
+  `DEFAULT_MODEL_CONTEXT_WINDOW` for the alias `MODEL` names; [ADR 0088](../decisions/0088-the-context-window-follows-the-model-and-the-history-budget-is-200k.md)),
+  to what the window leaves after
+  20,000 tokens and the history the agent keeps: `max_history_tokens` (200,000 when the key is omitted), at most half
+  the window, and half the window when it is `0`. A history the window cannot hold gives way, so a 200,000-token
+  window leaves the output 80,000 tokens, not one (ADR 0088). A **preset** above the model's limit is refused at startup, and a profile's own
   `maxOutputTokens` above its limit is refused when the profiles file is read; the folder's own
   value is clamped. `0` is refused: leave the key out to take the profile and the fallback.
 * **The tools a root agent has without writing any** are the person's screen and a plan: `ask_user`, `show`,
@@ -200,6 +206,48 @@ You are the coder agent. Stop after at most {{max_check_cycles}} failed check cy
   declared server that gave no tools (an `optional` one that is down) is skipped with a warning. Ignored, with a
   warning, on a remote subagent. A policy only applies to failures the tool reports as retryable: an MCP tool's
   call that fails is an error result for the model, so its `retry:` covers little more than a refused bearer.
+* **`session:` is a subagent's say in its sessions** ([ADR 0089](../decisions/0089-every-child-is-a-session-and-the-one-shot-subagent-tool-goes.md),
+  slice C3). `mode` (`one_shot`, `sealed` or `open`) is what a `subagent_start` that names no mode gets, **and the widest
+  one a call may ask**: a call only narrows it (`open` is wider than `sealed`, which is wider than `one_shot`). `wait`
+  (`true` or `false`) is a default only. Without the block a session starts `one_shot`, may be asked up to `open`, and
+  does not wait. Local and remote subagents take it alike; only the root has session tools, so on a subagent's own
+  subagent it has no effect. Another key, or another word, stops the load (exit 78); on a
+  root agent the block is ignored with a warning.
+
+  ```markdown
+  ---
+  description: Reviews a change and says what to fix.
+  session:
+    mode: sealed     # starts sealed; a call may ask one_shot, never open
+    wait: true       # a call that does not say waits for the first report
+  ---
+  ```
+
+  A call asking wider is an error result that names both and starts nothing:
+  `` `mode` is open; at most sealed for reviewer, as its file's `session.mode` says: one of one_shot, sealed ``. The
+  subagent's line in `subagent_start`'s description says what the file sets (`(mode sealed by default, at most sealed;
+  waits by default)`), and a subagent without the block keeps its line as it was. A person's own session through
+  `child-sessions/v1` is theirs and is not held to it.
+* **`limits.output` sets what a command tool shows by default** ([ADR 0090](../decisions/0090-a-tool-result-is-bounded-when-it-is-made-and-a-command-that-succeeds-says-so.md),
+  slice T3). Its keys are the three command tools, `run_checks`, `run` and `run_command`; each value is `on_error` (a
+  command that succeeds is one line naming the id its output is kept under) or `full` (the output however it ended).
+  A call that gives no `output` takes the file's value; a tool the block leaves out keeps its own default
+  (`run_checks` and `run` `on_error`, `run_command` `full`); a call's `output` always wins. Another key, or another
+  word, stops the load (exit 78). Root agent only: the tools are the process's, so on a subagent the block is ignored
+  with a warning. `adam-coder` reads it; `adam-agent` has none of these tools, so there it changes nothing. The
+  tools' descriptions name their own defaults, and every result says what it shows, so a folder that changes a
+  default can say so in its instructions.
+
+  ```markdown
+  ---
+  name: coder
+  limits:
+    output:
+      run_command: on_error   # a look that succeeds is one line too; read_output reads it
+      run_checks: full        # a check that passes shows its output
+  ---
+  ```
+
 * **A subagent inherits nothing** from its parent (eve's isolation boundary), and omitting `tools:`
   gives it **no tools** (decision D3). Claude Code inherits everything; adam does not.
 * **A copied file parses unchanged, but its `tools` must name adam tools.** A Claude Code file listing
@@ -214,6 +262,7 @@ description: Handles billing questions for a customer account.
 a2a: https://billing.example.com/.well-known/agent-card.json
 auth: bearer:BILLING_AGENT_TOKEN     # names an environment variable, resolved at startup, fail closed
 files: true                          # optional: the file parts of its answer are shared, not described
+session: { mode: one_shot }          # optional: as on a local subagent (above)
 ---
 ```
 
@@ -365,11 +414,12 @@ so a mode's narrowing reaches the helpers too.
 }
 ```
 
-* **A long result is kept and paged, not cut.** A text answer over 64 KiB is kept and the model is shown its first
-  page and an output id; the agent gets a `read_output` tool (added when its tools include an MCP tool) that reads the rest by
+* **A long result is kept and paged, not cut.** A text answer over 16 KiB (the deployment's bound of a tool result,
+  `CHECK_OUTPUT_TAIL_BYTES` in the coder; [ADR 0090](../decisions/0090-a-tool-result-is-bounded-when-it-is-made-and-a-command-that-succeeds-says-so.md))
+  is kept and the model is shown a first page within that bound and an output id; the agent gets a `read_output` tool (added when its tools include an MCP tool) that reads the rest by
   lines. A folder agent has no volume, so it keeps the text **in the run's state, at most 4 MiB for the run** (as the tools gave it: a host that sets `ToolCtx::with_scrub` has it scrubbed before it is folded and at every read; the shipped `adam-agent` sets none and has no secrets registry, so it does not); a
   result that would go over is shown as its first page and `[not kept: ...]`. An error result is still cut at
-  64 KiB, and images and blobs are not paged. See [`adam-mcp`](../../crates/adam-mcp/README.md).
+  the bound, and images and blobs are not paged. See [`adam-mcp`](../../crates/adam-mcp/README.md).
 * Field names follow Claude Code's `.mcp.json` (*verified 2026-09-29*,
   <https://code.claude.com/docs/en/mcp.md>) and the draft SEP-2633 (*verified draft status 2026-09-29*,
   <https://github.com/modelcontextprotocol/modelcontextprotocol/pull/2633>; the field details are
@@ -440,7 +490,8 @@ sequenceDiagram
   is a string. Unknown keys are read into `serde_json::Value` and become warnings.
 * **Agent files.** One schema, `AgentFrontmatter`, for the root agent, a directory subagent and a flat
   subagent file: `name`, `description`, `tools`, `model`, `skills`, `preload_skills`, `si_memory`, `limits`, `vars`,
-  `card` (root only), `a2a` and `auth` (remote subagent), `metadata`. A subagent needs a `description`. The
+  `card` (root only), `a2a` and `auth` (remote subagent), `session` (subagent only; an unknown key or word in it is an
+  error), `metadata`. A subagent needs a `description`. The
   keys `api_key`, `apiKey`, `token`, `secret`, `password` and `base_url` are errors (compared without case,
   `_` and `-`), and so is a `model` that is a URL. Claude Code, Copilot and OpenCode keys adam does not act on
   warn "ignored"; any other unknown key warns "unknown".
@@ -715,7 +766,8 @@ si_memory:                # on, tuned
   scopes: [agent, repository]
 ```
 
-* **What `on` gives a run.** `si_recall` and `si_record`, as one lazy group (`load__group__memory`), over the folder
+* **What `on` gives a run.** `si_recall` and `si_record`, as one lazy group (`load__group__memory`): `si_recall` returns the L1 problems, then the
+  audience's approved L2 lessons when `MEMORY_URL` names a store, and `si_record` writes the attempt, over the folder
   `SI_MEMORY_DIR` names ([environment](environment.md#environment-variables)). With no folder, L1 is absent: the tools
   are still offered and answer that nothing is recorded, and the run goes on (ADR 0081 decision 12).
 * **The deployment's ceiling wins downwards.** `SI_MEMORY=off` ([environment](environment.md#environment-variables))
@@ -827,8 +879,11 @@ A root with a subagent, local or remote, also gets six tools that run a subagent
 [child runs](child-runs.md#sessions-adr-0045-slices-1-to-4)). No file declares them: they follow the folder's subagents,
 whose names are the enum of `agent`, and they are not given to a subagent. A subagent file needs nothing for them, and a remote
 (`a2a:`) subagent works too ([remote sessions](#remote-sessions)). A tool or a subagent named like one of the six is refused at
-bind. A root whose subagents are all remote gets the six tools as well. `subagent_edit` changes a session's `config` — a patch,
-where `null` returns a member to the folder's — within the same bounds a start has ([ADR 0054](../decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md), decision 11).
+bind. A root whose subagents are all remote gets the six tools as well. A subagent's `session:` sets the `mode` and
+`wait` of a start that names none, and the widest `mode` a start may name ([above](#agent-and-subagent-files-instructionsmd-subagentsmd-agentmd)).
+The subagent's own tool always starts `one_shot` and waits, the narrowest, so the block never refuses it. `subagent_edit` changes a
+session's `config` — a patch, where `null` returns a member to the folder's — within the same bounds a start has ([ADR 0054](../decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md), decision 11),
+and never its `mode`: an edit that names one is refused, and the session keeps the mode it was started with ([ADR 0089](../decisions/0089-every-child-is-a-session-and-the-one-shot-subagent-tool-goes.md), amended 2026-11-28).
 
 **The same helpers are offered to a person.** `adam-agent` and `adam-coder` list `child-sessions/v1` on the card of a root with a subagent, so a client can open, talk to and close a session on any of them ([A2A server](a2a-server.md#child-sessions-child-sessionsv1)). The card's `maxOpen` is the effective `SESSION_MAX_OPEN`: `limits.max_open_sessions` of the root's file lowers it, never raises it. A root with no subagent lists nothing.
 
@@ -978,7 +1033,7 @@ sequenceDiagram
   B->>B: per agent: connected, same file, names fit its servers, no clash, tools: selects
   Note over J,S: at run time
   J->>S: tools/call (one call, within a timeout, dropped when the run is cancelled)
-  S-->>J: content, as text (cut at 64 KiB), isError kept
+  S-->>J: content, as text (over 16 KiB: kept, a first page shown), isError kept
 ```
 
 ```mermaid
@@ -1047,7 +1102,7 @@ tools, named after the server, loaded by one generated tool, `load__group__<serv
   another machine, a URL with credentials or a `${VAR}`, a bad header, a server that is down or refuses the
   credentials, an allow-list naming a tool the server lacks.
 * **Names and text.** `<server>__<tool>`; without an allow-list a tool whose name does not fit
-  `^[A-Za-z0-9_-]{1,64}$` is skipped with a warning. Descriptions are cut at 8 KiB, answers at 64 KiB; images
+  `^[A-Za-z0-9_-]{1,64}$` is skipped with a warning. Descriptions are cut at 8 KiB, an answer over 16 KiB is kept and paged; images
   and blobs are described, never included (unless the server has `files: true`, below); `isError` is an error
   result.
 * **At-least-once.** A call runs inside the journaled step, so a replay of a committed call does not call the

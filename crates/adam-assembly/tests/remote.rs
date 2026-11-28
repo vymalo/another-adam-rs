@@ -448,8 +448,8 @@ async fn a_remote_subagent_is_called_polled_and_its_answer_comes_back() {
         // Same shape as a local subagent: `{message}` and the same suffix.
         assert_eq!(
             requests[0].tools.len(),
-            6,
-            "the tool and the five of a session"
+            7,
+            "the tool and the six of a session"
         );
         assert_eq!(
             requests[0].tools[0].description,

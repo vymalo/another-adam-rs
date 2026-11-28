@@ -827,6 +827,10 @@ fn sorted_entries(dir: &Path) -> Vec<(std::ffi::OsString, std::fs::FileType, Pat
 /// paths, the same on every call: a file does not come and go with the order the file system lists.
 fn walk_capped(root: &Path, extensions: &[&str], cap: usize) -> HashMap<PathBuf, (u64, u128)> {
     let mut found = HashMap::new();
+    // A server that watches no file (the Dockerfile's) costs no walk.
+    if extensions.is_empty() {
+        return found;
+    }
     let mut stack = vec![sorted_entries(root).into_iter()];
     while let Some(top) = stack.last_mut() {
         let Some((name, kind, path)) = top.next() else {
@@ -1209,6 +1213,10 @@ pub struct ServerInfo {
     pub root: PathBuf,
     /// Its process id.
     pub pid: Option<u32>,
+    /// Whether it is working through its index now: a `$/progress` is open, it said it is not
+    /// quiescent, or it said it reports its status and has not said it is quiescent yet. A test
+    /// that must observe a server *while* it indexes waits for this instead of sleeping.
+    pub indexing: bool,
 }
 
 /// What the probe of a program found.
@@ -1347,6 +1355,7 @@ impl Servers {
                 language: s.key.language,
                 root: s.key.root.clone(),
                 pid: s.pid,
+                indexing: s.shared.indexing(),
             })
             .collect()
     }

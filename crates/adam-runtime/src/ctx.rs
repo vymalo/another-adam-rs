@@ -8,9 +8,10 @@ use futures::{StreamExt, TryStreamExt};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
-use adam_core::{DynStore, JournalEntry, RunId, RunRecord, StoreError};
+use adam_core::{BlobId, DynStore, JournalEntry, RunId, RunRecord, StoreError};
 
 use crate::agent::{AgentError, Inbound};
+use crate::blob::BlobWriter;
 use crate::cancel::CancelToken;
 use crate::child::{ChildLook, ChildStarter, ChildStatus, RESUME_KIND, news_since};
 use crate::clock::DynClock;
@@ -32,6 +33,10 @@ const NOW_STEP: &str = "ctx.now";
 /// recorded result instead of running again.
 pub struct Ctx {
     run: RunId,
+    /// The journal epoch the run started on ([ADR 0076]).
+    ///
+    /// [ADR 0076]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0076-a-run-records-the-journal-epoch-it-started-on.md
+    epoch: u32,
     conversation_id: Option<String>,
     attempt: u32,
     /// See [`Ctx::retries_left`].
@@ -44,6 +49,8 @@ pub struct Ctx {
     reopen: bool,
     /// See [`Ctx::read_already`].
     read: Vec<String>,
+    /// See [`Ctx::reference_blobs`].
+    blobs: Vec<BlobId>,
     store: DynStore,
     clock: DynClock,
     cancel: CancelToken,
@@ -145,10 +152,16 @@ pub(crate) struct CtxOutcome {
     /// See [`Ctx::read_already`].
     pub read: Vec<String>,
     pub artifacts: Vec<Artifact>,
+    /// See [`Ctx::reference_blobs`].
+    pub blobs: Vec<BlobId>,
 }
 
 pub(crate) struct CtxParts {
     pub run: RunId,
+    /// The journal epoch the run started on ([ADR 0076]); [`Ctx::epoch`].
+    ///
+    /// [ADR 0076]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0076-a-run-records-the-journal-epoch-it-started-on.md
+    pub epoch: u32,
     pub agent: String,
     pub conversation_id: Option<String>,
     pub attempt: u32,
@@ -165,9 +178,20 @@ pub(crate) struct CtxParts {
 }
 
 impl Ctx {
+    /// The journal epoch the run started on ([ADR 0076]): the step list its journal was written
+    /// against, as the agent declared it when the run began. A transition that changes its step
+    /// list may read it to keep an old run replayable.
+    ///
+    /// [ADR 0076]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0076-a-run-records-the-journal-epoch-it-started-on.md
+    #[must_use]
+    pub fn epoch(&self) -> u32 {
+        self.epoch
+    }
+
     pub(crate) fn new(p: CtxParts) -> Self {
         Self {
             run: p.run,
+            epoch: p.epoch,
             conversation_id: p.conversation_id,
             attempt: p.attempt,
             retries_left: p.retries_left,
@@ -177,6 +201,7 @@ impl Ctx {
             consumed: 0,
             reopen: false,
             read: Vec::new(),
+            blobs: Vec::new(),
             store: p.store,
             clock: p.clock,
             cancel: p.cancel,
@@ -196,6 +221,7 @@ impl Ctx {
             consumed: self.consumed,
             reopen: self.reopen,
             read: self.read,
+            blobs: self.blobs,
             artifacts: std::mem::take(
                 &mut *self
                     .emitter
@@ -811,6 +837,29 @@ impl Ctx {
     pub fn emitter(&self) -> Emitter {
         self.emitter.clone()
     }
+
+    /// An owned handle that stores bytes as content-addressed blobs, for a [`Ctx::step`] closure
+    /// (see [`BlobWriter`]). The bytes are kept for the run only once their ids are named with
+    /// [`reference_blobs`](Self::reference_blobs).
+    pub fn blob_writer(&self) -> BlobWriter {
+        BlobWriter::new(self.store.clone())
+    }
+
+    /// Name `ids` as blobs this transition's state references: the commit records them
+    /// ([`RunUpdate::blobs`](adam_core::RunUpdate::blobs), a delta the store unions), so their
+    /// bytes survive until no run references them. Call it **after** the step that stored them,
+    /// with the ids the step returned, so a replay of a recorded step names them too.
+    ///
+    /// Only a transition that commits progress records them: a transition that fails (its state is
+    /// not kept) or is retried drops them, as it drops its artifacts. Naming an id twice, or an id
+    /// an earlier commit already named, is harmless.
+    pub fn reference_blobs(&mut self, ids: impl IntoIterator<Item = BlobId>) {
+        for id in ids {
+            if !self.blobs.contains(&id) {
+                self.blobs.push(id);
+            }
+        }
+    }
 }
 
 /// The outcome of the step `name` at `seq`: `recorded` if the journal had it, else `f`'s, written
@@ -1010,6 +1059,7 @@ mod tests {
             .expect("create run");
         Ctx::new(CtxParts {
             run: run.id,
+            epoch: 0,
             agent: "a".into(),
             conversation_id: None,
             attempt: 0,
@@ -1202,6 +1252,7 @@ mod tests {
     fn ctx_on(store: &DynStore, run: RunId, seq: u64) -> Ctx {
         Ctx::new(CtxParts {
             run,
+            epoch: 0,
             agent: "a".into(),
             conversation_id: None,
             attempt: 0,

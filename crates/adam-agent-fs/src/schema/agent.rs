@@ -301,7 +301,9 @@ pub struct Limits {
     /// 0064; `0` is refused). Absent: the model's profile's, then the 128,000 fallback.
     #[serde(skip_serializing_if = "Option::is_none", alias = "maxOutputTokens")]
     pub max_output_tokens: Option<u32>,
-    /// Budget for the history sent to the model.
+    /// Budget for the history sent to the model, in tokens: the run compacts at the smaller of
+    /// this and what the model's window leaves; `0` leaves the window's alone. Absent: the loop's
+    /// default, 200,000 (`adam_llm_agent::DEFAULT_MAX_HISTORY_TOKENS`, ADR 0088).
     #[serde(skip_serializing_if = "Option::is_none", alias = "maxHistoryTokens")]
     pub max_history_tokens: Option<u32>,
     /// The longest a run of this agent may take **as a subagent**, in minutes; `0` is no limit, at
@@ -350,9 +352,130 @@ pub struct Limits {
         alias = "maxInlineUploadBytes"
     )]
     pub max_inline_upload_bytes: Option<u64>,
+    /// What the command tools show of an output when a call gives no `output` ([ADR 0090]
+    /// decision 3): a default per tool. Root agent only (the tools are the process's); read by
+    /// `adam-coder`, the agent that has the three tools.
+    ///
+    /// [ADR 0090]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0090-a-tool-result-is-bounded-when-it-is-made-and-a-command-that-succeeds-says-so.md
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output: Option<OutputDef>,
     /// Keys this schema does not know.
     #[serde(flatten)]
     pub extra: BTreeMap<String, Value>,
+}
+
+/// What a command's result shows of its output (`limits.output.<tool>`, [ADR 0090] decision 3):
+/// the file's word for `adam_code_tools::OutputMode`, which this crate does not depend on.
+///
+/// The enum is closed on purpose (Rule 3): `adam-coder` maps it onto the tools' with a match that
+/// has no wildcard, so a mode added on either side fails to compile there.
+///
+/// [ADR 0090]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0090-a-tool-result-is-bounded-when-it-is-made-and-a-command-that-succeeds-says-so.md
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OutputModeDef {
+    /// A command that succeeded is one line, naming the id its output is kept under; one that
+    /// failed is shown whole.
+    OnError,
+    /// The output is shown however the command ended.
+    Full,
+}
+
+impl OutputModeDef {
+    /// The word as the file writes it: `on_error` or `full`.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::OnError => "on_error",
+            Self::Full => "full",
+        }
+    }
+}
+
+impl fmt::Display for OutputModeDef {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// `limits.output`: the default `output` of each command tool, the one a call that gives none
+/// takes ([ADR 0090] decision 3). A tool the block leaves out keeps its own default (`run_checks`
+/// and `run`: `on_error`; `run_command`: `full`), and a call's `output` always wins.
+///
+/// **Unknown keys are refused** (`deny_unknown_fields`): the keys are the three tools' names, and
+/// a misspelt one would leave a tool showing what the file says it does not.
+///
+/// [ADR 0090]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0090-a-tool-result-is-bounded-when-it-is-made-and-a-command-that-succeeds-says-so.md
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct OutputDef {
+    /// `run_checks`'s default.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run_checks: Option<OutputModeDef>,
+    /// `run`'s default.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run: Option<OutputModeDef>,
+    /// `run_command`'s default.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run_command: Option<OutputModeDef>,
+}
+
+/// Who may write to a session of a subagent after its first round (`session.mode`, [ADR 0089]
+/// decision 2): the file's word for `adam_runtime::SessionMode`, which this crate does not depend
+/// on. Narrowest first, as the runtime's: `one_shot`, `sealed`, `open`.
+///
+/// The enum is closed on purpose (Rule 3): `adam-assembly` maps it onto the runtime's with a match
+/// that has no wildcard, so a mode added on either side fails to compile there.
+///
+/// [ADR 0089]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0089-every-child-is-a-session-and-the-one-shot-subagent-tool-goes.md
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionModeDef {
+    /// The session closes when its first round has ended.
+    OneShot,
+    /// The session stays open, and only the agent that started it sends it more.
+    Sealed,
+    /// The session stays open, and the agent and the person send it more.
+    Open,
+}
+
+impl SessionModeDef {
+    /// The word as the file writes it: `one_shot`, `sealed` or `open`.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::OneShot => "one_shot",
+            Self::Sealed => "sealed",
+            Self::Open => "open",
+        }
+    }
+}
+
+impl fmt::Display for SessionModeDef {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// `session:` in a subagent's file ([ADR 0089] decision 4): the defaults of a `subagent_start` that
+/// does not say, and the ceiling of one that does. `mode` is both the mode a start gets when it
+/// names none and the widest it may ask (a start only narrows it: `open` is wider than `sealed`,
+/// which is wider than `one_shot`); `wait` is a default only. Both are optional; a file without the
+/// block starts `one_shot`, up to `open`, and does not wait.
+///
+/// **Unknown keys are refused** (`deny_unknown_fields`): a misspelt `mode` would leave a subagent
+/// wider than its file says. A subagent's key: on the root agent it is ignored with a warning.
+///
+/// [ADR 0089]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0089-every-child-is-a-session-and-the-one-shot-subagent-tool-goes.md
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SessionDef {
+    /// The mode of a start that names none, and the widest one a start may name.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mode: Option<SessionModeDef>,
+    /// Whether a start that does not say waits for the first report.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wait: Option<bool>,
 }
 
 /// One skill advertised on the A2A agent card. **Not** an Agent Skill: the two never map
@@ -627,6 +750,11 @@ pub struct AgentFrontmatter {
     /// calling run instead of being described (an adam extension; remote subagents only).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub files: Option<bool>,
+    /// The defaults and the ceiling of the sessions a parent starts on this subagent
+    /// ([`SessionDef`], ADR 0089 decision 4); local and remote subagents alike. Left out of the
+    /// JSON (and so of the digest) when absent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session: Option<SessionDef>,
     /// Free-form map, passed through (an Agent Skills and Copilot convention). Scalars are
     /// read as text; a list or a map is kept as its JSON text.
     #[serde(
@@ -775,6 +903,50 @@ mod tests {
             ToolsLoading::Searchable,
         ] {
             assert_eq!(round_trip(&loading), loading);
+        }
+        for mode in [
+            SessionModeDef::OneShot,
+            SessionModeDef::Sealed,
+            SessionModeDef::Open,
+        ] {
+            assert_eq!(round_trip(&mode), mode);
+            assert_eq!(serde_json::to_value(mode).unwrap(), mode.as_str());
+        }
+    }
+
+    #[test]
+    fn a_session_block_reads_its_two_keys_and_refuses_any_other() {
+        let front: AgentFrontmatter = serde_json::from_value(serde_json::json!({
+            "session": { "mode": "sealed", "wait": true }
+        }))
+        .unwrap();
+        let session = front.session.unwrap();
+        assert_eq!(
+            (session.mode, session.wait),
+            (Some(SessionModeDef::Sealed), Some(true))
+        );
+        assert_eq!(round_trip(&front), front);
+        // An empty block is a block: no default, and nothing written but the key.
+        let empty: AgentFrontmatter =
+            serde_json::from_value(serde_json::json!({ "session": {} })).unwrap();
+        assert_eq!(empty.session, Some(SessionDef::default()));
+        assert_eq!(serde_json::to_string(&empty).unwrap(), r#"{"session":{}}"#);
+        for (bad, needle) in [
+            (
+                serde_json::json!({ "mode": "wide" }),
+                "unknown variant `wide`",
+            ),
+            (
+                serde_json::json!({ "keep_open": true }),
+                "unknown field `keep_open`",
+            ),
+            (serde_json::json!({ "wait": "yes" }), "invalid type"),
+        ] {
+            let error =
+                serde_json::from_value::<AgentFrontmatter>(serde_json::json!({ "session": bad }))
+                    .unwrap_err()
+                    .to_string();
+            assert!(error.contains(needle), "{error}");
         }
     }
 

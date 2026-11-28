@@ -2050,6 +2050,7 @@ fn read_output_is_independent_and_the_session_list_runs_alone() {
         within: None,
         remote: false,
         bounds: adam_runtime::SessionBounds::default(),
+        session: adam_llm_agent::SessionDefaults::default(),
     }]);
     for tool in roster.tools() {
         assert_eq!(

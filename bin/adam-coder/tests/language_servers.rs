@@ -274,7 +274,10 @@ async fn a_file_no_server_serves_is_answered_with_what_they_serve() {
     assert!(
         out.content.contains(".rs (Rust)")
             && out.content.contains(".go (Go)")
-            && out.content.contains(".dart (Dart)"),
+            && out.content.contains(".dart (Dart)")
+            && out.content.contains(".toml (TOML)")
+            && out.content.contains(".yaml .yml (YAML)")
+            && out.content.contains("named Dockerfile or Containerfile"),
         "{}",
         out.content
     );
@@ -315,6 +318,293 @@ async fn dart_files_start_a_dart_server_at_the_nearest_pubspec() {
             .iter()
             .any(|s| s.root == lsp.worktree().join("apps/mobile"))
     );
+}
+
+// ------------------------------------------------------------------ the six of ADR 0091 (L1)
+
+/// The production table with every program replaced by the scripted server and its arguments
+/// kept: with `log_argv` the script logs what its launch line gave it.
+fn production_launches(script: &Path) -> ServerTable {
+    let production = ServerTable::production();
+    Language::ALL
+        .into_iter()
+        .fold(ServerTable::production(), |table, language| {
+            let spec = production.get(language);
+            let args = spec
+                .launch
+                .strip_prefix(&format!("exec {}", spec.program))
+                .expect("a launch line is `exec <program> ...`");
+            let mut env = spec.env.clone();
+            env.push(("ADAM_LSP_SCRIPT".to_owned(), script.display().to_string()));
+            table.with(
+                language,
+                ServerSpec {
+                    program: SCRIPT_BIN.to_owned(),
+                    launch: format!("exec '{SCRIPT_BIN}'{args}"),
+                    env,
+                    version_probe: false,
+                },
+            )
+        })
+}
+
+/// A rig whose servers are started with the production launch lines, room for `max` of them.
+async fn six_rig(script: Value, max: usize) -> Lsp {
+    Lsp::build(
+        Fixture::with(|s| s.language_servers_max = max).await,
+        script,
+        production_launches,
+    )
+    .await
+}
+
+impl Lsp {
+    /// The arguments of every server started so far, in the order they were started.
+    fn argvs(&self) -> Vec<Value> {
+        self.log()
+            .into_iter()
+            .filter_map(|m| m.get("argv").cloned())
+            .collect()
+    }
+
+    /// The answers of the client to the script's `server_requests`, by id, once there are `n`.
+    async fn answers(&self, n: usize) -> Vec<Value> {
+        until("the answers to be logged", || {
+            self.log()
+                .iter()
+                .filter(|m| m.get("answer_to").is_some())
+                .count()
+                >= n
+        })
+        .await;
+        self.log()
+            .into_iter()
+            .filter(|m| m.get("answer_to").is_some())
+            .collect()
+    }
+}
+
+#[tokio::test]
+async fn each_of_the_six_languages_starts_its_own_server_with_its_launch_line_at_the_slot_root() {
+    let lsp = six_rig(
+        json!({"log_argv": true, "diagnostics": [diag(1, 0, 0, "seen")]}),
+        8,
+    )
+    .await;
+    let cases: [(&str, Language, &str, &[&str]); 6] = [
+        ("config/app.toml", Language::Toml, "toml", &["lsp", "stdio"]),
+        (
+            ".github/workflows/ci.yml",
+            Language::Yaml,
+            "yaml",
+            &["--stdio"],
+        ),
+        ("deploy/values.json", Language::Json, "json", &["--stdio"]),
+        ("dev/e2e.sh", Language::Shell, "shellscript", &["start"]),
+        (
+            "docker/Dockerfile",
+            Language::Dockerfile,
+            "dockerfile",
+            &["--stdio"],
+        ),
+        ("src/add.c", Language::C, "c", &["--background-index=false"]),
+    ];
+    for (n, (path, language, id, argv)) in cases.into_iter().enumerate() {
+        lsp.put(path, "x\n");
+        let out = lsp.diagnostics(json!({"path": path})).await;
+        assert!(!out.is_error, "{path}: {}", out.content);
+        assert!(
+            out.content.contains(&format!("{path}:1:1: error: seen")),
+            "{path}: {}",
+            out.content
+        );
+        let servers = lsp.servers();
+        assert_eq!(servers.len(), n + 1, "one server per language: {servers:?}");
+        let server = servers
+            .iter()
+            .find(|s| s.language == language)
+            .unwrap_or_else(|| panic!("a {language:?} server: {servers:?}"));
+        // None of the six has a marker here: the project root is the slot's.
+        assert_eq!(server.root, lsp.worktree(), "{path}");
+        assert_eq!(lsp.argvs()[n], json!(argv), "{path}");
+        let opened = lsp.logged("textDocument/didOpen");
+        assert_eq!(
+            opened[n]["params"]["textDocument"]["languageId"], id,
+            "{path}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_dockerfile_is_matched_by_its_name_and_not_by_the_name_of_its_directory() {
+    let lsp = six_rig(json!({"diagnostics": [diag(1, 0, 0, "seen")]}), 8).await;
+    for path in ["Dockerfile", "Containerfile", "api.Dockerfile"] {
+        lsp.put(path, "FROM alpine\n");
+        let out = lsp.diagnostics(json!({"path": path})).await;
+        assert!(
+            out.content.contains(&format!("{path}:1:1: error: seen")),
+            "{path}: {}",
+            out.content
+        );
+    }
+    let servers = lsp.servers();
+    assert_eq!(servers.len(), 1, "one server for the three: {servers:?}");
+    assert_eq!(servers[0].language, Language::Dockerfile);
+    for path in [
+        "Dockerfile.d/notes.txt",
+        "images/Dockerfile/README.md",
+        "Dockerfile.prod",
+    ] {
+        lsp.put(path, "FROM alpine\n");
+        let out = lsp.diagnostics(json!({"path": path})).await;
+        assert!(!out.is_error, "{path}: {}", out.content);
+        assert!(
+            out.content.contains("No language server serves")
+                && out.content.contains("Dockerfile or Containerfile"),
+            "{path}: {}",
+            out.content
+        );
+    }
+    assert_eq!(lsp.servers().len(), 1);
+}
+
+#[tokio::test]
+async fn clangd_and_taplo_are_rooted_at_their_markers_and_the_rest_at_the_slot() {
+    let lsp = six_rig(json!({"diagnostics": []}), 8).await;
+    lsp.put("native/compile_flags.txt", "-std=c11\n");
+    lsp.put(
+        "native/src/add.c",
+        "int add(int a, int b) { return a + b; }\n",
+    );
+    lsp.put("engine/compile_commands.json", "[]\n");
+    lsp.put("engine/src/a.cpp", "int a() { return 1; }\n");
+    lsp.put("tools/.clangd", "CompileFlags:\n  Add: [-std=c++20]\n");
+    lsp.put("tools/b.hpp", "int b();\n");
+    lsp.put("loose/x.h", "int x();\n");
+    lsp.put("crates/a/Cargo.toml", "[package]\nname = \"a\"\n");
+    lsp.put("crates/b/taplo.toml", "include = [\"*.toml\"]\n");
+    lsp.put("crates/b/Cargo.toml", "[package]\nname = \"b\"\n");
+    let root = lsp.worktree();
+    for (path, language, at) in [
+        ("native/src/add.c", Language::C, root.join("native")),
+        ("engine/src/a.cpp", Language::C, root.join("engine")),
+        ("tools/b.hpp", Language::C, root.join("tools")),
+        ("loose/x.h", Language::C, root.clone()),
+        ("crates/a/Cargo.toml", Language::Toml, root.clone()),
+        ("crates/b/Cargo.toml", Language::Toml, root.join("crates/b")),
+    ] {
+        let out = lsp.diagnostics(json!({"path": path})).await;
+        assert!(!out.is_error, "{path}: {}", out.content);
+        assert!(
+            lsp.servers()
+                .iter()
+                .any(|s| s.language == language && s.root == at),
+            "{path} at {}: {:?}",
+            at.display(),
+            lsp.servers()
+        );
+    }
+    assert_eq!(lsp.servers().len(), 6, "{:?}", lsp.servers());
+}
+
+#[tokio::test]
+async fn the_yaml_server_is_told_to_use_no_schema_store_and_no_kubernetes_catalog() {
+    // What yaml-language-server 2.0.0 asks for when it is initialized.
+    let lsp = six_rig(
+        json!({"server_requests": [{"method": "workspace/configuration", "params": {"items": [
+            {"section": "yaml"}, {"section": "http"}, {"section": "[yaml]"}, {"section": "editor"}
+        ]}}]}),
+        8,
+    )
+    .await;
+    lsp.put("deploy/values.yaml", "replicas: 1\n");
+    let out = lsp.diagnostics(json!({"path": "deploy/values.yaml"})).await;
+    assert!(!out.is_error, "{}", out.content);
+    let answers = lsp.answers(1).await;
+    let yaml = &answers[0]["result"][0];
+    assert_eq!(yaml["schemaStore"]["enable"], false, "{answers:?}");
+    assert_eq!(yaml["kubernetesCRDStore"]["enable"], false, "{answers:?}");
+    assert_eq!(yaml["validate"], true, "{answers:?}");
+    assert!(yaml.get("schemas").is_none(), "no schema is named: {yaml}");
+    for other in 1..4 {
+        assert!(answers[0]["result"][other].is_null(), "{answers:?}");
+    }
+}
+
+#[tokio::test]
+async fn the_json_server_fetches_only_file_schemas_and_the_client_has_none_to_give() {
+    // A `$schema` of the web is asked of the client (`vscode/content`), which has none.
+    let lsp = six_rig(
+        json!({"server_requests": [
+            {"method": "vscode/content", "params": ["https://json.schemastore.org/package.json"]}
+        ]}),
+        8,
+    )
+    .await;
+    lsp.put(
+        "package.json",
+        "{\"$schema\": \"https://json.schemastore.org/package.json\"}\n",
+    );
+    let out = lsp.diagnostics(json!({"path": "package.json"})).await;
+    assert!(!out.is_error, "{}", out.content);
+    let options = lsp.init_options(0);
+    assert_eq!(
+        options["handledSchemaProtocols"],
+        json!(["file"]),
+        "{options}"
+    );
+    let answers = lsp.answers(1).await;
+    assert_eq!(answers[0]["error"]["code"], -32601, "{answers:?}");
+}
+
+#[tokio::test]
+async fn taplo_is_told_to_validate_by_no_schema() {
+    let lsp = six_rig(
+        json!({"server_requests": [{"method": "workspace/configuration", "params": {"items": [
+            {"section": "evenBetterToml"}
+        ]}}]}),
+        8,
+    )
+    .await;
+    lsp.put("Cargo.toml", "[package]\nname = \"x\"\n");
+    let out = lsp.diagnostics(json!({"path": "Cargo.toml"})).await;
+    assert!(!out.is_error, "{}", out.content);
+    let answers = lsp.answers(1).await;
+    assert_eq!(
+        answers[0]["result"][0]["schema"]["enabled"], false,
+        "{answers:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_new_language_with_no_server_is_answered_as_not_installed() {
+    let lsp = Lsp::build(Fixture::new().await, json!({}), |_| {
+        ServerTable::production().with(
+            Language::Yaml,
+            ServerSpec {
+                program: "/nonexistent/yaml-language-server".to_owned(),
+                launch: "exec /nonexistent/yaml-language-server --stdio".to_owned(),
+                env: Vec::new(),
+                version_probe: false,
+            },
+        )
+    })
+    .await;
+    lsp.put(".github/workflows/ci.yml", "on: push\n");
+    let out = lsp
+        .diagnostics(json!({"path": ".github/workflows/ci.yml"}))
+        .await;
+    assert!(!out.is_error, "{}", out.content);
+    assert!(
+        out.content.contains("No language server for YAML")
+            && out
+                .content
+                .contains("`yaml-language-server` is not on PATH")
+            && out.content.contains("the tool that reads the file"),
+        "{}",
+        out.content
+    );
+    assert!(lsp.servers().is_empty());
 }
 
 // ------------------------------------------------------------------------------- diagnostics
@@ -557,11 +847,24 @@ async fn a_server_is_kept_between_calls_and_one_exists_per_project_root() {
 
 #[tokio::test]
 async fn indexing_past_the_wait_gives_a_partial_result_and_the_next_call_finds_the_server_warm() {
-    let lsp = Lsp::new(
-        json!({"progress_ms": 3500, "diagnostics": [diag(1, 0, 0, "found while indexing")]}),
-    )
+    // The begin is sent 600 ms after `initialized`, longer than the quiet window a server needs to
+    // count as ready (`SETTLE`, 300 ms): a call made before it is read would be answered as if the
+    // server were idle. The test therefore gates on the server being **observed** indexing — the
+    // readiness latch, not a clock — which is what the flake needed.
+    let lsp = Lsp::new(json!({
+        "progress_ms": 3500,
+        "progress_delay_ms": 600,
+        "diagnostics": [diag(1, 0, 0, "found while indexing")]
+    }))
     .await;
     rust_project(&lsp);
+    // Start the server (this call may answer early: the gate below is what the test relies on).
+    lsp.diagnostics(json!({"path": "src/lib.rs", "wait": 1}))
+        .await;
+    until("the server is observed indexing", || {
+        lsp.servers().iter().any(|s| s.indexing)
+    })
+    .await;
     let started = Instant::now();
     let first = lsp
         .diagnostics(json!({"path": "src/lib.rs", "wait": 1}))
@@ -569,6 +872,8 @@ async fn indexing_past_the_wait_gives_a_partial_result_and_the_next_call_finds_t
     assert!(!first.is_error, "{}", first.content);
     assert!(
         first.content.starts_with("[still indexing after ")
+            // The time spent, then the bound the call asked for (ANR-1185); the seconds are the
+            // runner's, so only the shape is asserted.
             && first.content.contains("of at most 1 s"),
         "{}",
         first.content
@@ -609,14 +914,29 @@ async fn indexing_past_the_wait_gives_a_partial_result_and_the_next_call_finds_t
 
 #[tokio::test]
 async fn a_server_that_reports_its_status_is_not_ready_until_it_says_it_is_quiescent() {
-    // Not a `$/progress` in sight: only `experimental/serverStatus`, as rust-analyzer says it.
-    let lsp = Lsp::new(json!({"status_ms": 3000, "diagnostics": [diag(1, 0, 0, "early")]})).await;
+    // Not a `$/progress` in sight: only `experimental/serverStatus`, as rust-analyzer says it. The
+    // "not quiescent" is sent 600 ms after `initialized` (longer than `SETTLE`), so the call below
+    // must be gated on the latch rather than on the clock — see the test above.
+    let lsp = Lsp::new(json!({
+        "status_ms": 3000,
+        "status_delay_ms": 600,
+        "diagnostics": [diag(1, 0, 0, "early")]
+    }))
+    .await;
     rust_project(&lsp);
+    lsp.diagnostics(json!({"path": "src/lib.rs", "wait": 1}))
+        .await;
+    until("the server reports it is not quiescent", || {
+        lsp.servers().iter().any(|s| s.indexing)
+    })
+    .await;
     let first = lsp
         .diagnostics(json!({"path": "src/lib.rs", "wait": 1}))
         .await;
     assert!(
         first.content.starts_with("[still indexing after ")
+            // The time spent, then the bound the call asked for (ANR-1185); the seconds are the
+            // runner's, so only the shape is asserted.
             && first.content.contains("of at most 1 s"),
         "{}",
         first.content

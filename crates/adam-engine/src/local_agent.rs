@@ -84,7 +84,7 @@ impl Plugin for AsksBeforeWritingOrCommand {
                 if let Some(named) = listed_paths(&names) {
                     named
                 } else {
-                    "Apply a patch in the person's directory? The patch names no file.".to_owned()
+                    "Apply a patch in the person's directory? The model did not name a file in the patch.".to_owned()
                 }
             }
             // Commands — the shell line, so the person reads what the run would run, and the cwd
@@ -134,16 +134,27 @@ impl Plugin for AsksBeforeWritingOrCommand {
 /// would turn it into `dev/null`, a path that is not the person's file.
 fn patch_paths(patch: &str) -> Vec<String> {
     let mut out = Vec::new();
+    // The `--- ` path of the file the next `+++ ` line pairs with: a deletion names its file there.
+    let mut old_side: Option<&str> = None;
     for line in patch.lines() {
+        if let Some(rest) = line.strip_prefix("--- ") {
+            old_side = Some(rest.trim());
+            continue;
+        }
         let Some(rest) = line.strip_prefix("+++ ") else {
             continue;
         };
-        let path = rest.trim();
+        let mut path = rest.trim();
         // A deletion: `+++ /dev/null`. `git apply` would strip the leading `/` and leave
-        // `dev/null`, which is not a file in the person's directory; skip it before `-p1`.
+        // `dev/null`, which is not a file in the person's directory: the file deleted is the one
+        // its `--- ` line names, when that is not `/dev/null` too.
         if path == "/dev/null" || path == "dev/null" {
-            continue;
+            match old_side.take() {
+                Some(old) if old != "/dev/null" && old != "dev/null" => path = old,
+                _ => continue,
+            }
         }
+        old_side = None;
         // `git diff` writes `+++ b/<path>`; a model may also write `+++ x/<path>`. The leading
         // `b/` (or whatever) is a label, not part of the path, and `git apply -p1` drops the first
         // component. Strip it when the rest has one, keep the rest otherwise.
@@ -348,8 +359,10 @@ pub async fn run_command(
     cwd: Option<String>,
     /// Seconds before the command is killed; at most the directory's limit, which is also the default. Example: {"command":"ls -la","timeout":10}
     timeout: Option<i64>,
+    /// What the result shows of the output: `full` (the default) or `on_error`, the exit code alone when it is 0
+    output: Option<String>,
 ) -> Result<ToolOutput, ToolError> {
-    inspect::run_command(&*person, ctx, command, cwd, None, timeout).await
+    inspect::run_command(&*person, ctx, command, cwd, None, timeout, output).await
 }
 
 /// Make something with a shell command in the person's directory and keep what it changes:
@@ -373,8 +386,10 @@ pub async fn run(
     cwd: Option<String>,
     /// Seconds before the command is killed; at most the directory's limit, which is also the default. Example: {"command":"npm install","timeout":120}
     timeout: Option<i64>,
+    /// What the result shows of the output: `on_error` (the default: the exit code and the changed files alone when it succeeds) or `full`
+    output: Option<String>,
 ) -> Result<ToolOutput, ToolError> {
-    make::run(&*person, ctx, command, cwd, None, timeout).await
+    make::run(&*person, ctx, command, cwd, None, timeout, output).await
 }
 
 /// The tool set the local agent registers on top of the engine's screen tools: every file and

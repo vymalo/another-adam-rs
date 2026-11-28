@@ -36,16 +36,25 @@ impl RedactorFromConfig for Redactor {
                 .iter()
                 .map(|t| t.expose_secret().to_owned()),
         );
-        if let Ok(url) = url::Url::parse(config.service.database_url.expose_secret())
-            && let Some(password) = url.password()
-        {
-            secrets.push(password.to_owned());
-            if let Ok(decoded) = urlencoding_decode(password) {
-                secrets.push(decoded);
-            }
-        }
+        secrets.extend(database_password(
+            config.service.database_url.expose_secret(),
+        ));
         Redactor::new(secrets)
     }
+}
+
+/// The password of `database_url`, as written and percent-decoded; empty when it has none.
+pub(crate) fn database_password(database_url: &str) -> Vec<String> {
+    let mut secrets = Vec::new();
+    if let Ok(url) = url::Url::parse(database_url)
+        && let Some(password) = url.password()
+    {
+        secrets.push(password.to_owned());
+        if let Ok(decoded) = urlencoding_decode(password) {
+            secrets.push(decoded);
+        }
+    }
+    secrets
 }
 
 /// Git credentials whose every token is registered with a [`Redactor`] before it is handed out, so

@@ -479,7 +479,7 @@ fn a_worker_bounds_hold_the_names_of_the_subagents_tools_and_a_definitions_do_no
     assert_eq!(why.option(), Some("deny_tools"));
     assert!(
         why.message()
-            .contains("matches none of its tools: read_file, write_file"),
+            .contains("matches none of the names this agent declares: read_file, write_file"),
         "{why}"
     );
 
@@ -549,7 +549,7 @@ fn an_agent_with_a_source_has_an_incomplete_set_that_still_catches_a_deny_typo()
         .expect_err("a typo of a concrete name");
     assert_eq!(why.option(), Some("deny_tools"));
     assert!(
-        why.message().contains("matches none of its tools: read_file, write_file; the agent may get more tools while it runs"),
+        why.message().contains("matches none of the names this agent declares: read_file, write_file; the agent may get more tools while it runs"),
         "{why}"
     );
     assert!(
@@ -631,8 +631,9 @@ fn a_source_that_declares_its_tools_makes_the_set_complete_and_catches_an_allow_
         .expect_err("an allow entry matching none of a complete set");
     assert_eq!(why.option(), Some("tools"));
     assert!(
-        why.message()
-            .contains("matches none of its tools: read_file, write_file, thread_tool"),
+        why.message().contains(
+            "matches none of the names this agent declares: read_file, write_file, thread_tool"
+        ),
         "{why}"
     );
     assert!(
@@ -705,7 +706,7 @@ fn a_source_that_declares_a_shape_makes_the_set_complete_and_admits_a_servers_to
     assert_eq!(why.option(), Some("tools"));
     assert!(
         why.message()
-            .contains("matches none of its tools: read_file, write_file, turn_output, *__*"),
+            .contains("matches none of the names this agent declares: read_file, write_file, turn_output, *__*"),
         "{why}"
     );
     assert!(
@@ -724,7 +725,7 @@ fn a_source_that_declares_a_shape_makes_the_set_complete_and_admits_a_servers_to
     assert_eq!(why.option(), Some("deny_tools"));
     assert!(
         why.message()
-            .contains("matches none of its tools: read_file, write_file, turn_output, *__*"),
+            .contains("matches none of the names this agent declares: read_file, write_file, turn_output, *__*"),
         "{why}"
     );
 }

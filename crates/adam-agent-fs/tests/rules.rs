@@ -275,6 +275,42 @@ fn cases() -> Vec<Case> {
             Warning,
             "`limits.max_minutes` is for a subagent",
         ),
+        (
+            "session on a root agent",
+            vec![(
+                "agent/instructions.md",
+                "---\nname: root\nsession: { mode: sealed }\n---\nHi.\n",
+            )],
+            Warning,
+            "`session` is for a subagent",
+        ),
+        with_root(
+            "session mode not one of the three",
+            vec![(
+                "agent/subagents/x.md",
+                "---\ndescription: d\nsession: { mode: shared }\n---\nBody.\n",
+            )],
+            Error,
+            "unknown variant `shared`",
+        ),
+        with_root(
+            "session with an unknown key",
+            vec![(
+                "agent/subagents/x.md",
+                "---\ndescription: d\nsession: { mode: sealed, keep_open: true }\n---\nBody.\n",
+            )],
+            Error,
+            "unknown field `keep_open`",
+        ),
+        with_root(
+            "session wait not a boolean",
+            vec![(
+                "agent/subagents/x.md",
+                "---\ndescription: d\nsession: { wait: soon }\n---\nBody.\n",
+            )],
+            Error,
+            "invalid frontmatter",
+        ),
         with_root(
             "max_minutes is at most a day",
             vec![(
@@ -580,6 +616,33 @@ fn cases() -> Vec<Case> {
             )],
             Error,
             "`limits.max_working_sessions` is 3, more than `limits.max_open_sessions` (2)",
+        ),
+        (
+            "limits.output names a tool that is not a command tool",
+            vec![(
+                "agent/instructions.md",
+                "---\nname: root\nlimits: { output: { run_test: full } }\n---\nHi.\n",
+            )],
+            Error,
+            "unknown field `run_test`",
+        ),
+        (
+            "limits.output with a mode that is not one of the two",
+            vec![(
+                "agent/instructions.md",
+                "---\nname: root\nlimits: { output: { run: quiet } }\n---\nHi.\n",
+            )],
+            Error,
+            "unknown variant `quiet`",
+        ),
+        with_root(
+            "limits.output on a subagent",
+            vec![(
+                "agent/subagents/x.md",
+                "---\ndescription: d\nlimits: { output: { run: full } }\n---\nBody.\n",
+            )],
+            Warning,
+            "`limits.output` is the root agent's",
         ),
         with_root(
             "an out-of-range session limit on a subagent is only ignored",
@@ -1950,6 +2013,77 @@ fn files_on_a_remote_subagent_is_read_and_defaults_to_false() {
 }
 
 #[test]
+fn session_on_a_subagent_is_read_local_and_remote_and_absent_by_default() {
+    use adam_agent_fs::{SessionDef, SessionModeDef};
+
+    let dir = write(&[
+        ("agent/instructions.md", ROOT),
+        (
+            "agent/subagents/reviewer.md",
+            "---\ndescription: Reviews.\nsession:\n  mode: sealed\n  wait: true\n---\nYou review.\n",
+        ),
+        (
+            "agent/subagents/browser.md",
+            "---\ndescription: Reads pages.\na2a: https://browser.example.com/card\n\
+             session: { mode: one_shot }\n---\n",
+        ),
+        ("agent/subagents/plain.md", SUB),
+    ]);
+    let report = load(dir.path());
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let sessions: Vec<(&str, Option<SessionDef>)> = report.package.agents[0]
+        .subagents
+        .iter()
+        .map(|s| match s {
+            Subagent::Remote(r) => (r.name.as_str(), r.session),
+            Subagent::Local(l) => (l.name.as_str(), l.frontmatter.session),
+        })
+        .collect();
+    assert_eq!(
+        sessions,
+        [
+            (
+                "browser",
+                Some(SessionDef {
+                    mode: Some(SessionModeDef::OneShot),
+                    wait: None,
+                })
+            ),
+            ("plain", None),
+            (
+                "reviewer",
+                Some(SessionDef {
+                    mode: Some(SessionModeDef::Sealed),
+                    wait: Some(true),
+                })
+            ),
+        ]
+    );
+}
+
+#[test]
+fn a_bad_session_block_stops_the_subagent_with_its_line() {
+    let dir = write(&[
+        ("agent/instructions.md", ROOT),
+        (
+            "agent/subagents/reviewer.md",
+            "---\ndescription: Reviews.\nsession:\n  mode: wide\n---\nYou review.\n",
+        ),
+    ]);
+    let report = load(dir.path());
+    assert!(
+        !report.is_ok(),
+        "a mode that is not one of the three stops the folder"
+    );
+    let error = report.errors().next().expect("one error");
+    assert_eq!(error.line, Some(4), "{error}");
+    let text = error.to_string();
+    for word in ["unknown variant `wide`", "one_shot", "sealed", "open"] {
+        assert!(text.contains(word), "{word}: {text}");
+    }
+}
+
+#[test]
 fn merging_adds_servers_and_refuses_a_name_both_have() {
     use adam_agent_fs::parse_mcp;
     use std::path::Path;
@@ -2011,6 +2145,63 @@ fn the_process_limits_are_read_in_both_spellings_and_are_no_diagnostic() {
         assert_eq!(limits.max_processes, Some(2));
         assert_eq!(limits.command_memory.as_deref(), Some("2GB"));
         assert_eq!(limits.command_cpu.as_deref(), Some("1.5"));
+    }
+}
+
+/// `limits.output` reads a mode per command tool (ADR 0090 slice T3), leaves the tools it does not
+/// name unset, and survives the round trip the embedded copy makes (JSON).
+#[test]
+fn limits_output_is_read_per_tool_and_is_no_diagnostic() {
+    use adam_agent_fs::{OutputDef, OutputModeDef};
+
+    let dir = write(&[(
+        "agent/instructions.md",
+        "---\nname: root\nlimits:\n  output:\n    run_checks: full\n    run_command: on_error\n---\nHi.\n",
+    )]);
+    let report = load(dir.path());
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    let package = report.into_package(Strictness::Strict).unwrap();
+    let limits = package.agents[0].frontmatter.limits.as_ref().unwrap();
+    let output = limits.output.unwrap();
+    assert_eq!(
+        output,
+        OutputDef {
+            run_checks: Some(OutputModeDef::Full),
+            run: None,
+            run_command: Some(OutputModeDef::OnError),
+        }
+    );
+    let json = serde_json::to_string(limits).unwrap();
+    assert_eq!(
+        serde_json::from_str::<adam_agent_fs::Limits>(&json).unwrap(),
+        *limits,
+        "{json}"
+    );
+    assert!(limits.extra.is_empty(), "{:?}", limits.extra);
+}
+
+/// A bad `limits.output` stops the folder at its line, naming what it takes.
+#[test]
+fn a_bad_limits_output_stops_the_folder_with_its_line() {
+    for (text, words) in [
+        (
+            "---\nname: root\nlimits:\n  output: { run_checks: never }\n---\nHi.\n",
+            &["unknown variant `never`", "on_error", "full"][..],
+        ),
+        (
+            "---\nname: root\nlimits:\n  output: { checks: full }\n---\nHi.\n",
+            &["unknown field `checks`", "run_checks", "run", "run_command"][..],
+        ),
+    ] {
+        let dir = write(&[("agent/instructions.md", text)]);
+        let report = load(dir.path());
+        assert!(!report.is_ok(), "{text}");
+        let error = report.errors().next().expect("one error");
+        assert_eq!(error.line, Some(4), "the line of `output:`: {error}");
+        let shown = error.to_string();
+        for word in words {
+            assert!(shown.contains(word), "{word}: {shown}");
+        }
     }
 }
 

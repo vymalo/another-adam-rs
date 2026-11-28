@@ -1,4 +1,4 @@
-//! `run_checks { command | commands, cwd?, repo? }`, and the `checks` artifact it reports.
+//! `run_checks { command | commands, cwd?, repo?, timeout?, output? }`, and the `checks` artifact it reports.
 //!
 //! # The `checks` artifact
 //!
@@ -62,6 +62,16 @@
 //! pre-existing failure is never reused (it spends no cycle and the model is told the failure is
 //! the repository's), and the most recent run of the check on the tree decides: a pass after a
 //! failure means the command runs again, not that the older failure is the answer.
+//!
+//! # A check that passes is one line
+//!
+//! By default ([`DEFAULT_OUTPUT`], `output: "on_error"`) a command that passes is shown as
+//! itself, `exit code 0: passed` and one line with the size of its output and the id it is kept
+//! under (`read_output` reads it; each command of a call has its own id); a command that fails is
+//! shown as before, and so is every command with `output: "full"` (ADR 0090). The folder's `limits.output.run_checks` may set the other
+//! default ([`CoderSettings::checks_output`](crate::CoderSettings::checks_output)); a call's
+//! `output` wins. Only the result changes: the `checks` artifact, the record in the notes and the
+//! check cycles are the same either way.
 
 use adam::Artifact;
 use adam::prelude::*;
@@ -73,12 +83,17 @@ use serde_json::Value;
 use crate::redact::Redactor;
 
 use super::notes::{CheckKey, CheckRecord};
+use super::output::OutputMode;
 use super::preexisting::{self, OnBase};
 use super::shell::{
     MissingTool, ShellOutcome, cwd_key, missing_tool, project_dependency_hint, resolve_cwd,
     shell_spec,
 };
 use super::{Outcome, ToolEnv, non_empty, notes_error, run_error};
+
+/// What `run_checks` shows of an output when the call asks for nothing: one line for a check that
+/// passed, which needs no output (ADR 0090, decision 3).
+pub const DEFAULT_OUTPUT: OutputMode = OutputMode::OnError;
 
 /// The most commands one `run_checks` call may take: the tool's time limit grows with the count
 /// (one wave per `MAX_PARALLEL_TOOL_CALLS` commands, plus one re-run per failing command), so an
@@ -646,7 +661,13 @@ pub(crate) fn missing_tool_text(
     )
 }
 
-fn render(command: &str, outcome: &ShellOutcome, timeout: std::time::Duration) -> String {
+/// The command, its verdict, and its output as `mode` shows it.
+fn render(
+    command: &str,
+    outcome: &ShellOutcome,
+    timeout: std::time::Duration,
+    mode: OutputMode,
+) -> String {
     let verdict = if outcome.timed_out {
         format!(
             "TIMED OUT after {} (the command was killed): FAILED",
@@ -662,7 +683,7 @@ fn render(command: &str, outcome: &ShellOutcome, timeout: std::time::Duration) -
         }
     };
     let mut text = format!("$ {command}\n{verdict}\n");
-    text.push_str(&super::output::section(outcome));
+    text.push_str(&super::output::section_as(outcome, mode));
     text
 }
 
@@ -827,6 +848,7 @@ fn missing_of(commands: &[String], outcomes: &[ShellOutcome]) -> Vec<(usize, Mis
 /// Run `commands` in `dir`, at most `bound` at a time, each through the run's environment (and the
 /// process pool behind it), and return what each did in the caller's order. Each command settles its
 /// own output, so a long output is kept under an id of its own.
+#[allow(clippy::too_many_arguments)] // what each command of the call runs with
 async fn run_all(
     env: &ToolEnv,
     ctx: &ToolCtx,
@@ -834,6 +856,7 @@ async fn run_all(
     dir: &std::path::Path,
     commands: &[String],
     timeout: std::time::Duration,
+    mode: OutputMode,
     bound: usize,
 ) -> Result<Vec<ShellOutcome>, ToolError> {
     let one = commands.len() == 1;
@@ -864,7 +887,7 @@ async fn run_all(
                     )
                     .await
                     .map_err(|e| run_error(&env.redactor, &e))?;
-                super::output::settle(env, &part, &mut outcome).await;
+                super::output::settle_as(env, &part, &mut outcome, mode).await;
                 Ok(outcome)
             }
         })
@@ -936,8 +959,10 @@ fn batch_repeat_key(outcomes: &[ShellOutcome]) -> String {
 /// call that passed on exactly the same code is answered from that pass too (nothing runs, and the
 /// `checks` report says the results were reused). A command
 /// the shell cannot find means the workspace lacks that tool: that is reported, costs no cycle, and
-/// is for the person to decide.
+/// is for the person to decide. By default (output "on_error") a command that passes is one line
+/// with an output id that read_output reads.
 #[tool(label = "Run the checks", icon = "execute", parallel = "exclusive")]
+#[allow(clippy::too_many_arguments)] // the model's arguments, one each
 pub async fn run_checks(
     env: State<ToolEnv>,
     ctx: &ToolCtx,
@@ -951,6 +976,8 @@ pub async fn run_checks(
     repo: Option<String>,
     /// Seconds before each command is killed; at most the deployment's limit, which is also the default. Example: {"commands":["npm test"],"timeout":120}
     timeout: Option<i64>,
+    /// What you see of the output: "on_error" (a command that succeeds is one line with an output id that read_output reads) or "full". Default "on_error". Example: {"command":"cargo test","output":"full"}
+    output: Option<String>,
 ) -> Outcome {
     let commands = match commands_of(command, commands) {
         Ok(commands) => commands,
@@ -993,6 +1020,10 @@ pub async fn run_checks(
     };
     let timeout = match super::output::timeout_of(&env, timeout) {
         Ok(timeout) => timeout,
+        Err(reason) => return Ok(ToolOutput::error(reason)),
+    };
+    let mode = match OutputMode::of(output.as_deref(), env.settings.checks_output) {
+        Ok(mode) => mode,
         Err(reason) => return Ok(ToolOutput::error(reason)),
     };
 
@@ -1092,7 +1123,17 @@ pub async fn run_checks(
     // 1 runs the commands one after another, and each takes a seat of the process pool
     // (`MAX_PROCESSES`, ADR 0065) as it runs.
     let bound = env.settings.max_parallel_tool_calls.max(1);
-    let outcomes = run_all(&env, ctx, &*environment, &dir, &commands, timeout, bound).await?;
+    let outcomes = run_all(
+        &env,
+        ctx,
+        &*environment,
+        &dir,
+        &commands,
+        timeout,
+        mode,
+        bound,
+    )
+    .await?;
 
     // A command the shell could not find is a missing toolchain, not a failing check: the
     // workspace lacks the tool, and no change to the code would make the check pass. So the call is
@@ -1119,7 +1160,7 @@ pub async fn run_checks(
         if !ran.is_empty() {
             said.push_str("\nThe other commands of this call ran:\n");
             for n in ran {
-                said.push_str(&render(&shown[n], &outcomes[n], timeout));
+                said.push_str(&render(&shown[n], &outcomes[n], timeout, mode));
             }
         }
         return Ok(ToolOutput::error(said));
@@ -1190,7 +1231,7 @@ pub async fn run_checks(
     let artifact = report.clone().into_artifact(redactor);
     let mut text = String::new();
     for (n, outcome) in outcomes.iter().enumerate() {
-        text.push_str(&render(&shown[n], outcome, timeout));
+        text.push_str(&render(&shown[n], outcome, timeout, mode));
     }
     let failures = notes.record_check(CheckRecord {
         call_id: call,
@@ -1610,6 +1651,31 @@ mod tests {
                 .contains("no check ran in this run")
         );
         assert!(none.findings[0].message.contains("an unknown tree"));
+    }
+
+    /// The `checks` artifact is the exporter's outcome contract (ADR 0087, slice E4): its name,
+    /// media type and `passed` are what `adam_export::checks_of` reads.
+    #[test]
+    fn the_artifact_is_the_export_contract() {
+        assert_eq!(CHECKS_ARTIFACT, adam_export::CHECKS_ARTIFACT);
+        let verdicts: Vec<adam_export::RunArtifact> = [(Some(1), false), (Some(0), true)]
+            .into_iter()
+            .map(|(code, passed)| {
+                let a = report(&outcome(code, ""), Some(SHA), false)
+                    .into_artifact(&Redactor::default());
+                assert_eq!(a.mime_type.as_deref(), Some(adam_export::JSON_MEDIA_TYPE));
+                assert_eq!(a.data["passed"], passed);
+                adam_export::RunArtifact::new(a.name, a.mime_type, a.data)
+            })
+            .collect();
+        assert_eq!(
+            adam_export::checks_of(&verdicts),
+            Some(adam_export::ChecksOutcome {
+                passed: true,
+                reports: 2,
+                failed: 1,
+            })
+        );
     }
 
     #[test]

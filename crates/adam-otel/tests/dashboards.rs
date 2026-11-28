@@ -26,7 +26,12 @@
 //!
 //! A metric that is emitted but unreachable from a dashboard is not a failure here — this is the
 //! direction that keeps a graph honest.
-#![allow(clippy::unwrap_used, clippy::expect_used)] // integration tests assert by unwrapping
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+// integration tests assert by unwrapping
+// `Instrument::labels` is `&'static [&'static str]`, so `labels.contains(&label.as_str())` would
+// demand a `'static` borrow of a `String` that lives for the test only (E0597). Clippy's
+// `manual_contains` sees the shape, not the lifetime, and suggests exactly that.
+#![allow(clippy::manual_contains)]
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -281,10 +286,7 @@ fn every_metric_a_panel_queries_is_one_the_service_emits() {
                     );
                     for label in &labels {
                         assert!(
-                            instrument
-                                .labels
-                                .iter()
-                                .any(|carried| *carried == label.as_str()),
+                            instrument.labels.contains(&label.as_str()),
                             "{}: `{name}` declares the label `{label}`, which the instrument does not carry ({:?})",
                             path.display(),
                             instrument.labels
@@ -359,20 +361,16 @@ fn every_metric_and_label_a_template_variable_names_is_emitted() {
                         )
                     });
                     assert!(
-                        instrument
-                            .labels
-                            .iter()
-                            .any(|carried| *carried == label.as_str()),
+                        instrument.labels.contains(&label.as_str()),
                         "{}: a template variable reads the label `{label}` of `{metric}`, which the instrument does not carry ({:?})",
                         path.display(),
                         instrument.labels
                     );
                 }
                 Some((None, label)) => assert!(
-                    catalogue::EMITTED.iter().any(|instrument| instrument
-                        .labels
+                    catalogue::EMITTED
                         .iter()
-                        .any(|carried| *carried == label.as_str())),
+                        .any(|instrument| instrument.labels.contains(&label.as_str())),
                     "{}: a template variable reads the label `{label}`, which no emitted instrument carries: {query}",
                     path.display()
                 ),

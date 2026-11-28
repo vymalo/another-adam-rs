@@ -331,6 +331,34 @@ impl ChildStarter {
         self.runtime.cancel(session.latest_run, reason).await
     }
 
+    /// Delete a session whose latest round is working ([`Runtime::delete_session_round`]): the
+    /// round is cancelled and the session's tombstone is written in the same commit, so no listing
+    /// and no report sees the round between the two (ADR 0054 decision 10, amended).
+    ///
+    /// The tombstone belongs to the latest round, so the session is read again first: a view taken
+    /// before another round started would hide nothing, and the caller gets
+    /// [`RuntimeError::Contended`] (class `Conflict`) to look at the session as it is now.
+    ///
+    /// # Errors
+    ///
+    /// As [`Runtime::delete_session_round`], and [`RuntimeError::Contended`] when the session's
+    /// latest round changed since `session` was read.
+    pub async fn delete_round(
+        &self,
+        session: &crate::SessionView,
+        reason: &str,
+    ) -> Result<(), RuntimeError> {
+        match self.session(session.id).await? {
+            Some(now) if now.latest_run == session.latest_run => {
+                self.runtime.delete_session_round(session, reason).await
+            }
+            _ => Err(RuntimeError::Contended(format!(
+                "session {} changed while it was deleted",
+                session.id
+            ))),
+        }
+    }
+
     /// Cancel the latest round of a session of this conversation's listing ([`Runtime::cancel`]).
     ///
     /// # Errors
@@ -364,6 +392,41 @@ impl ChildStarter {
         round: RunId,
     ) -> Result<Option<serde_json::Value>, RuntimeError> {
         Ok(self.round_record(round).await?.map(|(_, state)| state))
+    }
+
+    /// Whether the round's inbox still holds the inbound `id`, unread: a message or an edit
+    /// delivered to it that it has not taken. A [`SessionView`](crate::SessionView) already shows
+    /// such an edit applied to the round's header (an edit a round ended before reading is not
+    /// lost), so a caller that builds the next round from that header must not apply it again.
+    /// Not journaled.
+    ///
+    /// # Errors
+    ///
+    /// As [`round_state`](Self::round_state).
+    pub async fn round_holds(&self, round: RunId, id: &str) -> Result<bool, RuntimeError> {
+        let Some(rec) = self.runtime.store().load_run(round).await? else {
+            return Ok(false);
+        };
+        let ours = rec
+            .conversation_id
+            .as_deref()
+            .and_then(|c| crate::session::session_of(&self.conversation, c))
+            .is_some();
+        if !ours {
+            return Err(RuntimeError::InvalidSession {
+                reason: format!("run {round} is not a round of a session of this conversation"),
+            });
+        }
+        Ok(!id.is_empty()
+            && rec
+                .state
+                .get("inbox")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|inbox| {
+                    inbox
+                        .iter()
+                        .any(|item| item.get("id").and_then(serde_json::Value::as_str) == Some(id))
+                }))
     }
 
     /// [`round_state`](Self::round_state) with the round's status: what a parent needs to count the

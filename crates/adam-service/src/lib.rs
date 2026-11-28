@@ -5,6 +5,8 @@
 mod activity;
 pub mod config;
 pub mod exit;
+#[cfg(feature = "export")]
+pub mod export;
 pub mod harden;
 pub mod hooks;
 pub mod logging;
@@ -14,6 +16,7 @@ mod prompt_commands;
 pub mod retention;
 mod serve;
 mod service;
+pub mod store_busy;
 
 pub use adam_model_openai::{OpenAiConfigError, endpoint_for_logs};
 #[cfg(feature = "mcp")]
@@ -31,6 +34,6 @@ pub use hooks::{HOOKS_ALLOW, HOOKS_FILE, HooksSettings, Program};
 pub use prompt_commands::{card_with_commands, refuse_prompt_commands, with_prompt_commands};
 pub use serve::{
     Agents, Register, ServeError, card_with_reasoning, claim_scope_for, inline_upload_threshold,
-    serve, serve_on, serve_on_with_activity,
+    open_store, serve, serve_on, serve_on_with_activity,
 };
 pub use service::{LiveSignals, RuntimeOptions, Service, router, router_with_options};

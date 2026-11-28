@@ -8,6 +8,7 @@
 //! | Key | Does |
 //! |---|---|
 //! | `log` | a file every message it receives is appended to, one JSON line each: `{"method", "params"}` |
+//! | `log_argv` | its arguments are the first line of `log`: `{"argv": [..]}` (what the launch line gave it) |
 //! | `stderr` | text written to stderr at start |
 //! | `pid_file` | its pid is written there (and the child's pid beside it with `.child`, and the grandchild's with `.grandchild`, for `spawn_tree`) |
 //! | `spawn_tree` | starts a child that starts a grandchild, in its process group |
@@ -15,7 +16,9 @@
 //! | `position_encoding` | `utf-8`: says so when the client offers it |
 //! | `pull` | offers `diagnosticProvider` and answers `textDocument/diagnostic` |
 //! | `progress_ms` | after `initialized`, a `$/progress` that begins and ends after that long |
+//! | `progress_delay_ms` | the begin is sent that long after `initialized` (a client that has not read it yet), the end `progress_ms` after the begin |
 //! | `status_ms` | says it reports `experimental/serverStatus`: not quiescent after `initialized`, quiescent after that long |
+//! | `status_delay_ms` | the "not quiescent" is sent that long after `initialized`, the quiescent `status_ms` after it |
 //! | `diagnostics` | `[{severity, message, line, character}]` for every opened file |
 //! | `echo` | each diagnostic message ends with ` \| held: ` and the text it holds for the file |
 //! | `silent_when_clean` | publishes nothing for a file with no diagnostics |
@@ -182,6 +185,10 @@ fn main() {
             .and_then(|bytes| serde_json::from_slice(&bytes).ok())
             .unwrap_or_else(|| json!({})),
     };
+    if script.bool("log_argv") {
+        let argv: Vec<String> = std::env::args().skip(1).collect();
+        log(&script, &json!({ "argv": argv }));
+    }
     if let Some(text) = script.str("stderr") {
         eprintln!("{text}");
     }
@@ -284,31 +291,50 @@ fn main() {
                 }
                 if let Some(ms) = script.u64("progress_ms") {
                     let out = out.clone();
-                    send(
-                        &out,
-                        &json!({"jsonrpc": "2.0", "method": "$/progress", "params": {
-                            "token": "index", "value": {"kind": "begin", "title": "Indexing"}}}),
-                    );
-                    std::thread::spawn(move || {
-                        std::thread::sleep(Duration::from_millis(ms));
-                        send(
-                            &out,
-                            &json!({"jsonrpc": "2.0", "method": "$/progress", "params": {
-                                "token": "index", "value": {"kind": "end"}}}),
-                        );
-                    });
+                    let delay = script.u64("progress_delay_ms").unwrap_or(0);
+                    let begin = json!({"jsonrpc": "2.0", "method": "$/progress", "params": {
+                        "token": "index", "value": {"kind": "begin", "title": "Indexing"}}});
+                    let end = json!({"jsonrpc": "2.0", "method": "$/progress", "params": {
+                        "token": "index", "value": {"kind": "end"}}});
+                    if delay == 0 {
+                        send(&out, &begin);
+                        std::thread::spawn(move || {
+                            std::thread::sleep(Duration::from_millis(ms));
+                            send(&out, &end);
+                        });
+                    } else {
+                        // A client that has not read the begin yet: it arrives after the delay, as
+                        // a busy server's does on a loaded machine.
+                        std::thread::spawn(move || {
+                            std::thread::sleep(Duration::from_millis(delay));
+                            send(&out, &begin);
+                            std::thread::sleep(Duration::from_millis(ms));
+                            send(&out, &end);
+                        });
+                    }
                 }
                 if let Some(ms) = script.u64("status_ms") {
                     let out = out.clone();
+                    let delay = script.u64("status_delay_ms").unwrap_or(0);
                     let status = |quiescent: bool| {
                         json!({"jsonrpc": "2.0", "method": "experimental/serverStatus",
                                "params": {"health": "ok", "quiescent": quiescent}})
                     };
-                    send(&out, &status(false));
-                    std::thread::spawn(move || {
-                        std::thread::sleep(Duration::from_millis(ms));
-                        send(&out, &status(true));
-                    });
+                    if delay == 0 {
+                        send(&out, &status(false));
+                        std::thread::spawn(move || {
+                            std::thread::sleep(Duration::from_millis(ms));
+                            send(&out, &status(true));
+                        });
+                    } else {
+                        // The same, late: the client has not read "not quiescent" when it asks.
+                        std::thread::spawn(move || {
+                            std::thread::sleep(Duration::from_millis(delay));
+                            send(&out, &status(false));
+                            std::thread::sleep(Duration::from_millis(ms));
+                            send(&out, &status(true));
+                        });
+                    }
                 }
                 if let Some(list) = script.json.get("server_requests").and_then(Value::as_array) {
                     for item in list {

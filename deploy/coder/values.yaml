@@ -7,7 +7,7 @@ image:
   # Bumped on every green build of main by .github/workflows/coder.yml
   # (`sha-<first 7 of the commit>`). A plain key so the workflow can edit it.
   # sha-0000000 is the placeholder that exists before the first build.
-  tag: sha-3dc7d68
+  tag: sha-ff3babf
   pullPolicy: IfNotPresent
 
 # The image package may be private; name a pull secret here if so.
@@ -93,9 +93,11 @@ config:
   # model wants. Needed by DeepSeek's thinking mode with tools, which answers a request without it
   # with a 400. On, the reasoning is stored in the run's history and is sent in every later request.
   modelEchoReasoning: ""
-  # MODEL_CONTEXT_WINDOW: the context window of `model`, in tokens, a whole number from 1 to
-  # 9007199254740991 (a number or a string of digits). Each call's usage report says it, so a screen
-  # shows how full the context is. null (default): reports carry no window. Roles that run workers only.
+  # DEFAULT_MODEL_CONTEXT_WINDOW (ADR 0088; it was MODEL_CONTEXT_WINDOW, the binary's deprecated alias):
+  # the context window of `model`, in tokens, a whole number from 1 to 9007199254740991 (a number or a
+  # string of digits), used only when the model's profile (`modelProfiles`) names no `contextWindow`.
+  # Each call's usage report says it, so a screen shows how full the context is. null (default): reports
+  # carry the profile's window, or none. Roles that run workers only.
   modelContextWindow: null
   # The per-model profiles (ADR 0063 and ADR 0064), one JSON file the workers read at startup
   # (MODEL_ALIASES_FILE): per model id, the reasoning levels it takes and how they are sent

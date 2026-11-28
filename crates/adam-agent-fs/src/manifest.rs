@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Serialize, Serializer};
 
-use crate::schema::{AgentFrontmatter, McpConfig, SkillFrontmatter, ToolList};
+use crate::schema::{AgentFrontmatter, McpConfig, SessionDef, SkillFrontmatter, ToolList};
 use crate::{Diagnostic, Error};
 
 /// The most bytes of resources (`scripts/`, `references/`, `assets/`) one skill may bundle: 1 MiB.
@@ -114,6 +114,10 @@ pub struct RemoteAgent {
     /// Left out of the JSON (and so of the digest) when `false`.
     #[serde(skip_serializing_if = "is_false")]
     pub files: bool,
+    /// The frontmatter's `session:`: the defaults and the ceiling of the sessions a parent starts
+    /// on it (ADR 0089 decision 4). Left out of the JSON (and so of the digest) when absent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session: Option<SessionDef>,
     /// The body of the file, if any: it extends the tool description.
     pub note: String,
     /// The file, relative to the source root.
