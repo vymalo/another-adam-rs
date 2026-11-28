@@ -118,9 +118,9 @@ notify = "8"
 # The exporter's HTTP client is the workspace `reqwest` below (`reqwest-client`, never
 # `reqwest-blocking-client`); gRPC/tonic is not compiled in, and the crate picks the TLS provider
 # exactly as adam-model-openai does.
-opentelemetry = { version = "0.33.1", default-features = false, features = ["trace", "metrics", "internal-logs"] }
-opentelemetry_sdk = { version = "0.33.1", default-features = false, features = ["trace", "metrics", "internal-logs", "experimental_trace_batch_span_processor_with_async_runtime", "experimental_metrics_periodicreader_with_async_runtime", "rt-tokio"] }
-opentelemetry-otlp = { version = "0.33.1", default-features = false, features = ["http-proto", "reqwest-client", "trace", "metrics", "internal-logs"] }
+opentelemetry = { version = "0.33.1", default-features = false, features = ["trace", "metrics", "logs", "internal-logs"] }
+opentelemetry_sdk = { version = "0.33.1", default-features = false, features = ["trace", "metrics", "internal-logs", "experimental_trace_batch_span_processor_with_async_runtime", "experimental_metrics_periodicreader_with_async_runtime", "experimental_logs_batch_log_processor_with_async_runtime", "rt-tokio"] }
+opentelemetry-otlp = { version = "0.33.1", default-features = false, features = ["http-proto", "reqwest-client", "trace", "metrics", "logs", "internal-logs"] }
 proc-macro2 = "1"
 proptest = "1"
 quote = "1"

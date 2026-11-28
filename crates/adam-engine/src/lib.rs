@@ -56,12 +56,14 @@ pub use adam_ui;
 mod engine;
 mod error;
 mod events;
+pub mod local_agent;
 mod resources;
 mod types;
 
 pub use engine::{Engine, EngineBuilder, Limits};
 pub use error::EngineError;
 pub use events::{EngineEvent, RunEvents, WithheldFile};
+pub use local_agent::AsksBeforeWritingOrCommand;
 pub use resources::ResourceReport;
 pub use types::{
     ApprovalRequest, ConversationId, DEFAULT_PAGE_SIZE, Decision, Delivered, Firing, FiringQuery,

@@ -133,6 +133,29 @@ backend's cardinality is what the deployment planned for, and no id, token or am
 accident. The shape check is not a secret filter — a token can have a name's shape — so what keeps a secret out is the
 set, never a value at hand.
 
+## Logs
+
+The process's `tracing` events become OTLP log records on the same switch (ANR-1348): with an endpoint set, a
+batch processor posts them to `{endpoint}/v1/logs`, and with none nothing is built.
+
+**A record is allowlisted.** It carries its target, its severity, the message the macro wrote, and only the fields
+named in [`logs::ALLOWED`] — an error's class, a run's state, a count, a declared tool or model, a worker id, an
+attempt number. Every other field the event carries (a prompt, a tool's arguments, a path, a token) is dropped before
+the record exists, so it cannot reach an exporter even by accident. The test emits an event with a prompt, an
+argument and a token beside a class, and asserts the exporter saw the class and neither of the other three.
+
+**No trace context.** A record carries no span's trace id, so a collector cannot join it to the traces this same
+`Otel` exports; the JSON log on stdout remains the join. Whether to inject the current span's context is ADR 0075
+open question 2's decision, not this card's.
+
+The coder's redactor holds per-run secrets this process-level layer cannot see; the allowlist is what makes that
+unnecessary, and it is why the log bridge is adam's own layer rather than a copy-everything appender.
+
+**The message is not filtered.** It is the format string the macro wrote, so a call site that formats a value into
+it puts that value in the record: eight sites do today (a startup warning, a panic payload, an OAuth error), and
+moving those values into fields — where the allowlist decides — is its own card. Until then the allowlist covers
+the fields, not the message.
+
 ## Dashboards
 
 [`catalogue`](src/catalogue.rs) is the list of instruments this workspace actually records — today

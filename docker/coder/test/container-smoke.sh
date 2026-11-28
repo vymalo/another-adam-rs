@@ -92,7 +92,7 @@ else
 fi
 # ADR 0052: the image carries no devcontainer CLI and no container engine's client, and nothing
 # needs them: the coder runs a repository's commands in this container or in a run pod.
-for binary in adam-coder adam-agent adam-kube-exec adam-egress adam-git-sandbox adam-git github-mcp-server; do
+for binary in adam-coder adam-agent adam-kube-exec adam-egress run-signer adam-git-sandbox adam-git github-mcp-server; do
   if docker exec "$name" test -x "/usr/local/bin/$binary"; then
     ok "$binary is in /usr/local/bin"
   else

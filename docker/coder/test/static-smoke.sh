@@ -1,10 +1,10 @@
 #!/bin/sh
-# The six binaries of the coder image are static and start in a foreign image.
+# The seven binaries of the coder image are static and start in a foreign image.
 #
 #   static-smoke.sh <image>
 #
 # ADR 0053 decision 11: `adam-coder`, `adam-agent`, `adam-kube-exec`,
-# `adam-egress`, `adam-git-sandbox` and `adam-git` are built for
+# `adam-egress`, `run-signer`, `adam-git-sandbox` and `adam-git` are built for
 # x86_64-unknown-linux-musl and statically linked, so they start in any x86-64
 # Linux image whatever its C library (ADR 0052 decision 10: the bench starts
 # the coder from each task image). This script takes the binaries from the image
@@ -36,7 +36,7 @@ trap cleanup EXIT INT TERM
 
 # The binaries as the image ships them, not as a rebuild would make them.
 container=$(docker create "$image")
-for binary in adam-coder adam-agent adam-kube-exec adam-egress adam-git-sandbox adam-git; do
+for binary in adam-coder adam-agent adam-kube-exec adam-egress run-signer adam-git-sandbox adam-git; do
   docker cp "$container:/usr/local/bin/$binary" "$work/$binary" >/dev/null
   chmod 0755 "$work/$binary"
 done
@@ -52,7 +52,7 @@ exit_code() {
 }
 message() {
   case $1 in
-    adam-coder|adam-egress|adam-git-sandbox) echo "invalid configuration" ;;
+    adam-coder|adam-egress|run-signer|adam-git-sandbox) echo "invalid configuration" ;;
     adam-agent) echo "ADAM_AGENT_DIR is required" ;;
     adam-git) echo "GIT_SANDBOX_SOCKET" ;;
     adam-kube-exec) echo "expected run or shell" ;;
@@ -71,7 +71,7 @@ case $user in
   *) bad "the image's default user is '${user:-root}', expected 10001" ;;
 esac
 
-for binary in adam-coder adam-agent adam-kube-exec adam-egress adam-git-sandbox adam-git; do
+for binary in adam-coder adam-agent adam-kube-exec adam-egress run-signer adam-git-sandbox adam-git; do
   out=$(file -b "$work/$binary")
   case $out in
     *"statically linked"*|*"static-pie linked"*) ok "$binary: $out" ;;
@@ -91,7 +91,7 @@ for base in \
   "debian:bookworm-slim@sha256:c67e92c8099ba22853ab4cfda7cfb494d253d6012ca82dee98ba8976772af018" \
   "alpine:3.22@sha256:9db2934886712d877c932e07249c75a59e6ca27adfbccc05261987a17bef2d63"; do
   docker pull -q "$base" >/dev/null
-  for binary in adam-coder adam-agent adam-kube-exec adam-egress adam-git-sandbox adam-git; do
+  for binary in adam-coder adam-agent adam-kube-exec adam-egress run-signer adam-git-sandbox adam-git; do
     want=$(exit_code "$binary")
     code=0
     # The uid is read inside the container: passing `--user` proves only what the
@@ -129,4 +129,4 @@ done
 if [ "$fail" -ne 0 ]; then
   exit 1
 fi
-echo "ok   the six binaries are static and start in bookworm-slim and alpine"
+echo "ok   the seven binaries are static and start in bookworm-slim and alpine"

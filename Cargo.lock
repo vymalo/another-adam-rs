@@ -521,10 +521,12 @@ dependencies = [
  "adam-agent-fs",
  "adam-assembly",
  "adam-budget",
+ "adam-code-tools",
  "adam-core",
  "adam-device-state",
  "adam-error",
  "adam-llm-agent",
+ "adam-macros",
  "adam-model",
  "adam-model-openai",
  "adam-runtime",
@@ -920,6 +922,34 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "url",
+ "wiremock",
+]
+
+[[package]]
+name = "adam-run-signer"
+version = "0.7.0"
+dependencies = [
+ "adam-core",
+ "adam-error",
+ "adam-model",
+ "adam-run-cert-broker",
+ "adam-service",
+ "async-trait",
+ "axum",
+ "base64 0.22.1",
+ "bytes",
+ "futures",
+ "mimalloc",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "url",
+ "uuid",
  "wiremock",
 ]
 

@@ -6,7 +6,7 @@ name: coder
 # ci.yml; this workflow covers what only the image and the chart can show.
 #
 # The image is built on pull requests too and smoke-tested as a container (a
-# Postgres service, a stub model, a real start under tini), its six binaries are
+# Postgres service, a stub model, a real start under tini), its seven binaries are
 # checked to be static and to start in debian:bookworm-slim and alpine
 # (docker/coder/test/static-smoke.sh, ADR 0053 decision 11), then run through
 # the compose stack (scripted models, a git remote, a mock GitHub) with a task
@@ -345,11 +345,11 @@ jobs:
             ADAM_BUILD_REVISION=${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max,ignore-error=true
-      # ADR 0053 decision 11: the six binaries are static and start in an image with a different C
+      # ADR 0053 decision 11: the seven binaries are static and start in an image with a different C
       # library (debian:bookworm-slim and alpine), as uid 10001 with no configuration, ending on their
       # own configuration error. That is what lets the bench start the coder from any task image
       # (ADR 0052 decision 10).
-      - name: The six binaries are static and start in a foreign image
+      - name: The seven binaries are static and start in a foreign image
         if: steps.guard.outputs.ready == 'true'
         run: sh docker/coder/test/static-smoke.sh coder:smoke
       - name: Container smoke test
