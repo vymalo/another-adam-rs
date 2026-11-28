@@ -1541,6 +1541,7 @@ impl ModelConfig {
         };
         let model_aliases_file = parse_file(&get, "MODEL_ALIASES_FILE", problems);
         let profiles = parse_profiles(model_aliases_file.as_deref(), problems);
+        warn_about_aliases(model_aliases_file.as_deref(), &profiles, &alias);
         let context_window = parse_default_context_window(&get, problems);
         // The window the client will answer for `MODEL` (ADR 0088): the profile's, else the variable's.
         let window = adam_model::resolve_context_window(profiles.profile(&alias), context_window);
@@ -1889,6 +1890,44 @@ fn parse_images(
 /// problem names the file and the profile or preset and key it is about; an unreadable file is one
 /// problem, and an empty set is returned either way, so the rest of the configuration is still
 /// reported.
+/// The aliases among `aliases` that cannot be an OpenTelemetry label ([ANR-1512]), sorted and
+/// without duplicates.
+///
+/// A metric labelled by an alias outside [`adam_otel::labels::Name`]'s alphabet is **not emitted
+/// at all** — no substitute label, no counter of refusals — so a deployment using one loses every
+/// model metric and nothing else says so.
+fn aliases_outside_labels<'a>(aliases: impl IntoIterator<Item = &'a str>) -> Vec<&'a str> {
+    let mut out: Vec<&str> = aliases.into_iter().collect();
+    out.sort_unstable();
+    out.dedup();
+    out.retain(|alias| adam_otel::labels::Name::new(*alias).is_err());
+    out
+}
+
+/// Warn, once per alias, when an alias cannot be an OTel label ([ANR-1512]): the deployment keeps
+/// booting (refusing would stop a deployment that boots today, which is the owner's to ask for) and
+/// nothing is normalised (a lower-cased alias is a different model to the gateway).
+fn warn_about_aliases(file: Option<&std::path::Path>, profiles: &ModelProfiles, model: &str) {
+    let source = if file.is_some() {
+        "MODEL_ALIASES_FILE"
+    } else {
+        "MODEL"
+    };
+    let aliases = profiles
+        .profiles
+        .keys()
+        .map(String::as_str)
+        .chain((!model.is_empty()).then_some(model));
+    for alias in aliases_outside_labels(aliases) {
+        tracing::warn!(
+            alias = %alias,
+            source,
+            "this alias cannot be an OpenTelemetry label, so every model metric for it is \
+             dropped: labels accept [a-z0-9._-] and at most 64 bytes (ANR-1512)"
+        );
+    }
+}
+
 fn parse_profiles(path: Option<&std::path::Path>, problems: &mut Vec<String>) -> ModelProfiles {
     const NAME: &str = "MODEL_ALIASES_FILE";
     let Some(path) = path else {
@@ -4435,5 +4474,35 @@ mod tests {
                 );
             }
         }
+    }
+}
+
+/// Which aliases lose their model metrics ([ANR-1512]).
+///
+/// [ANR-1512]: https://github.com/vymalo/another-adam-rs/issues
+#[cfg(test)]
+mod alias_label_tests {
+    use super::aliases_outside_labels;
+
+    #[test]
+    fn an_alias_outside_the_label_alphabet_is_named() {
+        // A gateway-style alias (a slash, an upper-case letter) is plausible and loses every
+        // metric for that model; a dotted or dashed one is fine.
+        assert_eq!(
+            aliases_outside_labels([
+                "gpt-5.3",
+                "openrouter/claude-3.5",
+                "Anthropic/Claude",
+                "glm-5.3",
+                "openrouter/claude-3.5",
+            ]),
+            vec!["Anthropic/Claude", "openrouter/claude-3.5"],
+            "sorted, without duplicates, and only the ones a label cannot hold"
+        );
+    }
+
+    #[test]
+    fn every_alias_in_the_alphabet_names_nothing() {
+        assert!(aliases_outside_labels(["gpt-5.3", "glm-5.3", "a_b-c.d"]).is_empty());
     }
 }
