@@ -20,12 +20,22 @@
 //! MCP server). `read_output` is never held back: a round that cannot read a result it was handed
 //! could not finish. A run that is no round of a configured session has no narrowing.
 //!
+//! **A group's loader goes with the tools of its server** (ANR-1304). A lazy MCP server's group is
+//! loaded by an own tool named [`GROUP_LOADER_PREFIX`]`<server>` ([ADR 0066]), a name an allow-list
+//! such as `github__*` does not match, so the list would keep the server's tools out of the request
+//! and its loader too: a session could never load the group those tools belong to. A session whose
+//! `tools` names any tool of that server keeps the loader; a session whose `tools` names none of
+//! them keeps none, because a loader that can load nothing is not handed out. Nothing widens: once
+//! the group is loaded, its members go through this narrowing like every other tool.
+//!
 //! [ADR 0054]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md
+//! [ADR 0066]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0066-a-first-request-is-lean-and-tools-load-in-groups.md
 
 use adam_model::ToolSpec;
 use adam_runtime::{SessionConfig, glob};
 use serde_json::{Map, Value};
 
+use crate::GROUP_LOADER_PREFIX;
 use crate::conversation::{Conversation, SESSION_TOOLS_CONTEXT_KEY};
 use crate::kept::READ_OUTPUT;
 use crate::source::Withheld;
@@ -40,6 +50,9 @@ use crate::source::Withheld;
 pub(crate) struct SessionNarrowing {
     allows: Vec<Vec<String>>,
     denies: Vec<String>,
+    /// The group loaders the allow-lists keep: an allow-list that names a tool of a server keeps
+    /// that server's loader, which names none of its tools (see [`kept_loaders`]).
+    keeps: Vec<String>,
 }
 
 /// The names of a list written as JSON: `None` when the member is absent, `Err(())` when it is
@@ -57,10 +70,54 @@ fn names(value: Option<&Value>) -> Option<Result<Vec<String>, ()>> {
     }
 }
 
+/// The group loaders a session keeps: `load__group__<server>` is kept when **every** allow-list
+/// names the loader itself or a tool of that server (`<server>__<tool>`), the way an allow-list
+/// keeps a tool. A session whose lists name none of a server's tools keeps no loader for it: a
+/// loader that could load nothing is not handed out. A narrowing with no allow-list keeps none,
+/// and a deny-list is applied after this, so a denied loader stays withheld (ANR-1304).
+///
+/// `own` are the names of the agent's own tools: a group's members are its own tools, and its
+/// loader is one too ([`GROUP_LOADER_PREFIX`]). Read from the session's config and the agent's
+/// fixed tool set only, never from a turn's state, so the offered array does not move between
+/// turns (ADR 0044).
+fn kept_loaders(allows: &[Vec<String>], own: &[&str]) -> Vec<String> {
+    if allows.is_empty() {
+        // No allow-list: nothing to keep, and no loader is held back either.
+        return Vec::new();
+    }
+    let mut keeps: Vec<String> = Vec::new();
+    for loader in own
+        .iter()
+        .copied()
+        .filter(|name| name.starts_with(GROUP_LOADER_PREFIX))
+    {
+        let server = &loader[GROUP_LOADER_PREFIX.len()..];
+        let members = format!("{server}__");
+        let selected = allows.iter().all(|allow| {
+            allow.iter().any(|entry| glob(entry, loader))
+                || own.iter().copied().any(|tool| {
+                    tool.starts_with(&members) && allow.iter().any(|entry| glob(entry, tool))
+                })
+        });
+        if selected {
+            keeps.push(loader.to_owned());
+        }
+    }
+    keeps.sort();
+    keeps
+}
+
 impl SessionNarrowing {
     /// The narrowing of a run: what its session header's `config` says (the truth) and what its
     /// context carries under [`SESSION_TOOLS_CONTEXT_KEY`] (a second, narrower-only reading).
-    pub(crate) fn of(config: Option<&SessionConfig>, context: Option<&Map<String, Value>>) -> Self {
+    ///
+    /// `own` are the names of the agent's own tools, loaders included: an allow-list that names a
+    /// tool of a server keeps that server's group loader ([`kept_loaders`]).
+    pub(crate) fn of(
+        config: Option<&SessionConfig>,
+        context: Option<&Map<String, Value>>,
+        own: &[&str],
+    ) -> Self {
         let mut narrowing = Self::default();
         if let Some(config) = config {
             if let Some(tools) = &config.tools {
@@ -71,21 +128,24 @@ impl SessionNarrowing {
             }
         }
         if let Some(entry) = context.and_then(|context| context.get(SESSION_TOOLS_CONTEXT_KEY)) {
-            let Some(entry) = entry.as_object() else {
-                narrowing.allows.push(Vec::new());
-                return narrowing;
-            };
-            match names(entry.get("tools")) {
-                Some(Ok(allow)) => narrowing.allows.push(allow),
-                Some(Err(())) => narrowing.allows.push(Vec::new()),
-                None => {}
-            }
-            match names(entry.get("denyTools")) {
-                Some(Ok(deny)) => narrowing.denies.extend(deny),
-                Some(Err(())) => narrowing.denies.push("*".to_owned()),
-                None => {}
+            match entry.as_object() {
+                // A key of the wrong shape allows nothing, and denies nothing by itself.
+                None => narrowing.allows.push(Vec::new()),
+                Some(entry) => {
+                    match names(entry.get("tools")) {
+                        Some(Ok(allow)) => narrowing.allows.push(allow),
+                        Some(Err(())) => narrowing.allows.push(Vec::new()),
+                        None => {}
+                    }
+                    match names(entry.get("denyTools")) {
+                        Some(Ok(deny)) => narrowing.denies.extend(deny),
+                        Some(Err(())) => narrowing.denies.push("*".to_owned()),
+                        None => {}
+                    }
+                }
             }
         }
+        narrowing.keeps = kept_loaders(&narrowing.allows, own);
         narrowing
     }
 
@@ -94,13 +154,20 @@ impl SessionNarrowing {
         self.allows.is_empty() && self.denies.is_empty()
     }
 
-    /// Whether `tool` is held back. `read_output` never is.
+    /// Whether `tool` is held back. `read_output` never is, and a group's loader is not when the
+    /// allow-lists keep it ([`kept_loaders`]); a deny-list still wins over that.
     fn holds_back(&self, tool: &str) -> bool {
         if tool == READ_OUTPUT {
             return false;
         }
         let matched = |entries: &[String]| entries.iter().any(|entry| glob(entry, tool));
-        self.allows.iter().any(|allow| !matched(allow)) || matched(&self.denies)
+        if matched(&self.denies) {
+            return true;
+        }
+        if self.keeps.iter().any(|kept| kept == tool) {
+            return false;
+        }
+        self.allows.iter().any(|allow| !matched(allow))
     }
 
     /// The one tool `name`, if it is held back, with the words its call answers.
@@ -123,14 +190,17 @@ impl SessionNarrowing {
 }
 
 /// What the run's session holds back of its tools: read from the **header** the state carries,
-/// which is the truth, and from the context's copy of the same lists.
+/// which is the truth, and from the context's copy of the same lists. `own` are the names of the
+/// agent's own tools, loaders included ([`SessionNarrowing::of`]).
 pub(crate) fn narrowing_of(
     state: &Conversation,
     context: Option<&Map<String, Value>>,
+    own: &[&str],
 ) -> SessionNarrowing {
     SessionNarrowing::of(
         state.session.as_ref().and_then(|h| h.config.as_ref()),
         context,
+        own,
     )
 }
 
@@ -155,6 +225,18 @@ mod tests {
         "linear__list_issues",
         READ_OUTPUT,
         "subagent_start",
+    ];
+
+    /// The agent's own tools: the ones [`TOOLS`] names, and the loaders of two groups, `linear`
+    /// (whose member is `linear__list_issues`) and `github` (whose tools are not here).
+    const OWN: [&str; 7] = [
+        "read_file",
+        "write_file",
+        "linear__list_issues",
+        READ_OUTPUT,
+        "subagent_start",
+        "load__group__linear",
+        "load__group__github",
     ];
 
     fn config(tools: Option<&[&str]>, deny: Option<&[&str]>) -> SessionConfig {
@@ -186,24 +268,29 @@ mod tests {
 
     #[test]
     fn no_config_and_no_key_hold_nothing_back() {
-        assert!(SessionNarrowing::of(None, None).is_inert());
+        assert!(SessionNarrowing::of(None, None, &OWN).is_inert());
         assert!(
-            SessionNarrowing::of(Some(&config(None, None)), Some(&keyed(json!({})))).is_inert()
+            SessionNarrowing::of(Some(&config(None, None)), Some(&keyed(json!({}))), &OWN)
+                .is_inert()
         );
-        assert!(held(&SessionNarrowing::of(None, None)).is_empty());
+        assert!(held(&SessionNarrowing::of(None, None, &OWN)).is_empty());
     }
 
     #[test]
     fn an_allow_list_holds_back_what_it_does_not_match_but_read_output() {
-        let n = SessionNarrowing::of(Some(&config(Some(&["read_file"]), None)), None);
+        let n = SessionNarrowing::of(Some(&config(Some(&["read_file"]), None)), None, &OWN);
         assert_eq!(
             held(&n),
             ["write_file", "linear__list_issues", "subagent_start"]
         );
-        let n = SessionNarrowing::of(Some(&config(Some(&["read_*", "linear__*"]), None)), None);
+        let n = SessionNarrowing::of(
+            Some(&config(Some(&["read_*", "linear__*"]), None)),
+            None,
+            &OWN,
+        );
         assert_eq!(held(&n), ["write_file", "subagent_start"]);
         // An empty allow-list offers nothing but `read_output`.
-        let n = SessionNarrowing::of(Some(&config(Some(&[]), None)), None);
+        let n = SessionNarrowing::of(Some(&config(Some(&[]), None)), None, &OWN);
         assert_eq!(held(&n), ALL_BUT_READ_OUTPUT);
     }
 
@@ -215,13 +302,71 @@ mod tests {
                 Some(&["write_*"]),
             )),
             None,
+            &OWN,
         );
         assert_eq!(
             held(&n),
             ["write_file", "linear__list_issues", "subagent_start"]
         );
-        let n = SessionNarrowing::of(Some(&config(None, Some(&["*"]))), None);
+        let n = SessionNarrowing::of(Some(&config(None, Some(&["*"]))), None, &OWN);
         assert_eq!(held(&n), ALL_BUT_READ_OUTPUT);
+    }
+
+    /// A session whose `tools` names a tool of a server keeps that server's group loader, so the
+    /// group can be loaded (ANR-1304); one whose `tools` names none of them keeps none, and a
+    /// `deny_tools` entry still takes the loader away.
+    #[test]
+    fn a_loader_is_kept_with_the_tools_of_its_server_and_a_deny_list_still_wins() {
+        let keeps = |tools: Option<&[&str]>, deny: Option<&[&str]>| {
+            let n = SessionNarrowing::of(Some(&config(tools, deny)), None, &OWN);
+            (
+                n.hold("load__group__linear").is_none(),
+                n.hold("load__group__github").is_none(),
+            )
+        };
+        assert_eq!(
+            keeps(Some(&["linear__*"]), None),
+            (true, false),
+            "a server's pattern keeps its group's loader"
+        );
+        assert_eq!(
+            keeps(Some(&["linear__list_issues"]), None),
+            (true, false),
+            "a tool of the server keeps it"
+        );
+        assert_eq!(
+            keeps(Some(&["load__group__linear"]), None),
+            (true, false),
+            "the loader itself keeps it"
+        );
+        assert_eq!(
+            keeps(Some(&["read_file"]), None),
+            (false, false),
+            "a list that names none of the server's tools keeps no loader"
+        );
+        assert_eq!(
+            keeps(Some(&[]), None),
+            (false, false),
+            "an empty allow-list keeps no loader"
+        );
+        assert_eq!(
+            keeps(Some(&["linear__*"]), Some(&["load__group__*"])),
+            (false, false),
+            "the deny-list wins over the allow-list"
+        );
+        // `github__*` selects nothing of the `github` group this agent has: its loader could load
+        // nothing, so it is not handed out.
+        assert_eq!(keeps(Some(&["github__*"]), None), (false, false));
+        // Every allow-list must keep it: the round's key, which only narrows, takes it away.
+        let n = SessionNarrowing::of(
+            Some(&config(Some(&["linear__*"]), None)),
+            Some(&keyed(json!({"tools": ["read_file"]}))),
+            &OWN,
+        );
+        assert!(
+            n.hold("load__group__linear").is_some(),
+            "the narrower key takes the loader away too"
+        );
     }
 
     #[test]
@@ -232,16 +377,17 @@ mod tests {
             Some(&keyed(
                 json!({"tools": ["read_file"], "denyTools": ["subagent_*"]}),
             )),
+            &OWN,
         );
         assert_eq!(
             held(&n),
             ["write_file", "linear__list_issues", "subagent_start"]
         );
         // A key that allows more than the header does not offer more.
-        let n = SessionNarrowing::of(Some(&header), Some(&keyed(json!({"tools": ["*"]}))));
+        let n = SessionNarrowing::of(Some(&header), Some(&keyed(json!({"tools": ["*"]}))), &OWN);
         assert_eq!(held(&n), ["linear__list_issues", "subagent_start"]);
         // A key with no header narrows a run on its own.
-        let n = SessionNarrowing::of(None, Some(&keyed(json!({"tools": ["read_file"]}))));
+        let n = SessionNarrowing::of(None, Some(&keyed(json!({"tools": ["read_file"]}))), &OWN);
         assert_eq!(
             held(&n),
             ["write_file", "linear__list_issues", "subagent_start"]
@@ -253,6 +399,7 @@ mod tests {
         let n = SessionNarrowing::of(
             Some(&config(Some(&["read_file"]), None)),
             Some(&Map::from_iter([("other".to_owned(), json!(1))])),
+            &OWN,
         );
         assert_eq!(
             held(&n),
@@ -268,7 +415,7 @@ mod tests {
             // A mixed list is not a list of names: its strings alone would narrow less than written.
             json!({"tools": ["read_file", 1]}),
         ] {
-            let n = SessionNarrowing::of(None, Some(&keyed(bad.clone())));
+            let n = SessionNarrowing::of(None, Some(&keyed(bad.clone())), &OWN);
             assert_eq!(held(&n), ALL_BUT_READ_OUTPUT, "{bad}");
         }
         for bad in [
@@ -276,14 +423,14 @@ mod tests {
             json!({"denyTools": ["write_file", 1]}),
             json!({"denyTools": [null]}),
         ] {
-            let n = SessionNarrowing::of(None, Some(&keyed(bad.clone())));
+            let n = SessionNarrowing::of(None, Some(&keyed(bad.clone())), &OWN);
             assert_eq!(held(&n), ALL_BUT_READ_OUTPUT, "{bad}");
         }
     }
 
     #[test]
     fn the_refusal_names_the_tool_and_tells_the_model_to_say_so() {
-        let n = SessionNarrowing::of(Some(&config(Some(&["read_file"]), None)), None);
+        let n = SessionNarrowing::of(Some(&config(Some(&["read_file"]), None)), None, &OWN);
         let held = n.hold("write_file").expect("held");
         assert_eq!(held.tool, "write_file");
         assert!(held.reason.contains("`write_file` is not offered"));
@@ -303,7 +450,8 @@ mod tests {
         let mut specs: Vec<ToolSpec> = TOOLS.iter().map(|name| spec(name)).collect();
         SessionNarrowing::default().retain(&mut specs);
         assert_eq!(specs.len(), 5);
-        SessionNarrowing::of(Some(&config(Some(&["read_file"]), None)), None).retain(&mut specs);
+        SessionNarrowing::of(Some(&config(Some(&["read_file"]), None)), None, &OWN)
+            .retain(&mut specs);
         let names: Vec<&str> = specs.iter().map(|s| s.name.as_str()).collect();
         assert_eq!(names, ["read_file", READ_OUTPUT]);
     }
@@ -344,7 +492,7 @@ mod tests {
             !state.context.contains_key(SESSION_TOOLS_CONTEXT_KEY),
             "the unprotected key went with the rest"
         );
-        let n = narrowing_of(&state, Some(&state.context));
+        let n = narrowing_of(&state, Some(&state.context), &OWN);
         assert_eq!(
             held(&n),
             ["write_file", "linear__list_issues", "subagent_start"]

@@ -551,7 +551,12 @@ parks the run and returns.
   written by `subagent_start` and `subagent_send` from the header's clamped config), a held tool being held when either says
   so. The key is **not** in `PROTECTED_CONTEXT_KEYS` (a child of the session does not inherit it), so an oversized context
   drops it and the header holds alone. A value of the wrong shape (a mixed array too) fails closed. A remote subagent takes
-  neither option.
+  neither option. **A group's loader goes with the tools of its server** (ANR-1304): a lazy MCP server's group is loaded by
+  an own tool named `load__group__<server>` (ADR 0066), which `github__*` does not match, so a session that names any tool of
+  that server keeps its loader — and one that names none of them keeps none, because a loader that can load nothing is not
+  handed out. The decision is read from the config and the agent's fixed tool set, never from a turn's state, so the tools
+  array does not move between turns (ADR 0044); `deny_tools` still wins over it, and once loaded the group's members go
+  through the same lists, so nothing widens.
 * **`report_schema`** (ADR 0054 slice 9, local subagents only). The round's final answer must be one JSON value that matches
   the schema (draft 2020-12, so a `format` is an annotation and is not enforced; checked with `jsonschema` without its default features: nothing is fetched, so the crate still
   holds no HTTP client or TLS stack for the embedded set). `LlmAgent::report_gate` checks it where the round would end (the words that end a turn, an announced answer and a tool's `final_answer`): a
