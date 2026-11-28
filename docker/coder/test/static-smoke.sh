@@ -124,6 +124,43 @@ for base in \
       *) bad "$binary in $base exited $want but did not say '$(message "$binary")': $out" ;;
     esac
   done
+
+  # `run-signer` is the one binary whose start is worth proving here, not only its configuration
+  # error: it serves on loopback, so this starts it with a run-certificate configuration that needs
+  # no broker (the issuer and the upstream both point at a closed port), waits for its listening
+  # line, and stops it with SIGTERM. What it answers is A4's tests' business (`cargo test -p
+  # adam-run-signer`); this is the image's binary starting where no CA exists.
+  code=0
+  out=$(timeout 30 docker run --rm --user 10001:10001 --network none \
+    --mount "type=bind,src=$work/run-signer,dst=/bin/run-signer,readonly" \
+    --entrypoint /bin/sh "$base" -c '
+      printf "a-projected-token\n" > /tmp/run-cert-token || exit 96
+      RUN_SIGNER_LISTEN=127.0.0.1:8443 \
+      RUN_SIGNER_UPSTREAM=http://127.0.0.1:1 \
+      RUN_CERT_ISSUER=broker \
+      RUN_CERT_ISSUER_URL=http://127.0.0.1:1 \
+      RUN_CERT_TOKEN_FILE=/tmp/run-cert-token \
+      /bin/run-signer >/tmp/run-signer.out 2>&1 &
+      pid=$!
+      i=0
+      while [ "$i" -lt 20 ]; do
+        grep -q "adam-run-signer listening" /tmp/run-signer.out && break
+        kill -0 "$pid" 2>/dev/null || break
+        sleep 1
+        i=$((i+1))
+      done
+      if ! grep -q "adam-run-signer listening" /tmp/run-signer.out; then
+        cat /tmp/run-signer.out
+        exit 90
+      fi
+      kill -TERM "$pid"
+      wait "$pid"
+      echo "exit=$?"
+    ' 2>&1) || code=$?
+  case $out in
+    *"exit=0"*) ok "run-signer in $base: listens on loopback and stops clean on SIGTERM" ;;
+    *) bad "run-signer in $base did not start on loopback and stop clean: $out" ;;
+  esac
 done
 
 if [ "$fail" -ne 0 ]; then
