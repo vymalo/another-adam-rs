@@ -28,7 +28,7 @@
 
 use adam_a2a::{AccessTier, AccessTiers};
 use adam_a2a_runtime::CONTEXT_ACCESS_TIER;
-use adam_llm_agent::{SourceCtx, ToolCtx, ToolError, ToolOutput, ToolSource, Withheld};
+use adam_llm_agent::{Declared, SourceCtx, ToolCtx, ToolError, ToolOutput, ToolSource, Withheld};
 use adam_model::ToolSpec;
 use adam_runtime::Inbound;
 use async_trait::async_trait;
@@ -244,6 +244,13 @@ impl ToolSource for TierSource {
         Vec::new()
     }
 
+    /// The tier offers no tool of its own: it holds back the tools above it, and never grants one.
+    /// It answers `All` of nothing, so it never makes a session's set of tools incomplete (ADR 0054
+    /// decision 4).
+    fn declared(&self) -> Declared {
+        Declared::All(Vec::new())
+    }
+
     async fn instructions(&self, ctx: &SourceCtx) -> Option<String> {
         named_in_context(ctx.context_map()).map(|named| words(named.min(self.max)))
     }
@@ -276,6 +283,16 @@ mod tests {
 
     fn source(max: AccessTier) -> TierSource {
         TierSource::new(NotesStore::new(std::path::Path::new("/nonexistent")), max)
+    }
+
+    /// The tier offers no tool of its own: it holds back the tools above it (ADR 0036). It declares
+    /// `All` of nothing, so it never makes a session's set of tools incomplete (ADR 0054 decision 4).
+    #[test]
+    fn the_tier_declares_no_tool_of_its_own() {
+        assert_eq!(
+            source(AccessTier::Auto).declared(),
+            Declared::All(Vec::new())
+        );
     }
 
     fn context(tier: Value) -> Map<String, Value> {

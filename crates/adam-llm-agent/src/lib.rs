@@ -245,7 +245,7 @@ pub use sessions::{
 };
 pub use si_memory::{SI_MEMORY_GROUP, SI_RECALL, SI_RECORD, SiMemoryHandle, SiRecall, SiRecord};
 pub use source::{
-    DynToolSource, Listing, MAX_SOURCE_TOOLS, SourceCtx, ToolNote, ToolSource, Withheld,
+    Declared, DynToolSource, Listing, MAX_SOURCE_TOOLS, SourceCtx, ToolNote, ToolSource, Withheld,
 };
 pub use state::{Extensions, State, StateKey};
 pub use step_io::StepIo;
