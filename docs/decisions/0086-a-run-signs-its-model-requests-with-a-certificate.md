@@ -104,6 +104,15 @@ request asked about, or the chain is refused (`RunKeyError::Chain`, `Internal`).
    | `RunCertError::Internal` | the answer is not a chain adam can carry | `Internal` |
    | `BadCertificateRequest` | the request is empty or over 8 KiB, refused before it is sent | `Invalid` |
 
+*Amended 2026-11-28 (A4, the sidecar).* The `broker` adapter landed in `crates/adam-run-cert-broker` (A3), with the
+`RUN_CERT_*` configuration in `adam-service`; `bin/run-signer` is the other way to satisfy decision 8's "a request the
+run key cannot sign is not sent", for an agent that holds no key. It listens on **loopback only**, requires `X-Run-Id`
+and the prompt statement (the statement's `sub` is the person the leaf's SAN names), forwards the call to
+`RUN_SIGNER_UPSTREAM`, and adds `Turn-Signature` from the run's `RunKeyring`. Its upstream client trusts
+`RUN_SIGNER_UPSTREAM_CA_FILE`, which defaults to `RUN_CERT_CA_FILE`: one trust domain today, two names so a future
+gateway can present its own chain. Still not built: the in-process request path (a worker choosing `KeySource::Run`
+per run, R3) and the deployment that runs the sidecar.
+
 ## What it protects, and what it does not
 
 **It protects** the model gateway from a caller that replays or fabricates a request: the request is signed
@@ -122,14 +131,14 @@ adam's process key set.
 
 ## Diagrams
 
-Issue once per run, sign every call, renew at two thirds of the leaf's life. The ports are built; the adapter
-and the wiring are not.
+Issue once per run, sign every call, renew at two thirds of the leaf's life. The ports and the broker adapter are
+built; the in-process wiring and the deployment are not.
 
 ```mermaid
 sequenceDiagram
-    participant R as RunKeys (adapter, planned)
+    participant R as RunKeyring (built, one per run)
     participant I as RunCertIssuer (port, built)
-    participant C as CA (adapter, planned)
+    participant C as CA (broker adapter, built)
     participant S as SignedRequests (built)
     R->>I: issue(CertificateRequest)
     I->>C: the CSR, DER

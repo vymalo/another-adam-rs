@@ -888,6 +888,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "adam-run-signer"
+version = "0.7.0"
+dependencies = [
+ "adam-core",
+ "adam-error",
+ "adam-model",
+ "adam-run-cert-broker",
+ "adam-service",
+ "axum",
+ "base64 0.22.1",
+ "bytes",
+ "futures",
+ "mimalloc",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "url",
+ "uuid",
+ "wiremock",
+]
+
+[[package]]
 name = "adam-runtime"
 version = "0.7.0"
 dependencies = [
