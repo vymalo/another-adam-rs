@@ -36,7 +36,7 @@ use adam_workspace::{CodeHost, DynCodeHost, MemoryCodeHost, NewPullRequest, Repo
 use common::Fixture;
 use serde_json::{Value, json};
 
-/// The tools of the coder in the order they are offered, with the five session tools, as the model is
+/// The tools of the coder in the order they are offered, with the six session tools, as the model is
 /// shown them at the highest tier.
 const ALL: [&str; 43] = [
     "prepare_workspace",

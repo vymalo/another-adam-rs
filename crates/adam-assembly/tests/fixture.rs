@@ -183,6 +183,7 @@ fn the_fixture_binds_each_agent_as_its_files_say() {
             "subagent_start",
             "subagent_send",
             "subagent_read",
+            "subagent_edit",
             "subagent_close",
             "subagent_list"
         ]

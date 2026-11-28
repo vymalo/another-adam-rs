@@ -1082,7 +1082,7 @@ pub struct RemoteInfo {
 /// A subagent is an agent of its own, registered under `<parent>/<name>` with its own prompt,
 /// tools, skills, model alias and limits, and it inherits nothing from its parent: not the tools
 /// (a subagent with no `tools:` has none), not the skills, not the history. Its parent gets the
-/// five session tools of `adam-llm-agent`, whose `subagent_start` starts the subagent as a round of
+/// six session tools of `adam-llm-agent`, whose `subagent_start` starts the subagent as a round of
 /// a session, a durable child run on the runtime that steps the parent ([ADR 0089]: no tool is
 /// named after a subagent), so **every agent of the assembly must be registered on that runtime**,
 /// which [`register`](Self::register) does.

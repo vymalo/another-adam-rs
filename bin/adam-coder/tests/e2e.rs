@@ -4252,7 +4252,7 @@ async fn three_questions_as_one_form_the_answers_come_back_and_the_run_goes_on(s
         .map(|t| t.name.clone())
         .collect();
     assert_eq!(
-        offered[offered.len() - 16..],
+        offered[offered.len() - 14..],
         [
             "ask_user",
             "show",

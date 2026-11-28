@@ -142,7 +142,7 @@ fn delegate(id: &str, agent: &str, prompt: &str) -> ToolCall {
     )
 }
 
-/// `own`, then the five session tools, as an agent with subagents is offered them.
+/// `own`, then the six session tools, as an agent with subagents is offered them.
 fn with_sessions(own: &[&str]) -> Vec<String> {
     own.iter()
         .chain(SESSION_TOOLS.iter())
@@ -259,7 +259,11 @@ async fn a_parent_calls_its_subagent_which_calls_its_own_and_the_parent_goes_on(
         // The child: its own prompt, its own tools (and the session tools for its own subagent),
         // and a history that starts with `prompt`, not with the parent's conversation.
         for r in [r1, r2] {
-            assert_eq!(plain(&r.system).as_deref(), Some("You research."));
+            let child_system = format!(
+                "You research.\n\n{}",
+                SessionTools::guide_for(["summarizer"])
+            );
+            assert_eq!(plain(&r.system).as_deref(), Some(child_system.as_str()));
             assert_eq!(offered(r), with_sessions(&["fetch"]));
             assert_eq!(
                 r.tools[1].parameters["properties"]["agent"]["enum"],
@@ -1104,7 +1108,8 @@ fn a_subagent_named_like_a_skill_tool_is_refused() {
     files.pop();
     files.retain(|(path, _)| !path.starts_with("agent/skills"));
     let assembly = assemble(&files, ToolSet::new(), &Arc::new(MockModel::new()));
-    assert_eq!(assembly.info()[0].tools, with_sessions(&["load_skill"]));
+    // No tool is named after a subagent (ADR 0089 slice C4): the root has the session tools.
+    assert_eq!(assembly.info()[0].tools, with_sessions(&[]));
 }
 
 #[test]

@@ -94,11 +94,11 @@
 //! # Subagents
 //!
 //! Each local subagent is an agent of its own, `<parent>/<name>`, that inherits nothing. Its
-//! parent delegates to it through the five session tools of `adam-llm-agent` (`subagent_start`,
-//! `subagent_send`, `subagent_read`, `subagent_close`, `subagent_list`), which [`AgentDef::bind`]
-//! gives every agent that has a subagent: every child is a session ([ADR 0089]), and
-//! `subagent_start` with `mode: one_shot` and `wait: true` is the one-shot call (the child's first
-//! report is the result and the parent parks until then). There is no tool named after a subagent.
+//! parent delegates to it through the six session tools of `adam-llm-agent` (`subagent_start`,
+//! `subagent_send`, `subagent_read`, `subagent_edit`, `subagent_close`, `subagent_list`), which
+//! [`AgentDef::bind`] gives every agent that has a subagent: every child is a session
+//! ([ADR 0089]), and `subagent_start` with `mode: one_shot` and `wait: true` is the one-shot call
+//! (the child's first report is the result and the parent parks until then). There is no tool named after a subagent.
 //! A subagent may have a tool that asks the person
 //! ([`Tool::asks_user`](adam_llm_agent::Tool::asks_user)): whether it may ask is decided per run by
 //! the loop (ADR 0045 decision 9), not here. Its name may not clash with a tool of its parent, which

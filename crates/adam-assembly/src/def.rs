@@ -815,7 +815,7 @@ impl AgentDef {
     ///
     /// The root agent gets every registered tool when it has no `tools:`; a subagent gets none
     /// (decision D3 of `docs/reference/agent-files.md`), whatever its parent has. An agent that has
-    /// subagents, the root or a subagent with its own, then gets the five session tools of
+    /// subagents, the root or a subagent with its own, then gets the six session tools of
     /// `adam-llm-agent` (`subagent_start` and the others) after its own tools and its skills' tools:
     /// that is how it delegates ([ADR 0089]: every child is a session, and no tool is named after a
     /// subagent). One more thing is refused here:
@@ -1498,7 +1498,7 @@ struct Roster {
     rounds: Rounds,
 }
 
-/// The subagents of the agent as its five session tools offer them (ADR 0045, ADR 0089 slice C4):
+/// The subagents of the agent as its six session tools offer them (ADR 0045, ADR 0089 slice C4):
 /// the roster, in the order of the manifest, and an agent of its own for the rounds of each remote
 /// one. Nothing is offered under a subagent's name: a subagent is the `agent` of a
 /// `subagent_start`. A name must still not be one the agent's model already reads for something
