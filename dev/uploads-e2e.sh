@@ -26,8 +26,9 @@
 #      byte-for-byte the file the model wrote.
 #
 # The red proof: `UPLOADS_E2E_TAMPER=1 sh dev/uploads-e2e.sh` appends one byte to the expected text,
-# and the last check fails on the SHA-256 (the run itself still succeeds), which is how a check that
-# compares the right thing is known to be able to fail.
+# and the two comparisons fail on the size and the SHA-256 — the slot request's, and the bucket's
+# (the run itself still succeeds), which is how a check that compares the right thing is known to be
+# able to fail.
 #
 # Environment (defaults match compose.yaml on one machine):
 #   CODER_URL            http://127.0.0.1:${CODER_PORT:-8080}

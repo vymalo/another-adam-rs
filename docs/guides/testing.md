@@ -165,7 +165,7 @@ carries the `e2e-full` label or changes `dev/`, `docker/coder/` or `compose.yaml
 them. Start the stack first:
 
 ```sh
-docker compose --profile app up -d --build --wait postgres mock-openai mock-github mock-github-mcp git-server coder
+docker compose --profile app up -d --build --wait postgres mock-openai mock-github mock-github-mcp mock-uploads git-server coder
 ```
 
 | Script | What it proves |
