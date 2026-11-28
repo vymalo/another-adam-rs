@@ -23,6 +23,10 @@ async fn activity(
 ) -> Result<Json<Value>, StatusCode> {
     match store.activity(&agents, now()).await {
         Ok(activity) => {
+            crate::store_busy::record_store_busy(
+                &opentelemetry::global::meter(crate::store_busy::SCOPE),
+                activity.busy,
+            );
             let mut body = json!({ "busy": activity.busy });
             if let Some(at) = activity.next_due_at {
                 body["nextDueAt"] = Value::String(at.to_string());

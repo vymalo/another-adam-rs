@@ -16,6 +16,7 @@ mod prompt_commands;
 pub mod retention;
 mod serve;
 mod service;
+pub mod store_busy;
 
 pub use adam_model_openai::{OpenAiConfigError, endpoint_for_logs};
 #[cfg(feature = "mcp")]
