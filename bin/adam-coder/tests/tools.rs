@@ -1061,10 +1061,112 @@ async fn a_failed_check_runs_again_after_run_kept_files_the_tree_does_not_show()
     );
 }
 
-/// A passing run is never reused: the model may be confirming it, and the environment may have
-/// changed under it, so the command runs again.
+/// A second gate on the same tree runs no check and gives the same verdict: a **pass** is reused
+/// for the same call on the same tree, the counter does not advance, and the report says which
+/// results were reused.
 #[tokio::test]
-async fn a_passing_check_runs_again_on_the_same_tree() {
+async fn a_second_gate_on_the_same_tree_runs_no_check_and_gives_the_same_verdict() {
+    let rig = Rig::new().await;
+    rig.prepare().await;
+    let dir = tempfile::tempdir().unwrap();
+    let counter = dir.path().join("runs");
+    let command = format!("echo x >> {}; true", counter.display());
+
+    let first = RunChecks
+        .call(&rig.ctx, json!({"command": command}))
+        .await
+        .unwrap();
+    assert!(!first.is_error, "{}", first.content);
+    assert_eq!(runs_of(&counter), 1, "the first gate ran the check");
+    let verdict = checks_of(&first);
+
+    let again = RunChecks
+        .call(&another_call(&rig, "call-2"), json!({"command": command}))
+        .await
+        .unwrap();
+    assert!(!again.is_error, "{}", again.content);
+    assert_eq!(runs_of(&counter), 1, "the second gate ran no check");
+    let second = checks_of(&again);
+    assert_eq!(second["passed"], true, "{second}");
+    assert_eq!(second["tree"], verdict["tree"], "the verdict of the pass");
+    assert_eq!(second["reused"], true, "{second}");
+    assert!(
+        second["summary"]
+            .as_str()
+            .unwrap()
+            .contains("these results were reused"),
+        "{second}"
+    );
+    assert!(
+        again.content.contains("passed") && again.content.contains("not run again"),
+        "{}",
+        again.content
+    );
+    assert!(
+        again.content.contains("marked as reused"),
+        "{}",
+        again.content
+    );
+    let notes = notes_of(&rig).await;
+    assert_eq!(notes.checks.history.len(), 1, "the reuse records nothing");
+}
+
+/// The risk the slice names: a check may read a file the project **ignores**, and the tree id does
+/// not show it. A pass is therefore reused only at the epoch it ran at: after `write_file` changed
+/// an ignored file, the check runs again and its new verdict — here a failure — is the answer,
+/// never the earlier pass.
+#[tokio::test]
+async fn a_pass_is_not_reused_after_write_file_wrote_an_ignored_file() {
+    let rig = Rig::new().await;
+    rig.prepare().await;
+    std::fs::write(rig.worktree().join(".gitignore"), "conf/\n").unwrap();
+    std::fs::create_dir_all(rig.worktree().join("conf")).unwrap();
+    std::fs::write(rig.worktree().join("conf/setting"), "good\n").unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let counter = dir.path().join("runs");
+    let command = format!("echo x >> {}; grep -q good conf/setting", counter.display());
+
+    let first = RunChecks
+        .call(&rig.ctx, json!({"command": command}))
+        .await
+        .unwrap();
+    assert!(!first.is_error, "{}", first.content);
+    assert_eq!(runs_of(&counter), 1, "the first gate ran the check");
+    let epoch = notes_of(&rig).await.checks.epoch;
+
+    WriteFile
+        .call(
+            &another_call(&rig, "call-2"),
+            json!({"path": "conf/setting", "content": "bad\n"}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        notes_of(&rig).await.checks.epoch,
+        epoch + 1,
+        "the ignored write moved the epoch"
+    );
+
+    let again = RunChecks
+        .call(&another_call(&rig, "call-3"), json!({"command": command}))
+        .await
+        .unwrap();
+    assert!(
+        again.is_error,
+        "the ignored file now says bad, so the pass is stale: {}",
+        again.content
+    );
+    assert_eq!(runs_of(&counter), 2, "the epoch moved: the check ran again");
+    assert!(
+        checks_of(&again).get("reused").is_none(),
+        "{:?}",
+        checks_of(&again)
+    );
+}
+
+/// Any change to the tree runs the checks again: a write to a tracked file is another tree.
+#[tokio::test]
+async fn changing_a_file_runs_the_checks_again() {
     let rig = Rig::new().await;
     rig.prepare().await;
     let dir = tempfile::tempdir().unwrap();
@@ -1078,13 +1180,129 @@ async fn a_passing_check_runs_again_on_the_same_tree() {
     assert!(!first.is_error, "{}", first.content);
     assert_eq!(runs_of(&counter), 1);
 
+    let readme = rig.worktree().join("README.md");
+    let original = std::fs::read_to_string(&readme).unwrap();
+    std::fs::write(&readme, format!("{original}more\n")).unwrap();
+
     let again = RunChecks
         .call(&another_call(&rig, "call-2"), json!({"command": command}))
         .await
         .unwrap();
     assert!(!again.is_error, "{}", again.content);
-    assert_eq!(runs_of(&counter), 2, "a pass is never reused");
-    assert_eq!(checks_of(&again)["passed"], true);
+    assert_eq!(runs_of(&counter), 2, "the tree changed: it ran again");
+    assert!(
+        checks_of(&again).get("reused").is_none(),
+        "{:?}",
+        checks_of(&again)
+    );
+}
+
+/// A new untracked, not ignored file is in the tree id (the check keys on the tree, never on the
+/// commit): the checks run again. This is the case that fails when the key is `HEAD` only.
+#[tokio::test]
+async fn adding_an_untracked_file_runs_the_checks_again() {
+    let rig = Rig::new().await;
+    rig.prepare().await;
+    let dir = tempfile::tempdir().unwrap();
+    let counter = dir.path().join("runs");
+    let command = format!("echo x >> {}; true", counter.display());
+
+    let first = RunChecks
+        .call(&rig.ctx, json!({"command": command}))
+        .await
+        .unwrap();
+    assert!(!first.is_error, "{}", first.content);
+    assert_eq!(runs_of(&counter), 1);
+
+    std::fs::write(rig.worktree().join("fresh.txt"), "new\n").unwrap();
+
+    let again = RunChecks
+        .call(&another_call(&rig, "call-2"), json!({"command": command}))
+        .await
+        .unwrap();
+    assert!(!again.is_error, "{}", again.content);
+    assert_eq!(
+        runs_of(&counter),
+        2,
+        "a new untracked file is another tree: it ran again"
+    );
+    assert!(
+        checks_of(&again).get("reused").is_none(),
+        "{:?}",
+        checks_of(&again)
+    );
+}
+
+/// A pass is keyed on the tree, the call and the run's file/environment epoch: a file changed and
+/// reverted leaves the tree the first pass decided on, but each write moved the epoch — a file the
+/// project ignores does not change the tree and a check may read it — so the pass is not reused
+/// and the check runs again. One run, never a stale verdict.
+#[tokio::test]
+async fn a_reverted_file_runs_the_check_again_because_a_write_moved_the_epoch() {
+    let rig = Rig::new().await;
+    rig.prepare().await;
+    let dir = tempfile::tempdir().unwrap();
+    let counter = dir.path().join("runs");
+    let command = format!("echo x >> {}; true", counter.display());
+
+    let first = RunChecks
+        .call(&rig.ctx, json!({"command": command}))
+        .await
+        .unwrap();
+    assert!(!first.is_error, "{}", first.content);
+    assert_eq!(runs_of(&counter), 1);
+
+    // Change a tracked file with the file tools (each write moves the check epoch), let the check
+    // run on the new tree, then put the original content back.
+    let readme = rig.worktree().join("README.md");
+    let original = std::fs::read_to_string(&readme).unwrap();
+    WriteFile
+        .call(
+            &another_call(&rig, "call-2"),
+            json!({"path": "README.md", "content": format!("{original}more\n")}),
+        )
+        .await
+        .unwrap();
+    let changed = RunChecks
+        .call(&another_call(&rig, "call-3"), json!({"command": command}))
+        .await
+        .unwrap();
+    assert!(!changed.is_error, "{}", changed.content);
+    assert_eq!(runs_of(&counter), 2, "the change ran the check again");
+    WriteFile
+        .call(
+            &another_call(&rig, "call-4"),
+            json!({"path": "README.md", "content": original}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        notes_of(&rig).await.checks.epoch,
+        2,
+        "each write moved the epoch"
+    );
+
+    let again = RunChecks
+        .call(&another_call(&rig, "call-5"), json!({"command": command}))
+        .await
+        .unwrap();
+    assert!(!again.is_error, "{}", again.content);
+    assert_eq!(
+        runs_of(&counter),
+        3,
+        "the tree is the first one again, but the writes moved the epoch, and a pass is reused \
+         only at its own epoch: the check runs again rather than risk a stale verdict"
+    );
+    assert!(
+        checks_of(&again).get("reused").is_none(),
+        "{:?}",
+        checks_of(&again)
+    );
+    assert_eq!(
+        notes_of(&rig).await.checks.history.len(),
+        3,
+        "a new run is a new record"
+    );
 }
 
 /// The timeout is part of what makes a failure: a run killed after 1 s says nothing about the same
