@@ -1,10 +1,14 @@
 # The oldest major of every action a workflow uses (ANR-1427).
 #
-# `tools/check-workflow-pins.sh` reads this file and refuses a `uses:` below its
-# line. The floors are the majors that run on node24: a node20 action is what
-# this check exists to keep out, and it has come back twice by habit — ANR-62
-# moved every pin, then #495 added a job with `actions/checkout@v4` and
-# `actions/setup-node@v4`, and nothing went red until a person grepped (ANR-1410).
+# `tools/check-workflow-pins.sh` refuses a `uses:` below its line. A floor is the
+# major this repository has moved to, so it is an anti-regression floor: not a
+# claim that every action at it runs on node24 (`Swatinem/rust-cache@v2.0.0` is
+# node16, `hadolint` and `cargo-deny` are Docker actions), and not a check of
+# minor versions. For `checkout`, `setup-node`, `upload-artifact` and
+# `download-artifact` the floor is deliberately above the oldest node24 major,
+# because those are the pins the fallback happened on: ANR-62 moved every pin,
+# then #495 added a job with `actions/checkout@v4` and `actions/setup-node@v4`,
+# and nothing went red until a person grepped (ANR-1410).
 #
 # Move a major here in the same pull request that moves the action, exactly as a
 # lockfile is edited. Never lower one to get a change through: lower the floor and
