@@ -354,9 +354,17 @@ jobs:
       mongodb:
         image: mongo:${{ matrix.mongodb }}
         ports: ["27017:27017"]
+      redis:
+        # Redis 8.2, by tag and digest (the OCI index of docker.io/library/redis:8.2, *verified
+        # 2026-11-28* against the registry). Keep ci.yml, coder.yml and compose.yaml in step.
+        image: redis:8.2@sha256:bb302517211721bf85ae3152b663c848a7cb36e79b02d69239ce20b5ddce95be
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping" --health-interval 2s --health-retries 30
     env:
       ADAM_TEST_POSTGRES_URL: postgres://postgres:postgres@localhost:5432/adam_test
       ADAM_TEST_MONGODB_URI: mongodb://localhost:27017
+      ADAM_TEST_REDIS_URL: redis://localhost:6379
       # A database suite that would skip (variable unset) fails instead: see
       # adam_core::testing. Without this, a typo here turns the suites green.
       ADAM_TEST_REQUIRE_DB: "1"
@@ -418,9 +426,17 @@ jobs:
       mongodb:
         image: mongo:8.0
         ports: ["27017:27017"]
+      redis:
+        # Redis 8.2, by tag and digest (the OCI index of docker.io/library/redis:8.2, *verified
+        # 2026-11-28* against the registry). Keep ci.yml, coder.yml and compose.yaml in step.
+        image: redis:8.2@sha256:bb302517211721bf85ae3152b663c848a7cb36e79b02d69239ce20b5ddce95be
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping" --health-interval 2s --health-retries 30
     env:
       ADAM_TEST_POSTGRES_URL: postgres://postgres:postgres@localhost:5432/adam_test
       ADAM_TEST_MONGODB_URI: mongodb://localhost:27017
+      ADAM_TEST_REDIS_URL: redis://localhost:6379
       ADAM_TEST_REQUIRE_DB: "1"
     steps:
       - uses: actions/checkout@v7
