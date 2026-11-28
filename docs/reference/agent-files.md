@@ -869,14 +869,16 @@ sees the parent's history. The sequence and the states of the wait are in
 
 ### The session tools
 
-A root with a subagent, local or remote, also gets five tools that run a subagent **in the background** as a session
-(`subagent_start`, `subagent_send`, `subagent_read`, `subagent_close`, `subagent_list`; [ADR 0045](../decisions/0045-a-subagent-can-run-in-the-background-as-a-session.md),
+A root with a subagent, local or remote, also gets six tools that run a subagent **in the background** as a session
+(`subagent_start`, `subagent_send`, `subagent_read`, `subagent_edit`, `subagent_close`, `subagent_list`; [ADR 0045](../decisions/0045-a-subagent-can-run-in-the-background-as-a-session.md),
 [child runs](child-runs.md#sessions-adr-0045-slices-1-to-4)). No file declares them: they follow the folder's subagents,
 whose names are the enum of `agent`, and they are not given to a subagent. A subagent file needs nothing for them, and a remote
-(`a2a:`) subagent works too ([remote sessions](#remote-sessions)). A tool or a subagent named like one of the five is refused at
-bind. A root whose subagents are all remote gets the five tools as well. A subagent's `session:` sets the `mode` and
+(`a2a:`) subagent works too ([remote sessions](#remote-sessions)). A tool or a subagent named like one of the six is refused at
+bind. A root whose subagents are all remote gets the six tools as well. A subagent's `session:` sets the `mode` and
 `wait` of a start that names none, and the widest `mode` a start may name ([above](#agent-and-subagent-files-instructionsmd-subagentsmd-agentmd)).
-The subagent's own tool always starts `one_shot` and waits, the narrowest, so the block never refuses it.
+The subagent's own tool always starts `one_shot` and waits, the narrowest, so the block never refuses it. `subagent_edit` changes a
+session's `config` — a patch, where `null` returns a member to the folder's — within the same bounds a start has ([ADR 0054](../decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md), decision 11),
+and never its `mode`: an edit that names one is refused, and the session keeps the mode it was started with ([ADR 0089](../decisions/0089-every-child-is-a-session-and-the-one-shot-subagent-tool-goes.md), amended 2026-11-28).
 
 **The same helpers are offered to a person.** `adam-agent` and `adam-coder` list `child-sessions/v1` on the card of a root with a subagent, so a client can open, talk to and close a session on any of them ([A2A server](a2a-server.md#child-sessions-child-sessionsv1)). The card's `maxOpen` is the effective `SESSION_MAX_OPEN`: `limits.max_open_sessions` of the root's file lowers it, never raises it. A root with no subagent lists nothing.
 

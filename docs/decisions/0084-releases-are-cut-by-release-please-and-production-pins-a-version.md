@@ -131,3 +131,17 @@ A release is now also a binary. The decisions:
 6. `aapctl` (another-agentic-platform) takes the same shape in its own repository; it is not decided here.
 
 Unverified until a release: every runner step (see the agent page).
+
+## Amended 2026-11-28: `ci.yml`'s group is per commit on a push (ANR-1360)
+
+In the amendment of 2026-11-27 (ANR-1195), item 4's statement that `ci.yml`'s "group is unchanged" no longer holds.
+`ci.yml` grouped every push to `main` under one ref, and GitHub replaces a *pending* run in a group with a newer one
+**even with `cancel-in-progress: false`**, so on a busy `main` a merge's checks were cancelled before they started
+(`d3281289`, `dfc99a8e`, `5178c56c`, `78733509`, and on 2026-11-28 `2fe3b131` and `ecfa5361`).
+
+The group is now the pushed head sha on a push and the ref on a pull request, so a push no longer replaces a
+pending one, while a pull request still cancels the run its next head supersedes. The `coverage` job, whose steps
+open and close one issue on `main`, runs one at a time under its own `ci-coverage` group, with `queue: max` so the
+waiting runs are kept rather than replaced and each commit's run still reaches a verdict. The gate (decision 4(a),
+as amended by item 2 of ANR-1195) does not read `ci.yml` and is unchanged, and `coder.yml`'s group is unchanged:
+only its release commits and manual dispatches are per-sha.

@@ -1150,6 +1150,8 @@ fn narrowed_session(tools: &[&str]) -> adam_runtime::SessionHeader {
         visible: false,
         config: Some(config),
         spent: 0,
+        editing: false,
+        edits: Vec::new(),
     }
 }
 

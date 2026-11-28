@@ -1,7 +1,7 @@
 //! The bounds of a session on one of a root's subagents ([ADR 0054], slice 1 part 2): what the
 //! subagent's folder declares, what the deployment allows, and the one-way rule between them. The
 //! bounds are computed once, at startup, from the same files and settings the agents are built
-//! from, and handed to the five session tools, where `SessionBounds::admit` holds every
+//! from, and handed to the six session tools, where `SessionBounds::admit` holds every
 //! `subagent_start` request to them.
 //!
 //! [ADR 0054]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md

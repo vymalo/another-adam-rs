@@ -24,8 +24,9 @@ use a2a::{
 use adam_llm_agent::{MESSAGE_KIND, ToolError};
 use adam_runtime::{
     Agent, AgentError, AgentStarter, Ctx, Inbound, RuntimeError, SESSION_CLOSE_KIND,
-    SESSION_CLOSE_ROUND_KEY, SESSION_STATE_KEY, SessionHeader, SessionState, Transition,
-    child_run_id, closing_round_payload,
+    SESSION_CLOSE_ROUND_KEY, SESSION_EDIT_KIND, SESSION_EDIT_ROUND_KEY, SESSION_STATE_KEY,
+    SessionEditRequest, SessionHeader, SessionState, Transition, child_run_id,
+    closing_round_payload,
 };
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -107,6 +108,13 @@ pub struct RoundState {
     /// What the next send says: the round's message and the messages that waited.
     #[serde(default)]
     queued: Vec<Queued>,
+    /// This round only **edits** its session ([ADR 0054], decision 11): it calls no remote task
+    /// and has no report, and ends at once with the header it was started with. Absent when
+    /// `false`.
+    ///
+    /// [ADR 0054]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    editing: bool,
     /// Set on a **timer run**, never on a round: when the session this round ended may have
     /// expired, a run parked until then ends the remote task of a session nobody reads again.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -241,12 +249,31 @@ impl RoundState {
         }
     }
 
-    /// Take what the inbox holds: a close request, and the messages not read before.
+    /// Take what the inbox holds: a close request, an edit of the session, and the messages not
+    /// read before.
     fn absorb_inbox(&mut self, inbox: Vec<Inbound>) {
         for inbound in inbox {
             if inbound.kind == SESSION_CLOSE_KIND {
                 if let Some(header) = &mut self.session {
                     header.closed = true;
+                }
+            } else if inbound.kind == SESSION_EDIT_KIND {
+                // An edit is applied to the header here, so a remote round does not lose it: its
+                // options are the next-round ones (`timeLimit`, `maxRounds`), which this round does
+                // not read, so the header is all it needs (ADR 0054, decision 11).
+                if self.read_ids.contains(&inbound.id) {
+                    continue;
+                }
+                let Some(request) = SessionEditRequest::from_payload(&inbound.payload) else {
+                    tracing::warn!(inbound = %inbound.id, "ignoring an unreadable session edit");
+                    continue;
+                };
+                self.read_ids.push(inbound.id.clone());
+                if self.read_ids.len() > MAX_READ_IDS {
+                    self.read_ids.remove(0);
+                }
+                if let Some(header) = &mut self.session {
+                    header.apply_edit(&request);
                 }
             } else if inbound.kind == MESSAGE_KIND && !self.read_ids.contains(&inbound.id) {
                 let text = text_of(&inbound.payload).unwrap_or_default();
@@ -673,6 +700,7 @@ impl RemoteRoundAgent {
         header.round = view.round + 1;
         header.closed = true;
         header.closing = true;
+        header.editing = false;
         let input = Inbound::new(MESSAGE_KIND, closing_round_payload(&header));
         match starter
             .start_round(
@@ -698,6 +726,16 @@ impl RemoteRoundAgent {
     ) -> Result<Transition<RoundState>, AgentError> {
         if st.reap.is_some() {
             return Self::reap(ctx, st, &self.name).await;
+        }
+        // A round that only edits its session calls no remote task and has no report: the header
+        // it was started with already carries the edit ([ADR 0054], decision 11).
+        //
+        // [ADR 0054]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md
+        if st.editing {
+            return Ok(Transition::Done {
+                state: st,
+                output: json!({ "text": "", "artifacts": [], "edited": true }),
+            });
         }
         ctx.reopen_on_arrival();
         let started = *st.started.get_or_insert_with(|| ctx.now());
@@ -901,15 +939,23 @@ fn start_round(input: &Inbound) -> Result<RoundState, AgentError> {
         .get(SESSION_CLOSE_ROUND_KEY)
         .and_then(Value::as_bool)
         .unwrap_or(false);
+    let edits = payload
+        .get(SESSION_EDIT_ROUND_KEY)
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     if closes && let Some(header) = &mut header {
         header.closing = true;
+    }
+    if edits && let Some(header) = &mut header {
+        header.editing = true;
     }
     let mut state = RoundState {
         session: header,
         queues_messages: true,
+        editing: edits,
         ..RoundState::default()
     };
-    if !closes {
+    if !closes && !edits {
         match text_of(payload).filter(|text| !text.trim().is_empty()) {
             Some(text) => state.queued.push(Queued {
                 id: String::new(),
@@ -1131,6 +1177,8 @@ mod tests {
             visible: false,
             config: None,
             spent: 0,
+            editing: false,
+            edits: Vec::new(),
         });
         assert_eq!(state.next(), Action::Close, "a closing round calls nothing");
         // But it cancels what the round before left working first.
@@ -1412,6 +1460,8 @@ mod tests {
             visible: false,
             config: None,
             spent: 0,
+            editing: false,
+            edits: Vec::new(),
         };
         let close = Inbound::new(
             SESSION_CLOSE_KIND,
@@ -1470,6 +1520,8 @@ mod tests {
             visible: false,
             config: None,
             spent: 0,
+            editing: false,
+            edits: Vec::new(),
         };
         let close = Inbound::new(
             SESSION_CLOSE_KIND,
@@ -1513,6 +1565,8 @@ mod tests {
             visible: false,
             config: None,
             spent: 0,
+            editing: false,
+            edits: Vec::new(),
         };
         let close = Inbound::new(
             SESSION_CLOSE_KIND,

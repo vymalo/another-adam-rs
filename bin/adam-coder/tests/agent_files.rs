@@ -132,7 +132,7 @@ fn the_prompt_names_no_opencode_and_stays_under_30000_chars() {
 
 /// The tools in the order the model is offered them: the coder's own, the screen's, and one per
 /// subagent of the shipped folder.
-const TOOLS: [&str; 44] = [
+const TOOLS: [&str; 45] = [
     "prepare_workspace",
     "start_scratch",
     "publish_scratch",
@@ -174,10 +174,11 @@ const TOOLS: [&str; 44] = [
     "read_skill_file",
     "explorer",
     "reviewer",
-    // The five that run a subagent in the background (ADR 0045), after the one tool per subagent.
+    // The six that run a subagent in the background (ADR 0045), after the one tool per subagent.
     "subagent_start",
     "subagent_send",
     "subagent_read",
+    "subagent_edit",
     "subagent_close",
     "subagent_list",
 ];
@@ -192,7 +193,11 @@ async fn every_tool_of_the_coder_has_a_title_for_its_step() {
     })
     .await;
     let tools = coder_tools(&fx.env);
-    assert_eq!(tools.len(), TOOLS.len() - 9, "the coder's and the screen's");
+    assert_eq!(
+        tools.len(),
+        TOOLS.len() - 10,
+        "the coder's and the screen's"
+    );
     let mut titles = Vec::new();
     for tool in tools.iter() {
         let name = tool.spec().name;
@@ -922,11 +927,12 @@ async fn a_folder_may_narrow_the_tools() {
             "subagent_start",
             "subagent_send",
             "subagent_read",
+            "subagent_edit",
             "subagent_close",
             "subagent_list"
         ],
         "the tools of the folder's `tools:`, the two skill tools (`tools:` does not filter them), \
-         then one per subagent, then the five that run one in the background"
+         then one per subagent, then the six that run one in the background"
     );
 }
 
@@ -1058,9 +1064,9 @@ async fn a_subagent_of_the_folder_is_registered_and_runs_as_a_child() {
         ]
     );
     assert_eq!(agent.subagents().len(), 3);
-    // The subagents' tools, in the order of the files, and the five session tools after them.
+    // The subagents' tools, in the order of the files, and the six session tools after them.
     let tools = &info[0].tools;
-    assert_eq!(tools[tools.len() - 6], "summariser");
+    assert_eq!(tools[tools.len() - 7], "summariser");
     assert_eq!(tools.last().map(String::as_str), Some("subagent_list"));
 
     let coder = Coder::new(Arc::new(MemoryStore::new()), agent, &options());
@@ -1303,8 +1309,8 @@ async fn a_folder_with_an_mcp_json_gives_the_coder_the_tools_of_its_servers() {
     )
     .expect("the folder assembles with its MCP tools");
     let tools = &agent.assembly().info()[0].tools;
-    // The coder's own tools, the server's, then one per subagent and the five session tools.
-    let own = TOOLS.len() - 9;
+    // The coder's own tools, the server's, then one per subagent and the six session tools.
+    let own = TOOLS.len() - 10;
     assert_eq!(tools.len(), TOOLS.len() + 1, "{tools:?}");
     assert_eq!(&tools[..own], &TOOLS[..own]);
     assert_eq!(tools[own], "test__echo");

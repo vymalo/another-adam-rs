@@ -193,19 +193,16 @@ impl SessionNarrowing {
     }
 }
 
-/// What the run's session holds back of its tools: read from the **header** the state carries,
-/// which is the truth, and from the context's copy of the same lists. `own` are the names of the
-/// agent's own tools, loaders included ([`SessionNarrowing::of`]).
+/// What the run's session holds back of its tools: read from the config the round runs with
+/// ([`Conversation::config`], the header's unless an edit changed it mid-round, ADR 0054 decision
+/// 11) and from the context's copy of the same lists. `own` are the names of the agent's own tools,
+/// loaders included ([`SessionNarrowing::of`]).
 pub(crate) fn narrowing_of(
     state: &Conversation,
     context: Option<&Map<String, Value>>,
     own: &[&str],
 ) -> SessionNarrowing {
-    SessionNarrowing::of(
-        state.session.as_ref().and_then(|h| h.config.as_ref()),
-        context,
-        own,
-    )
+    SessionNarrowing::of(state.config(), context, own)
 }
 
 /// What a withheld tool's call answers: a result for the model, not for the person.
@@ -480,6 +477,8 @@ mod tests {
                 visible: false,
                 config: Some(config(Some(&["read_file"]), None)),
                 spent: 0,
+                editing: false,
+                edits: Vec::new(),
             }),
             ..Conversation::default()
         };

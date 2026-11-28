@@ -6,6 +6,7 @@ The session tools (an argument marked `?` is optional):
 - `subagent_start` (`agent`, `description`, `prompt`, `mode?`, `wait?`, `config?`): start a session on a helper and get its session id at once, or its first report with `wait`. `mode` says who may send it more after its first round: nobody (`one_shot`), only you (`sealed`), or you and the person (`open`). Give it a `config` to narrow its limits.
 - `subagent_send` (`session`, `message`): send a message to a session. It starts the next round of an idle session, and is steered into a round that works. A closed session takes none.
 - `subagent_read` (`session`, `wait?`, `offset?`, `limit?`): read the report of a session's latest round, paged by lines. Pass `wait` to wait for a working round to end; never poll.
+- `subagent_edit` (`session`, `config`): change a session's options while it runs or between rounds, within the same bounds a start has. A member set to null returns it to the helper's own. It starts no work: send a message to make the session work with the new options.
 - `subagent_close` (`session`, `cancel?`, `delete?`): close a session for good: it takes no more messages. A working round finishes unless you pass `cancel`, and `delete` removes an idle session from every listing.
 - `subagent_list` (`offset?`, `limit?`): list the sessions of this conversation and their state, the open ones first, paged by sessions.
 

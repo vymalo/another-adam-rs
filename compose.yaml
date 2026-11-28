@@ -2,7 +2,7 @@
 # a local git remote, and (profile `app`) the coder and a general agent wired to all of them.
 # Everything binds to 127.0.0.1 only; every credential in here is a dummy.
 #
-#   docker compose up -d --wait          # postgres, mongodb and the mocks
+#   docker compose up -d --wait          # postgres, mongodb, redis and the mocks
 #   docker compose --profile app up -d --build --wait   # ... and the coder and the agent
 #   docker compose down -v               # stop and forget all state
 #
@@ -51,6 +51,22 @@ services:
       - mongodb-data:/data/db
     healthcheck:
       test: ["CMD", "mongosh", "--quiet", "--eval", "db.runCommand({ ping: 1 })"]
+      interval: 2s
+      retries: 30
+
+  redis:
+    # Redis 8.2, by tag and digest (the OCI index of docker.io/library/redis:8.2, *verified
+    # 2026-11-28* against the registry). The L2 memory adapter's suite (adam-memory-redis) runs
+    # against it. The command turns AOF on and eviction off: the durability settings a lesson
+    # store needs (the adapter documents them; it cannot enforce them on a server it does not
+    # own). An eviction policy would silently drop lessons instead of refusing a write.
+    image: redis:8.2@sha256:bb302517211721bf85ae3152b663c848a7cb36e79b02d69239ce20b5ddce95be
+    command: ["redis-server", "--appendonly", "yes", "--maxmemory-policy", "noeviction"]
+    ports: ["127.0.0.1:${REDIS_PORT:-6379}:6379"]
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
       interval: 2s
       retries: 30
 
@@ -305,5 +321,6 @@ services:
 volumes:
   postgres-18-data:
   mongodb-data:
+  redis-data:
   git-data:
   coder-work:

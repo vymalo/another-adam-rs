@@ -27,14 +27,16 @@ use common::Fixture;
 // The old pin (30814, measured 2026-11-21 on the merged head b16c076a) plus 1766 bytes: "\n\n" and
 // the 1696 bytes of `SessionTools::guide_for(["explorer", "reviewer"])` (ADR 0054 decision 9), plus
 // the 68 bytes the `delete` argument of `subagent_close` added to that section (slice 5), plus the
-// 11 bytes `command | commands` added to `run_checks`'s line (ANR-243). The deltas are computed,
-// not measured: re-pin this from the `system N B` line this test prints on the first green CI run.
-const BASELINE_PROMPT_BYTES: usize = 32591;
-// The tools: re-measured 2026-11-28 on the merge of main into ADR 0087-0091's branch: main's 64752
-// (the `commands` argument of run_checks, ANR-243) plus the `output` argument `run_command`, `run`
-// and `run_checks` took (ADR 0090, slice T1) and `subagent_start`'s `mode` and `wait` (ADR 0089,
-// slice C2).
-const BASELINE_TOOLS_BYTES: usize = 66497;
+// 11 bytes `command | commands` added to `run_checks`'s line (ANR-243), plus the 271 bytes
+// `subagent_edit`'s line adds to it (ANR-216, slice 4). The deltas are computed, not measured:
+// re-pin this from the `system N B` line this test prints on the first green CI run.
+const BASELINE_PROMPT_BYTES: usize = 32862; // 32591 + the 271 bytes `subagent_edit`'s line adds to the guide
+// The tools: re-measured 2026-11-28 on the second merge of main into ADR 0087-0091's branch: the
+// first merge's 66497 (main's 64752 with the `commands` argument of run_checks, ANR-243, plus the
+// `output` argument `run_command`, `run` and `run_checks` took, ADR 0090 slice T1, and
+// `subagent_start`'s `mode` and `wait`, ADR 0089 slice C2) plus the 2231 bytes of `subagent_edit`'s
+// spec as the coder serves it (ANR-216).
+const BASELINE_TOOLS_BYTES: usize = 68728;
 const GROWTH_ALLOWED: usize = 1024;
 /// The owner's budget for the coder's tools once S3 makes it lean (ADR 0066).
 const TOOLS_BUDGET_TOKENS: usize = 3000;

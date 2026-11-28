@@ -1,0 +1,24 @@
+[package]
+name = "adam-memory-redis"
+description = "Redis adapter for the L2 memory of adam-rs durable agents"
+readme = "README.md"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+adam-core.workspace = true
+adam-memory.workspace = true
+serde_json.workspace = true
+redis.workspace = true
+
+[dev-dependencies]
+# `tests/redis.rs` asserts the class of a backend failure, so it needs the trait.
+adam-error.workspace = true
+adam-core.workspace = true
+adam-memory-testkit.workspace = true
+
+[lints]
+workspace = true

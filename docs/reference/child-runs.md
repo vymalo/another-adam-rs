@@ -249,8 +249,8 @@ reading it sleeps until its timer.
 ## Sessions (ADR 0045, slices 1 to 4)
 
 [ADR 0045](../decisions/0045-a-subagent-can-run-in-the-background-as-a-session.md) lets a subagent run in the
-background as a session that is sent more messages. The runtime half (slice 1) is in `crates/adam-runtime`; the five tools
-(slice 2) are in `crates/adam-llm-agent` (`sessions.rs`) and are given to a root with subagents by `adam-assembly`, which also ends that root's instructions with a short *Child sessions* section that tells the model what each tool does ([ADR 0054](../decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md) decision 9). A person can start the same sessions over A2A (`child-sessions/v1`, slice 6): the rounds are runs of the same helper agents, started by the front of a `control-plane` process through start-only registrations (`AgentDef::session_starters`) and stepped by a worker; see [the A2A server](a2a-server.md#child-sessions-child-sessionsv1).
+background as a session that is sent more messages. The runtime half (slice 1) is in `crates/adam-runtime`; the six tools
+(slice 2, and slice 4's `subagent_edit`) are in `crates/adam-llm-agent` (`sessions.rs`) and are given to a root with subagents by `adam-assembly`, which also ends that root's instructions with a short *Child sessions* section that tells the model what each tool does ([ADR 0054](../decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md) decision 9). A person can start the same sessions over A2A (`child-sessions/v1`, slice 6): the rounds are runs of the same helper agents, started by the front of a `control-plane` process through start-only registrations (`AgentDef::session_starters`) and stepped by a worker; see [the A2A server](a2a-server.md#child-sessions-child-sessionsv1).
 
 **What the runtime has.**
 
@@ -265,7 +265,7 @@ background as a session that is sent more messages. The runtime half (slice 1) i
   | `mode` | After the first round | Who sends the next one | A person's message or steer |
   |---|---|---|---|
   | `one_shot` (default) | the session closes | nobody | refused, unless the person started the session |
-  | `sealed` | it stays idle | the parent only | refused, naming the mode |
+  | `sealed` | it stays idle | the parent only | refused, naming the mode (an `edit` too) |
   | `open` | it stays idle | the parent and the person | taken |
 
   `keep_open` is read for one release (`true` is `open`, `false` `one_shot`; with a `mode` that disagrees, an error result naming
@@ -301,7 +301,7 @@ background as a session that is sent more messages. The runtime half (slice 1) i
 **What the tools do.** `subagent_start` creates round 1 and returns at once (with `wait: true`, parks until the first report). `subagent_send` steers a working round
 (`Runtime::deliver`, the message id is the call id, so a repeat is read once) or starts the next round from the latest one.
 `subagent_read` reads the latest round: working, or its report as a numbered page; with `wait: true` and a working round it
-returns `ToolError::AwaitSession` and the parent parks on a `PendingWait::Session`. `subagent_close` asks a working round to be
+returns `ToolError::AwaitSession` and the parent parks on a `PendingWait::Session`. `subagent_edit` changes the session's options within the bounds of that moment (below). `subagent_close` asks a working round to be
 the last (`SESSION_CLOSE_KIND` in its inbox: it finishes, then the session takes no more) or, with `cancel`, cancels it; an idle
 session is closed by a round that calls no model (`header.closing`) and ends with the last answer again. `delete: true`
 closes it with a **tombstone** (`header.deleted`): a deleted session is never listed again and every tool refuses it as `no
@@ -332,6 +332,25 @@ the **closing turn**, and the round ends with `limit: "token_budget"` — or, wh
 session object's listing read it from the round's record, and a **send to a spent session is refused** (`subagent_send` in
 words, the A2A front as `UnsupportedOperation`) from the header the send already reads: no round starts and no model is
 called. A session with no budget spends and is never refused.
+
+**Editing a session** (slice 4). `subagent_edit { session, config }` changes a session's options, a working one included, and
+takes no message: a message is `subagent_send`'s. Its `config` is a **patch**: a member set to `null` returns that option to the
+folder's, and a member left out is not touched. The bounds are the ones of the moment of the edit (a deployment that lowered a
+limit since is obeyed) and the editor's own grant; a patch that would go past one is refused in words, as a start is, and the
+session is left as it was. The whole admitted config travels, so the round that reads it never merges or admits again.
+
+* **A working round** receives `adam.session.edit` in its inbox (not counted as unread input: it does not reopen a round that is
+  finishing) and reads it at its next step. The options that apply at the next model call take effect there; the others
+  (`time_limit`, `max_rounds`, `report_schema`, and `instructions` when it is settable) are pending in the header and apply from
+  the next round. A round that ends before reading it leaves it in its inbox, where a reader of the session applies it, so an
+  edit is never lost.
+* **An idle session** gets a round that calls no model and has no report (`header.editing`), as a close of an idle session does:
+  it counts toward `max_rounds`, and a read still gives the last round that worked.
+* **The history**: the header keeps the last 16 edits (`edits`: the round, who — `agent` or `person` — and the members changed),
+  and every later round carries it. A person edits with `metadata[URI].edit {config}` on a message to the child context; the
+  round event's session object then reports the new `config` and the `edits`.
+* Changing `tools`, `max_output_tokens` or a later slice's `reasoning_effort` mid-round changes the request's prefix once, so the
+  prompt cache of that session misses once (ADR 0044).
 
 `config` also takes `tools` and `deny_tools` (ADR 0054, slice 3): lists of tool names, in the folder's own syntax (an exact name or
 a `*` pattern; `github__*` selects an MCP server). The session is offered only the tools `tools` matches, less the ones `deny_tools`
@@ -396,6 +415,8 @@ stateDiagram-v2
     Working --> Closed: the round ended after a close request, or was cancelled after one
     Working --> Working: the closing round of an idle session runs (header closing, no model, no report)
     Idle --> Working: subagent_send starts the next round
+    Working --> Working: subagent_edit is delivered to the open round (adam.session.edit, no new round)
+    Idle --> Idle: subagent_edit starts a round that calls no model (header editing, no report)
     Idle --> Closed: subagent_close starts a round that calls no model
     Idle --> Closed: idle for idle_ttl (read, not written)
     Working --> Deleted: subagent_close with delete (it cancels the round first)
@@ -484,7 +505,7 @@ answer has streamed, not before the call.
 | S5 | `subagent_read` waits and the round ends | One resume, with the report as the call's result; three reads that do not wait and say "working" are refused on the third |
 | S6 | The model answers while a session works | The run waits for it and calls the model again with the report |
 | S7 | The parent is cancelled while a session works | The round is failed by the cascade; a kept-open session is idle and a later task of the conversation reads it and sends it a round that continues it |
-| S8 | A message reaches a working round, or a close request does | The message is read as a steer (the round's next request ends with it); the request makes the round the last and costs no model turn |
+| S8 | A message reaches a working round, a close request does, or an edit does | The message is read as a steer (the round's next request ends with it); the request makes the round the last and costs no model turn; the edit is read at the next step, its *next model call* options change that call and its others wait for the next round |
 | S9 | An id that is unknown, malformed or another conversation's | An error result in words that say what to do; nothing is started |
 | S10 | A session on a remote subagent | A round of the agent registered under the subagent's name, which talks to the remote ([below](#remote-sessions)) |
 | S11 | A round ends while the parent does other work, and a closing round may follow it | The next model call lists the sessions and is given the round's report as a `subagent_read` call and result, with no read by the model; the request starts with the one before; a closing round does not hide it |
@@ -493,12 +514,13 @@ answer has streamed, not before the call.
 | S14 | A person's round ended | It is reported at the next listing, in this task while a session is open or at the first call of a task that continues this one, once (a task that does not continue another is not told of a round that ended before it began); the header says "started by the person" and the person's words are not in it |
 | S15 | The model read the report itself, or the run has no session | A report the model read is not appended again; a run that never opens a session lists once, at its first call |
 | S16 | A journal from before slice 3, or one with reports, is replayed, with a message that arrived since | The same history, no model asked, no child run, no disagreement; the rounds are counted once even when the answer is dropped as stale |
-| S17 | A session has sat idle for `idle_ttl` | It reads closed, frees its place, refuses a send in words; a working round never expires; its unreported report is told once |
+| S17 | A session has sat idle for `idle_ttl`, or an edit goes past a bound, or an edit reaches an idle session | It reads closed, frees its place, refuses a send in words; a working round never expires; its unreported report is told once. An edit past a bound is refused in words and changes nothing; an edit of an idle session is a round that calls no model, has no report and counts toward `max_rounds` |
 | S18 | A round asks the person, and one that may not asks anyway | A shown kept-open round parks `input-required` and the parent's read says `blocked`; an answer in the child context resumes it; a child that may not ask is told `NOT_ASKABLE` and goes on |
 | S19 | A subagent's own tool is called (ADR 0089, slice C1) | The child is a **one-shot session**: round 1 under the call's derived id, closed from its start. It has a session's conversation id, is listed working and then closed, refuses a send from the parent and a message or a steer from a person, and its answer is the call's result once, never a report; a child a journal started before C1 (no conversation) is found by the call |
 | S20 | `subagent_start` names a `mode` (ADR 0089, slice C2) | `one_shot` closes after its round and refuses a send; `sealed` and `open` stay idle and take the parent's next round. A person's message to an agent's `sealed` or `one_shot` session, and a steer of its round, are `UnsupportedOperation` naming the mode; a close passes. Only an `open` round may ask the person. `keep_open` maps onto `mode`, and a disagreement is an error result naming both |
 | S21 | `subagent_start` with `wait: true` | The call parks on round 1 and its result is the first report, with the session id; the report is not told again; observers see `session.started` at the park and `session.round.ended` at the settle |
 | S22 | The subagent's file has `session:` (ADR 0089, slice C3) | A start that names no `mode` gets the file's, and one that names no `wait` the file's; a narrower `mode` (or `keep_open: false`) starts; a wider one (or `keep_open: true`) is an error result naming the mode asked, the ceiling and the subagent, and starts nothing; `wait: false` beats a filed `wait: true`. Only that subagent's roster line in `subagent_start` changes |
+| S23 | `subagent_edit` names a `mode` (or `keep_open`), or a person edits an agent's `sealed` session (ADR 0089, amended 2026-11-28) | An error result: past the file's ceiling in `subagent_start`'s words, else what the call wrote, then the mode the session keeps; nothing changes. The person's `edit` is `UnsupportedOperation` naming the mode, as their message is |
 
 **Tokens.** Each round a run started or sent to is counted once in the run's `usage_totals`: a journaled step `usage:<call id>` reads it when a report is given to the model and, at the latest, when the run ends (`sessions_end`), whether or not the report was read; a store error on the read is retried. **Known limit:** the checks scan every round of the conversation, and past 5,000 rounds of one subagent a start **and a send** are refused.
 
@@ -610,7 +632,7 @@ variables are set.
 
 ## Remote sessions
 
-A session on a remote (`a2a:`) subagent works like any other session: the same five tools, listing, notices, closing
+A session on a remote (`a2a:`) subagent works like any other session: the same six tools, listing, notices, closing
 round and turn-end wait. Its rounds are runs of `RemoteRoundAgent` (`crates/adam-assembly/src/remote_session.rs`),
 registered as `<root>/<subagent>` by `Assembly::register`. The round has no model: it sends the message, looks at the
 task and reports. It shares the connection of the subagent's tool (`RemoteEndpoint` in `remote.rs`: card, token,
@@ -725,7 +747,7 @@ message id, which a deduplicating remote answers with the task it made, and canc
 makes a task and then cancels it.) A closing round cancels what the round before left before it closes. Messages a failed or
 cancelled round never sent go first in the next round. The cancel is not durable: it is sent once by the process that commits the cancel, and a process that registered
 only the starter sends nothing (the next round recovers it). A reload of `LiveAssembly` does not replace the round agents:
-a changed remote needs a restart. A parent that has a remote subagent and no local one now has the five session tools.
+a changed remote needs a restart. A parent that has a remote subagent and no local one now has the six session tools.
 
 ## Remote tasks: the same wait without a message
 

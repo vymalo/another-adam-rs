@@ -1513,6 +1513,7 @@ async fn a_local_subagent_of_the_folder_runs_as_a_child_run() {
             "subagent_start",
             "subagent_send",
             "subagent_read",
+            "subagent_edit",
             "subagent_close",
             "subagent_list"
         ]

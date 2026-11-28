@@ -163,3 +163,25 @@ Proof: `crates/adam-agent-fs/tests/rules.rs` (`session_on_a_subagent_is_read_loc
 (`the_definition_carries_each_subagents_session_block`,
 `a_start_gets_the_filed_mode_says_it_in_the_roster_and_may_not_widen_it`) and the unit
 `a_start_may_narrow_the_filed_mode_and_never_widen_it` of `crates/adam-llm-agent/src/sessions.rs`.
+
+*Amended 2026-11-28, `subagent_edit` meets `mode`:* main brought `subagent_edit` ([ADR 0054](0054-a-child-session-can-be-configured-within-what-its-folder-allows.md)
+decision 11, #546), so the C3 note above that it did not exist no longer holds. It changes a session's **config** within its
+bounds, and **never its mode**: its patch (`SessionPatch`) has no member for who may write or whether the session stays
+open, so it can neither widen a session past its file's `session.mode` nor narrow it. A session keeps the mode it was
+started with, which `subagent_start` held to the ceiling, and that is the only place the ceiling is applied.
+
+* **A call that names a mode is refused**, beside `config` or in it (`mode`, or the `keep_open` read for one release),
+  and changes nothing: no round, no entry in `edits`. The error result is `subagent_start`'s sentence for a mode past the
+  ceiling when the mode asked is wider than the file's (`` `mode` is open; at most sealed for helper, as its file's
+  `session.mode` says: one of one_shot, sealed ``), else what the call wrote (`` `mode` is one_shot ``), followed by the
+  mode the session keeps and how to get another (close it and start one).
+* **A person's `edit` of a session they may not write to is refused**, as their message and steer are (C2): an edit starts a
+  round or steers one, which is writing to it. `child-sessions/v1` answers `UnsupportedOperation` in the same words
+  (`session <id> is sealed: only the agent that started it writes to it`), before the edit's bounds are read.
+* The header written by an edit carries `mode` (and the `keep_open` it means, for one release) like any other round's;
+  `HeaderWire` also carries main's `editing` and `edits`. A session with no header, which an edit can find, is `open`,
+  as a listing reads it.
+
+Proof: `crates/adam-llm-agent/tests/sessions.rs` (`an_edit_changes_no_mode_and_names_the_ceiling`) and
+`crates/adam-a2a-runtime/tests/child_sessions.rs` (`a_sealed_or_one_shot_session_of_the_agent_refuses_the_persons_message_and_steer`,
+which now sends an edit too).

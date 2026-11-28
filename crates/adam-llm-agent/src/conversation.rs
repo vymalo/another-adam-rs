@@ -106,6 +106,18 @@ pub(crate) fn asks_to_close(payload: &Value) -> bool {
         .unwrap_or(false)
 }
 
+/// Whether a round's first message asks for a round that only **edits** its session ([ADR 0054],
+/// decision 11): it calls no model and has no report either, so it carries the header and no
+/// message.
+///
+/// [ADR 0054]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md
+pub(crate) fn asks_to_edit(payload: &Value) -> bool {
+    payload
+        .get(adam_runtime::SESSION_EDIT_ROUND_KEY)
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
 /// The text of an inbound payload: `{"text": "..."}` or a bare JSON string.
 pub(crate) fn parse_user_text(payload: &Value) -> Result<String, String> {
     match payload {
@@ -913,6 +925,15 @@ pub struct Conversation {
     /// [ADR 0045]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0045-a-subagent-can-run-in-the-background-as-a-session.md
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session: Option<SessionHeader>,
+    /// The config **this round** runs with, when an edit changed it after the round started
+    /// ([ADR 0054], decision 11): the header's config with the edit's *next model call* options
+    /// applied and the *next round* ones still the round's own, which the header holds as pending.
+    /// `None` when the round read no edit, and what state written before it existed reads: the
+    /// round then runs with [`session`](Self::session)'s config.
+    ///
+    /// [ADR 0054]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub round_config: Option<adam_runtime::SessionConfig>,
     /// The call ids of the `subagent_start` and `subagent_send` calls of **this task** whose round's
     /// tokens are not yet in [`usage_totals`](Self::usage_totals) ([ADR 0045]): the round of a call
     /// is `child_run_id(run, call id)`, so a replay names the same ones. A round is counted once,
@@ -1374,6 +1395,17 @@ fn shorten_outputs(
 }
 
 impl Conversation {
+    /// The config this round runs with ([ADR 0054], decision 11): [`round_config`](Self::round_config)
+    /// when an edit changed it, else the header's. A run that is no round of a session has none.
+    ///
+    /// [ADR 0054]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md
+    #[must_use]
+    pub fn config(&self) -> Option<&adam_runtime::SessionConfig> {
+        self.round_config
+            .as_ref()
+            .or_else(|| self.session.as_ref().and_then(|h| h.config.as_ref()))
+    }
+
     /// A conversation that starts with one user message.
     pub fn new(text: impl Into<String>) -> Self {
         Self {

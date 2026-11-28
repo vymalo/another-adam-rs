@@ -1875,22 +1875,39 @@ pub(crate) enum Expected {
 /// ([`adam_llm_agent::MODEL_CONTEXT_KEY`]).
 const MODEL_KEY: &str = adam_llm_agent::MODEL_CONTEXT_KEY;
 
+/// The metadata key a [`Say::tier`] travels under, and the context key the agent reads
+/// ([`adam_llm_agent::ACCESS_TIER_CONTEXT_KEY`]).
+const ACCESS_TIER_KEY: &str = adam_llm_agent::ACCESS_TIER_CONTEXT_KEY;
+
 /// How the engine's backend reads a message: as [`default_inbound`] does, and the model the message
 /// names (its metadata under [`MODEL_KEY`]) goes into the run's context. Only this engine reads it
 /// there: a served agent's front does not, so a remote caller cannot pick a run's model.
 fn inbound(message: &Message) -> Result<adam_runtime::Inbound, String> {
     let mut inbound = default_inbound(message)?;
-    let alias = message
+    let mut context = serde_json::Map::new();
+    if let Some(alias) = message
         .metadata
         .as_ref()
         .and_then(|metadata| metadata.get(MODEL_KEY))
         .and_then(|entry| entry.get("model"))
-        .and_then(serde_json::Value::as_str);
-    if let (Some(alias), Some(payload)) = (alias, inbound.payload.as_object_mut()) {
-        payload.insert(
-            "context".to_owned(),
-            serde_json::json!({ MODEL_KEY: { "model": alias } }),
+        .and_then(serde_json::Value::as_str)
+    {
+        context.insert(MODEL_KEY.to_owned(), serde_json::json!({ "model": alias }));
+    }
+    if let Some(tier) = message
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.get(ACCESS_TIER_KEY))
+        .and_then(|entry| entry.get("tier"))
+        .and_then(serde_json::Value::as_str)
+    {
+        context.insert(
+            ACCESS_TIER_KEY.to_owned(),
+            serde_json::json!({ "tier": tier }),
         );
+    }
+    if let (false, Some(payload)) = (context.is_empty(), inbound.payload.as_object_mut()) {
+        payload.insert("context".to_owned(), serde_json::Value::Object(context));
     }
     Ok(inbound)
 }
@@ -1903,6 +1920,12 @@ fn message(say: &Say) -> Message {
     let mut metadata = std::collections::HashMap::new();
     if let Some(alias) = &say.model {
         metadata.insert(MODEL_KEY.to_owned(), serde_json::json!({ "model": alias }));
+    }
+    if let Some(tier) = say.tier {
+        metadata.insert(
+            ACCESS_TIER_KEY.to_owned(),
+            serde_json::json!({ "tier": tier.as_str() }),
+        );
     }
     if let Some(prompt) = &say.prompt_statement
         && let Ok(entry) = serde_json::to_value(prompt)
@@ -1923,6 +1946,39 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::*;
+
+    /// A `Say` that names an access tier carries it into the run's context under the key the agent
+    /// reads, beside the model a message may also name; a message that names none adds nothing.
+    #[test]
+    fn a_say_carries_its_access_tier_into_the_run() {
+        let say = Say::new("hello").with_tier(adam_a2a::AccessTier::Plan);
+        let sent = message(&say);
+        let metadata = sent.metadata.as_ref().expect("a tier is metadata");
+        assert_eq!(metadata[ACCESS_TIER_KEY], json!({ "tier": "plan" }));
+        let read = inbound(&sent).expect("an inbound");
+        assert_eq!(
+            read.payload["context"][ACCESS_TIER_KEY],
+            json!({ "tier": "plan" })
+        );
+
+        let both = Say::new("hello")
+            .with_model("small")
+            .with_tier(adam_a2a::AccessTier::Auto);
+        let read = inbound(&message(&both)).expect("an inbound");
+        assert_eq!(
+            read.payload["context"][MODEL_KEY],
+            json!({ "model": "small" })
+        );
+        assert_eq!(
+            read.payload["context"][ACCESS_TIER_KEY],
+            json!({ "tier": "auto" })
+        );
+
+        let plain = Say::new("hello");
+        assert!(message(&plain).metadata.is_none());
+        let read = inbound(&message(&plain)).expect("an inbound");
+        assert!(read.payload.get("context").is_none());
+    }
 
     /// The page token of `firings` reads back what it wrote: a timestamp to the nanosecond, a
     /// schedule name with `|` in it, and it refuses a token of another filter or a malformed one.

@@ -219,6 +219,8 @@ classDiagram
     SiMemory <|.. InProcessSiMemory
     class Memory { <<interface>> }
     Memory <|.. InProcessMemory
+    Memory <|.. RedisMemory
+    Memory <|.. MongoMemory
 ```
 
 | Port | Defined in | Real implementations | Doubles |
@@ -241,7 +243,7 @@ classDiagram
 | `Confine` | `adam-workspace` | `Rlimits`, `SystemdScope` (`adam-confine`, Unix); `best_effort()` picks | `NoConfine`; the suite `confine_conformance!` (`adam-confine-testkit`) is the reference |
 | `DeviceState` | `adam-device-state` | none yet: the host pushes its readings, and `adam_budget::Throttled` lowers the admission by them ([ADR 0065](decisions/0065-resource-governance-admission-pools-and-os-limits.md) decision 8) | `FakeDevice`, the reference of `device_state_conformance!` |
 | `SiMemory` (L1) | `adam-memory` | `FolderSiMemory`, the in-folder store and L1's only one ([ADR 0081](decisions/0081-an-agent-keeps-a-self-improvement-memory-near-it-and-what-holds-becomes-the-deployments-memory.md) decision 2) | `InProcessSiMemory` (reference); `ScopeBlindSiMemory` and `DoubleWritingSiMemory` (testkit, which the suite rejects) |
-| `Memory` (L2) | `adam-memory` | none yet (M2b: PostgreSQL, MongoDB, Redis) | `InProcessMemory` (reference); `ScopeBlindMemory` and `DoubleWritingMemory` (testkit, which the suite rejects) |
+| `Memory` (L2) | `adam-memory` | `RedisMemory` (`adam-memory-redis`) and `MongoMemory` (`adam-store-mongodb`, feature `memory`), both [ADR 0081](decisions/0081-an-agent-keeps-a-self-improvement-memory-near-it-and-what-holds-becomes-the-deployments-memory.md) M2b; PostgreSQL remains (ANR-1292) | `InProcessMemory` (reference); `ScopeBlindMemory` and `DoubleWritingMemory` (testkit, which the suite rejects) |
 | `RunSource` | `adam-export` | `RuntimeSource` (any `Store` through a `Runtime`) | the suite `source_conformance!` (`adam-export-testkit`); `RuntimeSource` over `MemoryStore` is the reference |
 | `RecordSink` | `adam-export` | `JsonLines` (any `std::io::Write`: a file, standard output) | the suite `sink_conformance!` (`adam-export-testkit`); `JsonLines` is the reference |
 | `PermissionPrompt` | `adam-acp` | none (the default policy needs no prompt) | `StaticPrompt` |
@@ -1461,7 +1463,7 @@ The failure interleavings, their tests and what the design refuses are in
 ### Child sessions
 
 A subagent can also run in the background as a **session** ([ADR 0045](decisions/0045-a-subagent-can-run-in-the-background-as-a-session.md)):
-a conversation of child runs ("rounds") in the parent's own conversation, started, read, sent to and closed by five tools
+a conversation of child runs ("rounds") in the parent's own conversation, started, read, sent to, edited and closed by six tools
 that return at once. The parent parks only when a read asks to wait, or when its model answers while a session it started
 still works or a round ended and was not yet reported. A round that ends meanwhile is told to the model by its next call: the
 journaled step `model:<turn>` lists the sessions first and records the reports it appended (`reports`, no new step). A round that ended during the final call is read at the end of the turn with `wait_<turn>`, which answers at once and does not park. The sequence, the states and the interleavings are in [Child runs](reference/child-runs.md#sessions-adr-0045-slices-1-to-4).

@@ -111,7 +111,7 @@ pub use prompt::{
     MAX_PROMPT_JWS_BYTES, NoPromptId, NotAPromptStatement, PROMPT_STATEMENT_HEADER,
     PROMPT_USER_SIGNATURE_HEADER, PromptStatement,
 };
-pub use signed::{SignedRequests, TURN_SIGNATURE_HEADER, request_target};
+pub use signed::{KeySource, SignedRequests, TURN_SIGNATURE_HEADER, request_target};
 pub use types::{
     ADAM_MAKER, ContentPart, FinishReason, INVALID_ARGUMENTS_MARKER, ImageData, ImageLimits,
     ImageOrigin, ImageRef, InputModalities, Message, ModelDelta, ModelRequest, ModelResponse,

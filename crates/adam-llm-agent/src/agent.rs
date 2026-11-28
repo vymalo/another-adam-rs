@@ -23,8 +23,8 @@ use adam_runtime::{
     AGENT_TEXT_KIND, Agent, AgentError, AgentStarter, CHILD_PARKED_KIND, CHILD_REPORTED_KIND,
     CancelToken, ChildLook, ChildStarter, ChildStatus, Ctx, Emitter, Inbound, MAX_RUN_FILE_BYTES,
     MAX_SESSION_PAGE, RUN_FINISHED_KIND, ReservedStep, RetryPolicy, RunEvent, SESSION_CLOSE_KIND,
-    SandboxUsage, SessionState, SessionSummary, StepEvent, StepIcon, StepKind, StepState,
-    Transition, UsageEvent, UsageTotals, child_run_id,
+    SESSION_EDIT_KIND, SandboxUsage, SessionEditRequest, SessionState, SessionSummary, StepEvent,
+    StepIcon, StepKind, StepState, Transition, UsageEvent, UsageTotals, child_run_id,
 };
 use async_trait::async_trait;
 use futures::FutureExt;
@@ -43,7 +43,7 @@ use crate::compaction::{
 use crate::conversation::{
     ArtifactRef, Conversation, LOCALE_CONTEXT_KEY, LimitHit, LimitKind, Loaded, Loader,
     MODEL_CONTEXT_KEY, ModelSwitch, PendingQuestion, PendingRemote, PendingRun, PendingSession,
-    PendingWait, REASONING_EFFORT_CONTEXT_KEY, Repeats, asks_to_close, parse_context,
+    PendingWait, REASONING_EFFORT_CONTEXT_KEY, Repeats, asks_to_close, asks_to_edit, parse_context,
     parse_model_run, parse_prompt_statement, parse_root_run, parse_root_step, parse_session,
     parse_user_text,
 };
@@ -2631,6 +2631,26 @@ impl LlmAgent {
         {
             header.closed = true;
         }
+        // An edit of the session is read here too, and journaled with the state of the step that
+        // takes it (ADR 0054, decision 11): a run parked on its summary call is a working round.
+        let (edits, inbox): (Vec<_>, Vec<_>) =
+            inbox.into_iter().partition(|i| i.kind == SESSION_EDIT_KIND);
+        for edit in &edits {
+            // A message the run has read is not read again: a sender that did not hear the first
+            // delivery sends the same edit again, under the same id.
+            if state.has_read(&edit.id) {
+                continue;
+            }
+            match SessionEditRequest::from_payload(&edit.payload) {
+                Some(request) => {
+                    state.note_read(&edit.id);
+                    Self::apply_edit(state, &request);
+                }
+                None => {
+                    tracing::warn!(inbound = %edit.id, "ignoring an unreadable session edit");
+                }
+            }
+        }
         if inbox.is_empty() {
             return Ok(());
         }
@@ -2827,7 +2847,30 @@ impl LlmAgent {
         &self,
         state: &'a Conversation,
     ) -> Option<&'a adam_runtime::SessionConfig> {
-        state.session.as_ref().and_then(|h| h.config.as_ref())
+        state.config()
+    }
+
+    /// Apply an edit of the session this round belongs to ([ADR 0054], decision 11), at the step
+    /// that read it: the header carries the config the session runs with from then on and the edit
+    /// joins its history at this round, while the round itself adopts the options the ADR marks
+    /// *next model call* and keeps its own of the others, which wait in the header for the next
+    /// round. The whole effect is in the state the step commits, so a replay reads the same header
+    /// and makes no second call.
+    ///
+    /// A run that is no round of a session ignores it: it has no header to change.
+    ///
+    /// [ADR 0054]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md
+    fn apply_edit(state: &mut Conversation, request: &SessionEditRequest) {
+        let current = state.config().cloned().unwrap_or_default();
+        let Some(header) = &mut state.session else {
+            return;
+        };
+        header.apply_edit(request);
+        let pending = request.config.clone().unwrap_or_default();
+        let adopted = current.adopted_mid_round(&pending);
+        // Written only when the round's config is not the header's: `None` means "the header's",
+        // which is what a round that read no edit, and state written before this existed, reads.
+        state.round_config = (adopted != pending).then_some(adopted);
     }
 
     /// The cap on the tokens of this run's session ([ADR 0054], decision 6), `None` for a run that
@@ -3227,10 +3270,7 @@ impl LlmAgent {
         let live = self.live_model(state);
         let live_alias = live.alias.to_owned();
         let mut request = ModelRequest::new(live_alias.clone());
-        request.system = with_session_instructions(
-            self.instructions.clone(),
-            state.session.as_ref().and_then(|h| h.config.as_ref()),
-        );
+        request.system = with_session_instructions(self.instructions.clone(), state.config());
         // What is sent about an image is decided here, from the reference and the deployment's
         // settings now, and recorded nowhere: the same settings give the same lines every turn.
         let image_limits = self.model.input_modalities(&live_alias).images;
@@ -4107,10 +4147,7 @@ impl LlmAgent {
         let live = self.live_model(state);
         let live_alias = live.alias.to_owned();
         let mut request = ModelRequest::new(live_alias.clone());
-        request.system = with_session_instructions(
-            self.instructions.clone(),
-            state.session.as_ref().and_then(|h| h.config.as_ref()),
-        );
+        request.system = with_session_instructions(self.instructions.clone(), state.config());
         // The summary request is the request before it and one more message, so a provider's cache
         // serves it: its images are the ones the last request sent. A history that a provider
         // rejected as too long is sent shorter, with each image said in a few words.
@@ -7506,6 +7543,22 @@ fn continue_conversation(
         crate::signing::unsign_from(&mut conversation.messages, 0);
         return Ok(conversation);
     }
+    // A round that only edits its session has no message either: it carries the header, which
+    // already says what the session runs with, and nothing else ([ADR 0054], decision 11).
+    //
+    // [ADR 0054]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md
+    if asks_to_edit(&input.payload) {
+        let session = parse_session(&input.payload).or_else(|| prior.session.clone());
+        return Ok(Conversation {
+            continued_from: Some(prior_run),
+            context: prior.context.clone(),
+            plan: prior.plan.clone(),
+            // The editing round calls no model, so it only carries the session's spend.
+            spent: session.as_ref().map_or(0, |h| h.spent),
+            session,
+            ..Conversation::default()
+        });
+    }
     let text = start_text(input)?;
     let mut conversation = prior.continued(text, prior_run);
     // A carried row was signed under the run it came from, at its place in that run's chain. The
@@ -8354,6 +8407,17 @@ impl LlmAgent {
         ctx: &mut Ctx,
         mut state: Conversation,
     ) -> Result<Transition<Conversation>, AgentError> {
+        // A round that only edits its session calls no model and has no report: the header it
+        // starts with already carries the edit, so there is nothing left to do ([ADR 0054],
+        // decision 11). It is decided **before** a message that arrived can reopen the run: it
+        // would read nothing, and asking for the reopen again on every commit would not end.
+        //
+        // [ADR 0054]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md
+        if state.session.as_ref().is_some_and(|h| h.editing) {
+            let output = json!({ "text": "", "artifacts": [], "edited": true });
+            self.forget_chars(ctx.run_id());
+            return Ok(Transition::Done { state, output });
+        }
         // A message that arrives while this step finishes the run is read, not dropped: see
         // `Ctx::reopen_on_arrival`.
         ctx.reopen_on_arrival();
@@ -8583,6 +8647,31 @@ impl LlmAgent {
             && let Some(header) = &mut state.session
         {
             header.closed = true;
+        }
+        // An edit of the session this round belongs to ([ADR 0054], decision 11): it is read here,
+        // at this step, and its effect is journaled with this step's state. The options the ADR
+        // marks *next model call* are the ones this round adopts; the others wait in the header for
+        // the next round. A round that ended before reading one leaves it in its inbox, where a
+        // reader of the session finds it.
+        //
+        // [ADR 0054]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md
+        let (edits, inbox): (Vec<_>, Vec<_>) =
+            inbox.into_iter().partition(|i| i.kind == SESSION_EDIT_KIND);
+        for edit in &edits {
+            // A message the run has read is not read again: a sender that did not hear the first
+            // delivery sends the same edit again, under the same id.
+            if state.has_read(&edit.id) {
+                continue;
+            }
+            match SessionEditRequest::from_payload(&edit.payload) {
+                Some(request) => {
+                    state.note_read(&edit.id);
+                    Self::apply_edit(&mut state, &request);
+                }
+                None => {
+                    tracing::warn!(inbound = %edit.id, "ignoring an unreadable session edit");
+                }
+            }
         }
         let notices: Vec<(RunId, ChildStatus)> = finished
             .iter()

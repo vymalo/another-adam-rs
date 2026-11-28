@@ -1,4 +1,5 @@
-# What the pinned actionlint (ci.yml pins 1.7.7) does not know yet, for release.yml's adam-agent jobs.
+# What the pinned actionlint (ci.yml pins 1.7.7) does not know yet, for release.yml's adam-agent jobs and
+# ci.yml's coverage job.
 self-hosted-runner:
   # GitHub-hosted macOS 26 runners, arm64 and, natively, Intel (Homebrew and the binary are tried on both).
   labels:
@@ -9,4 +10,9 @@ paths:
     ignore:
       # `queue: max` is GitHub's (docs.github.com, workflow concurrency, *verified 2026-11-27*), and no actionlint
       # release parses it. This one message, for this one file; every other error still fails.
+      - 'unexpected key "queue" for "concurrency" section'
+  .github/workflows/ci.yml:
+    ignore:
+      # The same message, for `coverage`'s `queue: max` (ANR-1360): the waiting coverage runs are kept, not
+      # replaced, so each commit's run reaches a verdict.
       - 'unexpected key "queue" for "concurrency" section'

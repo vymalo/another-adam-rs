@@ -16,7 +16,7 @@ use adam_core::{RunId, RunRecord, RunStatus};
 
 use crate::agent::Inbound;
 use crate::runtime::{Runtime, RuntimeError};
-use crate::session::SESSION_CLOSE_KIND;
+use crate::session::{SESSION_CLOSE_KIND, SESSION_EDIT_KIND};
 
 /// [`Inbound::kind`] of the message a finished child sends its parent.
 ///
@@ -60,7 +60,10 @@ pub const CHILD_PARKED_KIND: &str = "adam.child.parked";
 /// is read from the store, by a tool or by the agent loop; a turn that a report keeps going is
 /// decided from the store at its end, not from a notice), the [`CHILD_PARKED_KIND`] ones (a park
 /// is read from the store too, and a run that finishes has no wait left), the [`SESSION_CLOSE_KIND`] requests (a round finishes its work and says so in its header; one that
-/// lands while the round finishes stays in its inbox, where a reader of the session finds it) and the [`RESUME_KIND`] wake-ups (they say nothing). A notice only saves a waiting parent its
+/// lands while the round finishes stays in its inbox, where a reader of the session finds it), the
+/// [`SESSION_EDIT_KIND`] ones (for the same reason: a round that ended before reading its edit
+/// leaves it where a reader of the session finds it, and the next round carries it) and the
+/// [`RESUME_KIND`] wake-ups (they say nothing). A notice only saves a waiting parent its
 /// timer. A run that finishes has no wait left (it settled its waits from the notice or from the
 /// store), and the same notice delivered just after its commit is refused, so one that lands during
 /// the step must not keep the run going either.
@@ -77,6 +80,7 @@ pub(crate) fn news_since(inbox: &[Inbound], base: usize, read: &[String]) -> usi
                 && i.kind != CHILD_REPORTED_KIND
                 && i.kind != CHILD_PARKED_KIND
                 && i.kind != SESSION_CLOSE_KIND
+                && i.kind != SESSION_EDIT_KIND
                 && i.kind != RESUME_KIND
                 && (i.id.is_empty() || !read.contains(&i.id))
         })
