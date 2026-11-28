@@ -26,7 +26,12 @@
 //!
 //! A metric that is emitted but unreachable from a dashboard is not a failure here — this is the
 //! direction that keeps a graph honest.
-#![allow(clippy::unwrap_used, clippy::expect_used)] // integration tests assert by unwrapping
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+// integration tests assert by unwrapping
+// `Instrument::labels` is `&'static [&'static str]`, so `labels.contains(&label.as_str())` would
+// demand a `'static` borrow of a `String` that lives for the test only (E0597). Clippy's
+// `manual_contains` sees the shape, not the lifetime, and suggests exactly that.
+#![allow(clippy::manual_contains)]
 
 use std::fs;
 use std::path::{Path, PathBuf};
