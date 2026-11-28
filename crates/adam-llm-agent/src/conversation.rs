@@ -7,7 +7,8 @@ use adam_core::RunId;
 use adam_core::time::Timestamp;
 use adam_model::{Message, ToolCall, Usage};
 use adam_runtime::{
-    AgentError, Inbound, SESSION_STATE_KEY, SandboxUsage, SessionHeader, UsageTotals,
+    AgentError, Inbound, SESSION_STATE_KEY, SandboxUsage, SessionHeader, ShorteningUsage,
+    UsageTotals,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -15,6 +16,7 @@ use serde_json::{Map, Value, json};
 use crate::compaction::{Compaction, CompactionReason, PromptSize};
 use crate::images::{InboundImage, KeptImage, StateImage};
 use crate::plan::Plan;
+use crate::request::RecordedRequest;
 use crate::source::ToolNote;
 
 /// Recommended [`Inbound::kind`] of a user message. The agent does not inspect
@@ -203,7 +205,7 @@ pub const LOCALE_CONTEXT_KEY: &str = "vymalo.locale";
 /// The context key under which a message says its client **shows child sessions**
 /// (`child-sessions/v1` activated): `true`, written by the A2A front, and cleared by a message that
 /// did not activate the extension. It is what lets a session the model starts be one the person
-/// sees: a round of a kept-open session asks the person only when the header says they see it
+/// sees: a round of an `open` session asks the person only when the header says they see it
 /// ([`SessionHeader::visible`](adam_runtime::SessionHeader::visible), ADR 0045 decision 9). Not one
 /// of [`PROTECTED_CONTEXT_KEYS`]: a context too large to keep it makes a child unable to ask, which
 /// is the safe way to lose it.
@@ -689,6 +691,14 @@ pub struct Conversation {
     /// that continues another starts with none (a new task).
     #[serde(default, skip_serializing_if = "SandboxUsage::is_empty")]
     pub sandbox_usage: SandboxUsage,
+    /// How many times this run's history was shortened ([`shortenings`](Self::shortenings)) and the
+    /// characters that took out of it: what the A2A server writes on the task as the `shortenings`
+    /// member of the `usage/v1` totals when it ends or waits (ADR 0090), so a deployment sees what
+    /// moved the cached prompt prefix. This run's own history only, never a child's. Absent from
+    /// state written before it existed, and not written while empty, so a run that never shortens
+    /// writes the bytes it always did; a run that continues another starts with none.
+    #[serde(default, skip_serializing_if = "ShorteningUsage::is_empty")]
+    pub shortening_usage: ShorteningUsage,
     /// The long outputs this run keeps in its own state, by output id, for
     /// [`read_output`](crate::ReadOutput): what a tool handed back in
     /// [`ToolOutput::kept`](crate::ToolOutput::kept) when its agent has no
@@ -1026,7 +1036,34 @@ pub struct Conversation {
     /// while `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chain_started: Option<Timestamp>,
+    /// The system prompt and tools of the run's last model call, by content address
+    /// ([`RecordedRequest`], ADR 0087 decision 7): what an export attaches as the exact request the
+    /// run's answers were made from. Set by every turn's model call: `None` when that call recorded
+    /// none (the store keeps no blobs, or a put failed: recording is fail-open), so a stale record
+    /// never stands for a later call. A call that failed leaves it as it was. Not carried to a later
+    /// task. Absent from state written before it existed, and not written while `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request: Option<RecordedRequest>,
+    /// The distinct requests of the run's model calls, oldest first (ADR 0087, slice E5): an entry
+    /// is appended when a call recorded its request ([`request`](Self::request)) and the request's
+    /// system prompt or tools are not the ones the entry before names, so a run whose tools never
+    /// change has one entry, and a run whose tools change (a group loaded, a tool removed) has one
+    /// more per change. The request of turn `n` is the entry with the latest `turn` at or before
+    /// `n`. Derived from the journaled answer of each call and the state before it, so a replay
+    /// writes the same list. At most [`MAX_RECORDED_REQUESTS`]: the oldest entry is given up. A
+    /// call that recorded nothing (fail-open) appends nothing. Not carried to a later task. Absent
+    /// from state written before it existed, and not written while empty.
+    ///
+    /// **Breaking:** a new public field of a struct that is not `#[non_exhaustive]`: a
+    /// `Conversation` built with a struct literal outside the workspace needs it (or
+    /// `..Default::default()`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub requests: Vec<RecordedRequest>,
 }
+
+/// How many distinct requests a run remembers ([`Conversation::requests`]): the oldest is given
+/// up. A run's tools change a few times (a group loaded, a tool removed), not at every turn.
+pub const MAX_RECORDED_REQUESTS: usize = 64;
 
 /// How many rounds a run remembers having reported ([`Conversation::reported_rounds`]): the oldest
 /// is given up. A round given up that is still due is not told again if its report is still in the
@@ -1054,6 +1091,25 @@ impl Conversation {
         let extra = self.read_ids.len().saturating_sub(MAX_READ_IDS);
         self.read_ids.drain(..extra);
     }
+
+    /// Keep what a model call recorded of its request: it is the last call's
+    /// ([`request`](Self::request), `None` when the call recorded none), and it is appended to
+    /// [`requests`](Self::requests) when its system prompt or tools are not the ones the last
+    /// entry names, giving up the oldest entry past [`MAX_RECORDED_REQUESTS`].
+    pub(crate) fn note_request(&mut self, request: Option<RecordedRequest>) {
+        if let Some(recorded) = &request {
+            let same = self
+                .requests
+                .last()
+                .is_some_and(|last| last.system == recorded.system && last.tools == recorded.tools);
+            if !same {
+                self.requests.push(recorded.clone());
+                let extra = self.requests.len().saturating_sub(MAX_RECORDED_REQUESTS);
+                self.requests.drain(..extra);
+            }
+        }
+        self.request = request;
+    }
 }
 
 fn is_zero(n: &u32) -> bool {
@@ -1078,9 +1134,10 @@ fn has_expired(value: &Value, now: Timestamp) -> bool {
 ///
 /// Why a cap at all: every continuation copies the carried history into the new run's state, which
 /// is one JSON value in the store, so without a bound each task in a long-lived context would
-/// store, and each model call would re-read, everything said before. Why this size: it is about
-/// what `Limits::max_history_tokens` lets through to the model (100 000 tokens of about 4
-/// characters). Bytes of JSON, not tokens: the cap has to be checkable without a tokenizer, and it
+/// store, and each model call would re-read, everything said before. Why this size: it was about
+/// what `Limits::max_history_tokens` let through to the model at its first default (100 000 tokens
+/// of about 4 characters); the default is [`DEFAULT_MAX_HISTORY_TOKENS`](crate::DEFAULT_MAX_HISTORY_TOKENS)
+/// since ADR 0088, and the cap was not raised with it. Bytes of JSON, not tokens: the cap has to be checkable without a tokenizer, and it
 /// over-counts the JSON's own punctuation, which only makes it stricter.
 ///
 /// What is given up to meet it, in this order, and only as far as needed:
@@ -1488,8 +1545,10 @@ impl Conversation {
     }
 
     /// Whether a tool of this run may **ask the person** ([`ToolError::NeedsInput`], ADR 0045
-    /// decision 9): a root run always; a round of a session only when the session is kept open and
-    /// a client shows it ([`SessionHeader::visible`](adam_runtime::SessionHeader::visible)); and no
+    /// decision 9): a root run always; a round of a session only when the session is `open`, so the
+    /// person may write to it ([`SessionMode::Open`](adam_runtime::SessionMode::Open), ADR 0089: a
+    /// `sealed` or `one_shot` round cannot be answered), and a client shows it
+    /// ([`SessionHeader::visible`](adam_runtime::SessionHeader::visible)); and no
     /// other child run at all, because nobody would answer it and it would wait for ever. A round
     /// of a session that carries no header (one an embedder made with
     /// `Runtime::start_child_continuing`) is no root either: nobody sees it.
@@ -1500,7 +1559,7 @@ impl Conversation {
     #[must_use]
     pub fn may_ask_person(&self, conversation_id: Option<&str>) -> bool {
         match &self.session {
-            Some(header) => header.keep_open && header.visible,
+            Some(header) => header.mode.takes_person_messages() && header.visible,
             None => {
                 self.root_run.is_none()
                     && conversation_id
@@ -1932,6 +1991,38 @@ mod tests {
             note: format!("what {loader} is for"),
             note_is_server: false,
         }
+    }
+
+    /// A recorded request is appended only when its prompt or tools differ from the last entry's,
+    /// a call that recorded nothing appends nothing (and clears `request`), and the list keeps the
+    /// newest [`MAX_RECORDED_REQUESTS`].
+    #[test]
+    fn a_request_is_listed_once_per_change_and_the_list_is_bounded() {
+        use adam_runtime::blob_id;
+        let recorded = |turn: u32, tools: &[u8]| RecordedRequest {
+            turn,
+            system: Some(blob_id(b"system")),
+            tools: blob_id(tools),
+        };
+        let mut state = Conversation::default();
+        state.note_request(Some(recorded(0, b"[]")));
+        state.note_request(Some(recorded(1, b"[]")));
+        assert_eq!(state.requests, [recorded(0, b"[]")]);
+        assert_eq!(state.request, Some(recorded(1, b"[]")));
+        state.note_request(None);
+        assert_eq!(state.request, None);
+        assert_eq!(state.requests.len(), 1);
+        state.note_request(Some(recorded(3, b"[1]")));
+        state.note_request(Some(recorded(4, b"[]")));
+        let turns: Vec<u32> = state.requests.iter().map(|r| r.turn).collect();
+        assert_eq!(turns, [0, 3, 4], "a change back is a change");
+
+        let mut long = Conversation::default();
+        for turn in 0..u32::try_from(MAX_RECORDED_REQUESTS + 5).unwrap() {
+            long.note_request(Some(recorded(turn, turn.to_string().as_bytes())));
+        }
+        assert_eq!(long.requests.len(), MAX_RECORDED_REQUESTS);
+        assert_eq!(long.requests[0].turn, 5, "the oldest are given up");
     }
 
     /// A load is state: the list merges by loader name, in call order, and the turn of the next

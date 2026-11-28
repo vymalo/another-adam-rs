@@ -394,6 +394,41 @@ impl ChildStarter {
         Ok(self.round_record(round).await?.map(|(_, state)| state))
     }
 
+    /// Whether the round's inbox still holds the inbound `id`, unread: a message or an edit
+    /// delivered to it that it has not taken. A [`SessionView`](crate::SessionView) already shows
+    /// such an edit applied to the round's header (an edit a round ended before reading is not
+    /// lost), so a caller that builds the next round from that header must not apply it again.
+    /// Not journaled.
+    ///
+    /// # Errors
+    ///
+    /// As [`round_state`](Self::round_state).
+    pub async fn round_holds(&self, round: RunId, id: &str) -> Result<bool, RuntimeError> {
+        let Some(rec) = self.runtime.store().load_run(round).await? else {
+            return Ok(false);
+        };
+        let ours = rec
+            .conversation_id
+            .as_deref()
+            .and_then(|c| crate::session::session_of(&self.conversation, c))
+            .is_some();
+        if !ours {
+            return Err(RuntimeError::InvalidSession {
+                reason: format!("run {round} is not a round of a session of this conversation"),
+            });
+        }
+        Ok(!id.is_empty()
+            && rec
+                .state
+                .get("inbox")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|inbox| {
+                    inbox
+                        .iter()
+                        .any(|item| item.get("id").and_then(serde_json::Value::as_str) == Some(id))
+                }))
+    }
+
     /// [`round_state`](Self::round_state) with the round's status: what a parent needs to count the
     /// tokens of a round only once it has ended (`Done` or `Failed`, a cancel included). Not journaled.
     ///

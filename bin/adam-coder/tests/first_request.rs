@@ -28,11 +28,15 @@ use common::Fixture;
 // the 1696 bytes of `SessionTools::guide_for(["explorer", "reviewer"])` (ADR 0054 decision 9), plus
 // the 68 bytes the `delete` argument of `subagent_close` added to that section (slice 5), plus the
 // 11 bytes `command | commands` added to `run_checks`'s line (ANR-243), plus the 271 bytes
-// `subagent_edit`'s line adds to it (ANR-216, slice 4). The tools grew by that tool's 2095-byte
-// spec (ANR-216). The deltas are computed, not measured: re-pin this from the `system N B` line
-// this test prints on the first green CI run.
+// `subagent_edit`'s line adds to it (ANR-216, slice 4). The deltas are computed, not measured:
+// re-pin this from the `system N B` line this test prints on the first green CI run.
 const BASELINE_PROMPT_BYTES: usize = 32862; // 32591 + the 271 bytes `subagent_edit`'s line adds to the guide
-const BASELINE_TOOLS_BYTES: usize = 66847; // 64752 + the 2095 bytes of `subagent_edit`'s spec (ANR-216)
+// The tools: re-measured 2026-11-28 on the second merge of main into ADR 0087-0091's branch: the
+// first merge's 66497 (main's 64752 with the `commands` argument of run_checks, ANR-243, plus the
+// `output` argument `run_command`, `run` and `run_checks` took, ADR 0090 slice T1, and
+// `subagent_start`'s `mode` and `wait`, ADR 0089 slice C2) plus the 2231 bytes of `subagent_edit`'s
+// spec as the coder serves it (ANR-216).
+const BASELINE_TOOLS_BYTES: usize = 68728;
 const GROWTH_ALLOWED: usize = 1024;
 /// The owner's budget for the coder's tools once S3 makes it lean (ADR 0066).
 const TOOLS_BUDGET_TOKENS: usize = 3000;

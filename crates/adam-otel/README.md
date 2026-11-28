@@ -185,8 +185,21 @@ a deployment imports it.
 versions the card measured on 2026-11-27). `opentelemetry-otlp` depends on `reqwest` 0.13.1 with
 `default-features = false`, so the workspace's `reqwest` is the one in the tree (*verified
 2026-11-28* in its normalized `Cargo.toml`). The crate adds no `-sys` package beyond the
-`aws-lc-sys` the workspace already links through `rustls` — and none at all under `default-features = false`. The
-**workspace sets that** for every member (`Cargo.toml`'s `adam-otel` entry), so a library that depends on this crate never
-puts a TLS provider into an embedding host's graph (`tools/tls-provider/check.sh`, ANR-118): only the binaries that export
-over HTTPS opt in with `features = ["aws-lc"]` (`adam-coder`, `adam-agent`), while `adam-egress` (static musl, ANR-1174) and
-`adam-git-sandbox` build it with no provider at all.
+`aws-lc-sys` the workspace already links through `rustls`, and none at all without `aws-lc`.
+
+## Features
+
+| Feature | Default | What it adds |
+|---|---|---|
+| `sdk` | on (through `aws-lc`) | everything but `labels`: `Settings`, `Otel`, `init`, the OTLP/HTTP exporter and the tracing layer, with `reqwest`, `rustls`, `tokio` and the OpenTelemetry SDK |
+| `aws-lc` | on | `sdk`, and `aws-lc-rs` as the TLS provider of `reqwest` and `rustls`, for an `https` endpoint |
+
+The workspace takes the crate with `default-features = false`, so each member names what it needs:
+
+* `adam-runtime` names nothing. It records its measurements under `labels::RunState` and links no HTTP client
+  and no TLS stack, which keeps `adam-engine`'s embedded set clean (`tools/embedded-deps/check.sh`, ADR 0047).
+* `adam-egress` and `adam-git-sandbox` take `sdk`: they export, to a plain `http` collector, with no TLS
+  provider.
+* `adam-coder` and `adam-agent` take `aws-lc`, so they can export over `https`.
+
+The integration test `tests/export.rs` needs `sdk`.

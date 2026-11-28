@@ -113,7 +113,10 @@ async fn a_command_and_a_check_run_as_the_environment_prepared_them() {
         looked.content
     );
     let checked = RunChecks
-        .call(&rig.ctx, json!({"command": "echo checking-in=$FAKE_ENV"}))
+        .call(
+            &rig.ctx,
+            json!({"command": "echo checking-in=$FAKE_ENV", "output": "full"}),
+        )
         .await
         .unwrap();
     assert!(!checked.is_error, "{}", checked.content);
@@ -856,7 +859,7 @@ async fn a_variable_a_mcp_json_names_is_really_absent_from_a_check_and_redacted_
     let open = rig_over(|_| Arc::new(adam_workspace::Local)).await;
     open.prepare().await;
     let seen = RunChecks
-        .call(&open.ctx, json!({"command": probe}))
+        .call(&open.ctx, json!({"command": probe, "output": "full"}))
         .await
         .unwrap();
     assert!(
@@ -875,7 +878,9 @@ async fn a_variable_a_mcp_json_names_is_really_absent_from_a_check_and_redacted_
     .await;
     rig.prepare().await;
     for tool in [
-        RunChecks.call(&rig.ctx, json!({"command": probe})).await,
+        RunChecks
+            .call(&rig.ctx, json!({"command": probe, "output": "full"}))
+            .await,
         RunCommand.call(&rig.ctx, json!({"command": probe})).await,
     ] {
         let out = tool.unwrap();

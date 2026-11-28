@@ -48,7 +48,7 @@ stateDiagram-v2
 | `BrokerIssuer::trusting(base_url, token_file, run, ca_pem)` | the same, also trusting the PEM of `RUN_CERT_CA_FILE` |
 | `BrokerIssuer::with_client(base_url, token_file, run, http)` | the same, with one client a host built for every run (`http_client`) |
 | `BrokerIssuer::endpoint()`, `run()`, `token_file()` | the route, the run and the file, for a log line that carries no secret |
-| `http_client(ca_pem)` | the client: no redirect, a 30 s bound, the anchors trusted beside the system roots; `None` for the system roots |
+| `http_client(ca_pem)` | the client: no redirect, a 30 s bound, the anchors trusted beside the system roots; `None` for the system roots. On a system with **no** roots (a slim base without `ca-certificates`) it trusts the given anchors alone, or nothing: an `http` broker still answers, and an `https` one is refused at its handshake, never trusted unverified |
 | `CONTRACT_VERSION`, `MAX_ANSWER_BYTES`, `MAX_CA_PEM_BYTES` | `1`, 64 KiB and 1 MiB |
 | `BrokerError` | the base URL, the trust anchors or the client is unusable: `Classify` gives `Invalid` |
 | `TokenError` | the projected token is unreadable, empty or not a header value: `Unauthenticated`; it carries the path, never the contents |

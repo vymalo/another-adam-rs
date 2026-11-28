@@ -1,6 +1,8 @@
 //! Kept command output and `read_output` (ADR 0044, slice 3): a long output is shown as its head and
 //! tail with an id, kept whole and scrubbed on the volume, and read back by lines; a command takes a
-//! `timeout` of its own, never over the deployment's limit.
+//! `timeout` of its own, never over the deployment's limit; and each command tool takes `output`
+//! (ADR 0090): with `on_error` (the default of `run` and `run_checks`) a command that succeeds is one
+//! line naming the id its output is kept under, short output included.
 #![allow(clippy::unwrap_used, clippy::expect_used)] // integration tests assert by unwrapping
 
 mod common;
@@ -14,7 +16,7 @@ use adam_coder::tools::make::Run;
 use adam_coder::tools::named::{named_in, without_untrusted};
 use adam_coder::tools::prepare::PrepareWorkspace;
 use adam_coder::tools::shell::KEPT_OUTPUT_MAX;
-use adam_llm_agent::{KeptStore, ReadOutput, Tool, ToolCtx, ToolOutput};
+use adam_llm_agent::{KeptStore, ReadOutput, Tool, ToolCtx, ToolOutput, output_id_of};
 use adam_runtime::CollectingSink;
 use common::{DB_PASSWORD, Fixture, GITHUB_TOKEN, LONG_TOKEN, MODEL_KEY};
 use serde_json::{Value, json};
@@ -951,17 +953,170 @@ async fn a_command_that_times_out_is_killed_and_its_output_so_far_is_kept() {
     assert!(last.starts_with("40000\n"), "{last}");
 }
 
+/// With `output: "full"`, a check that passes shows the bounded view of the other tools; by
+/// default it is one line, and the output is kept all the same.
 #[tokio::test]
 async fn run_checks_shows_the_same_bounded_view() {
     let rig = Rig::new().await;
     let out = RunChecks
-        .call(&rig.ctx, json!({"command": "seq 1 30000"}))
+        .call(
+            &rig.ctx,
+            json!({"command": "seq 1 30000", "output": "full"}),
+        )
         .await
         .unwrap();
     let text = out.content;
     assert!(text.contains("exit code 0: passed"), "{text}");
     assert!(text.contains("head and tail shown, kept as o-"), "{text}");
     assert!(text.contains("read_output"), "{text}");
+
+    // Another command than the first call's: a repeat of a passed check on the same tree is
+    // answered from its record (ANR-247), not run again.
+    let ctx = rig.call_ctx("default");
+    let out = RunChecks
+        .call(&ctx, json!({"command": "seq 1 30000 # default"}))
+        .await
+        .unwrap();
+    let id = output_id_of(&ctx);
+    assert_eq!(
+        out.content,
+        format!(
+            "$ seq 1 30000 # default\nexit code 0: passed\n[output: 168894 bytes, not shown \
+             because the command succeeded; kept as {id}; read_output {{\"id\":\"{id}\"}} reads \
+             it]\n"
+        )
+    );
+    assert!(rig.read(&id, -1).await.content.starts_with("30000\n"));
+}
+
+/// A command tool called by name with `args` in `ctx`.
+async fn call_command(name: &str, ctx: &ToolCtx, args: Value) -> ToolOutput {
+    match name {
+        "run_command" => RunCommand.call(ctx, args).await,
+        "run" => Run.call(ctx, args).await,
+        _ => RunChecks.call(ctx, args).await,
+    }
+    .unwrap()
+}
+
+/// The command tools whose default `output` is `on_error`, and the line a command that succeeded
+/// starts with.
+const COMMAND_TOOLS: [(&str, bool, &str); 3] = [
+    ("run_command", false, "exit code 0"),
+    ("run", true, "exit code 0"),
+    ("run_checks", true, "exit code 0: passed"),
+];
+
+/// With `on_error`, asked or the tool's default, a command that succeeds is one line with its size
+/// and the id its output is kept under, short as it is, and `read_output` reads the whole output; with
+/// `full`, and by default for `run_command`, the output is shown as it always was.
+#[tokio::test]
+async fn a_command_that_succeeds_is_one_line_with_on_error_and_read_output_reads_it() {
+    let rig = Rig::new().await;
+    for (tool, on_error_by_default, passed) in COMMAND_TOOLS {
+        for output in [Some("on_error"), Some("full"), None] {
+            // A command of its own per call: `run_checks` answers a repeat of a passed check on the
+            // same tree from its record (ANR-247), which is not what this case looks at.
+            let command = format!("seq 1 3 # {tool} {output:?}");
+            let ctx = rig.call_ctx(&format!("{tool}-{output:?}"));
+            let mut args = json!({ "command": command });
+            if let Some(output) = output {
+                args["output"] = json!(output);
+            }
+            let out = call_command(tool, &ctx, args).await;
+            assert!(!out.is_error, "{tool} {output:?}: {}", out.content);
+            let id = output_id_of(&ctx);
+            let hidden = output == Some("on_error") || (output.is_none() && on_error_by_default);
+            let shown = if hidden {
+                format!(
+                    "$ {command}\n{passed}\n[output: 6 bytes, not shown because the command \
+                     succeeded; kept as {id}; read_output {{\"id\":\"{id}\"}} reads it]\n"
+                )
+            } else {
+                format!("$ {command}\n{passed}\n--- output ---\n1\n2\n3\n")
+            };
+            // `run` follows with what git sees: nothing here.
+            assert!(
+                out.content.starts_with(&shown),
+                "{tool} {output:?}: {}",
+                out.content
+            );
+            if hidden {
+                assert_eq!(
+                    rig.read(&id, 1).await.content,
+                    "1\n2\n3\n[end: 3 lines]",
+                    "{tool}"
+                );
+            }
+        }
+    }
+}
+
+/// With `on_error`, a command that fails shows its output as `full` does, one that succeeds printing
+/// nothing says so, and a value that is neither is refused naming both and the tool's default.
+#[tokio::test]
+async fn on_error_shows_a_failure_says_no_output_and_another_value_is_refused() {
+    let rig = Rig::new().await;
+    for (tool, on_error_by_default, passed) in COMMAND_TOOLS {
+        for output in [Some("on_error"), None] {
+            // Another command each time: a failed check asked again on the same tree is not run.
+            let failing = format!("echo no; exit 4 # {tool} {output:?}");
+            let ctx = rig.call_ctx(&format!("{tool}-fails-{output:?}"));
+            let mut args = json!({ "command": failing });
+            if let Some(output) = output {
+                args["output"] = json!(output);
+            }
+            let out = call_command(tool, &ctx, args).await;
+            assert!(
+                out.content.contains("exit code 4")
+                    && out.content.contains("\n--- output ---\nno\n"),
+                "{tool} {output:?}: {}",
+                out.content
+            );
+        }
+
+        let quiet = format!("true # {tool}");
+        let ctx = rig.call_ctx(&format!("{tool}-quiet"));
+        let out = call_command(tool, &ctx, json!({"command": quiet, "output": "on_error"})).await;
+        assert!(
+            out.content
+                .starts_with(&format!("$ {quiet}\n{passed}\n(no output)\n")),
+            "{tool}: {}",
+            out.content
+        );
+
+        let default = if on_error_by_default {
+            "on_error"
+        } else {
+            "full"
+        };
+        let ctx = rig.call_ctx(&format!("{tool}-bad"));
+        let out = call_command(
+            tool,
+            &ctx,
+            json!({"command": "touch ran", "output": "errors"}),
+        )
+        .await;
+        assert!(out.is_error, "{tool}");
+        assert!(
+            out.content.starts_with("output must be \"on_error\"")
+                && out.content.contains("or \"full\"")
+                && out.content.contains("not \"errors\"")
+                && out
+                    .content
+                    .ends_with(&format!("the tool's default, \"{default}\"")),
+            "{tool}: {}",
+            out.content
+        );
+    }
+    assert!(
+        !rig.fx
+            .root
+            .join("workspaces")
+            .join(rig.ctx.run_id().to_string())
+            .join("remote/ran")
+            .exists()
+    );
 }
 
 /// Two long outputs of one call are kept under two ids: one must not overwrite the other, and each
@@ -999,4 +1154,92 @@ fn the_kept_output_of_a_command_is_in_the_value_only_as_text() {
     // The result is plain text: no kept copy rides in the journal.
     let v: Value = serde_json::to_value(ToolOutput::text("x")).unwrap();
     assert!(v.get("kept").is_none());
+}
+
+/// The folder's `limits.output` (ADR 0090 slice T3) is what a call that gives no `output` shows, for
+/// each of the three tools: here each is set to the other mode than its own. A call's `output`
+/// still wins, and a tool the block leaves out keeps its own default.
+#[tokio::test]
+async fn the_folders_output_defaults_are_what_a_call_without_output_shows() {
+    use adam::agent_fs::{OutputDef, OutputModeDef};
+
+    let flipped = OutputDef {
+        run_checks: Some(OutputModeDef::Full),
+        run: Some(OutputModeDef::Full),
+        run_command: Some(OutputModeDef::OnError),
+    };
+    let rig = Rig::with(|s| s.set_output_defaults(&flipped)).await;
+    for (tool, on_error_by_default, passed) in COMMAND_TOOLS {
+        // The tool's own default, asked for, then nothing asked: the folder's, which is the other.
+        let own = if on_error_by_default {
+            "on_error"
+        } else {
+            "full"
+        };
+        for (output, hidden) in [
+            (Some(own), on_error_by_default),
+            (None, !on_error_by_default),
+        ] {
+            // A command of its own per call: `run_checks` answers a repeat of a passed check on the
+            // same tree from its record (ANR-247).
+            let command = format!("seq 1 3 # folder {tool} {output:?}");
+            let ctx = rig.call_ctx(&format!("folder-{tool}-{output:?}"));
+            let mut args = json!({ "command": command });
+            if let Some(output) = output {
+                args["output"] = json!(output);
+            }
+            let out = call_command(tool, &ctx, args).await;
+            assert!(!out.is_error, "{tool} {output:?}: {}", out.content);
+            let id = output_id_of(&ctx);
+            let shown = if hidden {
+                format!(
+                    "$ {command}\n{passed}\n[output: 6 bytes, not shown because the command \
+                     succeeded; kept as {id}; read_output {{\"id\":\"{id}\"}} reads it]\n"
+                )
+            } else {
+                format!("$ {command}\n{passed}\n--- output ---\n1\n2\n3\n")
+            };
+            assert!(
+                out.content.starts_with(&shown),
+                "{tool} {output:?}: {}",
+                out.content
+            );
+        }
+    }
+
+    // A block that names one tool leaves the other two at their own defaults.
+    let mut settings = adam_coder::CoderSettings::new();
+    settings.set_output_defaults(&OutputDef {
+        run: Some(OutputModeDef::Full),
+        ..OutputDef::default()
+    });
+    assert_eq!(
+        (
+            settings.command_output.run,
+            settings.command_output.run_command,
+            settings.checks_output
+        ),
+        (
+            adam_code_tools::OutputMode::Full,
+            adam_code_tools::inspect::DEFAULT_OUTPUT,
+            adam_coder::tools::checks::DEFAULT_OUTPUT
+        )
+    );
+}
+
+/// Without `limits.output` the settings hold each tool's own default (ADR 0090 decision 3), and an
+/// empty block changes nothing.
+#[test]
+fn without_a_folder_block_each_tool_keeps_its_own_default() {
+    let mut settings = adam_coder::CoderSettings::new();
+    let untouched = (settings.command_output, settings.checks_output);
+    assert_eq!(
+        untouched,
+        (
+            adam_code_tools::OutputDefaults::TOOLS,
+            adam_code_tools::OutputMode::OnError
+        )
+    );
+    settings.set_output_defaults(&adam::agent_fs::OutputDef::default());
+    assert_eq!((settings.command_output, settings.checks_output), untouched);
 }

@@ -24,7 +24,7 @@
 #      The greeting is one model call, reported once (`usage/v1`, which the script activates too): a
 #      `working` status with no message and, in its metadata, the tokens the script's mapping says
 #      (100 in, 64 of them cached; 20 out, 5 of them reasoning), provider `openai`, model
-#      `mock-coder`, the window compose.yaml sets (MODEL_CONTEXT_WINDOW=131072) and no step; and
+#      `mock-coder`, the window compose.yaml sets (DEFAULT_MODEL_CONTEXT_WINDOW=131072) and no step; and
 #      GetTask says the same as the task's totals.
 #   2. A message to the same task names http://git-server:8080/local/sandbox.git: the run goes on
 #      with the script and ends TASK_STATE_COMPLETED with a `branch` and a `pull_request` artifact.

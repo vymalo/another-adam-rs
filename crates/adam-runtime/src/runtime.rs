@@ -359,6 +359,11 @@ pub(crate) struct Inner {
     pub notifier: Option<DynNotifier>,
     /// Cancellation tokens of the transitions this runtime is stepping now.
     pub in_flight: Mutex<HashMap<RunId, CancelToken>>,
+    /// The runs this worker refused because their journal is a newer epoch ([ADR 0076]): kept out
+    /// of its claims for a period, so a rollout does not spin on them.
+    ///
+    /// [ADR 0076]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0076-a-run-records-the-journal-epoch-it-started-on.md
+    pub skip: Mutex<crate::worker::SkipSet>,
     /// The file bytes a view's reader has fetched, bounded and shared by every clone: a poll of a
     /// run whose file was already served does not read the blob again.
     pub blobs: Mutex<BlobCache>,
@@ -1311,6 +1316,7 @@ impl RuntimeBuilder {
                 cfg: self.cfg,
                 wake: watch::channel(0).0,
                 in_flight: Mutex::default(),
+                skip: Mutex::default(),
                 blobs: Mutex::default(),
             }),
         }

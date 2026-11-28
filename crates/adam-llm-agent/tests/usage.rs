@@ -9,7 +9,9 @@ use std::time::{Duration, Instant};
 
 use adam_core::{DynStore, JournalEntry, MemoryStore, RunId, RunStatus};
 use adam_llm_agent::{Conversation, LlmAgent, Tool, ToolCtx, ToolError, ToolOutput, user_message};
-use adam_model::{DynModel, Message, MockModel, ModelResponse, ToolCall, ToolSpec, Usage};
+use adam_model::{
+    DynModel, Message, MockModel, ModelProfiles, ModelResponse, ToolCall, ToolSpec, Usage,
+};
 use adam_runtime::{CollectingSink, RetryPolicy, RunEvent, RunView, Runtime, UsageEvent};
 use async_trait::async_trait;
 use serde_json::{Value, json};
@@ -214,6 +216,59 @@ async fn a_call_without_usage_is_reported_with_zeros_and_no_provider() {
     let totals = conversation(&rt, &view).await.usage_totals;
     assert_eq!(totals.entries().len(), 1);
     assert_eq!(totals.entries()[0].usage, Usage::default());
+}
+
+/// ADR 0088 decision 3: each report carries the window of its own call's alias, as the client
+/// resolves it — the profile's `contextWindow` over the window configured for that alias
+/// (`DEFAULT_MODEL_CONTEXT_WINDOW`), and a subagent on another alias its own profile's window, which no
+/// variable ever gave it.
+#[tokio::test]
+async fn each_report_carries_the_window_its_aliases_profile_names() {
+    let store: DynStore = Arc::new(MemoryStore::new());
+    let sink = CollectingSink::new();
+    let profiles = ModelProfiles::parse_json(
+        r#"{"profiles": {"big": {"contextWindow": 400000}, "small": {"contextWindow": 64000}}}"#,
+    )
+    .expect("valid profiles");
+    let mock = Arc::new(
+        MockModel::new()
+            .with_context_window("big", 131_072)
+            .with_profiles(profiles),
+    );
+    mock.push_response(calls_with(vec![call("t1", "spawn")], Usage::new(100, 10)))
+        .push_response(text_with("leaf done", Usage::new(10, 1)))
+        .push_response(text_with("top done", Usage::new(200, 20)));
+    let model: DynModel = mock.clone();
+    let rt = Runtime::builder(store)
+        .poll_interval(Duration::from_millis(20))
+        .event_sink(sink.clone())
+        .agent(
+            LlmAgent::builder("top", Arc::clone(&model), "big")
+                .tool(Spawn {
+                    target: "leaf".into(),
+                })
+                .build(),
+        )
+        .agent(LlmAgent::builder("leaf", model, "small").build())
+        .build();
+    let top = rt.start("top", user_message("go"), None).await.unwrap();
+    assert_eq!(run_to_end(&rt, top).await.status, RunStatus::Done);
+
+    let reports = reports(&sink, top);
+    assert_eq!(reports.len(), 3, "{reports:#?}");
+    for report in &reports {
+        let want = match report.model.as_str() {
+            "big" => 400_000,
+            "small" => 64_000,
+            other => panic!("an unexpected alias {other}"),
+        };
+        assert_eq!(report.context_window, Some(want), "{report:?}");
+    }
+    assert_eq!(
+        reports.iter().filter(|r| r.model == "small").count(),
+        1,
+        "the subagent's call"
+    );
 }
 
 /// `top` spawns `mid`, which spawns `leaf`. Every call of `mid` and `leaf` is reported **on `top`**,

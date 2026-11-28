@@ -103,7 +103,7 @@ call is a stream) to a client that activates `text-stream/v1`: chunks while the 
 stream's id, and the whole reply with the turn to one that does not (the same ADR; `adam-a2a-runtime`'s README says how).
 **The tokens of every model call are reported** to a client that activates `usage/v1`, a subagent's under its step, and the
 task carries its totals when it ends or waits ([ADR 0032](../../docs/decisions/0032-usage-per-model-call.md)): the provider is
-`openai`, the model the alias, and the context window `MODEL_CONTEXT_WINDOW`.
+`openai`, the model the alias, and the context window (its profile's `contextWindow`, else `DEFAULT_MODEL_CONTEXT_WINDOW`).
 
 A folder that follows the **persona convention** (the body opens with `Your name is {{display_name}}.` and a line
 `In one sentence: <summary>.`, the summary without `"` and ending at its first period) is greeted by the mock
@@ -224,7 +224,8 @@ same way; every problem is reported at once at startup):
 | `MODEL_EXTRA_BODY` | a JSON object merged into every chat-completions request of the agent's model, for a flag that makes a gateway or model emit its reasoning: `{"reasoning_effort":"medium"}`, `{"thinking":{"type":"enabled"}}`, `{"chat_template_kwargs":{"enable_thinking":true}}`. **Not a secret** (it shows in the pod's environment). A request's typed reasoning level wins over the members its model's `reasoningWire` would duplicate (ADR 0063 decision 6). Not JSON, not an object, or a member the runtime owns (`model`, `messages`, `tools`, `tool_choice`, `stream`): exit 78 at startup, the message names the variable and never repeats the value | unset: nothing is added |
 | `MODEL_ECHO_REASONING` | `reasoning_content` or `reasoning`: keep the model's reasoning in the run's history and send it back under that member name. For a provider that requires it (DeepSeek's thinking mode with tools answers a request without it with a 400); `false` or unset sends none, which is what almost every model wants. Anything else: exit 78 | unset: never sent |
 | `MODEL_PROMPT_CACHE_KEY` | `off` or `conversation`: send each request's `prompt_cache_key` (a hash of the conversation id cut to 32 characters), so a gateway with a prompt cache routes one conversation's requests together; a `MODEL_EXTRA_BODY` member of that name wins. Anything else: exit 78 | `off` |
-| `MODEL_CONTEXT_WINDOW` | the context window of the model `MODEL` names, in tokens (1 to 9007199254740991): what each `usage/v1` call report of a call on that alias says as `contextWindow`; a subagent whose `model:` names another alias reports none. Anything else: exit 78 | unset: reports carry no window |
+| `DEFAULT_MODEL_CONTEXT_WINDOW` | the context window of the model `MODEL` names, in tokens (1 to 9007199254740991), used only when its profile in `MODEL_ALIASES_FILE` names no `contextWindow` ([ADR 0088](../../docs/decisions/0088-the-context-window-follows-the-model-and-the-history-budget-is-200k.md)): what each `usage/v1` call report of a call on that alias says as `contextWindow`; a subagent whose `model:` names another alias takes its own profile's window, or reports none. Anything else: exit 78 | unset: the profile's window, else none |
+| `MODEL_CONTEXT_WINDOW` | **deprecated** alias of `DEFAULT_MODEL_CONTEXT_WINDOW`: read only when that is unset, with one warning at startup; both set to different values is exit 78 | unset |
 | `MCP_ALLOW_STDIO`, `MCP_ALLOW_INSECURE`, `MCP_ALLOW_URL_VARS` | what the folder's MCP servers may be (see above) | `false` each |
 | `A2A_ALLOW_INSECURE_REMOTES` | roles that run workers: a remote subagent (`a2a:` in a subagent file) may be at plain `http` on another machine, such as a service of the same cluster (`AgentDef::allow_insecure_remotes`); without it such a URL is exit 78. **The messages and the bearer then cross the pod network in clear text**: protect it (a NetworkPolicy that admits only the caller, or mesh mTLS); plain `http` goes only to the card's own host, never from an `https` card. The subagent's token is `auth: bearer:VAR`, a variable of this process ([remote subagents](../../docs/reference/agent-files.md#remote-subagents-a2a)) | `false` |
 | `MCP_MAX_CALL_SECS` | the longest one MCP server is waited for, a call and a connection each: what `timeoutSecs` and `connectTimeoutSecs` ask for and the defaults (60 s and 30 s) are lowered to it, and a value the file asks for is at least 1 s in `mcp.json` or the extra file (1 to 86400); a larger value is lowered to it, with a warning at startup | `900` |
@@ -298,6 +299,48 @@ Exit codes are `adam-service`'s: 0 after a clean shutdown, 78 configuration (inc
 component stopped), 1 anything else. A failure is one structured log line with the whole cause chain, and
 nothing on stderr.
 
+## Export
+
+`adam-agent export` writes the folder's runs as training records, one JSON Lines record per run
+([ADR 0087](../../docs/decisions/0087-runs-are-exported-as-training-records.md), the record is
+[`adam-export`](../../crates/adam-export/README.md)'s). It serves nothing: no A2A server, no worker, no schedule, no
+MCP server. Without `export` as its first argument the binary serves, as before.
+
+```sh
+ADAM_AGENT_DIR=dev/agents/assistant DATABASE_URL=sqlite:///var/lib/adam/adam.sqlite \
+EXPORT_PSEUDONYM_KEY=... adam-agent export --require lang=rust --out runs.jsonl
+```
+
+| Flag | What |
+|---|---|
+| `--agent NAME` | an agent the folder registers: the root, or a subagent as `<root>/<name>` (repeatable). Default: every one |
+| `--status done\|failed\|all` | which runs: `done` (default), `failed`, or `all` (every status, unfinished runs included) |
+| `--require KIND=VALUE` | a facet every record must have, `lang=rust`, `dep=axum` (repeatable: all of them) |
+| `--since RFC3339`, `--until RFC3339` | only runs last updated at or after, and before, an instant |
+| `--include-compacted` | keep runs whose history a compaction replaced (with `--samples turn` they are kept anyway) |
+| `--verified-only` | keep only runs that delivered a pull request whose head was verified: a run whose artifacts follow the exporter's outcome contract (`pull_request` with `verified: true`, [`adam-export`](../../crates/adam-export/README.md#the-outcome-contract)); a folder agent's runs have none unless its tools emit them |
+| `--include-reasoning` | keep the reasoning text a run kept |
+| `--samples run\|turn` | one record per run (`run`, the default), or one per assistant turn since the run's last compaction (`turn`): the request of that model call, its answer last, `train_on: "last"` and a `sample` field |
+| `--max-tokens N` | leave out a record over `N` estimated tokens (characters / 4), whole, never cut (counted as `over_budget`) |
+| `--out PATH` | write to `PATH` (created or truncated, mode `0600`) instead of standard output |
+| `--help` | the usage, on standard output |
+
+It reads `ADAM_AGENT_DIR` and `DATABASE_URL` as serving does, `ADAM_EXTRA_MCP_FILE` when set, and
+`EXPORT_PSEUDONYM_KEY`: the key of the pseudonymous ids, read as bytes (set and empty: exit 78; unset: a random key,
+said in the log, so the ids link to nothing else). No model or A2A variable is needed. The runtime registers the
+starters a control plane registers (the root's and each subagent's), which is what joins a run's transcript.
+
+Every string is scrubbed of the secrets the process holds: the password of `DATABASE_URL`, the value of every
+variable named like a secret (`MODEL_API_KEY`, each of `A2A_BEARER_TOKENS`, ...) and of every variable the folder's
+`mcp.json` reads (`redact::export_secret_values`). The log is on standard error, and the summary is its one
+`export finished` line (`seen`, `written`, `filtered`, `not_a_conversation`, `unreadable`, `over_budget`, `turns_lost_to_compaction`,
+`inexact`). Exit codes: 0, 64 for a
+wrong command line, otherwise as serving (78 configuration or files, 69 a store that is down, 71 an `--out` that
+cannot be created). `--current-tools` (attach the agent's current prompt and tools) is not available yet: it is a
+usage error (64), and a record says `tools_source: "none"`.
+
+`sqlite://` holds one process per file: stop the process that serves the file before exporting it.
+
 ## Library
 
 The binary is `main.rs` over a small library, so everything it does is testable without a process:
@@ -350,7 +393,7 @@ model, `tini` as PID 1, SIGTERM exits 0), then the compose scenarios.
 * The subscriber is `adam_otel::init`; its two cases (no endpoint builds nothing; one reaches a loopback collector)
   are tested in [`adam-otel`](../../crates/adam-otel/README.md), once for every binary.
 * `src/config.rs`: `ADAM_AGENT_DIR` required by every role and an existing directory, every problem at once,
-  a control plane that needs no model, `MODEL_CONTEXT_WINDOW` read by the workers (a bad value is exit 78),
+  a control plane that needs no model, `DEFAULT_MODEL_CONTEXT_WINDOW` read by the workers (a bad value, or a different one in its deprecated alias `MODEL_CONTEXT_WINDOW`, is exit 78),
   `A2A_ALLOW_INSECURE_REMOTES` off by default, read by the workers and a boolean, secrets hidden from `Debug`;
   `src/serve.rs`: the switch reaches the binding of the folder's remote subagents (off: refused; on: bound). The
   `schedules` component is `adam_schedule::reconcile_until_stopped`, tested in `adam-schedule`.
@@ -385,6 +428,12 @@ model, `tini` as PID 1, SIGTERM exits 0), then the compose scenarios.
   the official A2A client against a model scripted by the prompt, and the same database after an edit and a
   restart saying the edited words**, a researcher answering with its source through a stateless MCP server, `MAX_PARALLEL_TOOL_CALLS` at 1 and at 2 read in the model's request (the `after_previous` property and sentence absent and present), a control plane and a worker in two processes completing a task over one
   database, and the MCP cases of the section above as a process.
+* Export: `src/export.rs` (`only_a_first_argument_export_is_the_subcommand`, `the_export_parses_the_contract_s_flags`,
+  `the_export_needs_the_database_and_the_folder_only`, `the_export_s_secrets_are_the_database_password_and_the_named_variables`);
+  `tests/binary.rs` `export_writes_the_runs_of_the_folder_as_records` (SQLite, no service): a chat folder serves one
+  task, then `export --out` with only `DATABASE_URL`, `ADAM_AGENT_DIR` and `EXPORT_PSEUDONYM_KEY` writes it as one
+  record (mode `0600`, the pasted A2A token scrubbed, a pseudonym id, the same under the same key on stdout), the
+  summary on stderr; `--bogus` is 64 and an empty key 78. The parser itself is tested in `adam-service`.
 * The mock models `mock-assistant` (`dev/wiremock/mock-openai/mappings/agent-script.json`) and `mock-researcher`
   (`researcher-cards.json`, the script of `[mock:cards]`) are probed by the `compose` job of `ci.yml`; the container
   smoke test and the compose scenarios (`dev/agent-e2e.sh`, and `dev/agent-cards-e2e.sh`, which serves the researcher

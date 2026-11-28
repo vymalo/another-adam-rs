@@ -68,6 +68,10 @@ that asks two of `start`, `close` and `edit`. `asked` answers `Asked::Edit {patc
 * The edit is handled **above** the spent check: raising the `tokenBudget` of a session that spent it is what the option is
   for, so a message to a spent session is `UnsupportedOperation` while an edit of it is accepted (a close is exempt there
   too). An empty `edit.config` is `InvalidParams`, as the tool refuses it, so it records no edit and spends no round.
+* **A person may not edit a session they may not write to** (ADR 0089, amended 2026-11-28): `refused_to_the_person` runs
+  after the closed check and **before** the edit, so an agent's `sealed` (or working `one_shot`) session refuses an `edit`
+  with the words of a message (`session <id> is sealed: ...`). An edit never changes `mode`: `SessionPatch` has no such
+  member, and `parse_edit` refuses an unknown one. Test: `a_sealed_or_one_shot_session_of_the_agent_refuses_the_persons_message_and_steer`.
 * `SessionEditRequest` is the whole admitted config, so the round applies it and never merges; `by: Person` is what
   `SessionHeader.edits` records.
 * **Evidence:** `crates/adam-a2a-runtime/tests/child_sessions.rs` `an_edit_of_an_idle_session_is_a_round_that_calls_no_model`

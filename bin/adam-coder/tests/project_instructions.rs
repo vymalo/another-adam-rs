@@ -380,9 +380,9 @@ fn coder_with_history_and_summaries(
 fn history_coder(fx: &Fixture, model: DynModel, store: DynStore, max_history_tokens: u32) -> Coder {
     let folder = common::plain_folder();
     common::edit_instructions(&folder, |text| {
-        assert!(text.contains("max_history_tokens: 100000"));
+        assert!(text.contains("max_history_tokens: 200000"));
         text.replace(
-            "max_history_tokens: 100000",
+            "max_history_tokens: 200000",
             &format!("max_history_tokens: {max_history_tokens}"),
         )
     });
@@ -972,16 +972,13 @@ async fn the_prepare_result_survives_a_compaction() {
         .push_tool_calls(vec![read("c3", "notes.txt")])
         .push_text("SUMMARY: prepared the workspace and read the notes")
         .push_text("done");
-    // The budget sits between what the request holds after the cut and what it holds after the
-    // second read: a compaction that left the request over the budget would not be made at all
-    // (`Agent::compaction_due`), and one made earlier than the second read would not test what this
-    // case says. Measured on the run this constant was last set from: the fixed part (the
-    // instructions and every tool schema, the `after_previous` property of each per ADR 0049) plus
-    // the task is 24,804 tokens; after the first read 25,025; after the second 33,661, where no cut
-    // was possible yet; after the third 42,297, where a cut leaves 33,440. So the budget is 36,000:
-    // over the post-cut 33,440 and under the 42,297 that triggers it. It was 32,500, which the fixed
-    // part has outgrown — that, and not a lost request, is why this case went red.
-    let coder = coder_with_history_and_summaries(&fx, &mock, Arc::new(MemoryStore::new()), 36_000);
+    // The budget is over what the request holds at least after the cut (the instructions and the
+    // tools, the task and the newest read: a compaction that left the request over it would not be
+    // made) and under what it holds after the second read, each by about 3,000 tokens. The fixed part
+    // counts the `after_previous` property of every schema (ADR 0049), about 1,500 tokens here.
+    // Re-measured 2026-11-28 when main's session guide and the `output`, `commands`, `mode` and
+    // `wait` arguments grew the fixed part: the test passes from about 33,500 to about 43,000.
+    let coder = coder_with_history_and_summaries(&fx, &mock, Arc::new(MemoryStore::new()), 36_500);
     let task_text = format!("look at {}", fx.remote_url());
     let (_, run) = submit(&coder, &task_text).await;
     let worker = spawn_worker(&coder);

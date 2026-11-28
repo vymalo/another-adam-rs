@@ -33,10 +33,16 @@ pub trait ModelClient: Send + Sync + 'static {
     }
 
     /// The context window, in tokens, of the model the alias `model` names, as the deployment
-    /// configured it. `None` (the default) when nobody said: a report then carries no window.
+    /// configured it ([ADR 0088](https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0088-the-context-window-follows-the-model-and-the-history-budget-is-200k.md)):
+    /// what the history budget, the clamp of the output cap and each `usage/v1` report use for
+    /// that alias. `None` when nobody said: a report then carries no window.
+    ///
+    /// The default is the window of the model's [`profile`](Self::profile)
+    /// ([`resolve_context_window`](crate::resolve_context_window) with nothing else configured). A
+    /// client that knows windows outside the profiles answers through the same function, so the
+    /// profile's window always wins.
     fn context_window(&self, model: &str) -> Option<u64> {
-        let _ = model;
-        None
+        crate::resolve_context_window(self.profile(model), None)
     }
 
     /// What the model the alias `model` names can read besides text, as the deployment declared
@@ -139,6 +145,18 @@ mod tests {
         fn profile(&self, model: &str) -> Option<&ModelProfile> {
             (model == "m").then_some(&self.0)
         }
+    }
+
+    #[test]
+    fn the_default_window_is_the_profiles() {
+        let windowed: DynModel = Arc::new(Profiled(ModelProfile {
+            context_window: Some(400_000),
+            ..ModelProfile::default()
+        }));
+        assert_eq!(windowed.context_window("m"), Some(400_000));
+        assert_eq!(windowed.context_window("other"), None, "no profile");
+        let bare: DynModel = Arc::new(Profiled(ModelProfile::default()));
+        assert_eq!(bare.context_window("m"), None, "a profile without one");
     }
 
     #[test]

@@ -35,7 +35,7 @@ before you rely on a detail here.
    * `description` (or `card.description`): the A2A card needs one.
    * `card:` (`name`, `skills` with `id`, `name`, `description`, `tags`, `examples`), `limits:` (`max_turns`, `max_tool_calls`, `max_output_tokens` — the cap this agent asks for, at least 1;
      absent, its preset's, the model's profile's, then 128,000, clamped to the model's limit and
-     window, ADR 0064; a `0` stops the load, naming the key — `max_history_tokens`, and for commands `max_processes`, `command_memory` and `command_cpu`, which only lower the deployment's `MAX_PROCESSES`, `COMMAND_MEMORY_MAX` and `COMMAND_CPU_MAX` and are read by `adam-coder`; see `docs/reference/agent-files.md` at https://github.com/vymalo/another-adam-rs/blob/main/docs/reference/agent-files.md), `model:` (an alias,
+     window, ADR 0064; a `0` stops the load, naming the key — `max_history_tokens`, and for commands `max_processes`, `command_memory` and `command_cpu`, which only lower the deployment's `MAX_PROCESSES`, `COMMAND_MEMORY_MAX` and `COMMAND_CPU_MAX` and are read by `adam-coder`, and `output` (root only, read by `adam-coder`: `{ run_checks, run, run_command }`, each `on_error` or `full`, the default of a call that gives no `output`; another key or word is exit 78; ADR 0090); see `docs/reference/agent-files.md` at https://github.com/vymalo/another-adam-rs/blob/main/docs/reference/agent-files.md), `model:` (an alias,
      only when it should not be `MODEL`), `model_fallback:` (overrides the `fallback` of the agent's `model_preset` and of
      its model's profile in `MODEL_ALIASES_FILE`: the alias the run continues on, once, when the endpoint refuses
      `model` as locked; not the agent's own alias, else exit 78; a subagent resolves its own, so an `inherit` subagent
@@ -77,6 +77,10 @@ before you rely on a detail here.
 3. **Body**: the system prompt. Optional `skills/<name>/SKILL.md` (Agent Skills format, loaded on
    demand by `load_skill` and `read_skill_file`, which take a plain string name and page; a folder with no `skills:` has all of them, `skills: []` none) and `subagents/` (each one tool of the parent, a
    child run with only the tools it lists and never `ask_user`; registered as `<name>/<subagent>`).
+   A subagent file may set `session:` (`mode`: `one_shot`, `sealed` or `open`; `wait`: `true` or `false`): what a
+   `subagent_start` that names none gets, and `mode` is also the widest a call may ask (a call only narrows it; asking
+   wider is an error result naming both). Another key or word is exit 78; on the root it is a warning and ignored
+   (ADR 0089 slice C3; `docs/reference/agent-files.md`).
    A root with subagents also gets the five session tools (`subagent_start` .. `subagent_list`) and a fixed *Child sessions* section at the end of its prompt, after the skills catalog (the tools, the helpers sorted, what `config` takes): do not write a paragraph about them in the instructions.
    A subagent file with `a2a: <agent-card URL>` is a **remote subagent** (another A2A agent): render the URL into
    the file, and give its token through `auth: bearer:VAR` (a variable of the process, from a Secret; unset is exit

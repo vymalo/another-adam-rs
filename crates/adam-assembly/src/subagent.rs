@@ -60,11 +60,16 @@ pub(crate) fn title_of(tool_name: &str) -> String {
 ///
 /// The tool takes `{ "message": string }` and its description is the subagent's `description`
 /// followed by "The agent does not see this conversation; put everything it needs in `message`."
-/// A call starts the subagent as a child run of the parent's run (`ToolCtx::start_child`, under
-/// the id derived from the call, so a replay finds the child it started), with `message` as its
-/// first user message, and returns [`ToolError::AwaitRun`]: the parent parks, and the child's final
-/// text becomes the tool result (an error result when the child failed). See "Child runs" in
+/// A call starts the subagent as a child run of the parent's run, under the id derived from the
+/// call (so a replay finds the child it started), with `message` as its first user message, and
+/// returns [`ToolError::AwaitRun`]: the parent parks, and the child's final text becomes the tool
+/// result (an error result when the child failed). The child is a **one-shot session** of the
+/// parent ([ADR 0089] slice C1, `ToolCtx::start_one_shot_session`): it has a session's
+/// conversation id, so a session listing and the exporter see it, and it is closed from the start,
+/// so nobody can send to it and it closes when its round ends. See "Child runs" in
 /// `docs/architecture.md`.
+///
+/// [ADR 0089]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0089-every-child-is-a-session-and-the-one-shot-subagent-tool-goes.md
 ///
 /// What that means for the model and for the author:
 ///
@@ -148,8 +153,10 @@ impl Tool for SubagentTool {
                 )));
             }
         };
+        // A one-shot session (ADR 0089 slice C1): the child the call always started, under the same
+        // id, now with a session's conversation id, closed from the start.
         let run = ctx
-            .start_child_within(&self.agent, message, self.within)
+            .start_one_shot_session(&self.agent, message, self.within)
             .await?;
         Err(ToolError::AwaitRun { run })
     }

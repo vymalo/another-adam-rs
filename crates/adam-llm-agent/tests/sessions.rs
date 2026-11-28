@@ -25,7 +25,8 @@ use adam_model::{
 };
 use adam_runtime::{
     CHILD_REPORTED_KIND, CollectingSink, Inbound, ManualClock, RetryPolicy, RunView, Runtime,
-    RuntimeBuilder, RuntimeError, SessionHeader, SessionLimits, SessionState, child_run_id,
+    RuntimeBuilder, RuntimeError, SessionHeader, SessionLimits, SessionMode, SessionState,
+    child_run_id,
 };
 use adam_store_testkit::fault::{FaultyStore, Method};
 use async_trait::async_trait;
@@ -418,6 +419,8 @@ struct Rig {
     child_source: Option<Arc<std::sync::Mutex<Vec<String>>>>,
     /// How long a kept-open session may sit idle (`None`: the runtime's default).
     idle_ttl: Option<Duration>,
+    /// What `helper`'s file says of its sessions (`session:`, ADR 0089 slice C3).
+    session: adam_llm_agent::SessionDefaults,
     sink: CollectingSink,
     /// A sink that lists the sessions when a round is cancelled (`None`: the collecting one).
     cancel_watch: Option<Arc<CancelWatch>>,
@@ -445,10 +448,17 @@ impl Rig {
             child_tools: None,
             child_source: None,
             idle_ttl: None,
+            session: adam_llm_agent::SessionDefaults::default(),
             sink: CollectingSink::new(),
             cancel_watch: None,
             clock: ManualClock::new(),
         }
+    }
+
+    /// `helper` as a file with `session:` filed `mode` and `wait`.
+    fn filed(mut self, mode: Option<SessionMode>, wait: Option<bool>) -> Self {
+        self.session = adam_llm_agent::SessionDefaults { mode, wait };
+        self
     }
 
     fn holding(mut self, n: usize) -> Self {
@@ -512,6 +522,7 @@ impl Rig {
                 within: self.within,
                 remote: false,
                 bounds: adam_runtime::SessionBounds::default(),
+                session: self.session,
             },
             SessionAgent {
                 name: "far".into(),
@@ -520,6 +531,7 @@ impl Rig {
                 within: None,
                 remote: true,
                 bounds: adam_runtime::SessionBounds::default(),
+                session: adam_llm_agent::SessionDefaults::default(),
             },
         ]);
         match self.limits {
@@ -728,6 +740,15 @@ fn start_call(id: &str, keep_open: bool) -> ToolCall {
         json!({"agent": "helper", "description": "look at it", "prompt": "do the work",
                "keep_open": keep_open}),
     )
+}
+
+/// A start of `helper` with `extra` members beside its required ones (`mode`, `wait`, ...).
+fn start_with(id: &str, extra: Value) -> ToolCall {
+    let mut args = json!({"agent": "helper", "description": "look at it", "prompt": "do the work"});
+    if let (Some(args), Some(extra)) = (args.as_object_mut(), extra.as_object()) {
+        args.extend(extra.clone());
+    }
+    call(id, "subagent_start", args)
 }
 
 fn read_call(id: &str, session: RunId, wait: bool) -> ToolCall {
@@ -1029,7 +1050,7 @@ async fn start_persons_round_with(
         id: session,
         agent: rig.child_name.clone(),
         description: "asked by a person".into(),
-        keep_open: true,
+        mode: adam_runtime::SessionMode::Open,
         closed: false,
         closing: false,
         deleted: false,
@@ -1296,7 +1317,7 @@ mod cases {
         let started = as_json(&result_of(&results, "c1").1);
         assert_eq!(started["session"], session.to_string());
         assert_eq!(started["state"], "working");
-        assert_eq!(started["keep_open"], false);
+        assert_eq!(started["mode"], "one_shot", "the default");
         assert_eq!(
             rig.parent_mock.requests().len(),
             2,
@@ -1684,7 +1705,7 @@ mod cases {
             .unwrap();
         assert_eq!(list.sessions[0].state, SessionState::Idle);
         assert_eq!(list.sessions[0].round, 2);
-        assert!(list.sessions[0].keep_open);
+        assert_eq!(list.sessions[0].mode, adam_runtime::SessionMode::Open);
         assert_eq!(list.sessions[0].description, "look at it");
     }
 
@@ -1926,8 +1947,15 @@ mod cases {
         let conv = conv_id();
         let parent = rig.start(&rt, &conv).await;
         let session = child_run_id(parent, "c1");
+        // A retry runs the transition's steps afresh (the runtime abandons the failed try's
+        // journal), so the model is asked again and answers the same call: the edit's second try.
         rig.parent_mock
             .push_tool_calls(vec![start_call("c1", true)])
+            .push_tool_calls(vec![edit_call(
+                "c2",
+                session,
+                json!({"max_output_tokens": 512}),
+            )])
             .push_tool_calls(vec![edit_call(
                 "c2",
                 session,
@@ -2357,7 +2385,7 @@ mod cases {
             lines[2].starts_with(&s1.to_string()) && lines[2].contains("closed"),
             "{all}"
         );
-        assert!(lines[0].contains("helper working round 1 keep_open=true \"still working\""));
+        assert!(lines[0].contains("helper working round 1 mode=open \"still working\""));
         assert_eq!(lines[3], "[end: 3 sessions]");
         let first = &result_of(&results, "c7").1;
         assert_eq!(first.lines().count(), 3);
@@ -3281,6 +3309,7 @@ mod cases {
                 within: Some(Duration::from_secs(5)),
                 remote: false,
                 bounds: adam_runtime::SessionBounds::default(),
+                session: adam_llm_agent::SessionDefaults::default(),
             },
             SessionAgent {
                 name: "far".into(),
@@ -3289,6 +3318,7 @@ mod cases {
                 within: None,
                 remote: true,
                 bounds: adam_runtime::SessionBounds::default(),
+                session: adam_llm_agent::SessionDefaults::default(),
             },
         ]);
         let again: Vec<adam_model::ToolSpec> = again.tools().iter().map(|t| t.spec()).collect();
@@ -3546,7 +3576,7 @@ mod cases {
             id: stranded,
             agent: rig.child_name.clone(),
             description: "left working".into(),
-            keep_open: true,
+            mode: adam_runtime::SessionMode::Open,
             closed: false,
             closing: false,
             deleted: false,
@@ -4101,6 +4131,11 @@ mod cases {
             .unwrap();
         assert_eq!(started.fields["session"], json!(session.to_string()));
         assert_eq!(started.fields["keep_open"], json!(true));
+        assert_eq!(
+            started.fields["mode"],
+            json!("open"),
+            "what keep_open true meant"
+        );
 
         if with_child {
             return;
@@ -5869,7 +5904,7 @@ mod cases {
             id: session,
             agent: rig.child_name.clone(),
             description: "asked by a person".into(),
-            keep_open: true,
+            mode: adam_runtime::SessionMode::Open,
             closed: false,
             closing: true,
             deleted: false,
@@ -6557,7 +6592,7 @@ mod cases {
     pub async fn a_model_started_session_asks_only_when_the_client_shows_child_sessions(
         store: DynStore,
     ) {
-        for shown in [false, true] {
+        for (shown, mode) in [(false, "open"), (true, "open"), (true, "sealed")] {
             let rig = Rig::new().asking();
             rig.child_mock
                 .push_tool_calls(vec![ask_call("q1", "which branch?")])
@@ -6574,7 +6609,7 @@ mod cases {
                 .await
                 .unwrap();
             rig.parent_mock
-                .push_tool_calls(vec![start_call("c1", true)])
+                .push_tool_calls(vec![start_with("c1", json!({"mode": mode}))])
                 .push_text("started");
             let worker = spawn_worker(&rt);
             let session = child_run_id(parent, "c1");
@@ -6582,9 +6617,381 @@ mod cases {
                 v.waiting || v.state == SessionState::Idle
             })
             .await;
-            assert_eq!(view.waiting, shown, "shown = {shown}");
+            // A sealed round has nobody to answer it, shown or not (ADR 0089): the person cannot
+            // write to it.
+            assert_eq!(
+                view.waiting,
+                shown && mode == "open",
+                "shown = {shown}, mode = {mode}"
+            );
             worker.stop().await;
         }
+    }
+
+    /// ADR 0089 slice C2: each `mode` is the session's header, and what happens after the first
+    /// round follows it: `one_shot` closes and refuses a send, `sealed` and `open` stay idle and
+    /// take the parent's next round.
+    pub async fn each_mode_is_kept_in_the_header_and_decides_what_follows_the_round(
+        store: DynStore,
+    ) {
+        for (mode, wanted, after) in [
+            ("one_shot", SessionMode::OneShot, SessionState::Closed),
+            ("sealed", SessionMode::Sealed, SessionState::Idle),
+            ("open", SessionMode::Open, SessionState::Idle),
+        ] {
+            let rig = Rig::new();
+            rig.child_mock.push_text("first").push_text("second");
+            let (parent_agent, child_agent) = (rig.parent(), rig.child());
+            let rt = rig.together(&store, &parent_agent, &child_agent);
+            let conv = conv_id();
+            let parent = rig.start(&rt, &conv).await;
+            let session = child_run_id(parent, "c1");
+            rig.parent_mock
+                .push_tool_calls(vec![start_with("c1", json!({"mode": mode}))])
+                .push_tool_calls(vec![read_call("r1", session, true)])
+                .push_tool_calls(vec![send_call("s1", session, "more")])
+                .push_tool_calls(vec![read_call("r2", session, true)])
+                .push_text("done");
+            let worker = spawn_worker(&rt);
+            wait_done(&rt, parent).await;
+            worker.stop().await;
+            let results = tool_results(&state_of(&rt, parent).await);
+            assert_eq!(as_json(&result_of(&results, "c1").1)["mode"], mode);
+            let view = rt.session_view(&conv, session).await.unwrap().unwrap();
+            assert_eq!(view.header.as_ref().map(|h| h.mode), Some(wanted), "{mode}");
+            let (_, sent, refused) = result_of(&results, "s1");
+            match after {
+                SessionState::Closed => {
+                    assert!(*refused && sent.contains("is closed"), "{mode}: {sent}");
+                    assert_eq!(view.round, 1, "{mode}");
+                    assert_eq!(view.state, SessionState::Closed, "{mode}");
+                }
+                _ => {
+                    assert!(!refused, "{mode}: the parent sends to it: {sent}");
+                    assert_eq!(as_json(sent)["delivered"], "new_round", "{mode}");
+                    assert_eq!((view.round, view.state), (2, SessionState::Idle), "{mode}");
+                    assert!(result_of(&results, "r2").1.contains("second"), "{mode}");
+                }
+            }
+        }
+    }
+
+    /// ADR 0089 slice C2: `wait: true` parks the start on its round and answers the first report,
+    /// as a read that waits does; the report is counted as read, so it is never told again as a
+    /// report of the session. Observers see the start when it parks and the report when it settles.
+    pub async fn a_start_that_waits_answers_its_first_report_once(store: DynStore) {
+        let watches = Arc::new(Watches::default());
+        let rig = Rig::new();
+        rig.child_mock.push_text("the first report");
+        let model: DynModel = rig.parent_mock.clone();
+        let mut builder = LlmAgent::builder(&rig.parent_name, model, "m")
+            .session_agents([rig.child_name.clone()])
+            .plugin(SharedWatches(watches.clone()));
+        for tool in rig.roster().tools() {
+            builder = builder.dyn_tool(tool);
+        }
+        let (parent_agent, child_agent) = (builder.build(), rig.child());
+        let rt = rig.together(&store, &parent_agent, &child_agent);
+        let conv = conv_id();
+        let parent = rig.start(&rt, &conv).await;
+        let session = child_run_id(parent, "c1");
+        rig.parent_mock
+            .push_tool_calls(vec![start_with(
+                "c1",
+                json!({"mode": "sealed", "wait": true}),
+            )])
+            .push_text("done");
+        let worker = spawn_worker(&rt);
+        wait_done(&rt, parent).await;
+        worker.stop().await;
+        let state = state_of(&rt, parent).await;
+        let results = tool_results(&state);
+        let (_, report, is_error) = result_of(&results, "c1");
+        assert!(!is_error, "{report}");
+        assert!(
+            report.starts_with(&format!(
+                "session {session} (helper, \"look at it\"): round 1, idle"
+            )),
+            "the session id comes with the report: {report}"
+        );
+        assert!(
+            report.contains("report: done") && report.contains("the first report"),
+            "{report}"
+        );
+        assert!(
+            report_calls(&state.messages).is_empty(),
+            "the report is the call's result, not a second report: {:#?}",
+            state.messages
+        );
+        assert_eq!(
+            rig.parent_mock.requests().len(),
+            2,
+            "one call to start, one after it"
+        );
+        let seen = watches.0.lock().unwrap().clone();
+        let named = |name: &str| {
+            seen.iter()
+                .filter(|e| e.kind.name() == name)
+                .collect::<Vec<_>>()
+        };
+        let started = named("session.started");
+        assert_eq!(started.len(), 1);
+        assert_eq!(started[0].fields["session"], json!(session.to_string()));
+        assert_eq!(started[0].fields["agent"], json!("helper"));
+        assert_eq!(started[0].fields["mode"], json!("sealed"));
+        assert_eq!(started[0].fields["keep_open"], json!(true));
+        assert_eq!(started[0].fields["wait"], json!(true));
+        assert_eq!(named("session.round.ended").len(), 1, "the report, settled");
+    }
+
+    /// ADR 0089 slice C2: `keep_open` is read for one release and mapped onto `mode`; the two
+    /// disagreeing is an error result naming both, and so is a mode that is none of the three.
+    /// Nothing is started for a refused call.
+    pub async fn keep_open_maps_onto_mode_and_a_disagreement_is_refused(store: DynStore) {
+        let rig = Rig::new();
+        rig.child_mock.push_text("one").push_text("two");
+        let (parent_agent, child_agent) = (rig.parent(), rig.child());
+        let rt = rig.together(&store, &parent_agent, &child_agent);
+        let conv = conv_id();
+        let parent = rig.start(&rt, &conv).await;
+        rig.parent_mock
+            .push_tool_calls(vec![
+                start_with("c1", json!({"keep_open": true, "mode": "sealed"})),
+                start_with("c2", json!({"mode": "ajar"})),
+                start_with("c3", json!({"wait": "yes"})),
+            ])
+            .push_tool_calls(vec![start_with(
+                "c4",
+                json!({"keep_open": true, "mode": "open"}),
+            )])
+            .push_tool_calls(vec![start_with("c5", json!({"keep_open": false}))])
+            .push_tool_calls(vec![read_call("r4", child_run_id(parent, "c4"), true)])
+            .push_tool_calls(vec![read_call("r5", child_run_id(parent, "c5"), true)])
+            .push_text("done");
+        let worker = spawn_worker(&rt);
+        wait_done(&rt, parent).await;
+        worker.stop().await;
+        let results = tool_results(&state_of(&rt, parent).await);
+        let (_, clash, refused) = result_of(&results, "c1");
+        assert!(
+            *refused && clash.contains("`keep_open` (true)") && clash.contains("`mode` (sealed)"),
+            "{clash}"
+        );
+        let (_, unknown, refused) = result_of(&results, "c2");
+        assert!(
+            *refused && unknown.contains("one_shot, sealed, open"),
+            "{unknown}"
+        );
+        assert!(result_of(&results, "c3").2, "`wait` is true or false");
+        for (id, mode) in [("c4", "open"), ("c5", "one_shot")] {
+            let (_, started, refused) = result_of(&results, id);
+            assert!(!refused, "{started}");
+            assert_eq!(as_json(started)["mode"], mode, "{id}");
+        }
+        let list = rt
+            .list_sessions(&conv, &[&rig.child_name], 0, 10)
+            .await
+            .unwrap();
+        assert_eq!(list.total, 2, "the refused calls started nothing");
+    }
+
+    /// ADR 0089 slice C3: a subagent filed `session.mode: sealed` starts `sealed` when a call names
+    /// no mode, and a call may narrow it (`one_shot`, or `keep_open: false`), never widen it:
+    /// `open`, or `keep_open: true`, is an error result naming the mode asked, the ceiling and the
+    /// subagent, and starts nothing.
+    pub async fn a_filed_mode_is_the_default_and_the_ceiling_of_a_start(store: DynStore) {
+        let rig = Rig::new().filed(Some(SessionMode::Sealed), None);
+        rig.child_mock
+            .push_text("one")
+            .push_text("two")
+            .push_text("three");
+        let (parent_agent, child_agent) = (rig.parent(), rig.child());
+        let rt = rig.together(&store, &parent_agent, &child_agent);
+        let conv = conv_id();
+        let parent = rig.start(&rt, &conv).await;
+        rig.parent_mock
+            .push_tool_calls(vec![
+                start_with("c1", json!({})),
+                start_with("c2", json!({"mode": "one_shot"})),
+                start_with("c3", json!({"mode": "open"})),
+                start_with("c4", json!({"keep_open": true})),
+                start_with("c5", json!({"keep_open": false})),
+            ])
+            .push_tool_calls(vec![
+                read_call("r1", child_run_id(parent, "c1"), true),
+                read_call("r2", child_run_id(parent, "c2"), true),
+                read_call("r5", child_run_id(parent, "c5"), true),
+            ])
+            .push_text("done");
+        let worker = spawn_worker(&rt);
+        wait_done(&rt, parent).await;
+        worker.stop().await;
+        let results = tool_results(&state_of(&rt, parent).await);
+        for (id, mode, wanted) in [
+            ("c1", "sealed", SessionMode::Sealed),
+            ("c2", "one_shot", SessionMode::OneShot),
+            ("c5", "one_shot", SessionMode::OneShot),
+        ] {
+            let (_, started, refused) = result_of(&results, id);
+            assert!(!refused, "{id}: {started}");
+            assert_eq!(as_json(started)["mode"], mode, "{id}");
+            let view = rt
+                .session_view(&conv, child_run_id(parent, id))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(view.header.map(|h| h.mode), Some(wanted), "{id}");
+        }
+        let (_, wider, refused) = result_of(&results, "c3");
+        assert!(*refused, "{wider}");
+        assert_eq!(
+            wider,
+            "`mode` is open; at most sealed for helper, as its file's `session.mode` says: one of \
+             one_shot, sealed"
+        );
+        let (_, kept, refused) = result_of(&results, "c4");
+        assert!(*refused, "{kept}");
+        assert!(
+            kept.starts_with("`keep_open` true is mode open; at most sealed for helper"),
+            "the refusal repeats what the call wrote: {kept}"
+        );
+        let list = rt
+            .list_sessions(&conv, &[&rig.child_name], 0, 10)
+            .await
+            .unwrap();
+        assert_eq!(list.total, 3, "the refused calls started nothing");
+    }
+
+    /// ADR 0089, amended 2026-11-28: `subagent_edit` changes the config, never the mode. An edit
+    /// that names a mode wider than the subagent's filed `session.mode` is refused in
+    /// `subagent_start`'s words for the ceiling; one that names a narrower mode, or the `keep_open`
+    /// of before, beside `config` or in it, is refused too; and each names the mode the session
+    /// keeps and changes nothing.
+    pub async fn an_edit_changes_no_mode_and_names_the_ceiling(store: DynStore) {
+        let rig = Rig::new().filed(Some(SessionMode::Sealed), None);
+        rig.child_mock.push_text("one");
+        let (parent_agent, child_agent) = (rig.parent(), rig.child());
+        let rt = rig.together(&store, &parent_agent, &child_agent);
+        let conv = conv_id();
+        let parent = rig.start(&rt, &conv).await;
+        let session = child_run_id(parent, "c1");
+        let edit = |id: &str, extra: Value| {
+            let mut args = json!({"session": session.to_string()});
+            if let (Some(args), Some(extra)) = (args.as_object_mut(), extra.as_object()) {
+                args.extend(extra.clone());
+            }
+            call(id, "subagent_edit", args)
+        };
+        rig.parent_mock
+            .push_tool_calls(vec![start_with("c1", json!({}))])
+            .push_tool_calls(vec![read_call("r1", session, true)])
+            .push_tool_calls(vec![
+                edit("e1", json!({"mode": "open", "config": {"max_turns": 5}})),
+                edit(
+                    "e2",
+                    json!({"config": {"mode": "one_shot", "max_turns": 5}}),
+                ),
+                edit("e3", json!({"keep_open": true})),
+            ])
+            .push_text("done");
+        let worker = spawn_worker(&rt);
+        wait_done(&rt, parent).await;
+        worker.stop().await;
+        let results = tool_results(&state_of(&rt, parent).await);
+        let stays = format!(
+            "`subagent_edit` changes a session's config, never its mode: session `{session}` \
+             stays sealed, the mode it was started with"
+        );
+        let (_, wider, refused) = result_of(&results, "e1");
+        assert!(*refused, "{wider}");
+        assert!(
+            wider.starts_with(
+                "`mode` is open; at most sealed for helper, as its file's `session.mode` says: \
+                 one of one_shot, sealed; "
+            ) && wider.contains(&stays),
+            "{wider}"
+        );
+        let (_, narrower, refused) = result_of(&results, "e2");
+        assert!(*refused, "{narrower}");
+        assert!(
+            narrower.starts_with("`mode` is one_shot; ") && narrower.contains(&stays),
+            "{narrower}"
+        );
+        let (_, kept, refused) = result_of(&results, "e3");
+        assert!(*refused, "{kept}");
+        assert!(
+            kept.starts_with("`keep_open` true is mode open; at most sealed for helper")
+                && kept.contains(&stays),
+            "the refusal repeats what the call wrote: {kept}"
+        );
+        let view = rt
+            .session_view(&conv, session)
+            .await
+            .unwrap()
+            .expect("the session");
+        let header = view.header.expect("a round of a session has a header");
+        assert_eq!(header.mode, SessionMode::Sealed, "the mode is unchanged");
+        assert!(header.config.is_none(), "{:?}", header.config);
+        assert!(header.edits.is_empty(), "a refused edit is no edit");
+        assert_eq!(view.round, 1, "a refusal starts no round");
+    }
+
+    /// ADR 0089 slice C3: a subagent filed `session.wait: true` makes a start that does not say
+    /// wait for its first report, and a start that says `wait: false` returns at once; `wait` is a
+    /// default, never a ceiling. The `session.started` of the start that waited names the filed
+    /// mode, which the call did not.
+    pub async fn a_filed_wait_is_a_default_a_call_may_turn_off(store: DynStore) {
+        let watches = Arc::new(Watches::default());
+        let rig = Rig::new().filed(Some(SessionMode::Sealed), Some(true));
+        rig.child_mock
+            .push_text("the first report")
+            .push_text("the second report");
+        let model: DynModel = rig.parent_mock.clone();
+        let roster = rig.roster();
+        let mut builder = LlmAgent::builder(&rig.parent_name, model, "m")
+            .session_agents([rig.child_name.clone()])
+            .session_default_modes(roster.default_modes())
+            .plugin(SharedWatches(watches.clone()));
+        for tool in roster.tools() {
+            builder = builder.dyn_tool(tool);
+        }
+        let (parent_agent, child_agent) = (builder.build(), rig.child());
+        let rt = rig.together(&store, &parent_agent, &child_agent);
+        let conv = conv_id();
+        let parent = rig.start(&rt, &conv).await;
+        let (waited, at_once) = (child_run_id(parent, "c1"), child_run_id(parent, "c2"));
+        rig.parent_mock
+            .push_tool_calls(vec![start_with("c1", json!({}))])
+            .push_tool_calls(vec![start_with("c2", json!({"wait": false}))])
+            .push_tool_calls(vec![read_call("r2", at_once, true)])
+            .push_text("done");
+        let worker = spawn_worker(&rt);
+        wait_done(&rt, parent).await;
+        worker.stop().await;
+        let results = tool_results(&state_of(&rt, parent).await);
+        let (_, report, refused) = result_of(&results, "c1");
+        assert!(!refused, "{report}");
+        assert!(
+            report.starts_with(&format!(
+                "session {waited} (helper, \"look at it\"): round 1"
+            )) && report.contains("the first report"),
+            "the filed wait parked the start on its report: {report}"
+        );
+        let (_, started, refused) = result_of(&results, "c2");
+        assert!(!refused, "{started}");
+        assert_eq!(as_json(started)["state"], "working", "`wait: false` wins");
+        assert_eq!(as_json(started)["mode"], "sealed");
+        let seen = watches.0.lock().unwrap().clone();
+        let parked: Vec<_> = seen
+            .iter()
+            .filter(|e| {
+                e.kind.name() == "session.started"
+                    && e.fields["session"] == json!(waited.to_string())
+            })
+            .collect();
+        assert_eq!(parked.len(), 1, "{seen:#?}");
+        assert_eq!(parked[0].fields["mode"], json!("sealed"));
+        assert_eq!(parked[0].fields["wait"], json!(true));
     }
 }
 
@@ -6598,6 +7005,7 @@ fn limits_do_not_change_the_specs() {
             within: None,
             remote: false,
             bounds: adam_runtime::SessionBounds::default(),
+            session: adam_llm_agent::SessionDefaults::default(),
         }]
     };
     let specs = |tools: SessionTools| {
@@ -6609,6 +7017,60 @@ fn limits_do_not_change_the_specs() {
         default,
         specs(SessionTools::new(agents()).with_limits(limited))
     );
+}
+
+/// ADR 0089 slice C3: the roster of `subagent_start` says a subagent's filed `session:` only on that
+/// subagent's line, so a folder without the block keeps the bytes of every spec (the pinned file
+/// below), and one with it changes that line alone.
+#[test]
+fn a_filed_session_changes_only_its_roster_line() {
+    let agent = |name: &str, session| SessionAgent {
+        name: name.into(),
+        agent: format!("coder/{name}"),
+        description: format!("The {name}."),
+        within: None,
+        remote: false,
+        bounds: adam_runtime::SessionBounds::default(),
+        session,
+    };
+    let start = |session| {
+        let roster = SessionTools::new([
+            agent("explorer", adam_llm_agent::SessionDefaults::default()),
+            agent("reviewer", session),
+        ]);
+        roster.tools()[0].spec()
+    };
+    let plain = start(adam_llm_agent::SessionDefaults::default());
+    for (session, note) in [
+        (
+            (Some(SessionMode::Sealed), None),
+            " (mode sealed by default, at most sealed)",
+        ),
+        (
+            (Some(SessionMode::OneShot), Some(true)),
+            " (mode one_shot by default, at most one_shot; waits by default)",
+        ),
+        ((Some(SessionMode::Open), None), " (mode open by default)"),
+        ((None, Some(true)), " (waits by default)"),
+    ] {
+        let (mode, wait) = session;
+        let filed = start(adam_llm_agent::SessionDefaults { mode, wait });
+        assert_eq!(
+            filed.description,
+            plain.description.replace(
+                "- reviewer: The reviewer.",
+                &format!("- reviewer: The reviewer.{note}")
+            ),
+            "{note}"
+        );
+        assert_eq!(filed.parameters, plain.parameters, "the schema is the same");
+    }
+    // `wait: false` is the tool's own default: nothing to say.
+    let quiet = start(adam_llm_agent::SessionDefaults {
+        mode: None,
+        wait: Some(false),
+    });
+    assert_eq!(quiet, plain);
 }
 
 /// The tools and arguments the guide documents, in its own order: each `- `tool` (`arg`, `opt?`):`
@@ -6727,6 +7189,7 @@ fn guide_roster() -> SessionTools {
         within: None,
         remote: false,
         bounds: adam_runtime::SessionBounds::default(),
+        session: adam_llm_agent::SessionDefaults::default(),
     }))
 }
 
@@ -6823,6 +7286,7 @@ fn the_six_specs_are_pinned() {
             within: None,
             remote: false,
             bounds: adam_runtime::SessionBounds::default(),
+            session: adam_llm_agent::SessionDefaults::default(),
         },
         SessionAgent {
             name: "explorer".into(),
@@ -6831,6 +7295,7 @@ fn the_six_specs_are_pinned() {
             within: None,
             remote: false,
             bounds: adam_runtime::SessionBounds::default(),
+            session: adam_llm_agent::SessionDefaults::default(),
         },
     ]);
     let specs: Vec<adam_model::ToolSpec> = roster.tools().iter().map(|t| t.spec()).collect();
@@ -6964,6 +7429,12 @@ macro_rules! session_suite {
                 a_persons_round_that_asks_the_person_is_blocked_and_the_answer_resumes_it,
                 a_child_run_that_is_no_shown_session_cannot_ask,
                 a_model_started_session_asks_only_when_the_client_shows_child_sessions,
+                each_mode_is_kept_in_the_header_and_decides_what_follows_the_round,
+                a_start_that_waits_answers_its_first_report_once,
+                keep_open_maps_onto_mode_and_a_disagreement_is_refused,
+                a_filed_mode_is_the_default_and_the_ceiling_of_a_start,
+                a_filed_wait_is_a_default_a_call_may_turn_off,
+                an_edit_changes_no_mode_and_names_the_ceiling,
             );
         }
     };

@@ -154,6 +154,7 @@ mod order;
 pub mod paging;
 mod plan;
 mod redact;
+mod request;
 mod schedule;
 #[cfg(feature = "schema")]
 mod schema;
@@ -190,11 +191,11 @@ pub use adam_plugin::{
 };
 pub use adam_runtime::{Artifact, StepEvent, StepIcon, StepKind, StepOutput, StepState};
 pub use agent::{
-    BuildError, CLOSING_TURN, DEFAULT_MAX_PARALLEL, DEFAULT_WAIT_POLL, Limits, LlmAgent,
-    LlmAgentBuilder, LlmStarter, MAX_INTERFACE_LANGUAGE_BYTES, MAX_PARALLEL_LIMIT,
-    MAX_THINKING_CUTS, ModelBinding, NOT_APPROVABLE, NOT_ASKABLE, THINKING_CUT_TURN, UNATTENDED,
-    approval_step, approves, interface_language, interface_language_turn, is_unattended,
-    tool_retry_key,
+    BuildError, CLOSING_TURN, DEFAULT_MAX_HISTORY_TOKENS, DEFAULT_MAX_PARALLEL, DEFAULT_WAIT_POLL,
+    Limits, LlmAgent, LlmAgentBuilder, LlmStarter, MAX_INTERFACE_LANGUAGE_BYTES,
+    MAX_PARALLEL_LIMIT, MAX_THINKING_CUTS, ModelBinding, NOT_APPROVABLE, NOT_ASKABLE,
+    THINKING_CUT_TURN, UNATTENDED, approval_step, approves, interface_language,
+    interface_language_turn, is_unattended, tool_retry_key,
 };
 pub use compaction::{
     COMPACTION_TURN, Compaction, CompactionReason, MAX_COMPACTIONS, PromptSize,
@@ -204,11 +205,11 @@ pub use conversation::{
     ACCESS_TIER_CONTEXT_KEY, Approval, ArtifactRef, CALLER_CONTEXT_KEY, CHILD_SESSIONS_CONTEXT_KEY,
     Conversation, LOCALE_CONTEXT_KEY, LimitHit, LimitKind, Loaded, Loader, MAX_CARRIED_BYTES,
     MAX_CONTEXT_BYTES, MAX_LOADED_NOTE_BYTES, MAX_PROTECTED_VALUE_BYTES, MAX_READ_IDS,
-    MAX_REPORTED_ROUNDS, MESSAGE_KIND, MODE_CONTEXT_KEY, MODEL_CONTEXT_KEY, ModelSwitch,
-    OMITTED_MARKER_PREFIX, PER_MESSAGE_CONTEXT_KEYS, PROMPT_STATEMENT_KEY, PROTECTED_CONTEXT_KEYS,
-    PendingQuestion, PendingRemote, PendingRun, PendingSession, PendingWait,
-    REASONING_EFFORT_CONTEXT_KEY, RENDERER_OFFER_CONTEXT_KEY, Repeats, SESSION_TOOLS_CONTEXT_KEY,
-    STOPPED_BY_THE_PERSON, loaded_note, user_message,
+    MAX_RECORDED_REQUESTS, MAX_REPORTED_ROUNDS, MESSAGE_KIND, MODE_CONTEXT_KEY, MODEL_CONTEXT_KEY,
+    ModelSwitch, OMITTED_MARKER_PREFIX, PER_MESSAGE_CONTEXT_KEYS, PROMPT_STATEMENT_KEY,
+    PROTECTED_CONTEXT_KEYS, PendingQuestion, PendingRemote, PendingRun, PendingSession,
+    PendingWait, REASONING_EFFORT_CONTEXT_KEY, RENDERER_OFFER_CONTEXT_KEY, Repeats,
+    SESSION_TOOLS_CONTEXT_KEY, STOPPED_BY_THE_PERSON, loaded_note, user_message,
 };
 pub use events::{EmitError, RecordedEvent};
 pub use fn_tool::FnTool;
@@ -226,8 +227,8 @@ pub use kept::{
     KeptError, KeptInfo, KeptMap, KeptOutput, KeptOutputs, KeptStore, LineFolder, MAX_KEPT_BYTES,
     MAX_RUN_KEPT_BYTES, MemoryKept, READ_OUTPUT, ReadOutput, SCRUB_OVERLAP, StreamScrubber,
     call_key, canonical_pointer_id, count_lines, find_pointer, is_output_id, keep_long,
-    keep_long_cut, kept_header, kept_outputs_conformance, kept_view, output_id, output_id_of,
-    page_of, pointer_line, prepare, read_pointer, scrub_open_end, scrub_open_start,
+    keep_long_cut, keep_long_within, kept_header, kept_outputs_conformance, kept_view, output_id,
+    output_id_of, page_of, pointer_line, prepare, read_pointer, scrub_open_end, scrub_open_start,
     scrubbed_for_keeping, unkept_view,
 };
 pub use model_wait::{
@@ -237,12 +238,14 @@ pub use model_wait::{
 pub use order::{AFTER_PREVIOUS, INSTRUCTION as AFTER_PREVIOUS_INSTRUCTION};
 pub use plan::{MAX_PLAN_ITEMS, Plan, PlanItem, PlanStatus};
 pub use redact::{REDACTED_MARKER, is_ordinary_word, is_value_position};
+pub use request::{RecordedRequest, RequestContent};
 #[cfg(feature = "schema")]
 pub use schema::{ToolSpecExt, spec_for};
 pub use sessions::{
     MAX_DESCRIPTION_CHARS, MAX_OPEN_SESSIONS, MAX_SESSION_ROUNDS, MAX_TEXT_CHARS,
     MAX_WORKING_ROUNDS, SESSION_TOOL_TIME_LIMIT, SESSION_TOOLS, SUBAGENT_CLOSE, SUBAGENT_EDIT,
-    SUBAGENT_LIST, SUBAGENT_READ, SUBAGENT_SEND, SUBAGENT_START, SessionAgent, SessionTools,
+    SUBAGENT_LIST, SUBAGENT_READ, SUBAGENT_SEND, SUBAGENT_START, SessionAgent, SessionDefaults,
+    SessionTools,
 };
 pub use si_memory::{SI_MEMORY_GROUP, SI_RECALL, SI_RECORD, SiMemoryHandle, SiRecall, SiRecord};
 pub use source::{

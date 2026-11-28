@@ -19,6 +19,7 @@ A page here that has a page for people sits at the same relative path, and the t
 | [Read a stuck run: queries](guides/read-a-stuck-run.md) | [Read a run's state when it is stuck](../../docs/guides/read-a-stuck-run.md) | the read-only queries on the run store and the code each claim stands on |
 | [Embed adam in an application: the evidence](guides/embed-in-an-app.md) | [Embed adam in an application](../../docs/guides/embed-in-an-app.md) | where the engine's approvals are in the code, the invariants to check, and each proof with the change it was seen failing against |
 | [Troubleshoot by error class: evidence](guides/troubleshoot-by-error-class.md) | [Troubleshoot by error class](../../docs/guides/troubleshoot-by-error-class.md) | where each class's retry, A2A code and exit code is decided |
+| [Export runs for training: invariants and evidence](guides/export-runs-for-training.md) | [Export runs for training](../../docs/guides/export-runs-for-training.md) | which fields of a run the exporter reads, what is cleaned and pseudonymised, which runs it reaches, the gates and the tests |
 | [Errors: rules to check](reference/errors.md) | [Errors](../../docs/reference/errors.md) | the rules every error enum keeps |
 | [Agent files: the decisions to keep](reference/agent-files.md) | [Agent files](../../docs/reference/agent-files.md) | the owner's decisions behind the folder format |
 | [Child runs: the tests](reference/child-runs.md) | [Child runs](../../docs/reference/child-runs.md) | the test of every failure interleaving, and how the tests make each happen |
@@ -27,6 +28,7 @@ A page here that has a page for people sits at the same relative path, and the t
 | [ADR 0081: the evidence](decisions/0081-an-agent-keeps-a-self-improvement-memory-near-it-and-what-holds-becomes-the-deployments-memory.md) | [ADR 0081](../../docs/decisions/0081-an-agent-keeps-a-self-improvement-memory-near-it-and-what-holds-becomes-the-deployments-memory.md) | the paper, the code the memory decision was checked against, the draft's values and the proof of each slice |
 | [Roadmap: the evidence](roadmap.md) | [Roadmap](../../docs/roadmap.md) | how to re-check each row of the roadmap, and what it was checked against |
 | [0082: the evidence](decisions/0082-the-sql-adapters-keep-their-rules-in-the-database.md) | [ADR 0082](../../docs/decisions/0082-the-sql-adapters-keep-their-rules-in-the-database.md) | the survey of every rule the SQL adapters enforce in Rust, with `path:line`, the sources of the facts, and each slice's decisive cases and mutations |
+| [0090: the evidence](decisions/0090-a-tool-result-is-bounded-when-it-is-made-and-a-command-that-succeeds-says-so.md) | [ADR 0090](../../docs/decisions/0090-a-tool-result-is-bounded-when-it-is-made-and-a-command-that-succeeds-says-so.md) | where `output` is in the code, the invariants of the success line, the tests of slice T1 |
 
 ## Still mixed
 

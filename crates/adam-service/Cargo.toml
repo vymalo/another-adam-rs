@@ -18,6 +18,9 @@ store-sqlite = ["dep:adam-store-sqlite"]
 store-mongodb = ["dep:adam-store-mongodb"]
 # `McpSettings`: the deployment's policy for the MCP servers of an agent folder (`MCP_ALLOW_*`).
 mcp = ["dep:adam-mcp", "dep:adam-agent-fs"]
+# `export`: the `export` command of a binary (ADR 0087): its arguments, `EXPORT_PSEUDONYM_KEY` and
+# the run over `adam-export`.
+export = ["dep:adam-export"]
 
 [dependencies]
 a2a-lf.workspace = true
@@ -27,6 +30,7 @@ adam-a2a-runtime.workspace = true
 adam-agent-fs = { workspace = true, optional = true }
 adam-core.workspace = true
 adam-error.workspace = true
+adam-export = { workspace = true, optional = true }
 adam-hook-exec.workspace = true
 jiff.workspace = true
 adam-host.workspace = true
@@ -64,6 +68,8 @@ adam-store-postgres.workspace = true
 rustls = { workspace = true, features = ["aws_lc_rs"] }
 tempfile.workspace = true
 async-trait.workspace = true
+# The starter the `export` test registers.
+adam-llm-agent.workspace = true
 serde_json.workspace = true
 tokio = { workspace = true, features = ["net", "io-util", "macros", "rt-multi-thread", "time"] }
 

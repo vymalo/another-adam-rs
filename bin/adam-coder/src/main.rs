@@ -5,6 +5,9 @@
 //! the steps they are in before the process exits; a step cut short by a hard
 //! kill is picked up by another replica when its lease expires. The work is
 //! done by [`adam_coder::serve`].
+//!
+//! `adam-coder export [...]` serves nothing: it writes the coder's runs as training records
+//! ([`adam_coder::export`], ADR 0087) and exits.
 
 use std::future::Future;
 use std::process::ExitCode;
@@ -23,12 +26,29 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 /// the process's secrets, written by the same logger as everything else.
 #[tokio::main]
 async fn main() -> ExitCode {
+    // `adam-coder export ...` writes records to standard output, so its log goes to standard error.
+    let export = adam_coder::export::subcommand(std::env::args_os().skip(1));
     // `RUST_LOG` when set, else `info` with the MCP client library quiet (`adam_service::logging`).
-    // The OTel layer joins it when `OTEL_EXPORTER_OTLP_ENDPOINT` is set, and nothing is built when
-    // it is not.
-    let telemetry = adam_otel::init(adam_service::logging::env_filter());
+    // A short offline command exports no traces, and its records are on standard output; serving
+    // gets the OTel layer when `OTEL_EXPORTER_OTLP_ENDPOINT` is set, and nothing is built when it
+    // is not.
+    if export.is_some() {
+        tracing_subscriber::fmt()
+            .json()
+            .with_env_filter(adam_service::logging::env_filter())
+            .with_writer(std::io::stderr)
+            .init();
+    }
+    let telemetry = match export {
+        Some(_) => None,
+        None => adam_otel::init(adam_service::logging::env_filter()),
+    };
 
     adam_service::harden::make_non_dumpable();
+
+    if let Some(args) = export {
+        return export_runs(args).await;
+    }
 
     let code = run().await;
     // Flush the batch queue before the process exits, so the spans of the last runs are not lost.
@@ -51,6 +71,31 @@ async fn run() -> ExitCode {
     match adam_coder::serve(config, shutdown_signal()).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => fail(&e, &redactor),
+    }
+}
+
+/// `adam-coder export`: 0 when the records are written, 64 for a wrong command line, otherwise
+/// the code of the error, as for serving. A failure's chain is scrubbed of the database's password.
+async fn export_runs(args: Vec<std::ffi::OsString>) -> ExitCode {
+    use adam_service::export::{Command, EX_USAGE, parse_args, usage};
+    match parse_args(args) {
+        Ok(Command::Help) => {
+            println!("{}", usage("adam-coder"));
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            tracing::error!(error = %e, code = EX_USAGE, usage = %usage("adam-coder"), "adam-coder export: wrong command line");
+            ExitCode::from(EX_USAGE)
+        }
+        Ok(Command::Export(args)) => match adam_coder::export::run(&args).await {
+            Ok(_) => ExitCode::SUCCESS,
+            Err(e) => {
+                let redactor = Config::from_env()
+                    .map(|config| Redactor::from_config(&config))
+                    .unwrap_or_default();
+                fail(&e, &redactor)
+            }
+        },
     }
 }
 

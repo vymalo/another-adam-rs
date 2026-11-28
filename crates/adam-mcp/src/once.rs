@@ -164,7 +164,8 @@ impl CallOptions {
 pub struct RemoteResult {
     /// The tool's own failure (`isError`): the text says what went wrong.
     pub is_error: bool,
-    /// The content blocks as text, scrubbed and cut at 64 KiB: what a model is shown.
+    /// The content blocks as text, scrubbed and cut a little past what a keeper keeps
+    /// (`adam_llm_agent::MAX_KEPT_BYTES`): the caller bounds what a model is shown.
     pub text: String,
     /// The `structuredContent`, when the tool gave one.
     pub structured: Option<Value>,
@@ -175,6 +176,8 @@ pub struct RemoteResult {
 pub struct Endpoint {
     recipe: Recipe,
     call_timeout: Duration,
+    /// Where structured content alone is pretty-printed ([`McpPolicy::result_bytes`]).
+    result_bytes: usize,
 }
 
 impl std::fmt::Debug for Endpoint {
@@ -224,6 +227,7 @@ impl Endpoint {
                 connect_timeout: policy.connect_timeout_value(),
             },
             call_timeout: policy.call_timeout_value(),
+            result_bytes: policy.result_bytes_value(),
         })
     }
 
@@ -297,7 +301,8 @@ impl Endpoint {
         let _ = service.close_with_timeout(CLOSE_GRACE).await;
         match called {
             Ok(Ok(CallToolResponse::Complete(result))) => {
-                let mut output = map_result(&result, &self.recipe.redactor, None);
+                let mut output =
+                    map_result(&result, &self.recipe.redactor, self.result_bytes, None);
                 // Nothing keeps this text: it is cut a little past what a keeper would keep.
                 output.content = cap_text(
                     output.content,

@@ -19,7 +19,9 @@ use adam_engine::adam_agent_fs::{Dir, Strictness};
 use adam_engine::adam_assembly::AgentDef;
 use adam_engine::adam_core::{DynStore, MemoryStore, RunId};
 use adam_engine::adam_error::{Classify, ErrorClass};
-use adam_engine::adam_llm_agent::{Decision as HookDecision, HookResult, HookedCall, Plugin};
+use adam_engine::adam_llm_agent::{
+    Decision as HookDecision, HookResult, HookSet, HookedCall, Plugin,
+};
 use adam_engine::adam_model::{DynModel, MockModel, ToolCall};
 use adam_engine::{Decision, Engine, EngineError, RunInfo, RunState, Say};
 use serde_json::json;
@@ -702,11 +704,15 @@ async fn a_bogus_directory_is_refused_at_start() {
 // 7. Red proof: skipping the ask would write without approval
 // ---------------------------------------------------------------------------
 
-/// **Red proof.** The ask is the only barrier: replace the local agent's asking hook with a
-/// no-op (`AlwaysContinue`) and the same scripted `write_file` runs without ever parking the
-/// run. The decisive 2 assertion (the file is absent after a refusal) would break: the file
-/// exists. The local agent's hook is restored (the test does not modify it; it installs an
-/// alternative) so the rest of the suite still asks.
+/// **Red proof.** The ask is the only barrier: the local agent's tools do not ask by themselves,
+/// its hook does. The same `write_file` call the local agent's hook asks about goes straight through
+/// a hook set without it (`AlwaysContinue`), so the barrier test above (the file is absent after a
+/// refusal) holds only because the hook is installed.
+///
+/// The proof is made at the hook set, where the decision is: [`EngineBuilder::local_agent`]
+/// installs the hook together with the directory the tools read, and nothing else gives the tools
+/// that directory, so an engine with the tools and without the hook cannot be built (it fails to
+/// start, `MissingState`).
 struct AlwaysContinue;
 
 impl Plugin for AlwaysContinue {
@@ -718,29 +724,27 @@ impl Plugin for AlwaysContinue {
     }
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn without_the_asking_hook_a_write_runs_without_approval() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = "no_ask_written.txt";
-    let mock = MockModel::new();
-    mock.push_tool_calls(vec![write_call("c1", path, "written without ask\n")])
-        .push_text("done without asking");
-    let model: DynModel = Arc::new(mock);
-    let store: DynStore = Arc::new(MemoryStore::new());
-    // The local-agent tools, but no asking hook: the file is written without ever parking.
-    let engine = Engine::builder(store, agent(), model, "m")
-        .tools(adam_engine::local_agent::tool_set())
-        .plugin(AlwaysContinue)
-        .start()
-        .await
-        .expect("the engine starts");
-    let turn = engine.send(None, Say::new("write it")).await.unwrap();
-    // The run goes straight to `Done` (no approval was asked), so the call ran once, unwatched.
-    let done = wait_for(&engine, turn.run, RunState::Done).await;
-    assert_eq!(done.approval, None, "the run was never asked");
+#[test]
+fn without_the_asking_hook_a_write_runs_without_approval() {
+    let decide = |hooks: HookSet| {
+        let mut arguments =
+            json!({ "path": "no_ask_written.txt", "content": "written without ask\n" });
+        hooks
+            .before_tool(&mut HookedCall {
+                tool: "write_file",
+                arguments: &mut arguments,
+            })
+            .expect("a hook decides")
+    };
+    let asked = decide(HookSet::new().with(adam_engine::local_agent::plugin()));
     assert!(
-        dir.path().join(path).exists(),
-        "the file was written without approval"
+        matches!(asked, HookDecision::Ask(_)),
+        "the local agent's hook asks before a write: {asked:?}"
     );
-    shutdown(engine).await;
+    let continued = decide(HookSet::new().with(Arc::new(AlwaysContinue)));
+    assert_eq!(
+        continued,
+        HookDecision::Continue,
+        "without it, nothing else stops the write"
+    );
 }

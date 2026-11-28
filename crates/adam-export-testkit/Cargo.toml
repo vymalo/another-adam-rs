@@ -1,0 +1,25 @@
+[package]
+name = "adam-export-testkit"
+description = "Conformance test suites for adam-rs export sources (RunSource) and sinks (RecordSink)"
+readme = "README.md"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+adam-core.workspace = true
+adam-error.workspace = true
+adam-export.workspace = true
+adam-llm-agent.workspace = true
+adam-model.workspace = true
+async-trait.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+adam-runtime.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+
+[lints]
+workspace = true

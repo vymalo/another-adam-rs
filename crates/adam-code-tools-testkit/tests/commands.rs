@@ -4,7 +4,7 @@
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
-use adam_code_tools::CommandLimits;
+use adam_code_tools::{CommandLimits, OutputDefaults};
 
 use adam_code_tools_testkit::{CommandHarness, DirWorkspace, detached_ctx};
 
@@ -24,6 +24,7 @@ fn harness() -> CommandHarness {
         .with_limits(CommandLimits {
             timeout: Duration::from_secs(20),
             output_tail: 2048,
+            output: OutputDefaults::TOOLS,
         });
     CommandHarness {
         workspace: Arc::new(workspace),

@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use adam_error::{Classify, ErrorClass};
 use adam_llm_agent::ToolError;
-use adam_mcp::{CallBearer, Env, Error, MAX_RESULT_BYTES, McpPolicy, McpServers, VarProblem};
+use adam_mcp::{CallBearer, DEFAULT_RESULT_BYTES, Env, Error, McpPolicy, McpServers, VarProblem};
 use adam_mcp_testkit::{LogCapture, TestHttpServer, TestServer, wait_until};
 use adam_runtime::CancelToken;
 use async_trait::async_trait;
@@ -249,8 +249,9 @@ async fn a_server_with_files_true_shares_its_images_and_blobs_as_files() {
     plain.shutdown().await;
 }
 
-/// A result over 64 KiB is not cut: with no keeper in the agent's state and no room in the run's own
-/// state (a detached context has none) the model is shown the first page and is told the rest is lost.
+/// A result over the bound (16 KiB by default) is not cut: with no keeper in the agent's state and no
+/// room in the run's own state (a detached context has none) the model is shown a first page within
+/// the bound and is told the rest is lost.
 #[tokio::test]
 async fn big_result_without_room_to_keep_it_shows_its_first_page_and_says_so() {
     let server = TestHttpServer::start(None).await;
@@ -264,7 +265,45 @@ async fn big_result_without_room_to_keep_it_shows_its_first_page_and_says_so() {
         "{}",
         &out.content[out.content.len() - 200..]
     );
-    assert!(out.content.len() < MAX_RESULT_BYTES);
+    assert!(out.content.len() <= DEFAULT_RESULT_BYTES);
+}
+
+/// The bound is the deployment's ([`McpPolicy::result_bytes`], the coder's
+/// `CHECK_OUTPUT_TAIL_BYTES`): a 10,000-byte result is whole under the default 16 KiB, and over a
+/// bound of 4,096 bytes it is kept and shown within that.
+#[tokio::test]
+async fn the_result_bound_the_policy_sets_is_the_one_a_result_is_shown_within() {
+    let server = TestHttpServer::start(None).await;
+    let config = http_config("t", &server.url(), "");
+    let plain = connect(&config).await;
+    let whole = call(&plain.tools(), "t__big", json!({"bytes": 10_000})).await;
+    assert_eq!(whole.content, "x".repeat(10_000));
+    plain.shutdown().await;
+
+    let policy = McpPolicy::default().result_bytes(4096);
+    let bounded = McpServers::connect(&config, &Env::new(), &policy)
+        .await
+        .unwrap();
+    let tools = bounded.tools();
+    let ctx = common::ctx("t__big").with_kept(adam_llm_agent::MAX_RUN_KEPT_BYTES, Arc::default());
+    let out = tools
+        .get("t__big")
+        .unwrap()
+        .call(&ctx, json!({"bytes": 10_000}))
+        .await
+        .unwrap();
+    assert!(!out.is_error);
+    assert!(out.content.len() <= 4096, "{}", out.content.len());
+    assert!(
+        out.content.starts_with("[kept as o-"),
+        "{}",
+        &out.content[..60]
+    );
+    assert_eq!(
+        out.kept.map(|k| k.text.replace('\n', "")),
+        Some("x".repeat(10_000))
+    );
+    bounded.shutdown().await;
 }
 
 /// With a keeper in the state, the same result is kept whole and read back page by page: the

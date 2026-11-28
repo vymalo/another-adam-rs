@@ -8,9 +8,10 @@ use futures::{StreamExt, TryStreamExt};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
-use adam_core::{DynStore, JournalEntry, RunId, RunRecord, StoreError};
+use adam_core::{BlobId, DynStore, JournalEntry, RunId, RunRecord, StoreError};
 
 use crate::agent::{AgentError, Inbound};
+use crate::blob::BlobWriter;
 use crate::cancel::CancelToken;
 use crate::child::{ChildLook, ChildStarter, ChildStatus, RESUME_KIND, news_since};
 use crate::clock::DynClock;
@@ -48,6 +49,8 @@ pub struct Ctx {
     reopen: bool,
     /// See [`Ctx::read_already`].
     read: Vec<String>,
+    /// See [`Ctx::reference_blobs`].
+    blobs: Vec<BlobId>,
     store: DynStore,
     clock: DynClock,
     cancel: CancelToken,
@@ -149,6 +152,8 @@ pub(crate) struct CtxOutcome {
     /// See [`Ctx::read_already`].
     pub read: Vec<String>,
     pub artifacts: Vec<Artifact>,
+    /// See [`Ctx::reference_blobs`].
+    pub blobs: Vec<BlobId>,
 }
 
 pub(crate) struct CtxParts {
@@ -196,6 +201,7 @@ impl Ctx {
             consumed: 0,
             reopen: false,
             read: Vec::new(),
+            blobs: Vec::new(),
             store: p.store,
             clock: p.clock,
             cancel: p.cancel,
@@ -215,6 +221,7 @@ impl Ctx {
             consumed: self.consumed,
             reopen: self.reopen,
             read: self.read,
+            blobs: self.blobs,
             artifacts: std::mem::take(
                 &mut *self
                     .emitter
@@ -829,6 +836,29 @@ impl Ctx {
     /// task. See [`Emitter`].
     pub fn emitter(&self) -> Emitter {
         self.emitter.clone()
+    }
+
+    /// An owned handle that stores bytes as content-addressed blobs, for a [`Ctx::step`] closure
+    /// (see [`BlobWriter`]). The bytes are kept for the run only once their ids are named with
+    /// [`reference_blobs`](Self::reference_blobs).
+    pub fn blob_writer(&self) -> BlobWriter {
+        BlobWriter::new(self.store.clone())
+    }
+
+    /// Name `ids` as blobs this transition's state references: the commit records them
+    /// ([`RunUpdate::blobs`](adam_core::RunUpdate::blobs), a delta the store unions), so their
+    /// bytes survive until no run references them. Call it **after** the step that stored them,
+    /// with the ids the step returned, so a replay of a recorded step names them too.
+    ///
+    /// Only a transition that commits progress records them: a transition that fails (its state is
+    /// not kept) or is retried drops them, as it drops its artifacts. Naming an id twice, or an id
+    /// an earlier commit already named, is harmless.
+    pub fn reference_blobs(&mut self, ids: impl IntoIterator<Item = BlobId>) {
+        for id in ids {
+            if !self.blobs.contains(&id) {
+                self.blobs.push(id);
+            }
+        }
     }
 }
 

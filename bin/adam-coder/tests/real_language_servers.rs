@@ -1,13 +1,17 @@
-//! The tools against the **real** language servers (ADR 0044 slice 17), on five tiny projects with
-//! one deliberate error each (`tests/fixtures/language-servers/`): Rust, TypeScript, Python, Go and
-//! Dart.
+//! The tools against the **real** language servers (ADR 0044 slice 17, ADR 0091), on tiny projects
+//! with one deliberate error each (`tests/fixtures/language-servers/`): Rust, TypeScript, Python, Go
+//! and Dart; and TOML, YAML, JSON, shell, Dockerfile and C (ADR 0091, written before any of their
+//! servers was run here: *unverified* until L2 runs them).
 //!
 //! Gated, like the tests that need a database (Rule 7): without `ADAM_TEST_LANGUAGE_SERVERS=1` they
 //! do nothing and say so; with it, a language whose server is not on `PATH` is skipped, and
-//! `ADAM_TEST_REQUIRE_LANGUAGE_SERVERS=1` turns every skip into a failure (it implies the gate). **CI
-//! runs them in the built image**: the `image` job of `.github/workflows/coder.yml` sets both
-//! variables, so a server the workspace base lacks fails the job. What is proved on every run is
-//! `language_servers.rs`, over a scripted server.
+//! `ADAM_TEST_REQUIRE_LANGUAGE_SERVERS=1` turns every skip of a server the image has
+//! ([`IN_THE_IMAGE`]) into a failure (it implies the gate). **CI runs them in the built image**: the
+//! `image` job of `.github/workflows/coder.yml` sets both variables, so a server the workspace base
+//! lacks fails the job. The six of ADR 0091 are not in the image until its slice L2, which adds them
+//! to [`IN_THE_IMAGE`]; until then they run where their server is installed and are skipped
+//! elsewhere, even under `REQUIRE`. What is proved on every run is `language_servers.rs`, over a
+//! scripted server.
 //!
 //! ```sh
 //! ADAM_TEST_LANGUAGE_SERVERS=1 cargo test --workspace --locked -- real_
@@ -29,6 +33,17 @@ use serde_json::{Value, json};
 const GATE: &str = "ADAM_TEST_LANGUAGE_SERVERS";
 const REQUIRE: &str = "ADAM_TEST_REQUIRE_LANGUAGE_SERVERS";
 
+/// The servers the coder image has, which `REQUIRE` may not skip. ADR 0091 L2 adds `taplo`,
+/// `yaml-language-server`, `vscode-json-language-server`, `bash-language-server`,
+/// `docker-langserver` and `clangd` when the workspace image installs them.
+const IN_THE_IMAGE: [&str; 5] = [
+    "rust-analyzer",
+    "typescript-language-server",
+    "pyright-langserver",
+    "gopls",
+    "dart",
+];
+
 /// Whether to run the test for the server `program`: `false` (and a line saying why) for a skip,
 /// a panic for a skip that `REQUIRE` forbids.
 fn run_for(program: &str) -> bool {
@@ -43,7 +58,7 @@ fn run_for(program: &str) -> bool {
         return true;
     }
     assert!(
-        !required,
+        !(required && IN_THE_IMAGE.contains(&program)),
         "{REQUIRE}=1 and `{program}` is not on PATH: the real language server test cannot be skipped"
     );
     eprintln!("skipped: `{program}` is not on PATH");
@@ -106,10 +121,8 @@ fn copy(from: &Path, to: &Path) {
     }
 }
 
-/// What every language is asked: the error is reported at its line, the definition of `add` is
-/// found from the call, and the references of `add` hold the declaration and the call.
-async fn check(project: &str, file: &str, error_line: u32, call_line: u32, definition: &str) {
-    let real = Real::new(project).await;
+/// The error of `file` is reported at its line, and no path of this machine is in the answer.
+async fn diagnose(real: &Real, file: &str, error_line: u32) -> ToolOutput {
     let diagnostics = real
         .call("file_diagnostics", json!({"path": file, "wait": 120}))
         .await;
@@ -126,6 +139,32 @@ async fn check(project: &str, file: &str, error_line: u32, call_line: u32, defin
         "{}",
         diagnostics.content
     );
+    let root = real.fx.root.display().to_string();
+    assert!(
+        !diagnostics.content.contains(&root),
+        "{}",
+        diagnostics.content
+    );
+    diagnostics
+}
+
+/// The languages whose files have no definitions to find (a manifest, a configuration, a
+/// Dockerfile): the error is reported at its line.
+async fn check_diagnostics(project: &str, file: &str, error_line: u32) {
+    let real = Real::new(project).await;
+    diagnose(&real, file, error_line).await;
+    real.fx
+        .env
+        .commands
+        .stop_run(&real.ctx.run_id().to_string(), "the test is over")
+        .await;
+}
+
+/// What every language is asked: the error is reported at its line, the definition of `add` is
+/// found from the call, and the references of `add` hold the declaration and the call.
+async fn check(project: &str, file: &str, error_line: u32, call_line: u32, definition: &str) {
+    let real = Real::new(project).await;
+    let diagnostics = diagnose(&real, file, error_line).await;
     let found = real
         .call(
             "find_definition",
@@ -190,5 +229,51 @@ async fn real_gopls_reports_an_error_and_finds_a_definition_and_references() {
 async fn real_dart_language_server_reports_an_error_and_finds_a_definition_and_references() {
     if run_for("dart") {
         check("dart", "lib/main.dart", 4, 4, "lib/main.dart:1:5").await;
+    }
+}
+
+// The six of ADR 0091: skipped where their server is not installed, even under REQUIRE, until L2.
+
+#[tokio::test]
+async fn real_taplo_reports_an_error_in_a_toml_file() {
+    if run_for("taplo") {
+        check_diagnostics("toml", "config.toml", 3).await;
+    }
+}
+
+#[tokio::test]
+async fn real_yaml_language_server_reports_an_error_in_a_yaml_file() {
+    if run_for("yaml-language-server") {
+        check_diagnostics("yaml", "config.yaml", 3).await;
+    }
+}
+
+#[tokio::test]
+async fn real_vscode_json_language_server_reports_an_error_in_a_json_file() {
+    if run_for("vscode-json-language-server") {
+        check_diagnostics("json", "config.json", 3).await;
+    }
+}
+
+#[tokio::test]
+async fn real_docker_langserver_reports_an_error_in_a_dockerfile() {
+    if run_for("docker-langserver") {
+        check_diagnostics("dockerfile", "Dockerfile", 2).await;
+    }
+}
+
+/// The error is shellcheck's (SC2068, an error), which `bash-language-server` runs when it is on
+/// `PATH`: the image installs both (ADR 0091 L2).
+#[tokio::test]
+async fn real_bash_language_server_reports_an_error_and_finds_a_definition_and_references() {
+    if run_for("bash-language-server") {
+        check("shell", "main.sh", 8, 8, "main.sh:3:1").await;
+    }
+}
+
+#[tokio::test]
+async fn real_clangd_reports_an_error_and_finds_a_definition_and_references() {
+    if run_for("clangd") {
+        check("c", "main.c", 6, 6, "main.c:1:5").await;
     }
 }

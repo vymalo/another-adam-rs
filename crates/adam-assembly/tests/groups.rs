@@ -571,7 +571,7 @@ fn narrowed_session(tools: &[&str]) -> SessionHeader {
         id: RunId::new(),
         agent: "root".into(),
         description: "a narrowed round".into(),
-        keep_open: false,
+        mode: adam_runtime::SessionMode::OneShot,
         closed: false,
         closing: false,
         deleted: false,

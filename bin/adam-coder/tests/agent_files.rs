@@ -512,7 +512,7 @@ async fn the_assembled_agent_is_what_the_hand_written_one_was() {
             max_turns: 200,
             max_tool_calls: 400,
             max_output_tokens: 128_000,
-            max_history_tokens: 100_000,
+            max_history_tokens: adam_llm_agent::DEFAULT_MAX_HISTORY_TOKENS,
         }
     );
     assert_eq!(

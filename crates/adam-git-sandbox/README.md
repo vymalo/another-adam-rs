@@ -152,6 +152,11 @@ The server reads these once at startup, every problem at once (`invalid configur
 This binary links **no TLS provider**, so `OTEL_EXPORTER_OTLP_ENDPOINT` must be a plain `http` URL (an in-cluster
 collector); the `aws-lc` feature on `adam-otel` is what adds `https`.
 
+What the two binaries need beside the library is the crate's `server` feature, on by default, which both require: the
+allocator (`mimalloc`) and the OTel layer. The library (`adam-workspace` takes it, through the workspace's
+`default-features = false`) needs neither, so a crate that embeds the workspace links no OTLP exporter, no HTTP client
+and no C allocator, and checks for a phone target (`tools/embedded-deps/check.sh`, ADR 0047).
+
 A socket path that exists and is **not a socket** (a file, a link) is never replaced (exit 71). A socket that a server answers on is
 not either. One that nobody answers on (a server that died) is replaced. The socket is made under a `0177` umask and set to `0600`: the
 control is the mode of the socket and of the directory it lives in, which the deployment shares with the coder only.

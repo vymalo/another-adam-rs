@@ -186,7 +186,8 @@ fn position_of(
 
 /// What a language server says is wrong in a file: errors and warnings as `path:line:col: error:
 /// message [code]`, sorted, a page of at most 100 (the last line says `[more: ... offset=N]` or
-/// `[end: ...]`). The server (Rust, TypeScript and JavaScript, Python, Go, Dart) runs in the
+/// `[end: ...]`). The server (Rust, TypeScript and JavaScript, Python, Go, Dart, C and C++, TOML,
+/// YAML, JSON, shell, Dockerfile) runs in the
 /// workspace's environment and is kept between calls; the first call on a project may wait for it
 /// to index (`wait` seconds, 1 to 120, default 30; a first line says when it still is). Nothing is
 /// changed. With no server in the environment the answer says so: use run_checks or run_command.
@@ -195,7 +196,7 @@ fn position_of(
 pub async fn file_diagnostics(
     env: State<ToolEnv>,
     ctx: &ToolCtx,
-    /// The file, relative to the worktree root (.rs, .ts .tsx .js .jsx, .py, .go, .dart)
+    /// The file, relative to the worktree root (.rs, .ts .tsx .js .jsx, .py, .go, .dart, .c .cpp .h, .toml, .yaml .yml, .json, .sh, Dockerfile)
     path: String,
     /// The slot the file is in: its name, or the repository's address. Leave out when the workspace has one.
     repo: Option<String>,
@@ -227,7 +228,7 @@ pub async fn file_diagnostics(
 }
 
 /// Where the symbol on a line of a file is defined, by a language server (Rust, TypeScript and
-/// JavaScript, Python, Go, Dart): at most 20 locations, each as `path:line:col: the source line`.
+/// JavaScript, Python, Go, Dart, C and C++, TOML, YAML, JSON, shell, Dockerfile): at most 20 locations, each as `path:line:col: the source line`.
 /// Give the `line` (from 1) and the `symbol` on it, and `occurrence` when it is there more than
 /// once; if the symbol is not on that line the answer shows the line. A first call on a project
 /// starts the server and may wait for it to index (`wait` seconds, 1 to 120, default 30); where
@@ -276,7 +277,7 @@ pub async fn find_definition(
 }
 
 /// Where the symbol on a line of a file is used, by a language server (Rust, TypeScript and
-/// JavaScript, Python, Go, Dart): `path:line:col: the source line`, sorted, a page of at most 100
+/// JavaScript, Python, Go, Dart, C and C++, TOML, YAML, JSON, shell, Dockerfile): `path:line:col: the source line`, sorted, a page of at most 100
 /// (the last line says `[more: ... offset=N]` or `[end: ...]`); at most 2000 are collected. Give
 /// the `line` (from 1) and the `symbol` on it, and `occurrence` when it is there more than once;
 /// `include_declaration` (default true) lists the definition too. The first call on a project may
@@ -369,6 +370,12 @@ fn instead(language: Language) -> &'static str {
         Language::Python => "a type checker or the tests",
         Language::Go => "`go vet ./...` or `go build ./...`",
         Language::Dart => "`dart analyze`",
+        Language::Toml => "the tool that reads the file (`cargo metadata` for a `Cargo.toml`)",
+        Language::Yaml => "the tool that reads the file",
+        Language::Json => "`jq empty <file>` or `python3 -m json.tool <file>`",
+        Language::Shell => "`bash -n <file>` or `shellcheck <file>`",
+        Language::Dockerfile => "`hadolint <file>` or a build of the image",
+        Language::C => "the project's build (`make`, `cmake --build`)",
     }
 }
 
@@ -384,8 +391,10 @@ async fn serve(env: &ToolEnv, ctx: &ToolCtx, ask: Ask) -> Outcome {
     let Some((language, language_id)) = Language::of_path(&path) else {
         return Ok(ToolOutput::text(format!(
             "No language server serves `{path}`: they serve .rs (Rust), .ts .tsx .mts .cts .js .jsx \
-             .mjs .cjs (TypeScript and JavaScript), .py .pyi (Python), .go (Go) and .dart (Dart). Read the file \
-             with read_file, and look for its uses with search_files."
+             .mjs .cjs (TypeScript and JavaScript), .py .pyi (Python), .go (Go), .dart (Dart), .c .h \
+             .cc .cpp .cxx .hpp .hh (C and C++), .toml (TOML), .yaml .yml (YAML), .json .jsonc \
+             (JSON), .sh .bash (shell) and a file named Dockerfile or Containerfile or ending in \
+             .Dockerfile. Read the file with read_file, and look for its uses with search_files."
         )));
     };
     let slot = match env.slot_to_read(ctx, ask.repo.as_deref()).await {
@@ -1408,6 +1417,33 @@ mod tests {
         std::fs::write(slot.join("crates/a/pubspec.yaml"), "name: a").unwrap();
         assert_eq!(
             root("crates/a/lib/main.dart", Language::Dart),
+            slot.join("crates/a")
+        );
+        // The languages with no marker have the slot's root, whatever is beside the file.
+        std::fs::write(slot.join("crates/a/compile_flags.txt"), "-std=c11").unwrap();
+        for (rel, language) in [
+            ("crates/a/ci.yml", Language::Yaml),
+            ("crates/a/package.json", Language::Json),
+            ("crates/a/run.sh", Language::Shell),
+            ("crates/a/Dockerfile", Language::Dockerfile),
+            ("crates/a/Cargo.toml", Language::Toml),
+        ] {
+            assert_eq!(root(rel, language), slot, "{rel}");
+        }
+        // clangd's markers, nearest first: a compile_flags.txt, a .clangd, a compilation database.
+        assert_eq!(root("crates/a/src/x.c", Language::C), slot.join("crates/a"));
+        std::fs::write(slot.join("crates/a/src/.clangd"), "").unwrap();
+        assert_eq!(
+            root("crates/a/src/x.hpp", Language::C),
+            slot.join("crates/a/src")
+        );
+        std::fs::create_dir_all(slot.join("tools/src")).unwrap();
+        std::fs::write(slot.join("tools/compile_commands.json"), "[]").unwrap();
+        assert_eq!(root("tools/src/y.cc", Language::C), slot.join("tools"));
+        assert_eq!(root("lib/y.cc", Language::C), slot);
+        std::fs::write(slot.join("crates/a/taplo.toml"), "").unwrap();
+        assert_eq!(
+            root("crates/a/Cargo.toml", Language::Toml),
             slot.join("crates/a")
         );
     }
