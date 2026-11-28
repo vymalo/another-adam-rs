@@ -85,6 +85,20 @@ struct Built<'a> {
 }
 
 impl BoundDef {
+    /// The names of the root agent's tools, in the order the model is shown them.
+    ///
+    /// The same list [`AgentInfo::tools`] gives after a full assembly, without building one: what
+    /// a test needs to prove that a tool the deployment turns on is offered — and that nothing is
+    /// offered when it is off.
+    #[must_use]
+    pub fn tool_names(&self) -> Vec<String> {
+        self.nodes
+            .iter()
+            .find(|node| node.parent.is_none())
+            .map(|node| node.tools.iter().map(|(name, _)| name.clone()).collect())
+            .unwrap_or_default()
+    }
+
     pub(crate) fn new(
         manifest: AgentManifest,
         nodes: Vec<Node>,

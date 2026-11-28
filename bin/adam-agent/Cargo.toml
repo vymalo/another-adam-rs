@@ -18,6 +18,8 @@ name = "adam-agent"
 path = "src/main.rs"
 
 [dependencies]
+# The L1 self-improvement memory's folder adapter (ADR 0081 decision 2).
+adam-memory.workspace = true
 adam = { workspace = true, features = ["a2a", "mcp"] }
 adam-a2a.workspace = true
 adam-a2a-runtime.workspace = true
