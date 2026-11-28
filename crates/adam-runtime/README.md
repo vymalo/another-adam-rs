@@ -696,6 +696,17 @@ two hands the worker a `Failed` run at the cancel's version. The worker steps no
 open and only releases its lease, so no step commits over a cancel and reopens the run
 (`worker::claim_tests` in `src/worker.rs`).
 
+## Runs the worker refused for their epoch
+
+A run records the journal epoch it started on ([ADR 0076](../../docs/decisions/0076-a-run-records-the-journal-epoch-it-started-on.md)).
+A worker that meets a run of a **newer** epoch does not step it, commits nothing, hands the lease
+back, and keeps the run in a bounded, worker-local **skip set** for a minute (`SkipSet`,
+`SKIP_PERIOD`, at most `MAX_SKIPPED` runs, the longest-held dropped first): every `claim_due` names
+those runs in `busy` beside the ones it is stepping, so the next poll does not offer them again.
+Without it an older worker in a rolling deploy would claim, refuse and release the same run on every
+poll — a spin that costs a store round trip a second and tells nobody anything. A run **below** the
+worker's `min_replay_epoch` is failed instead, naming both epochs.
+
 ## Errors
 
 `AgentError` and `RuntimeError` implement `adam_error::Classify`; the worker
