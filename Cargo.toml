@@ -52,6 +52,7 @@ adam-notify-testkit = { path = "crates/adam-notify-testkit", version = "0.7.0" }
 adam-plugin = { path = "crates/adam-plugin", version = "0.7.0" } # x-release-please-version
 adam-plugin-testkit = { path = "crates/adam-plugin-testkit", version = "0.7.0" } # x-release-please-version
 adam-postgres = { path = "crates/adam-postgres", version = "0.7.0" } # x-release-please-version
+adam-run-cert-broker = { path = "crates/adam-run-cert-broker", version = "0.7.0" } # x-release-please-version
 adam-runtime = { path = "crates/adam-runtime", version = "0.7.0" } # x-release-please-version
 adam-service = { path = "crates/adam-service", version = "0.7.0" } # x-release-please-version
 adam-store-mongodb = { path = "crates/adam-store-mongodb", version = "0.7.0" } # x-release-please-version

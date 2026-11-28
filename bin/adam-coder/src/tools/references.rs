@@ -67,7 +67,7 @@ use adam::agent_fs::{
 };
 use adam::prelude::*;
 use adam_error::{Classify, ErrorClass};
-use adam_llm_agent::{SourceCtx, ToolSource};
+use adam_llm_agent::{Declared, SourceCtx, ToolSource};
 use adam_model::ToolSpec;
 use adam_workspace::{RepoRef, Slot, WorkspaceError};
 use async_trait::async_trait;
@@ -301,6 +301,13 @@ pub struct ReferencesSource {
 impl ToolSource for ReferencesSource {
     async fn specs(&self, _ctx: &SourceCtx) -> Vec<ToolSpec> {
         Vec::new()
+    }
+
+    /// The references add words to the prompt and no tool: the read tools that take `repo:` are the
+    /// agent's own. It answers `All` of nothing, so it never makes a session's set of tools
+    /// incomplete (ADR 0054 decision 4).
+    fn declared(&self) -> Declared {
+        Declared::All(Vec::new())
     }
 
     async fn instructions(&self, _ctx: &SourceCtx) -> Option<String> {
@@ -967,6 +974,17 @@ mod tests {
             branch: None,
             description: description.into(),
         }
+    }
+
+    /// The references add words to the prompt and no tool: the read tools that take `repo:` are the
+    /// agent's own. It declares `All` of nothing, so it never makes a session's set of tools
+    /// incomplete (ADR 0054 decision 4).
+    #[test]
+    fn the_references_declare_no_tool_of_their_own() {
+        let source = ReferencesSource {
+            text: "the api reference".into(),
+        };
+        assert_eq!(source.declared(), Declared::All(Vec::new()));
     }
 
     #[test]

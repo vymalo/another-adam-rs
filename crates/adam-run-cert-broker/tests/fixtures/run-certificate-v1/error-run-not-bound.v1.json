@@ -1,0 +1,7 @@
+{
+  "type": "about:blank",
+  "title": "The run is not bound",
+  "status": 403,
+  "code": "run_not_bound",
+  "detail": "no live binding names this run, or the caller is not its agent"
+}

@@ -33,9 +33,11 @@ page above. `parse_config` in `crates/adam-a2a-runtime/src/child_sessions.rs` re
 reads the lists from the round's session header first (`crates/adam-llm-agent/src/session_tools.rs`).
 
 * **What differs between roles is the tool names**, never the numbers. A control plane's bounds (`AgentDef::session_bounds`)
-  carry `tools: []`, `tools_complete: false`: shape only. A worker's carry the names of the bound node, and `tools_complete`
-  only when no source adds tools at run time; the coder and the folder agent always add some, so a `tools` entry that matches
-  nothing is admitted there, and a concrete `denyTools` name no tool has is refused.
+  carry `tools: []`, `tools_complete: false`: shape only. A worker's carry the names of the bound node and of every source
+  that declares them (`ToolSource::declared`), and `tools_complete` only when every source of the node does; the coder and the
+  folder agent add the thread-tools source, whose endpoint lists another system's tools per conversation and answers
+  `Declared::Unknown`, so a `tools` entry that matches nothing is admitted there, and a concrete `denyTools` name no tool has
+  is refused (ANR-1319).
 * **Tests:** `child_sessions.rs` unit tests `a_start_takes_tools_and_deny_tools_as_lists_of_names`,
   `a_remote_helper_refuses_tools_and_deny_tools`, `a_round_carries_the_tools_its_header_narrows_over_what_the_message_said`;
   `adam-runtime` `session.rs` `an_incomplete_set_refuses_a_concrete_deny_entry_it_does_not_know_and_checks_no_pattern`,

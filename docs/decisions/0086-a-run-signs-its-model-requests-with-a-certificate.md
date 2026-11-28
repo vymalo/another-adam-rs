@@ -81,6 +81,13 @@ request asked about, or the chain is refused (`RunKeyError::Chain`, `Internal`).
    rotation. Unset `RUN_CERT_ISSUER_URL` is not "sign nothing": the request is still signed, by the process
    turn keys. It is "no run certificate".
 
+   *Amended 2026-11-28 (A3, the owner's ruling of 2026-11-27).* The names are final: `RUN_CERT_ISSUER`
+   (`broker`, or `openbao` once A6 lands; anything else is exit 78), `RUN_CERT_ISSUER_URL`,
+   `RUN_CERT_TOKEN_FILE`, `RUN_CERT_CA_FILE` and `RUN_CERT_RENEW_FRACTION` (default `2/3`). The token file is
+   `RUN_CERT_TOKEN_FILE`, not `RUN_CERT_ISSUER_TOKEN_FILE`. All unset is off; a half-set configuration is exit
+   78 naming the variable. `adam-service` reads them into `ModelConfig::run_cert`; the request path still
+   chooses the process turn key (R3).
+
 7. **The chain is carried, not trusted.** `verify_request` checks the signature against the key set it is
    given, by `kid`, and carries `x5c` for the verifier in front of the model to check against its CA. adam does
    not decide whether a CA is trusted: a deployment does, at the verifier.
@@ -156,14 +163,15 @@ stateDiagram-v2
 |---|---|---|
 | R1 | the ports (`RunCertIssuer`, `RunKeys`, `CertificateRequest`, `RunCertError`), the closed `KeySource`, the fake issuer and `run_cert_issuer_conformance!` | **built**, 2026-11-28 |
 | R2a | the renewal clock and the keyring: `RunKeyring`, `RunSubject`, `RunClock`, a key per run, a CSR with the person-and-run SAN, the chain cached, renewal at two thirds with a new key, fail closed on an expired leaf, a sentinel test | **built**, 2026-11-28 |
-| R2b | an issuer adapter (an HTTP CA, a token, a trust anchor) | not built |
-| R3 | the wiring: `RUN_CERT_ISSUER_URL` and the two files, a run key per run, and the request path choosing `KeySource::Run` | not built |
+| R2b | the `broker` adapter (contract v1: a CSR and a re-read projected token in, a chain out) and its `RUN_CERT_*` configuration | **built**, 2026-11-28 |
+| R3 | the wiring: a run key per run from `ModelConfig::run_cert`, and the request path choosing `KeySource::Run` | not built |
 | R4 | the gateway side: the verifier checks `x5c` against its CA and binds the chain to the run | another party's work, not adam's |
 
 ## Consequences
 
-* **No behaviour changes today.** No variable is read, no run key is made, and `SignedRequests::new` is the
-  process source, so every call is signed exactly as it was.
+* **No behaviour changes today.** The `RUN_CERT_*` variables are read into `ModelConfig::run_cert`, but nothing
+  builds a run key from them yet, no run key is made, and `SignedRequests::new` is the process source, so every
+  call is signed exactly as it was.
 * **A new port to implement** for a host that wants run certificates; the suite (`run_cert_issuer_conformance!`)
   is what proves an adapter.
 * **A chain per run is a few kilobytes of header** on every model call (a leaf and a CA certificate,

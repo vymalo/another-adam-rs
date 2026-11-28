@@ -878,6 +878,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "adam-run-cert-broker"
+version = "0.7.0"
+dependencies = [
+ "adam-core",
+ "adam-error",
+ "async-trait",
+ "base64 0.22.1",
+ "futures",
+ "reqwest",
+ "rustls",
+ "secrecy",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "url",
+ "wiremock",
+]
+
+[[package]]
 name = "adam-runtime"
 version = "0.7.0"
 dependencies = [
@@ -944,6 +966,7 @@ dependencies = [
  "adam-model-openai",
  "adam-notify-postgres",
  "adam-postgres",
+ "adam-run-cert-broker",
  "adam-runtime",
  "adam-store-mongodb",
  "adam-store-postgres",

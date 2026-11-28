@@ -914,14 +914,16 @@ pub struct SessionBounds {
     ///
     /// [ADR 0054]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0054-a-child-session-can-be-configured-within-what-its-folder-allows.md
     pub token_budget: Option<u64>,
-    /// The names of the tools the folder and the deployment can offer the subagent (its own, and
-    /// an MCP server's as `server__tool`), **as far as the caller knows them**: a worker fills them
-    /// from the node it binds. Empty for a caller that knows none: a control plane binds no agent
-    /// and cannot list an MCP server's tools without calling the server.
+    /// The names of the tools the folder and the deployment can offer the subagent (its own, an MCP
+    /// server's as `server__tool`, and what each of its sources declares:
+    /// `ToolSource::declared`), **as far as the caller knows them**: a worker fills them from the
+    /// node it binds. Empty for a caller that knows none: a control plane binds no agent and cannot
+    /// list an MCP server's tools without calling the server.
     pub tools: Vec<String>,
-    /// Whether [`tools`](Self::tools) is **every** tool the subagent can have: `false` when a
-    /// source adds tools while a run goes (an `mcp.json` server loaded by the task, or a source the
-    /// deployment gave), whose names no list made at startup holds. `admit` uses the two so that a
+    /// Whether [`tools`](Self::tools) is **every** tool the subagent can have: `false` when a source
+    /// cannot name its tools before a run calls it (`ToolSource::declared` answers
+    /// `Declared::Unknown`: an endpoint whose listing is another system's and may change with the
+    /// conversation), so no list made at startup holds them. `admit` uses the two so that a
     /// narrowing is never silently ignored (ADR 0054 decision 2):
     ///
     /// * a `tools` entry that matches no name is refused, listing the names, **only when the set is

@@ -59,7 +59,9 @@ use std::time::Duration;
 
 use adam_a2a_runtime::{CONTEXT_THREAD_TOOLS, CONTEXT_UPLOADS, integral_numbers};
 use adam_core::time::Timestamp;
-use adam_llm_agent::{Listing, SourceCtx, ToolCtx, ToolError, ToolNote, ToolOutput, ToolSource};
+use adam_llm_agent::{
+    Declared, Listing, SourceCtx, ToolCtx, ToolError, ToolNote, ToolOutput, ToolSource,
+};
 use adam_mcp::{
     CallOptions, Endpoint, EndpointError, McpPolicy, RemoteTool, UploadError, UploadRequest,
     Uploaded, Uploader,
@@ -631,6 +633,16 @@ impl ToolSource for ThreadTools {
         self.listing(ctx).await.specs
     }
 
+    /// **`Unknown`**: the endpoint is another system's. It lists per conversation (the grant in the
+    /// run's context, a new grant, a refused call or [`LISTING_TTL`] lists again) and it relays the
+    /// tools of the servers a person attached as `<server>__<tool>`, so no list made at startup is
+    /// every name this source can offer. A session's set of tools stays incomplete and
+    /// `SessionBounds::admit` checks the shape of a `tools` entry alone (ADR 0054 decision 4): an
+    /// entry naming a thread tool is admitted, and offers what it selects.
+    fn declared(&self) -> Declared {
+        Declared::Unknown
+    }
+
     fn expects_repeat(&self, name: &str, _taken: &[ToolSpec]) -> bool {
         is_relayed(name)
     }
@@ -795,6 +807,16 @@ mod tests {
 
     fn client() -> ThreadToolsClient {
         ThreadToolsClient::new(McpPolicy::default()).with_clock(at("2026-10-01T12:00:00Z"))
+    }
+
+    /// The endpoint is another system's: it lists per conversation and relays the tools of the
+    /// servers a person attached, so no list made at startup is every name this source can offer. A
+    /// session's set of tools stays incomplete and `admit` checks the shape of an entry alone (ADR
+    /// 0054 decision 4).
+    #[test]
+    fn the_thread_tools_declare_unknown() {
+        let source = ThreadTools::new(Arc::new(client()));
+        assert_eq!(source.declared(), Declared::Unknown);
     }
 
     #[test]

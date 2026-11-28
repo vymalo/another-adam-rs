@@ -5,7 +5,7 @@
 
 use std::sync::Arc;
 
-use adam_llm_agent::{SourceCtx, ToolCtx, ToolError, ToolOutput, ToolSource};
+use adam_llm_agent::{Declared, SourceCtx, ToolCtx, ToolError, ToolOutput, ToolSource};
 use adam_model::ToolSpec;
 use async_trait::async_trait;
 use serde_json::Value;
@@ -52,6 +52,13 @@ pub(crate) fn describe_show_in(ui: &UiState, ctx: &SourceCtx, specs: &mut [ToolS
 impl ToolSource for ScreenSource {
     async fn specs(&self, _ctx: &SourceCtx) -> Vec<ToolSpec> {
         Vec::new()
+    }
+
+    /// It offers no tool: the mentioned agents are instructions and `show`'s description is a
+    /// refinement of a tool the agent already has. `All` of nothing, so it never makes a session's
+    /// set of tools incomplete (ADR 0054 decision 4).
+    fn declared(&self) -> Declared {
+        Declared::All(Vec::new())
     }
 
     async fn instructions(&self, ctx: &SourceCtx) -> Option<String> {
