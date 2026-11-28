@@ -111,6 +111,17 @@ amendment is the owner's to make there.
    with a `*`, that matches none is still admitted there; a concrete `deny_tools` name is still refused, as the row above
    says. A deployment that does not give an agent the thread-tools source has the strict check on it.
 
+   *Amended 2026-11-28 (ANR-1304), the `tools` and `deny_tools` rows:* a lazy MCP server's tools are loaded by a tool of its
+   own, `load__group__<server>` (ADR 0066), which an allow-list such as `github__*` does not name: the loader was withheld
+   with the tools it loads, so a session narrowed to a lazy server's tools could never load that server's group. The
+   narrowing now keeps `load__group__<server>` when **every** allow-list names the loader or one of the server's tools
+   (`<server>__<tool>`), and keeps none when they name none of them, because a loader that can load nothing is not handed
+   out. `deny_tools` is still checked first, and once the group is loaded its members go through the same lists, so nothing
+   widens: the loader is a means to the tools the list names, not an extra tool the session may use. The decision reads the
+   header's config, the context's copy of the same lists and the agent's fixed tool set (`LlmAgent::own_names`) — all fixed
+   for the round — so the tools array does not move between the turns of one round (ADR 0044). It is exact for a `when` MCP
+   server's group, whose members are `<server>__<tool>`; a group whose members do not share its name prefix is not covered.
+
    *Amended 2026-11-21 (ADR 0063)*: for `reasoning_effort` only, the declaration is the **model entry** in
    `MODEL_ALIASES_FILE` (the alias's `reasoning` object: its levels and its wire), not a global variable. A folder or
    session value must be one of that model's levels; a request outside them is refused; a model whose entry takes none
