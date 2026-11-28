@@ -2473,12 +2473,6 @@ mod skip_set_tests {
     use adam_core::RunId;
     use adam_core::time::{Timestamp, span_of};
 
-    fn at(offset_secs: i64) -> Timestamp {
-        Timestamp::now()
-            + span_of(std::time::Duration::from_secs(offset_secs.unsigned_abs()))
-                * if offset_secs < 0 { -1 } else { 1 }
-    }
-
     #[test]
     fn a_held_run_is_busy_until_its_period_passes() {
         let mut set = SkipSet::default();
@@ -2552,7 +2546,7 @@ mod skip_set_tests {
                     .expect("released");
                 skip.hold(lease.run.id, now);
             }
-            now = now + span_of(std::time::Duration::from_secs(1));
+            now += span_of(std::time::Duration::from_secs(1));
         }
         assert_eq!(claims, 1, "refused once over ten polls, not once per poll");
         // And a newer worker, which does not hold it, takes it straight away.
