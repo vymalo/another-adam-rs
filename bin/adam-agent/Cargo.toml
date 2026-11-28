@@ -26,7 +26,7 @@ adam-a2a-runtime.workspace = true
 adam-error.workspace = true
 adam-llm-agent.workspace = true
 adam-model.workspace = true
-adam-otel.workspace = true
+adam-otel = { workspace = true, features = ["aws-lc"] }
 adam-runtime.workspace = true
 # The folder's schedules: the scheduler agent and `reconcile_store` (ADR 0060).
 adam-schedule = { path = "../../crates/adam-schedule", version = "0.7.0" } # x-release-please-version
