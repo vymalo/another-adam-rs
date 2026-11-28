@@ -165,16 +165,16 @@ impl HooksSettings {
         let file: File = match serde_json::from_str(raw) {
             Ok(file) => file,
             Err(e) => {
+                // A data error names the member serde refused (`unknown field \`alow\``); the
+                // test that an unknown member is refused asserts on that name, so keep it.
+                let detail = if e.is_data() {
+                    e.to_string()
+                } else {
+                    format!("it does not parse at line {} column {}", e.line(), e.column())
+                };
                 problems.push(format!(
-                    "{HOOKS_FILE} {:?} is not a valid file ({} at line {} column {})",
-                    path.display().to_string(),
-                    if e.is_data() {
-                        "a member is wrong"
-                    } else {
-                        "it does not parse"
-                    },
-                    e.line(),
-                    e.column()
+                    "{HOOKS_FILE} {:?} is not a valid file ({detail})",
+                    path.display().to_string()
                 ));
                 return Self::default();
             }
