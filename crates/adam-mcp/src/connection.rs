@@ -214,15 +214,16 @@ impl Recipe {
                         tracing::debug!(
                             target: "adam_mcp::stderr",
                             server = %server,
-                            "{}",
-                            text.trim_end()
+                            line = %text.trim_end(),
+                            "a line of the server's stderr"
                         );
                     }
                     Ok(Line::TooLong) => {
                         tracing::debug!(
                             target: "adam_mcp::stderr",
                             server = %server,
-                            "a stderr line over {STDERR_LINE_MAX} bytes was dropped"
+                            limit = STDERR_LINE_MAX,
+                        "a stderr line was dropped for its length"
                         );
                     }
                     Ok(Line::End) | Err(_) => break,

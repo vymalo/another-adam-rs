@@ -303,6 +303,29 @@ pub trait Agent: Send + Sync + 'static {
     /// Stable name, stored as `RunRecord::agent`.
     fn name(&self) -> &str;
 
+    /// The journal epoch this agent's step list is written against ([ADR 0076]): the number a run
+    /// it starts records, and the newest epoch a worker of this agent may replay.
+    ///
+    /// `0` by default, so an agent that never changes its step list never bumps it and every run
+    /// it made stays replayable. An author bumps it when a step's name, its order or its result
+    /// changes, so a run started under the older step list is never replayed against the newer
+    /// one: a worker whose epoch is **older** than the run's leaves the run untouched, for a
+    /// worker of its own epoch to finish ([`Agent::min_replay_epoch`] is the other end).
+    ///
+    /// [ADR 0076]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0076-a-run-records-the-journal-epoch-it-started-on.md
+    fn replay_epoch(&self) -> u32 {
+        0
+    }
+
+    /// The oldest journal epoch this agent can still replay ([ADR 0076]): a run started **below**
+    /// it ends `Failed`, naming both epochs, instead of being replayed against a step list that no
+    /// longer exists. `0` by default, so nothing is ever too old.
+    ///
+    /// [ADR 0076]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0076-a-run-records-the-journal-epoch-it-started-on.md
+    fn min_replay_epoch(&self) -> u32 {
+        0
+    }
+
     /// Initial state for a new run.
     fn init(&self, input: Inbound) -> Result<Self::State, AgentError>;
 
@@ -404,6 +427,16 @@ pub trait AgentStarter: Send + Sync + 'static {
     /// too: a run that continues another starts from the prior run's stored
     /// state.
     type State: Serialize + DeserializeOwned + Send + Sync;
+
+    /// The journal epoch this starter's agent writes into a run it starts ([ADR 0076]).
+    ///
+    /// The starter side of [`Agent::replay_epoch`]: a front that only starts runs (an A2A control
+    /// plane) has no `Agent`, and the run it starts must still record the epoch. `0` by default.
+    ///
+    /// [ADR 0076]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0076-a-run-records-the-journal-epoch-it-started-on.md
+    fn replay_epoch(&self) -> u32 {
+        0
+    }
 
     /// Stable name, stored as `RunRecord::agent`. Equal to the name of the
     /// [`Agent`] that steps these runs.

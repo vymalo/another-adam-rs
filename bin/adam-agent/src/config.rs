@@ -64,10 +64,42 @@ pub struct WorkerConfig {
     /// (`AgentDef::si_memory_ceiling`, ADR 0081 decision 11). It only narrows the folder's
     /// `si_memory:` key, never widens it.
     pub si_memory: SiMemoryCeiling,
+    /// `SI_MEMORY_DIR`: the folder L1 keeps its problems in (ADR 0081 decision 2, one folder per
+    /// process). No default: memory on with no directory means L1 is absent, and the process says
+    /// so once instead of inventing a path.
+    pub si_memory_dir: Option<PathBuf>,
+    /// `MEMORY_URL`: the deployment's L2, named by the scheme its adapter takes (`mongodb://`,
+    /// `mongodb+srv://`). `None`: no L2, and L1 alone works (ADR 0081 decision 11).
+    pub memory: Option<MemoryStore>,
 }
+
+/// The L2 store `MEMORY_URL` names.
+#[derive(Clone, PartialEq, Eq)]
+pub enum MemoryStore {
+    /// A MongoDB deployment, by its connection string.
+    Mongo(String),
+    /// A PostgreSQL database, by its connection string.
+    Postgres(String),
+}
+
+impl std::fmt::Debug for MemoryStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The URL may carry a password: never in a log.
+        match self {
+            Self::Mongo(_) => f.write_str("MemoryStore::Mongo(<url>)"),
+            Self::Postgres(_) => f.write_str("MemoryStore::Postgres(<url>)"),
+        }
+    }
+}
+
+/// The variable that names the deployment's L2 store.
+pub const MEMORY_URL_ENV: &str = "MEMORY_URL";
 
 /// The variable that is the deployment's ceiling on the self-improvement memory.
 pub const SI_MEMORY_ENV: &str = "SI_MEMORY";
+
+/// The variable that names the folder L1 keeps its problems in.
+pub const SI_MEMORY_DIR_ENV: &str = "SI_MEMORY_DIR";
 
 /// The variable that lets a remote subagent be at a plain `http` URL on another machine.
 pub const ALLOW_INSECURE_REMOTES_ENV: &str = "A2A_ALLOW_INSECURE_REMOTES";
@@ -90,6 +122,8 @@ impl std::fmt::Debug for WorkerConfig {
             .field("extra_mcp_file", &self.extra_mcp_file)
             .field("allow_insecure_remotes", &self.allow_insecure_remotes)
             .field("si_memory", &self.si_memory)
+            .field("si_memory_dir", &self.si_memory_dir)
+            .field("memory", &self.memory)
             .finish()
     }
 }
@@ -154,6 +188,15 @@ impl Config {
                 &|name: &str| lookup(name).filter(|v| !v.trim().is_empty()),
                 &mut problems,
             ),
+            memory: parse_memory_url(
+                &|name: &str| lookup(name).filter(|v| !v.trim().is_empty()),
+                &mut problems,
+            ),
+            si_memory_dir: adam_service::parse_dir(
+                &|name: &str| lookup(name).filter(|v| !v.trim().is_empty()),
+                SI_MEMORY_DIR_ENV,
+                &mut problems,
+            ),
         });
 
         ConfigError::check(problems)?;
@@ -163,6 +206,29 @@ impl Config {
             worker,
         })
     }
+}
+
+/// `MEMORY_URL`: the L2 store, by the scheme its adapter takes. A scheme no adapter in this build
+/// implements is a problem, named, because a deployment that asks for a store the process cannot
+/// reach would silently run without L2 (ADR 0081 decision 12: fail closed).
+fn parse_memory_url(
+    get: &impl Fn(&str) -> Option<String>,
+    problems: &mut Vec<String>,
+) -> Option<MemoryStore> {
+    let url = get(MEMORY_URL_ENV)?;
+    let url = url.trim();
+    if url.starts_with("mongodb://") || url.starts_with("mongodb+srv://") {
+        return Some(MemoryStore::Mongo(url.to_owned()));
+    }
+    if url.starts_with("postgres://") || url.starts_with("postgresql://") {
+        return Some(MemoryStore::Postgres(url.to_owned()));
+    }
+    problems.push(format!(
+        "{MEMORY_URL_ENV} must name a store this build has an adapter for: `mongodb://`, \
+         `mongodb+srv://`, `postgres://` or `postgresql://` (a URL is never logged; unset it for \
+         L1 alone)"
+    ));
+    None
 }
 
 /// `SI_MEMORY`: `on` (the default, and for a blank value) or `off`; anything else is a problem and
@@ -397,6 +463,88 @@ mod tests {
                 .problems
                 .iter()
                 .any(|p| p.contains("SI_MEMORY must be `on` or `off`")),
+            "{error}"
+        );
+        assert_eq!(adam_service::exit_code(&error), 78);
+        vars.insert("ROLE".into(), "control-plane".into());
+        assert!(parse(&vars).unwrap().worker.is_none());
+    }
+
+    /// `SI_MEMORY_DIR` names the folder L1 keeps its problems in (ADR 0081 decision 2): unset is
+    /// absent — no default, so memory on with no folder means no L1 — and a path that is not an
+    /// existing directory stops the start with 78.
+    #[test]
+    fn the_memory_folder_is_read_by_the_workers_and_must_be_a_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut vars = full(dir.path());
+        assert_eq!(parse(&vars).unwrap().worker.unwrap().si_memory_dir, None);
+        vars.insert(SI_MEMORY_DIR_ENV.into(), dir.path().display().to_string());
+        assert_eq!(
+            parse(&vars).unwrap().worker.unwrap().si_memory_dir,
+            Some(dir.path().to_path_buf())
+        );
+        let file = dir.path().join("a-file");
+        std::fs::write(&file, "x").unwrap();
+        for bad in [
+            file.display().to_string(),
+            dir.path().join("nowhere").display().to_string(),
+        ] {
+            vars.insert(SI_MEMORY_DIR_ENV.into(), bad);
+            let error = parse(&vars).unwrap_err();
+            assert!(
+                error
+                    .problems
+                    .iter()
+                    .any(|p| p.contains("SI_MEMORY_DIR") && p.contains("is not a directory")),
+                "{error}"
+            );
+            assert_eq!(adam_service::exit_code(&error), 78);
+        }
+        // A control plane binds no agent and does not read it.
+        vars.insert("ROLE".into(), "control-plane".into());
+        assert!(parse(&vars).unwrap().worker.is_none());
+    }
+
+    /// `MEMORY_URL` names the L2 store by the scheme its adapter takes (ADR 0081 decisions 4 and
+    /// 11): unset is no L2 and L1 alone, each known scheme selects its adapter, any other scheme is
+    /// a problem naming the variable and exit 78, and a control plane does not read it.
+    #[test]
+    fn memory_url_selects_the_adapter_its_scheme_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut vars = full(dir.path());
+        assert_eq!(parse(&vars).unwrap().worker.unwrap().memory, None);
+        for (url, want) in [
+            (
+                "mongodb://localhost:27017/adam",
+                MemoryStore::Mongo("mongodb://localhost:27017/adam".into()),
+            ),
+            (
+                "mongodb+srv://cluster.example/adam",
+                MemoryStore::Mongo("mongodb+srv://cluster.example/adam".into()),
+            ),
+            (
+                "postgres://localhost/adam",
+                MemoryStore::Postgres("postgres://localhost/adam".into()),
+            ),
+            (
+                "postgresql://localhost/adam",
+                MemoryStore::Postgres("postgresql://localhost/adam".into()),
+            ),
+        ] {
+            vars.insert(MEMORY_URL_ENV.into(), url.into());
+            assert_eq!(
+                parse(&vars).unwrap().worker.unwrap().memory,
+                Some(want),
+                "{url}"
+            );
+        }
+        vars.insert(MEMORY_URL_ENV.into(), "redis://localhost".into());
+        let error = parse(&vars).unwrap_err();
+        assert!(
+            error
+                .problems
+                .iter()
+                .any(|p| p.contains("MEMORY_URL") && p.contains("postgres://")),
             "{error}"
         );
         assert_eq!(adam_service::exit_code(&error), 78);

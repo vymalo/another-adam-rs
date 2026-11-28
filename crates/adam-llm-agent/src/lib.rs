@@ -149,6 +149,7 @@ mod gate;
 mod history;
 mod images;
 mod kept;
+mod metrics;
 mod model_wait;
 mod order;
 pub mod paging;

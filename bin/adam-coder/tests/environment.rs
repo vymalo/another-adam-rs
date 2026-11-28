@@ -602,10 +602,14 @@ async fn the_checks_artifact_says_where_it_ran_when_that_was_a_run_pod() {
     );
 
     // A template that names no image, and the coder's own container (which has no `environment`).
+    // Each call here must really run: a passed check is answered from the earlier one when the tree
+    // is unchanged (it is keyed on the tree and the call, never on the environment), so a file of
+    // the worktree moves between the runs.
     *rig.fake.session.kind.lock().unwrap() = Some(EnvKind::Kubernetes {
         pod: "adam-run-0123456789ab".to_owned(),
         image: None,
     });
+    std::fs::write(rig.worktree().join("moved-1"), "x\n").unwrap();
     let out = RunChecks
         .call(&rig.ctx, json!({"command": "true"}))
         .await
@@ -615,6 +619,7 @@ async fn the_checks_artifact_says_where_it_ran_when_that_was_a_run_pod() {
         json!({"kind": "kubernetes", "image": ""})
     );
     *rig.fake.session.kind.lock().unwrap() = Some(EnvKind::Local);
+    std::fs::write(rig.worktree().join("moved-2"), "x\n").unwrap();
     let out = RunChecks
         .call(&rig.ctx, json!({"command": "true"}))
         .await

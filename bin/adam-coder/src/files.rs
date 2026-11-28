@@ -238,7 +238,7 @@ impl AgentFiles {
             "agent files"
         );
         for warning in self.warnings() {
-            tracing::warn!("{warning}");
+            tracing::warn!(warning = %warning, "a warning while reading the agent's files");
         }
     }
 }

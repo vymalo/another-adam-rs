@@ -189,6 +189,16 @@ amendment is the owner's to make there.
     * It stops a working round, as a close with cancel does, then writes `deleted: true` (new) in the closing round's header.
       A deleted session is never listed, frees its place under `max_open`, and is refused by every tool in words
       (`session … was deleted`). It cannot be reopened (no closed session can).
+    * *Amended 2026-11-28 (ANR-1229)*: for a working round the tombstone is written **in the same commit as the cancel**, not
+      by a closing round after it. Between a cancel and a closing round the cancelled round is listed and its report is due
+      to the parent (`is_due` suppresses a cancelled round only once a closing round follows it), and a tombstone committed
+      before the cancel in a commit of its own would be overwritten by a step of the round that lands after it, because the
+      header's only home is the agent state the round itself writes. `Runtime::delete_session_round` therefore writes the
+      header and fails the round in one CAS commit (`Inner::cancel_run_with`), and `subagent_close` starts no closing round
+      for a working session; a round that ended before that commit is tombstoned without a cancel. An idle or closed session
+      keeps the closing round, which carries the tombstone from its first commit. The listing filter this decision promised
+      was missing from `page_of_sessions` and is added: `list_sessions` drops a deleted session, as `session_view` already
+      did, so the due rule never sees one.
     * **The store:** its rounds' runs are **kept** until `purge_finished` removes them by age (retention, for audit); a delete
       that erases them now needs a new required `Store` method, which breaks every implementer (Rule 2), and is not decided
       here. What the parent already read stays in the parent's history (ADR 0039 keeps history unrewritten).

@@ -101,7 +101,32 @@ terminal shows as text).
 
 Leaving the override out (`docker compose --profile app up -d --wait`) goes back to the mocks.
 
-## 7. Stop
+## 7. Check what a model call cost
+
+```sh
+dev/gateway-usage-check.sh
+```
+
+The Assistant answers one message with `usage/v1` and `reasoning/v1` activated, and the script prints
+adam's report for each model call — the call id, input, output, total, the reasoning and cached counts when
+the provider gave them, the context window, and the reasoning level the call named — then what to compare in
+the model gateway's own usage log. It runs green on the mocks, where the scripted model returns a fixed
+usage block.
+
+Against a real deployment, the key comes from the environment and is never printed:
+
+```sh
+GATEWAY_URL=https://<the deployment's gateway> GATEWAY_KEY=... \
+MODEL=deepseek-v4.1-flash EFFORT=high dev/gateway-usage-check.sh
+```
+
+With `GATEWAY_URL` and `GATEWAY_KEY` set, the script also makes **one** direct call to the gateway with the
+same model and effort and prints the gateway's own `usage` object beside adam's numbers: that is the
+comparison ANR-75 asks for (are `cached_tokens` and `reasoning_tokens` returned at all, and do the counts
+agree). `EFFORT` must be a level the agent's card lists; a deployment whose model has no profile lists no
+`reasoning/v1`, and the script says so instead of guessing.
+
+## 8. Stop
 
 ```sh
 docker compose --profile app down          # keep the database and the git server's repositories

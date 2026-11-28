@@ -29,6 +29,10 @@ use adam_memory::{
 use mongodb::bson::{Bson, Document, doc, from_document, to_document};
 use mongodb::sync::{Collection, Database};
 
+/// The collection a deployment's lessons live in: one per database, so two scopes on one database
+/// stay apart by their documents' `scope` field.
+pub const LESSONS_COLLECTION: &str = "adam_memory_lessons";
+
 /// The L2 memory over one MongoDB collection.
 pub struct MongoMemory {
     collection: Collection<Document>,
@@ -53,6 +57,29 @@ impl MongoMemory {
             settings,
             scope,
         })
+    }
+
+    /// Open a memory from a connection string, the shape a deployment's `MEMORY_URL` takes.
+    ///
+    /// `database` names the database; the collection is this adapter's own (`adam_memory_lessons`),
+    /// because a lesson is not a run's and has no run to share a namespace with.
+    ///
+    /// # Errors
+    ///
+    /// A MongoDB error, when the client cannot be built.
+    pub fn connect(
+        uri: &str,
+        database: &str,
+        settings: LessonSettings,
+        scope: MemoryScope,
+    ) -> Result<Self, mongodb::error::Error> {
+        let client = mongodb::sync::Client::with_uri_str(uri)?;
+        Self::new(
+            &client.database(database),
+            LESSONS_COLLECTION,
+            settings,
+            scope,
+        )
     }
 
     /// The settings it was built with.

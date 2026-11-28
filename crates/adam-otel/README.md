@@ -74,6 +74,7 @@ sequenceDiagram
 | `Otel::layer()` | the layer to compose beside `tracing_subscriber::fmt()` |
 | `Otel::meter()` | the meter a run's instruments are created from; its labels come from `labels` |
 | `labels::RunState`, `labels::Name` | the closed label sets: a value outside a set cannot be built |
+| `catalogue::EMITTED`, `catalogue::emitted(name)` | the instruments the workspace records — name, kind, unit, labels — and the list a dashboard panel is held to |
 | `init(filter)` | installs the process's subscriber — JSON `fmt()` and, when an endpoint is set, the OTel layer
   beside it — and returns the running `Otel` (or `None` when off); every adam binary calls it |
 | `Otel::shutdown()` | flush and stop, bounded by `SHUTDOWN_TIMEOUT` |
@@ -125,6 +126,11 @@ stops it, and every adam binary calls it before exit. Starting installs the mete
 crate that emits a measurement uses `opentelemetry::global::meter(..)` and needs no handle threaded through the
 layers; where nothing was started that meter is the no-op one. Ask for it per measurement rather than caching it: the global is read at the call, so a meter cached before `init` would stay the no-op one.
 
+**The instruments so far:** `adam.runs` (a counter of committed transitions, labelled by the run's state —
+`adam-runtime`) and `adam.tool.duration` (a histogram of a tool call's latency, labelled by the tool's
+name, recorded only when a tool answered — `adam-llm-agent`). Both are in `catalogue::EMITTED`, the list a
+dashboard is held to.
+
 **Labels are types.** [`labels`] holds the closed sets the instruments use: `RunState` (the four states of
 `adam_core::store::RunStatus`, held to them by a test) and a `Name` for the names a deployment declares (a tool, a
 model alias, a pool), which accepts only `[a-z0-9._-]`, at most 64 bytes. A value outside a set cannot be built, so a
@@ -155,6 +161,22 @@ it puts that value in the record: eight sites do today (a startup warning, a pan
 moving those values into fields — where the allowlist decides — is its own card. Until then the allowlist covers
 the fields, not the message.
 
+## Dashboards
+
+[`catalogue`](src/catalogue.rs) is the list of instruments this workspace creates from an OTel meter
+— today `adam.runs`, with its kind, its unit and the labels it may carry. It is data, not a doc
+comment, so `crates/adam-otel/tests/dashboards.rs` can read it: the test loads
+`deploy/dashboards/*.json` and fails when a panel queries a metric that is not in the list, or names
+a label the instrument does not declare — in any form PromQL has for one (`by`, `without`, `on`,
+`ignoring`, `group_left`, `group_right`, the four matchers), or in a templating variable's
+`label_values(…)`. A form the test does not read (`label_replace`, `label_join`) fails it outright.
+A metric a deployment cannot scrape cannot become a graph that quietly draws nothing.
+
+The dashboards are generated, not hand-written: `tools/dashboards/<name>.py` (standard library only)
+writes `deploy/dashboards/<name>.json`, `sh tools/dashboards/regenerate.sh` runs them all, and CI
+regenerates and fails on a difference. `deploy/dashboards/README.md` says what each one shows and how
+a deployment imports it.
+
 ## Versions
 
 `opentelemetry` 0.33.1, `opentelemetry_sdk` 0.33.1, `opentelemetry-otlp` 0.33.1 and
@@ -162,5 +184,8 @@ the fields, not the message.
 versions the card measured on 2026-11-27). `opentelemetry-otlp` depends on `reqwest` 0.13.1 with
 `default-features = false`, so the workspace's `reqwest` is the one in the tree (*verified
 2026-11-28* in its normalized `Cargo.toml`). The crate adds no `-sys` package beyond the
-`aws-lc-sys` the workspace already links through `rustls` — and none at all under `default-features = false`, which is how
-`adam-egress` and `adam-git-sandbox` build it.
+`aws-lc-sys` the workspace already links through `rustls` — and none at all under `default-features = false`. The
+**workspace sets that** for every member (`Cargo.toml`'s `adam-otel` entry), so a library that depends on this crate never
+puts a TLS provider into an embedding host's graph (`tools/tls-provider/check.sh`, ANR-118): only the binaries that export
+over HTTPS opt in with `features = ["aws-lc"]` (`adam-coder`, `adam-agent`), while `adam-egress` (static musl, ANR-1174) and
+`adam-git-sandbox` build it with no provider at all.

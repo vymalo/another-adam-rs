@@ -287,8 +287,10 @@ returns `ToolError::AwaitSession` and the parent parks on a `PendingWait::Sessio
 the last (`SESSION_CLOSE_KIND` in its inbox: it finishes, then the session takes no more) or, with `cancel`, cancels it; an idle
 session is closed by a round that calls no model (`header.closing`) and ends with the last answer again. `delete: true`
 closes it with a **tombstone** (`header.deleted`): a deleted session is never listed again and every tool refuses it as `no
-session`, while **its runs stay in the store**. It **implies `cancel: true`** (ADR 0054 decision 10): a working round is
-stopped as a close with cancel stops it, and the closing round then writes the tombstone.
+session`, while **its runs stay in the store**. It **implies `cancel: true`** (ADR 0054 decision 10, amended): a working round
+is stopped **with the tombstone in the same commit**, so the session is gone from every listing the moment its round stops and
+the cancelled round's report is never due to the parent; an idle or closed one is deleted by a closing round whose header
+already says `deleted`.
 `subagent_list` pages the sessions of the conversation. The sessions are reached by **the conversation**, not by the task: a
 later task finds the sessions an earlier one started, and no run reaches another conversation's (an id that is not one of
 this conversation's is "no session"). At most 16 sessions that are not closed and 20 rounds per session (decision 5's
@@ -401,7 +403,7 @@ stateDiagram-v2
     Idle --> Idle: subagent_edit starts a round that calls no model (header editing, no report)
     Idle --> Closed: subagent_close starts a round that calls no model
     Idle --> Closed: idle for idle_ttl (read, not written)
-    Working --> Deleted: subagent_close with delete (it cancels the round first)
+    Working --> Deleted: subagent_close with delete (the cancel and the tombstone are one commit)
     Idle --> Deleted: subagent_close with delete (a tombstone in the closing round)
     Closed --> Deleted: subagent_close with delete
     Closed --> [*]
@@ -498,6 +500,7 @@ answer has streamed, not before the call.
 | S16 | A journal from before slice 3, or one with reports, is replayed, with a message that arrived since | The same history, no model asked, no child run, no disagreement; the rounds are counted once even when the answer is dropped as stale |
 | S17 | A session has sat idle for `idle_ttl`, or an edit goes past a bound, or an edit reaches an idle session | It reads closed, frees its place, refuses a send in words; a working round never expires; its unreported report is told once. An edit past a bound is refused in words and changes nothing; an edit of an idle session is a round that calls no model, has no report and counts toward `max_rounds` |
 | S18 | A round asks the person, and one that may not asks anyway | A shown kept-open round parks `input-required` and the parent's read says `blocked`; an answer in the child context resumes it; a child that may not ask is told `NOT_ASKABLE` and goes on |
+| S19 | A working session is deleted, and the parent lists or reads between the cancel and anything that would follow it | The round is cancelled and the tombstone written in one commit: the session is already out of the listing when the round stops, so the cancelled round's report is never due; its runs stay in the store and a read or a send is refused as no session |
 
 **Tokens.** Each round a run started or sent to is counted once in the run's `usage_totals`: a journaled step `usage:<call id>` reads it when a report is given to the model and, at the latest, when the run ends (`sessions_end`), whether or not the report was read; a store error on the read is retried. **Known limit:** the checks scan every round of the conversation, and past 5,000 rounds of one subagent a start **and a send** are refused.
 

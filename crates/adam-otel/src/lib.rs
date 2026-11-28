@@ -16,7 +16,9 @@
 //! are created from, exported by a periodic reader on the same runtime, to `{endpoint}/v1/metrics`.
 //! Recording a measurement never blocks a run (the SDK aggregates in the process), a failed export
 //! is the SDK's internal log line, and a label is a type from [`labels`], so a value outside the set
-//! an instrument declares cannot be built.
+//! an instrument declares cannot be built. [`catalogue`] is the list of instruments the workspace
+//! actually records, and `crates/adam-otel/tests/dashboards.rs` holds every metric a panel of
+//! `deploy/dashboards/` queries to it.
 //!
 //! * **The closed set holds.** The layer's own extra attributes (`code.filepath`, `code.lineno`,
 //!   `busy_ns`, `idle_ns`, `thread.name`, `thread.id`) are switched off, so a span exports exactly
@@ -40,6 +42,7 @@
 
 mod install;
 
+pub mod catalogue;
 pub mod labels;
 pub mod logs;
 
@@ -49,7 +52,6 @@ use std::fmt;
 use std::time::Duration;
 
 use adam_error::{BoxError, Classify, ErrorClass};
-use opentelemetry::logs::{LoggerProvider as _, LoggerProvider};
 use opentelemetry::metrics::{Meter, MeterProvider as _};
 use opentelemetry::trace::TracerProvider as _;
 use opentelemetry_otlp::WithExportConfig as _;

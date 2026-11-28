@@ -8465,6 +8465,67 @@ mod cases {
         );
     }
 
+    /// A delete whose round ended before the commit still writes the tombstone, with no cancel: the
+    /// session is gone from the listing and from `session_view`, the run stays in the store, and its
+    /// header (here a synthesized one: `RoundAgent` keeps none) says `deleted`. The path is the one
+    /// `delete_session_round` takes when the tool read a working round that ended meanwhile.
+    pub async fn deleting_a_round_that_already_ended_writes_the_tombstone(store: DynStore) {
+        let (parent_name, agent) = (uniq("parent"), uniq("round"));
+        let rt = Runtime::builder(store.clone())
+            .agent(child_parked(&parent_name))
+            .agent(RoundAgent {
+                name: agent.clone(),
+                waits: false,
+            })
+            .worker_id(uniq("w"))
+            .poll_interval(Duration::from_millis(20))
+            .build();
+        let parent = rt.start(&parent_name, inbound(), None).await.unwrap();
+        let ctx = uniq("u:ctx");
+        let worker = spawn_worker(&rt);
+        let session = child_run_id(parent, "call-1");
+        rt.start_child_continuing(
+            parent,
+            session,
+            &agent,
+            say("one"),
+            &session_conversation_id(&ctx, session),
+            None,
+        )
+        .await
+        .unwrap();
+        wait_done(&rt, session).await;
+        worker.stop().await;
+
+        let view = rt
+            .session_view(&ctx, session)
+            .await
+            .unwrap()
+            .expect("a session");
+        assert_eq!(view.state, SessionState::Idle, "the round ended first");
+        rt.delete_session_round(&view, "the session was deleted")
+            .await
+            .unwrap();
+
+        assert!(
+            rt.session_view(&ctx, session).await.unwrap().is_none(),
+            "a deleted session is not a session"
+        );
+        assert!(
+            rt.list_sessions(&ctx, &[&agent], 0, 10)
+                .await
+                .unwrap()
+                .sessions
+                .is_empty(),
+            "a deleted session is never listed"
+        );
+        let rec = rt.view(session).await.unwrap().expect("the run stays");
+        assert_eq!(rec.status, RunStatus::Done, "the round was not cancelled");
+        let header = &rec.state["session"];
+        assert_eq!(header["deleted"], true, "{header}");
+        assert_eq!(header["closed"], true, "{header}");
+    }
+
     /// A report that lands while a run finishes is not news, as a finished notice is not: no
     /// agent reads it before slice 2.
     pub async fn a_report_that_lands_while_a_run_finishes_does_not_reopen_it(store: DynStore) {
@@ -8765,6 +8826,7 @@ macro_rules! runtime_suite {
                 session_listings_do_not_mix_awkward_parent_ids,
                 a_session_listing_dedupes_agents_caps_the_page_and_reads_every_page,
                 a_session_listing_says_how_the_round_ended,
+                deleting_a_round_that_already_ended_writes_the_tombstone,
                 a_session_idle_past_its_ttl_reads_closed,
                 a_working_round_never_expires,
                 a_report_that_lands_while_a_run_finishes_does_not_reopen_it,

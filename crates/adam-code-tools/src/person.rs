@@ -319,8 +319,8 @@ impl CommandGuard for Recorded {
         };
         // A Look guard's report is never read (`run_command` does not call `after_run`):
         // remove the entry now so the next command in the place is accepted. A Make guard's
-        // report is read by `after_run` (called by `make::run` between the command and this
-        // settle); leave the entry for it. `cut` only matters for Make.
+        // report is read by `after_run` (which `make::run` calls after this settle, ANR-1455); leave
+        // the entry for it. `cut` only matters for Make.
         let changed = match self.mode {
             Guarding::Look => {
                 let mut seen = self.seen.lock().unwrap_or_else(|e| e.into_inner());
@@ -613,9 +613,8 @@ mod tests {
             "the second is not refused with 'already running': {second:?}"
         );
 
-        // A `make::run` that creates a file: the entry is cleared by `after_run` (called inside
-        // `make::run` between the command and settle), so a second `run_command` after it is
-        // accepted. The file is on disk, the command's exit is zero, and the result text says
+        // A `make::run` that creates a file: the entry is cleared by `after_run` (which `make::run`
+        // calls after the guard settles), so a second `run_command` after it is accepted. The file is on disk, the command's exit is zero, and the result text says
         // the command ran.
         let (dir_m, place_m) = rig();
         let person_m = PersonDir::new(place_m.path(), std::iter::empty::<&str>()).unwrap();
@@ -633,6 +632,18 @@ mod tests {
         assert!(
             dir_m.path().join("by_make.txt").exists(),
             "make::run created the file on disk"
+        );
+        // ANR-1455: the model is told which files it changed. `PersonDir::after_run` is what reports
+        // them, and it can only do so once the guard has settled — the entry it reads is what
+        // `settle` records. The report's own opening line, not the file name: the command is echoed
+        // in the result too, so a bare `by_make.txt` would match the echo.
+        assert!(
+            made.content.contains("The person's own directory changed"),
+            "make::run reports the files it changed: {made:?}"
+        );
+        assert!(
+            made.content.contains("by_make.txt"),
+            "the report names the file it added: {made:?}"
         );
         let after_make =
             crate::inspect::run_command(&person_m, &ctx(), "true".to_owned(), None, None, None)

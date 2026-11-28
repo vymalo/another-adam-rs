@@ -216,7 +216,7 @@ fn log_join(res: Result<(), tokio::task::JoinError>) {
     if let Err(e) = res
         && e.is_panic()
     {
-        tracing::error!("run task panicked: {e}");
+        tracing::error!(panic = %e, "run task panicked");
     }
 }
 
@@ -576,6 +576,34 @@ fn run_span(status: RunStatus, child: bool) -> tracing::Span {
     }
 }
 
+/// What a worker of `worker` epoch does with a run that started on `run` epoch ([ADR 0076]),
+/// given the oldest epoch it can still replay.
+///
+/// The three answers the ADR names, as one function so they cannot drift apart: a run of the
+/// worker's own step list, or of an older one it still replays, is stepped; a run of a **newer**
+/// one is left untouched for a worker of that epoch; a run **below** the oldest is failed.
+///
+/// [ADR 0076]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0076-a-run-records-the-journal-epoch-it-started-on.md
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EpochVerdict {
+    /// This worker's step list, or an older one it still replays: step the run.
+    Replay,
+    /// A newer step list wrote the run: leave its version, journal and state untouched.
+    Leave,
+    /// Too old to replay: end it `Failed`, naming both epochs.
+    TooOld,
+}
+
+fn epoch_verdict(run: u32, worker: u32, oldest: u32) -> EpochVerdict {
+    if run > worker {
+        EpochVerdict::Leave
+    } else if run < oldest {
+        EpochVerdict::TooOld
+    } else {
+        EpochVerdict::Replay
+    }
+}
+
 /// The transition of one run, in its [`run_span`].
 async fn transition(
     inner: &Arc<Inner>,
@@ -693,8 +721,68 @@ async fn transition_inner(
         return true;
     };
 
+    // The journal epoch ([ADR 0076]): a worker replays only the step list it knows.
+    let worker_epoch = agent.replay_epoch();
+    let oldest = agent.min_replay_epoch();
+    match epoch_verdict(env.epoch, worker_epoch, oldest) {
+        EpochVerdict::Replay => {}
+        // A newer step list wrote this journal: leave the run exactly as it is — its version, its
+        // journal and its state — for a worker of that epoch to finish.
+        EpochVerdict::Leave => {
+            tracing::debug!(
+                run = %run,
+                run_epoch = env.epoch,
+                worker_epoch,
+                "leaving a run of a newer journal epoch untouched"
+            );
+            return false;
+        }
+        EpochVerdict::TooOld => {
+            let reason = format!(
+                "the run's journal is epoch {} and this worker replays from epoch {oldest} on: the \
+                 step list it was written against no longer exists",
+                env.epoch
+            );
+            tracing::error!(run = %run, error = %reason, "failing a run of a journal epoch too old to replay");
+            // The run keeps the format it was read in (a head stays a head) and its state; only
+            // the status and the error change.
+            let failed = match Stored::decode(run, &rec.state) {
+                Ok(Stored::Head(mut head)) => {
+                    head.error = Some(reason.clone());
+                    head.encode().ok().map(|bytes| (bytes, true))
+                }
+                Ok(Stored::Full(mut full)) => {
+                    full.error = Some(reason.clone());
+                    full.encode().ok().map(|bytes| (bytes, false))
+                }
+                Err(_) => None,
+            };
+            if let Some((state, was_head)) = failed {
+                let update = if was_head && inner.store.keeps_bodies() {
+                    RunUpdate::new(RunStatus::Failed, Value::Null).head(state)
+                } else {
+                    RunUpdate::new(RunStatus::Failed, state)
+                };
+                if let Ok(committed) = inner.store.commit_run(run, rec.version, update).await {
+                    crate::metrics::record_run_status(
+                        &opentelemetry::global::meter(crate::metrics::SCOPE),
+                        committed.status,
+                    );
+                    inner
+                        .emit_status(run, &rec.agent, RunStatus::Failed, Some(reason.clone()))
+                        .await;
+                    inner
+                        .notify_parent(&committed, &Value::Null, Some(&reason))
+                        .await;
+                }
+            }
+            return true;
+        }
+    }
+
     let mut ctx = Ctx::new(CtxParts {
         run,
+        epoch: env.epoch,
         agent: rec.agent.clone(),
         conversation_id: rec.conversation_id.clone(),
         attempt: env.attempt,
@@ -1351,6 +1439,7 @@ fn build_update(
     // leave a retry with `null`.
     let env = Envelope {
         v: cur.v,
+        epoch: cur.epoch,
         agent: next.agent.clone(),
         inbox: cur.inbox.iter().skip(next.consumed).cloned().collect(),
         seq: next.seq,
@@ -2266,5 +2355,35 @@ mod run_span_tests {
         let text = rendered(RunStatus::Parked, true);
         assert!(text.contains("adam.child"), "{text}");
         assert!(text.contains("parked"), "{text}");
+    }
+}
+
+/// The three answers of the journal epoch ([ADR 0076]), as a table.
+///
+/// [ADR 0076]: https://github.com/vymalo/another-adam-rs/blob/main/docs/decisions/0076-a-run-records-the-journal-epoch-it-started-on.md
+#[cfg(test)]
+mod epoch_verdict_tests {
+    use super::{EpochVerdict, epoch_verdict};
+
+    #[test]
+    fn a_run_of_the_workers_epoch_or_an_older_replayable_one_is_stepped() {
+        assert_eq!(epoch_verdict(2, 2, 0), EpochVerdict::Replay);
+        assert_eq!(epoch_verdict(1, 2, 0), EpochVerdict::Replay);
+        // The oldest replayable epoch is still replayed.
+        assert_eq!(epoch_verdict(1, 2, 1), EpochVerdict::Replay);
+    }
+
+    #[test]
+    fn a_run_of_a_newer_epoch_is_left_untouched() {
+        assert_eq!(epoch_verdict(2, 1, 0), EpochVerdict::Leave);
+        // Even when the worker also cannot replay down to it: leaving wins, so a run is never
+        // failed by a worker that is simply older than it.
+        assert_eq!(epoch_verdict(3, 1, 5), EpochVerdict::Leave);
+    }
+
+    #[test]
+    fn a_run_below_the_oldest_replayable_epoch_is_failed() {
+        assert_eq!(epoch_verdict(0, 2, 1), EpochVerdict::TooOld);
+        assert_eq!(epoch_verdict(1, 3, 2), EpochVerdict::TooOld);
     }
 }

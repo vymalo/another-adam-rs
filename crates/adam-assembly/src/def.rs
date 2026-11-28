@@ -14,6 +14,7 @@ use adam_agent_fs::{
 use adam_core::{DynSecretSource, ProcessEnv};
 use adam_llm_agent::{
     DynSkillCatalog, DynTool, DynToolSource, Limits, LlmStarter, SESSION_TOOLS, SessionTools,
+    SiMemoryHandle,
     ToolSet,
 };
 use adam_model::ReasoningEffort;
@@ -213,6 +214,9 @@ pub struct AgentDef {
     plugins: BTreeMap<String, PluginFactory>,
     /// The deployment's ceiling on the self-improvement memory ([`si_memory_ceiling`](Self::si_memory_ceiling)).
     si_memory_ceiling: SiMemoryCeiling,
+    /// The run's memory, when the deployment gave it one
+    /// ([`si_memory_handle`](Self::si_memory_handle)).
+    si_memory_handle: Option<SiMemoryHandle>,
 }
 
 /// The plugins one agent runs, by registered name.
@@ -252,6 +256,7 @@ impl AgentDef {
             reasoning_effort: None,
             plugins: BTreeMap::new(),
             si_memory_ceiling: SiMemoryCeiling::default(),
+            si_memory_handle: None,
         })
     }
 
@@ -487,6 +492,19 @@ impl AgentDef {
     #[must_use]
     pub fn si_memory_ceiling(mut self, ceiling: SiMemoryCeiling) -> Self {
         self.si_memory_ceiling = ceiling;
+        self
+    }
+
+    /// The run's memory: the store and the scope its two tools read and write (ADR 0081
+    /// decision 6), built by the deployment ([`SiMemoryHandle`]).
+    ///
+    /// [`bind`](Self::bind) offers `si_recall` and `si_record` as one lazy group **only** when this
+    /// is set and [`si_memory`](Self::si_memory) resolves `On`: a run with `si_memory: off`, with
+    /// `SI_MEMORY=off`, or with no handle has neither tool nor loader, so its tool list is what it
+    /// was.
+    #[must_use]
+    pub fn si_memory_handle(mut self, handle: SiMemoryHandle) -> Self {
+        self.si_memory_handle = Some(handle);
         self
     }
 
@@ -830,6 +848,10 @@ impl AgentDef {
                 known: agent_names,
             });
         }
+        let si_memory = match (&self.si_memory_handle, self.si_memory()) {
+            (Some(handle), SiMemorySetting::On(_)) => Some(handle.clone()),
+            _ => None,
+        };
         let mut walk = Walk {
             catalog: &catalog,
             values: &self.values,
@@ -838,6 +860,7 @@ impl AgentDef {
             secrets: &self.secrets,
             mcp: &self.mcp,
             plugins: &self.plugins,
+            si_memory,
             run_skills: self.run_skills.as_ref(),
             session_limits: lowered_by_file(
                 self.session_limits,
@@ -1049,6 +1072,9 @@ struct Walk<'a> {
     /// The root's modes (`modes/<name>.md`), once the root's tools are known: every agent of the
     /// assembly narrows by them, because a child run starts in its parent's mode.
     root_modes: Option<std::sync::Arc<crate::modes::Modes>>,
+    /// The run's self-improvement memory, when the deployment gave one **and** the ceiling allows
+    /// it (ADR 0081 decision 6): the root's tools, never a subagent's.
+    si_memory: Option<SiMemoryHandle>,
     nodes: Vec<Node>,
     remotes: Vec<Remote>,
 }
@@ -1191,6 +1217,28 @@ impl Walk<'_> {
                         .with_keywords(keywords.clone())
                 })
                 .collect();
+            let groups = crate::groups::Groups::bind(&origin, defs, &tools)?;
+            tools.extend(groups.loader_tools());
+            sources.push(Arc::new(groups));
+        }
+        // The self-improvement memory's two tools load as one group, and only when this run has a
+        // memory (ADR 0081 decision 6): `off`, or no handle from the deployment, leaves the tool
+        // list exactly as it was, so the golden of a folder that does not use it does not move.
+        if parent.is_none()
+            && let Some(handle) = &self.si_memory
+        {
+            let mut members = Vec::new();
+            for tool in handle.tools() {
+                members.push(tool.spec().name);
+                tools.push((tool.spec().name, tool));
+            }
+            let defs = vec![crate::groups::Group::new(
+                adam_llm_agent::SI_MEMORY_GROUP,
+                "What this agent has already learnt here: the problems it met, the remedies it \
+                 tried, what it predicted and what it saw. Call `si_recall` before solving \
+                 something that looks familiar; `si_record` writes what you learn.",
+                members,
+            )];
             let groups = crate::groups::Groups::bind(&origin, defs, &tools)?;
             tools.extend(groups.loader_tools());
             sources.push(Arc::new(groups));
@@ -1641,8 +1689,9 @@ fn lowered_by_file(
                     agent,
                     asked,
                     allowed,
-                    "`limits.{key}` is more than the deployment allows ({setting}): \
-                     the sessions run under {allowed}"
+                    key,
+                    setting,
+                    "a `limits` entry is more than the deployment allows; the sessions run under the allowed number"
                 );
             }
         }
@@ -2031,6 +2080,57 @@ mod tests {
             def_with("").si_memory(),
             SiMemorySetting::On(SiMemoryOptions::default()),
             "on by default"
+        );
+    }
+
+    /// ADR 0081 decision 6, the wiring: a run with a memory is offered the two tools and their
+    /// loader; `si_memory: off`, a ceiling of `off`, or no handle leaves the tool list untouched.
+    #[test]
+    fn a_run_with_a_memory_gets_the_two_tools_and_their_group() {
+        use adam_memory::{InProcessSiMemory, Scope, Scrubber, Settings};
+
+        let handle = || {
+            let memory = Arc::new(InProcessSiMemory::new(Settings::new(Scrubber::new(
+                |text: &str| text.to_owned(),
+            ))));
+            SiMemoryHandle::one_caller(memory, Scope::agent("dep", "-", "chat"), "caller")
+        };
+        let tools_of = |def: AgentDef| -> Vec<String> {
+            def.bind(ToolSet::new())
+                .expect("a bindable folder")
+                .tool_names()
+        };
+
+        let on = tools_of(def_with("si_memory: on\n").si_memory_handle(handle()));
+        for name in [
+            adam_llm_agent::SI_RECALL,
+            adam_llm_agent::SI_RECORD,
+            "load__group__memory",
+        ] {
+            assert!(on.iter().any(|tool| tool == name), "{name} in {on:?}");
+        }
+
+        let off = tools_of(def_with("si_memory: off\n").si_memory_handle(handle()));
+        assert!(!off.iter().any(|tool| tool.starts_with("si_")), "{off:?}");
+        assert!(
+            !off.iter().any(|tool| tool == "load__group__memory"),
+            "{off:?}"
+        );
+
+        let ceiling = tools_of(
+            def_with("si_memory: on\n")
+                .si_memory_ceiling(SiMemoryCeiling::Off)
+                .si_memory_handle(handle()),
+        );
+        assert!(
+            !ceiling.iter().any(|tool| tool.starts_with("si_")),
+            "SI_MEMORY=off with a handle offers nothing: {ceiling:?}"
+        );
+
+        let no_handle = tools_of(def_with("si_memory: on\n"));
+        assert!(
+            !no_handle.iter().any(|tool| tool.starts_with("si_")),
+            "{no_handle:?}"
         );
     }
 
